@@ -53,7 +53,7 @@ def find_best_contract(symbol, side, current_price):
     end_date = today + datetime.timedelta(days=MAX_DTE)
     
     req = GetOptionContractsRequest(
-        underlying_symbol=symbol,
+        underlying_symbols=[symbol],
         status="active",
         expiration_date_gte=start_date,
         expiration_date_lte=end_date,
