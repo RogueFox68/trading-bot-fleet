@@ -92,9 +92,9 @@ def find_best_contract(symbol, side, current_price):
     return best_contract
 
 def run_wheel_bot():
-    print(f"--- 治 FLEET WHEEL BOT STARTED ---")
+    print(f"--- 🎡 FLEET WHEEL BOT STARTED ---")
     print(f"Targets: {WATCHLIST}")
-    send_discord(f"治 **Fleet Wheel Online**\nTargets: {WATCHLIST}")
+    send_discord(f"🎡 **Fleet Wheel Online**\nTargets: {WATCHLIST}")
     log_to_influx("startup", 0, "None", "Bot Started")
     
     while True:
@@ -152,7 +152,7 @@ def run_wheel_bot():
                             time_in_force=TimeInForce.DAY
                         )
                         trading_client.submit_order(order_data=req)
-                        send_discord(f"到 **SOLD CALL {ticker}**\nStrike: ${contract.strike_price}")
+                        send_discord(f"💰 **SOLD CALL {ticker}**\nStrike: ${contract.strike_price}")
                         log_to_influx("sell_call", current_price, contract.symbol, "Opened Covered Call")
 
                 # SCENARIO C: SELL CASH SECURED PUT (No Stock, No Option)
@@ -180,7 +180,7 @@ def run_wheel_bot():
                             time_in_force=TimeInForce.DAY
                         )
                         trading_client.submit_order(order_data=req)
-                        send_discord(f"悼 **SOLD PUT {ticker}**\nStrike: ${contract.strike_price}")
+                        send_discord(f"🛡️ **SOLD PUT {ticker}**\nStrike: ${contract.strike_price}")
                         log_to_influx("sell_put", current_price, contract.symbol, "Opened Secured Put")
                         
                         # Reduce our 'local' tracking of BP so we don't overspend on the next ticker in the loop
