@@ -1,0 +1,6 @@
+alpaca-py
+pandas
+pandas_ta
+yfinance
+requests
+pytz

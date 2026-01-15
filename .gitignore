@@ -1,0 +1,32 @@
+# --- Security / Secrets (CRITICAL) ---
+.env
+config.py
+secrets.py
+keys.json
+*.pem
+*.key
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.manifest
+venv/
+.venv/
+env/
+
+# --- VS Code ---
+.vscode/
+*.code-workspace
+
+# --- OS Specific ---
+.DS_Store
+Thumbs.db
+
+# --- Logs and Local Databases ---
+*.log
+logs/
+*.sqlite3
+*.db
+# Assuming you don't want to upload your heavy grafana/influx data if it's local
+influx_data/
