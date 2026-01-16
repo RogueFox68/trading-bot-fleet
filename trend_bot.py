@@ -7,7 +7,7 @@ import pandas_ta as ta
 import pytz
 import yfinance as yf
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass
 from alpaca.trading.requests import MarketOrderRequest
 
 # --- CONFIGURATION ---
@@ -128,6 +128,10 @@ def run_trend_bot():
             for p in positions:
                 # SKIP Survivor/Crypto positions
                 if p.symbol in ["TQQQ", "SQQQ", "SOXL", "SOXS", "BTC/USD"]:
+                    continue
+                if p.asset_class == AssetClass.US_OPTION:
+                    continue
+                if p.symbol in ["DIS", "PLTR", "F"]:
                     continue
 
                 # --- EMERGENCY HARD STOP CHECK ---
