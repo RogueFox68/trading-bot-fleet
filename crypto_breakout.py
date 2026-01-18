@@ -21,9 +21,11 @@ data_client = CryptoHistoricalDataClient()
 
 def send_discord(msg):
     try:
+        # POINT TO THE SPECIFIC CONFIG KEY
         payload = {"content": msg, "username": "MoonBag Bot 🚀"}
-        requests.post(config.WEBHOOK_URL, json=payload)
-    except: pass
+        requests.post(config.WEBHOOK_MOONBAG, json=payload)
+    except Exception as e:
+        print(f"[!] Discord Error: {e}")
 
 def log_to_influx(symbol, action, price, qty):
     try:

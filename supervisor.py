@@ -16,13 +16,14 @@ HOSTNAME = socket.gethostname()
 def send_discord_alert(msg):
     """Sends admin alerts to the specific Overseer Webhook."""
     try:
-        # Check if user added the new key, otherwise fallback to default
-        webhook = getattr(config, 'WEBHOOK_OVERSEER', config.WEBHOOK_URL)
+        # OLD: webhook = getattr(config, 'WEBHOOK_OVERSEER', config.WEBHOOK_URL)
+        
+        # NEW: Explicitly use the Overseer webhook
         payload = {
             "content": msg, 
             "username": "Supervisor AI 👁️"
         }
-        requests.post(webhook, json=payload, timeout=5)
+        requests.post(config.WEBHOOK_OVERSEER, json=payload, timeout=5)
     except Exception as e:
         print(f"[!] Discord Error: {e}")
 
