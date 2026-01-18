@@ -5,6 +5,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 import datetime
+import time  # <--- FIXED: Added missing import
 import requests
 import pandas as pd
 import config
@@ -21,9 +22,11 @@ data_client = CryptoHistoricalDataClient()
 
 def send_discord(msg):
     try:
-        # POINT TO THE SPECIFIC CONFIG KEY
+        # FIXED: Using the specific Moon Bag webhook
         payload = {"content": msg, "username": "MoonBag Bot 🚀"}
-        requests.post(config.WEBHOOK_MOONBAG, json=payload)
+        # Checks if the specific key exists, falls back to default if not
+        webhook = getattr(config, 'WEBHOOK_MOONBAG', config.WEBHOOK_URL)
+        requests.post(webhook, json=payload)
     except Exception as e:
         print(f"[!] Discord Error: {e}")
 
@@ -76,15 +79,15 @@ def run_breakout_bot():
 
             for symbol in SYMBOLS:
                 try:
-                    entry_price, exit_price, current_price = get_donchian_levels(symbol)
+                    entry_high, exit_low, current_price = get_donchian_levels(symbol)
                     qty_held = pos_dict.get(symbol, 0)
                     
-                    print(f"  {symbol:<8} | Price: ${current_price:,.2f} | Breakout: ${entry_price:,.2f} | Stop: ${exit_price:,.2f}")
+                    print(f"  {symbol:<8} | Price: ${current_price:,.2f} | Breakout: ${entry_high:,.2f} | Stop: ${exit_low:,.2f}")
 
                     # --- ENTRY LOGIC ---
                     if qty_held == 0:
-                        if current_price > entry_price:
-                            print(f"    [SIGNAL] BREAKOUT! Price ${current_price} > ${entry_price}")
+                        if current_price > entry_high:
+                            print(f"    [SIGNAL] BREAKOUT! Price ${current_price} > ${entry_high}")
                             
                             # Calculate Size
                             target_val = equity * RISK_PCT
@@ -107,8 +110,8 @@ def run_breakout_bot():
 
                     # --- EXIT LOGIC ---
                     elif qty_held > 0:
-                        if current_price < exit_price:
-                            print(f"    [SIGNAL] TRAILING STOP! Price ${current_price} < ${exit_price}")
+                        if current_price < exit_low:
+                            print(f"    [SIGNAL] TRAILING STOP! Price ${current_price} < ${exit_low}")
                             
                             req = MarketOrderRequest(
                                 symbol=symbol,
@@ -126,7 +129,7 @@ def run_breakout_bot():
                 except Exception as e:
                     print(f"    [!] Error {symbol}: {e}")
 
-            # Sleep for 1 hour (Crypto markets move 24/7, but we don't need second-by-second checks for a Daily strategy)
+            # Sleep for 1 hour (Crypto markets move 24/7)
             time.sleep(3600)
 
         except Exception as e:
