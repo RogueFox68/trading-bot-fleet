@@ -25,7 +25,7 @@ def send_discord(msg):
         # FIXED: Using the specific Moon Bag webhook
         payload = {"content": msg, "username": "MoonBag Bot 🚀"}
         # Checks if the specific key exists, falls back to default if not
-        webhook = getattr(config, 'WEBHOOK_MOONBAG', config.WEBHOOK_URL)
+        webhook = getattr(config, 'WEBHOOK_MOONBAG')
         requests.post(webhook, json=payload)
     except Exception as e:
         print(f"[!] Discord Error: {e}")
