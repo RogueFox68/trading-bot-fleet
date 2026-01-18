@@ -1,0 +1,33 @@
+{
+    "bots": {
+        "crypto_grid": {
+            "script": "crypto_grid.py",
+            "status": "active",
+            "strategy": "neutral"
+        },
+        "survivor_bot": {
+            "script": "survivor_bot.py",
+            "status": "active",
+            "strategy": "long_only"
+        },
+        "wheel_bot": {
+            "script": "wheel_bot.py",
+            "status": "active",
+            "strategy": "conservative"
+        },
+        "trend_bot": {
+            "script": "trend_bot.py",
+            "status": "paused",
+            "strategy": "aggressive"
+        },
+        "moon_bag": {
+            "script": "crypto_breakout.py",
+            "status": "active",
+            "strategy": "breakout"
+        }
+    },
+    "global_settings": {
+        "market_condition": "normal",
+        "emergency_stop": false
+    }
+}
