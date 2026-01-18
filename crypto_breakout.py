@@ -42,22 +42,30 @@ def get_donchian_levels(symbol):
     Calculates the Donchian Channel (20-day High, 10-day Low).
     Returns (entry_level, exit_level, current_price)
     """
-    # Fetch 30 days of data to be safe
+    # FIX: Explicitly ask for data starting 60 days ago
+    # This ensures we get the full 30-day history we need
+    start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=60)
+
     req = CryptoBarsRequest(
         symbol_or_symbols=[symbol],
         timeframe=TimeFrame.Day,
+        start=start_time,  # <--- Critical Addition
         limit=30
     )
     bars = data_client.get_crypto_bars(req)
     df = bars.df.loc[symbol]
     
     # We exclude the 'current' unfinished candle for calculation
-    # otherwise a breakout today updates the high immediately
     completed_candles = df.iloc[:-1] 
     
+    # Safety Check: Do we actually have enough data?
+    if len(completed_candles) < LOOKBACK_ENTRY:
+        print(f"    [!] Not enough history for {symbol} (Got {len(completed_candles)} bars)")
+        return float('nan'), float('nan'), df.iloc[-1]['close']
+
     entry_high = completed_candles['high'].tail(LOOKBACK_ENTRY).max()
     exit_low = completed_candles['low'].tail(LOOKBACK_EXIT).min()
-    current_price = df.iloc[-1]['close'] # Use latest close as current price proxy
+    current_price = df.iloc[-1]['close']
     
     return entry_high, exit_low, current_price
 
