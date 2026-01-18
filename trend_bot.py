@@ -12,7 +12,7 @@ from alpaca.trading.requests import MarketOrderRequest
 
 # --- CONFIGURATION ---
 # The "Elite 8" (High Profit Factor from Universe Scan)
-SYMBOLS = ["CLX", "UNH", "DVN", "FMC", "ADBE", "RSG", "AON", "DUK"]
+SYMBOLS = ["NVDA", "TSLA", "COIN", "MSTR", "AMD", "PLTR", "META"]
 
 # Strategy Settings
 FAST_EMA = 7
@@ -90,15 +90,15 @@ def calculate_indicators(df):
     df['ema21'] = ta.ema(df['close'], length=SLOW_EMA)
     return df
 
-def check_time_rules():
-    now = datetime.datetime.now(TIMEZONE).time()
-    if MORNING_START <= now <= LUNCH_START: return True
-    if LUNCH_END <= now <= CLOSE_STOP: return True
-    return False
+# def check_time_rules():
+   # now = datetime.datetime.now(TIMEZONE).time()
+    # if MORNING_START <= now <= LUNCH_START: return True
+    # if LUNCH_END <= now <= CLOSE_STOP: return True
+    # return False
 
 def run_trend_bot():
     print(f"--- TREND SNIPER (Elite + Safety Cap) STARTED ---")
-    send_discord("昌 **Trend Sniper (Elite) Online**")
+    send_discord("**Trend Sniper (Elite) Online**")
     
     # --- ADD THIS LINE ---
     log_to_influx("SYSTEM", "startup", 0, 0)

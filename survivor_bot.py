@@ -11,7 +11,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
 
 # --- CONFIGURATION ---
-SYMBOLS = ["TQQQ", "SQQQ", "SOXL", "SOXS"]
+SYMBOLS = ["TQQQ", "SOXL", "FNGU", "UPRO"]
 RSI_PERIOD = 14
 RSI_OVERSOLD = 30
 RSI_EXIT = 55
@@ -97,7 +97,6 @@ def run_survivor_bot():
     # ---------------------
     
     while True:
-        try:
             try:
                 clock = trading_client.get_clock()
                 if not clock.is_open:
@@ -147,59 +146,92 @@ def run_survivor_bot():
 
             print(f"\nScanning Basket at {datetime.datetime.now(TIMEZONE).strftime('%H:%M')}...")
 
-            for symbol in SYMBOLS:
-                df = get_data_yahoo(symbol)
-                if df is None or len(df) < 30: continue
+for symbol in SYMBOLS:
+            try:
+                # --- 1. GET DATA ---
+                # We need 2 years of Daily data to calculate a valid 200 SMA
+                df = yf.download(symbol, period="2y", interval="1d", progress=False)
 
-                df = calculate_indicators(df)
-                # OLD CODE:
-                # curr = df.iloc[-1]
+                if df.empty or len(df) < 200:
+                    print(f"    [!] Insufficient data for {symbol}")
+                    continue
 
-                # NEW CODE:
-                signal_candle = df.iloc[-2] # Stable
-                execution_candle = df.iloc[-1] # Live
-                
-                price = execution_candle['close']
-                
-                # Logic uses STABLE history
-                rsi = signal_candle['rsi']
-                lower_bb = signal_candle['lower_bb']
-                
-                # Checks
-                # if rsi < RSI_OVERSOLD ... (This now won't flicker mid-candle)
+                # Fix for YFinance MultiIndex issues (common bug in recent versions)
+                if isinstance(df.columns, pd.MultiIndex):
+                    try:
+                        df = df.xs(symbol, axis=1, level=1)
+                    except:
+                        # Fallback if structure is different
+                        df.columns = df.columns.droplevel(1)
 
-                print(f"  {symbol:<4} | Price: {price:.2f} | RSI: {rsi:.1f} | LowBB: {lower_bb:.2f}")
+                # --- 2. CALCULATE INDICATORS ---
+                # A. The Trend Filter (200 SMA)
+                df['SMA_200'] = ta.sma(df['Close'], length=200)
 
+                # B. The Entry Trigger (RSI 14)
+                df['RSI'] = ta.rsi(df['Close'], length=RSI_PERIOD)
+
+                # C. The "Cheap" Check (Bollinger Bands)
+                bbands = ta.bbands(df['Close'], length=20, std=2.0)
+                # Concatenate the bands to the main dataframe
+                df = pd.concat([df, bbands], axis=1)
+
+                # --- 3. PARSE LATEST VALUES ---
+                latest = df.iloc[-1]
+                price = float(latest['Close'])
+                rsi = float(latest['RSI'])
+                sma_200 = float(latest['SMA_200'])
+                # pandas_ta names columns: BBL_length_std
+                lower_bb = float(latest[f'BBL_20_2.0']) 
+
+                # Debug print to see what the bot is thinking
+                print(f"    -> {symbol}: Price=${price:.2f} | RSI={rsi:.1f} | SMA200=${sma_200:.2f}")
+
+                # --- 4. CHECK POSITIONS ---
+                # Check if we already own it
+                # (Note: Alpaca symbols usually don't have slashes, but ETFs are safe)
+                pos_qty = 0
                 if symbol in pos_dict:
-                    pos = pos_dict[symbol]
-                    qty = float(pos.qty)
-                    # Check EXIT
+                    pos_qty = float(pos_dict[symbol].qty)
+
+                # --- 5. EXECUTION LOGIC ---
+                
+                # EXIT LOGIC (Take Profit)
+                if pos_qty > 0:
                     if rsi > RSI_EXIT:
-                        print(f"    [EXIT] Profit Target Hit on {symbol}")
-                        req = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC)
+                        print(f"    [EXIT] Profit Target Hit on {symbol} (RSI {rsi:.1f})")
+                        req = MarketOrderRequest(symbol=symbol, qty=pos_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC)
                         trading_client.submit_order(order_data=req)
 
-                        send_discord(f"💰 **CLOSE {symbol}** (RSI Rebound)\nPrice: {price:.2f}")
-                        log_to_influx(symbol, "sell_survivor", price, qty)
+                        send_discord(f"💰 **CLOSE {symbol}** (RSI Rebound)\nPrice: ${price:.2f}\nProfit Secured.")
+                        log_to_influx(symbol, "sell_survivor", price, pos_qty)
+                
+                # ENTRY LOGIC (Buy the Dip)
+                else:
+                    # CRITICAL FILTER: Only buy if Price is ABOVE the 200 SMA
+                    is_uptrend = price > sma_200
+                    
+                    if not is_uptrend:
+                        # If we are below SMA 200, we ignore oversold signals (save money!)
+                        continue 
 
-                elif symbol not in pos_dict:
-                    # Check ENTRY
                     if rsi < RSI_OVERSOLD and price < lower_bb:
-                        print(f"    [ENTRY] OVERSOLD SIGNAL on {symbol}")
+                        print(f"    [ENTRY] VALID DIP on {symbol} (Uptrend Confirmed)")
+                        
+                        # Calculate Position Size
                         risk_amt = equity * RISK_PER_TRADE
                         qty = int(risk_amt / price)
-                        if qty > 0 and (qty*price) < buying_power:
+                        
+                        if qty > 0 and (qty * price) < buying_power:
                             req = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
                             trading_client.submit_order(order_data=req)
 
-                            send_discord(f"🚑 **BUY {symbol}** (Crash Detected)\nPrice: {price:.2f}")
+                            send_discord(f"📉 **BUY {symbol}** (Trend Dip)\nPrice: ${price:.2f}\n200 SMA: ${sma_200:.2f}")
                             log_to_influx(symbol, "buy_survivor", price, qty)
 
-            time.sleep(60)
-
-        except Exception as e:
-            print(f"CRITICAL: {e}")
-            time.sleep(60)
+            except Exception as e:
+                print(f"    [!] Error processing {symbol}: {e}")
+                continue
 
 if __name__ == "__main__":
     run_survivor_bot()
