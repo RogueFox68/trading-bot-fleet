@@ -17,7 +17,7 @@
         },
         "trend_bot": {
             "script": "trend_bot.py",
-            "status": "paused",
+            "status": "active",
             "strategy": "aggressive"
         },
         "moon_bag": {
