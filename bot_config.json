@@ -24,6 +24,11 @@
             "script": "crypto_breakout.py",
             "status": "active",
             "strategy": "breakout"
+        },
+        "accountant": {
+            "script": "accountant.py",
+            "status": "active",
+            "strategy": "reporting"
         }
     },
     "global_settings": {
