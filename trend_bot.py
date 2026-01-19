@@ -177,9 +177,14 @@ def run_trend_bot():
             IGNORED_SYMBOLS = ["TQQQ", "SQQQ", "SOXL", "SOXS", "BTC/USD"]
             
             # Combine Elite List + Valid Held Positions
-            held_tickers = [s for s in pos_dict.keys() if s not in IGNORED_SYMBOLS and "/" not in s]
+            # FIX: Strictly filter for AssetClass.US_EQUITY to avoid scanning Options
+            held_tickers = [
+                p.symbol for p in pos_dict.values() 
+                if p.asset_class == AssetClass.US_EQUITY 
+                and p.symbol not in IGNORED_SYMBOLS
+            ]
+            
             scan_list = list(set(SYMBOLS + held_tickers))
-
             print(f"\nScanning {len(scan_list)} Assets ({'OPEN' if can_open_new else 'PAUSED'}) at {datetime.datetime.now(TIMEZONE).strftime('%H:%M')}...")
 
             for symbol in scan_list:
