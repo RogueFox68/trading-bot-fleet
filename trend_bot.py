@@ -110,12 +110,15 @@ def run_trend_bot():
             positions = trading_client.get_all_positions()
             pos_dict = {p.symbol: p for p in positions}
             
-            # --- HARD STOP CHECK ---
+            # --- HARD STOP CHECK (The Fix is Here) ---
             for p in positions:
-                # Ignore Crypto/Options/Survivor
+                # FIX: Explicitly ignore CRYPTO and OPTION assets
+                # This prevents it from seeing "BTCUSD" and selling it.
+                if p.asset_class == AssetClass.CRYPTO: continue 
                 if p.asset_class == AssetClass.US_OPTION: continue
-                if p.symbol in ["TQQQ", "SQQQ", "SOXL", "SOXS", "BTC/USD"]: continue
-                if "/" in p.symbol: continue
+                
+                # Also ignore specific Survivor symbols just in case
+                if p.symbol in ["TQQQ", "SQQQ", "SOXL", "SOXS", "FNGU", "UPRO"]: continue
 
                 entry_price = float(p.avg_entry_price)
                 current_price = float(p.current_price)
@@ -128,13 +131,12 @@ def run_trend_bot():
                     send_discord(f"💥 **HARD STOP** {p.symbol}")
                     continue
 
-            # --- PREPARE SCAN LIST (FIX: Ignore Options) ---
-            IGNORED_SYMBOLS = ["TQQQ", "SQQQ", "SOXL", "SOXS", "BTC/USD"]
-            
+            # --- PREPARE SCAN LIST ---
+            # FIX: Ensure we don't accidentally add Crypto/Options to the scan list
             held_tickers = []
             for p in positions:
-                # ONLY add strictly Equity positions (Stocks)
-                if p.asset_class == AssetClass.US_EQUITY and p.symbol not in IGNORED_SYMBOLS:
+                if p.asset_class == AssetClass.US_EQUITY and \
+                   p.symbol not in ["TQQQ", "SQQQ", "SOXL", "SOXS", "FNGU", "UPRO"]:
                     held_tickers.append(p.symbol)
 
             scan_list = list(set(SYMBOLS + held_tickers))
