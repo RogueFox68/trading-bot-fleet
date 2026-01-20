@@ -13,7 +13,7 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 # --- CONFIGURATION ---
-SYMBOLS = ["TQQQ", "SOXL", "FNGU", "UPRO", "SOXS", "SQQQ", "SPXS", "SPXL"]
+SYMBOLS = ["TQQQ", "SOXL", "FNGU", "UPRO"]
 RSI_PERIOD = 14
 RSI_OVERSOLD = 30
 RSI_EXIT = 55
@@ -120,9 +120,11 @@ def run_survivor_bot():
                         print(f"    [!] Insufficient data for {symbol}")
                         continue
 
-                    # Alpaca data is LOWERCASE. Indicators will be LOWERCASE.
+                    # Alpaca data is LOWERCASE keys
                     df['sma_200'] = ta.sma(df['close'], length=200)
                     df['rsi'] = ta.rsi(df['close'], length=RSI_PERIOD)
+                    
+                    # Generate Bands (Usually returns Uppercase keys like BBL_...)
                     bbands = ta.bbands(df['close'], length=20, std=2.0)
                     df = pd.concat([df, bbands], axis=1)
 
@@ -131,11 +133,17 @@ def run_survivor_bot():
                     rsi = float(latest['rsi'])
                     sma_200 = float(latest['sma_200'])
                     
-                    # FIX: Use lowercase key 'bbl_20_2.0'
-                    bbl_key = 'bbl_20_2.0'
-                    if bbl_key not in latest:
-                        # Fallback for debugging if column names differ
-                        print(f"    [!] Column Error. Available: {list(latest.index)}")
+                    # --- ROBUST COLUMN FINDER ---
+                    # We look for ANY column starting with 'BBL' or 'bbl'
+                    # The logs showed: 'BBL_20_2.0_2.0'
+                    bbl_key = None
+                    for col in latest.index:
+                        if col.startswith("BBL") or col.startswith("bbl"):
+                            bbl_key = col
+                            break
+                    
+                    if not bbl_key:
+                        print(f"    [!] BBL Column Missing. Available: {list(latest.index)}")
                         continue
                         
                     lower_bb = float(latest[bbl_key]) 
