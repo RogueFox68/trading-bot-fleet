@@ -13,7 +13,7 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 # --- CONFIGURATION ---
-SYMBOLS = ["TQQQ", "SOXL", "FNGU", "UPRO"]
+SYMBOLS = ["TQQQ", "SOXL", "FNGU", "UPRO", "SQQQ", "SOXS", "SPXL", "SPXS"]
 RSI_PERIOD = 14
 RSI_OVERSOLD = 30
 RSI_EXIT = 55
