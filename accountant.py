@@ -111,10 +111,24 @@ def log_metric(measurement, tags, fields):
         print(f"[!] Influx Write Error: {e}")
 
 def get_bot_owner(symbol, asset_class):
-    if asset_class == AssetClass.CRYPTO: return "crypto_grid"
-    if asset_class == AssetClass.US_OPTION: return "wheel_bot"
-    if symbol in BOT_MAPPING["survivor"]: return "survivor_bot"
-    if symbol in BOT_MAPPING["wheel"]: return "wheel_bot"
+    # 1. Asset Class Rules (The strongest filter)
+    if asset_class == AssetClass.CRYPTO: 
+        return "crypto_grid"
+    if asset_class == AssetClass.US_OPTION: 
+        return "wheel_bot"
+    
+    # 2. Survivor Rules (Specific Leveraged ETFs)
+    if symbol in BOT_MAPPING["survivor"]: 
+        return "survivor_bot"
+    
+    # 3. Wheel Rules (Only if it's NOT an Option, check if Wheel holds the stock)
+    # NOTE: Since Trend Bot also trades PLTR stock, we default PLTR stock to Trend Bot
+    # unless we are sure Wheel Bot was assigned it. 
+    # For now, Trend Bot is the aggressive trader, so we give stock to Trend.
+    if symbol in BOT_MAPPING["wheel"] and symbol != "PLTR": 
+        return "wheel_bot"
+        
+    # 4. Default to Trend Bot (Catch-all for NVDA, COIN, TSLA, PLTR Stock)
     return "trend_bot"
 
 def run_accountant():
