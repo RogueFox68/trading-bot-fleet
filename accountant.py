@@ -2,16 +2,15 @@ import config
 import time
 import datetime
 import requests
+import pandas as pd
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass
 
 # --- CONFIGURATION ---
-# Mapping Symbols to Bots for Attribution
 BOT_MAPPING = {
     "survivor": ["TQQQ", "SQQQ", "SOXL", "SOXS", "FNGU", "UPRO"],
-    "wheel": ["DIS", "F", "PLTR"], # Stocks managed by Wheel
+    "wheel": ["DIS", "F", "PLTR"], 
     "crypto": ["BTC/USD", "ETH/USD", "SOL/USD"]
-    # "trend" will be the "catch-all" for everything else (NVDA, TSLA, etc)
 }
 
 # --- CREDENTIALS ---
@@ -23,118 +22,155 @@ PAPER = config.PAPER
 INFLUX_HOST = config.INFLUX_HOST
 INFLUX_PORT = config.INFLUX_PORT
 INFLUX_DB_NAME = config.INFLUX_DB_NAME
+DB_QUERY_URL = f"http://{INFLUX_HOST}:{INFLUX_PORT}/query"
 
 # --- CLIENT ---
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
 
-def log_metric(measurement, tags, fields):
-    """
-    Writes a single point to InfluxDB using Line Protocol.
-    tags: dict of string tags (indexed)
-    fields: dict of float/int/str values (not indexed)
-    """
+def query_influx_trades(days=30):
+    """Fetches trade history from InfluxDB to calculate Realized P&L."""
     try:
-        # Format tags: key=value,key=value
-        tag_str = ",".join([f"{k}={v}" for k, v in tags.items()])
+        query = f"SELECT * FROM trades, crypto_trades, survivor_trades, wheel_trades WHERE time > now() - {days}d"
+        params = {'db': INFLUX_DB_NAME, 'q': query, 'epoch': 's'}
+        response = requests.get(DB_QUERY_URL, params=params, timeout=5)
+        data = response.json()
         
-        # Format fields: key=value,key=value
+        all_trades = []
+        if 'results' in data and 'series' in data['results'][0]:
+            for series in data['results'][0]['series']:
+                name = series['name'] # measurement name
+                cols = series['columns']
+                vals = series['values']
+                df = pd.DataFrame(vals, columns=cols)
+                df['bot_type'] = name
+                all_trades.append(df)
+        
+        if not all_trades: return pd.DataFrame()
+        return pd.concat(all_trades)
+    except Exception as e:
+        print(f"[!] History Fetch Error: {e}")
+        return pd.DataFrame()
+
+def calculate_realized_pl(df):
+    """
+    Calculates Closed Trade P&L.
+    Simple approximation: Sum(Sell_Val) - Sum(Buy_Val) per bot.
+    Note: This assumes we eventually close positions. For a running bot,
+    FIFO is better, but this is efficient for the Pi.
+    """
+    scores = {}
+    
+    if df.empty: return scores
+
+    # Group by Bot
+    for bot, group in df.groupby('bot_type'):
+        # Filter for entry/exit actions
+        buys = group[group['action'].str.contains('buy')]
+        sells = group[group['action'].str.contains('sell')]
+        
+        buy_val = (buys['price'] * buys['qty']).sum()
+        sell_val = (sells['price'] * sells['qty']).sum()
+        
+        # This raw metric needs to be adjusted by net quantity change 
+        # to avoid counting "Open Position Cost" as a "Realized Loss"
+        # Adjusted Realized P&L = Total Sell Val - (Avg Cost * Qty Sold)
+        
+        total_sold = sells['qty'].sum()
+        total_bought = buys['qty'].sum()
+        
+        if total_bought > 0:
+            avg_cost = buy_val / total_bought
+            # Cost of the specific units we sold
+            cost_of_sold = avg_cost * total_sold
+            realized = sell_val - cost_of_sold
+        else:
+            realized = 0.0
+            
+        # Map measurement name to bot name
+        bot_name = "trend_bot" # default
+        if bot == "crypto_trades": bot_name = "crypto_grid"
+        elif bot == "survivor_trades": bot_name = "survivor_bot"
+        elif bot == "wheel_trades": bot_name = "wheel_bot"
+            
+        scores[bot_name] = realized
+
+    return scores
+
+def log_metric(measurement, tags, fields):
+    try:
+        tag_str = ",".join([f"{k}={v}" for k, v in tags.items()])
         field_parts = []
         for k, v in fields.items():
-            if isinstance(v, str):
-                field_parts.append(f'{k}="{v}"')
-            else:
-                field_parts.append(f'{k}={v}')
+            if isinstance(v, str): field_parts.append(f'{k}="{v}"')
+            else: field_parts.append(f'{k}={v}')
         field_str = ",".join(field_parts)
-
         data_str = f"{measurement},{tag_str} {field_str}"
-        
         url = f"http://{INFLUX_HOST}:{INFLUX_PORT}/write?db={INFLUX_DB_NAME}"
         requests.post(url, data=data_str, timeout=5)
     except Exception as e:
         print(f"[!] Influx Write Error: {e}")
 
-def get_bot_name(symbol, asset_class):
-    """Determines which bot owns this position."""
-    if asset_class == AssetClass.CRYPTO:
-        return "crypto_grid"
-    
-    if asset_class == AssetClass.US_OPTION:
-        return "wheel_bot"
-    
-    if symbol in BOT_MAPPING["survivor"]:
-        return "survivor_bot"
-    
-    if symbol in BOT_MAPPING["wheel"]:
-        return "wheel_bot"
-        
-    # Default to Trend Bot for other tech stocks (NVDA, TSLA, etc.)
+def get_bot_owner(symbol, asset_class):
+    if asset_class == AssetClass.CRYPTO: return "crypto_grid"
+    if asset_class == AssetClass.US_OPTION: return "wheel_bot"
+    if symbol in BOT_MAPPING["survivor"]: return "survivor_bot"
+    if symbol in BOT_MAPPING["wheel"]: return "wheel_bot"
     return "trend_bot"
 
 def run_accountant():
-    print("--- 🧾 ACCOUNTANT BOT STARTED ---")
-    print("Tracking Leaders & Laggards...")
+    print("--- 🧾 SMART ACCOUNTANT (Realized + Unrealized) STARTED ---")
 
     while True:
         try:
-            # 1. FETCH ACCOUNT TOTALS
-            account = trading_client.get_account()
-            equity = float(account.equity)
-            cash = float(account.cash)
-            buying_power = float(account.buying_power)
+            # 1. FETCH REALIZED P&L (HISTORY)
+            history_df = query_influx_trades()
+            realized_scores = calculate_realized_pl(history_df)
             
-            # Log Global Stats
-            log_metric(
-                measurement="account_stats",
-                tags={"type": "global"},
-                fields={
-                    "equity": equity,
-                    "cash": cash,
-                    "buying_power": buying_power
-                }
-            )
-
-            # 2. FETCH POSITIONS & CALCULATE BOT PERFORMANCE
+            # 2. FETCH UNREALIZED P&L (LIVE)
             positions = trading_client.get_all_positions()
+            account = trading_client.get_account()
             
-            # buckets for aggregation
-            bot_stats = {
-                "survivor_bot": {"allocation": 0.0, "unrealized_pl": 0.0, "positions": 0},
-                "trend_bot":    {"allocation": 0.0, "unrealized_pl": 0.0, "positions": 0},
-                "wheel_bot":    {"allocation": 0.0, "unrealized_pl": 0.0, "positions": 0},
-                "crypto_grid":  {"allocation": 0.0, "unrealized_pl": 0.0, "positions": 0}
+            unrealized_stats = {
+                "survivor_bot": 0.0, "trend_bot": 0.0, 
+                "wheel_bot": 0.0, "crypto_grid": 0.0
             }
+            allocation_stats = unrealized_stats.copy()
 
             for p in positions:
-                symbol = p.symbol
-                market_value = float(p.market_value)
-                unrealized_pl = float(p.unrealized_pl)
-                
-                # Identify the owner
-                owner = get_bot_name(symbol, p.asset_class)
-                
-                # Accumulate stats
-                if owner in bot_stats:
-                    bot_stats[owner]["allocation"] += market_value
-                    bot_stats[owner]["unrealized_pl"] += unrealized_pl
-                    bot_stats[owner]["positions"] += 1
+                owner = get_bot_owner(p.symbol, p.asset_class)
+                if owner in unrealized_stats:
+                    unrealized_stats[owner] += float(p.unrealized_pl)
+                    allocation_stats[owner] += float(p.market_value)
 
-            # 3. PUSH BOT STATS TO INFLUX
-            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Update:")
-            for bot, stats in bot_stats.items():
-                print(f"  {bot:<15} | Alloc: ${stats['allocation']:<8.2f} | P&L: ${stats['unrealized_pl']:<8.2f}")
+            # 3. COMBINE & REPORT
+            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] TRUE P&L UPDATE:")
+            
+            for bot in unrealized_stats.keys():
+                r_pl = realized_scores.get(bot, 0.0)
+                u_pl = unrealized_stats[bot]
+                total_pl = r_pl + u_pl
+                
+                print(f"  {bot:<15} | Real: ${r_pl:>7.2f} | Paper: ${u_pl:>7.2f} | TOTAL: ${total_pl:>7.2f}")
                 
                 log_metric(
                     measurement="bot_performance",
                     tags={"bot": bot},
                     fields={
-                        "allocation": stats['allocation'],
-                        "unrealized_pl": stats['unrealized_pl'],
-                        "position_count": stats['positions']
+                        "allocation": allocation_stats[bot],
+                        "unrealized_pl": u_pl,
+                        "realized_pl": r_pl,
+                        "total_pl": total_pl  # <--- NEW METRIC
                     }
                 )
+            
+            # Log Global Stats
+            log_metric("account_stats", {"type": "global"}, {
+                "equity": float(account.equity),
+                "cash": float(account.cash),
+                "buying_power": float(account.buying_power)
+            })
 
-            # Run every 5 minutes (Trading is slow, no need for rapid updates)
-            time.sleep(300)
+            time.sleep(300) # 5 minutes
 
         except Exception as e:
             print(f"[!] Accountant Error: {e}")
