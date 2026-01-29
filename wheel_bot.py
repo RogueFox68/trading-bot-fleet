@@ -5,7 +5,7 @@ import datetime
 import requests
 import math
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import LimitOrderRequest, GetOptionContractsRequest # Switched to LimitOrderRequest
+from alpaca.trading.requests import LimitOrderRequest, GetOptionContractsRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, ContractType
 import config
 
@@ -14,14 +14,16 @@ WATCHLIST = ["DIS", "PLTR", "F"]
 MIN_DTE = 25             
 MAX_DTE = 45
 TARGET_OTM_PCT = 0.05
-MIN_PREMIUM = 0.10 # Will not sell options for less than $10
+MIN_PREMIUM = 0.10      # Will not sell options for less than $10
+TAKE_PROFIT_PCT = 0.50  # Close position if we captured 50% of max profit
 
 # --- CLIENTS ---
 trading_client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=config.PAPER)
 data_client = StockHistoricalDataClient(config.API_KEY, config.SECRET_KEY)
-option_data_client = OptionHistoricalDataClient(config.API_KEY, config.SECRET_KEY) # New Client for Quotes
+option_data_client = OptionHistoricalDataClient(config.API_KEY, config.SECRET_KEY)
 
 def send_discord(msg):
+    if "YOUR" in config.WEBHOOK_WHEEL: return
     try:
         payload = {"content": msg, "username": "WheelBot 🚜"}
         requests.post(config.WEBHOOK_WHEEL, json=payload)
@@ -43,16 +45,15 @@ def get_current_price(symbol):
         print(f"  [!] Error price {symbol}: {e}")
         return 0.0
 
-def get_option_bid(symbol):
+def get_option_price(symbol, side="bid"):
     """
-    Fetches the current BID price for a specific option contract.
-    This ensures we use a Limit Order and don't get slipped.
+    Fetches the current BID (for selling) or ASK (for buying/closing).
     """
     try:
         req = OptionLatestQuoteRequest(symbol_or_symbols=symbol)
         res = option_data_client.get_option_latest_quote(req)
-        # return the Bid price
-        return float(res[symbol].bid_price)
+        quote = res[symbol]
+        return float(quote.bid_price) if side == "bid" else float(quote.ask_price)
     except Exception as e:
         print(f"  [!] Error fetching option quote for {symbol}: {e}")
         return 0.0
@@ -62,7 +63,6 @@ def find_best_contract(symbol, side, current_price):
     start_date = today + datetime.timedelta(days=MIN_DTE)
     end_date = today + datetime.timedelta(days=MAX_DTE)
     
-    # FIX APPLIED: underlying_symbols must be a list!
     req = GetOptionContractsRequest(
         underlying_symbols=[symbol], 
         status="active",
@@ -79,15 +79,13 @@ def find_best_contract(symbol, side, current_price):
         print(f"  [!] API Error fetching contracts: {e}")
         return None
     
-    if not available:
-        return None
+    if not available: return None
 
     best_contract = None
     best_score = 1.0 
 
     for c in available:
         strike = float(c.strike_price)
-        
         if side == "PUT" and strike >= current_price: continue
         if side == "CALL" and strike <= current_price: continue
         
@@ -101,17 +99,15 @@ def find_best_contract(symbol, side, current_price):
     return best_contract
 
 def run_wheel_bot():
-    print(f"--- 🚜 FLEET WHEEL BOT STARTED ---")
-    print(f"Targets: {WATCHLIST}")
-    send_discord(f"🚜 **Fleet Wheel Online**\nTargets: {WATCHLIST}")
-    log_to_influx("startup", 0, "None", "Bot Started")
+    print(f"--- 🚜 FLEET WHEEL BOT (Harvest Mode) STARTED ---")
+    send_discord(f"🚜 **Wheel Bot Online**\nTargeting 50% Profit on: {WATCHLIST}")
     
     while True:
         try:
             try:
                 clock = trading_client.get_clock()
                 if not clock.is_open:
-                    print(f"[{datetime.datetime.now().strftime('%H:%M')}] Market Closed. Sleeping...", end='\r')
+                    print(f"[{datetime.datetime.now().strftime('%H:%M')}] Market Closed.", end='\r')
                     time.sleep(60)
                     continue
             except: pass
@@ -120,60 +116,91 @@ def run_wheel_bot():
             buying_power = float(account.buying_power)
             all_positions = trading_client.get_all_positions()
 
-            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Cycling through Watchlist...")
+            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning Portfolio & Watchlist...")
 
             for ticker in WATCHLIST:
-                has_stock = False
                 stock_qty = 0
-                has_option = False
+                active_option = None
                 
+                # 1. SCAN EXISTING POSITIONS
                 for p in all_positions:
                     if p.symbol == ticker and p.asset_class == AssetClass.US_EQUITY:
-                        has_stock = True
                         stock_qty = float(p.qty)
                     elif p.symbol.startswith(ticker) and p.asset_class == AssetClass.US_OPTION:
-                        has_option = True
+                        active_option = p
                 
-                current_price = get_current_price(ticker)
-                print(f"  {ticker:<4} | ${current_price:>7.2f} | Stock: {stock_qty:>3} | Option: {'YES' if has_option else 'NO '}")
-
-                if has_option:
-                    continue 
-
-                # --- TRADING LOGIC WITH LIMIT ORDERS ---
+                current_stock_price = get_current_price(ticker)
                 
+                # 2. MANAGE EXISTING OPTION (TAKE PROFIT)
+                if active_option:
+                    entry_price = float(active_option.avg_entry_price)
+                    # Note: p.current_price is estimated. For real logic, we might want to fetch quote, 
+                    # but for % check, the estimation is usually fine.
+                    current_opt_price = float(active_option.current_price) 
+                    qty = float(active_option.qty) # Negative for short
+                    
+                    if entry_price > 0:
+                        # Calculate how much of the premium we have kept
+                        # Example: Sold for 1.00, now 0.40. Capture = (1.00 - 0.40) / 1.00 = 60%
+                        capture_pct = (entry_price - current_opt_price) / entry_price
+                        
+                        print(f"  {ticker:<4} | Existing Option: {active_option.symbol} | Profit: {capture_pct*100:.1f}%")
+                        
+                        if capture_pct >= TAKE_PROFIT_PCT:
+                            print(f"    💰 [HARVEST] Profit Target Hit! Closing {active_option.symbol}")
+                            
+                            # Get real ASK price for the Limit Order
+                            close_price = get_option_price(active_option.symbol, side="ask")
+                            if close_price == 0: close_price = current_opt_price * 1.05 # Safety fallback
+                            
+                            req = LimitOrderRequest(
+                                symbol=active_option.symbol,
+                                qty=abs(int(qty)), # Buy back the positive amount
+                                side=OrderSide.BUY,
+                                time_in_force=TimeInForce.DAY,
+                                limit_price=close_price
+                            )
+                            trading_client.submit_order(order_data=req)
+                            send_discord(f"💰 **TOOK PROFIT {ticker}**\nClosed @ ${close_price} ({capture_pct*100:.0f}% Cap)")
+                            log_to_influx("buy_close", close_price, active_option.symbol, "Take Profit")
+                            # Don't open a new one same loop
+                            continue 
+                    
+                    # If we have an option and didn't close it, we are done with this ticker for now
+                    continue
+
+                # 3. OPEN NEW POSITIONS (If no option exists)
+                print(f"  {ticker:<4} | ${current_stock_price:>7.2f} | No Active Option. Hunting...")
+
                 contract = None
                 side = None
 
-                # Check for Covered Call
-                if has_stock and stock_qty >= 100:
+                # Covered Call?
+                if stock_qty >= 100:
                     side = "CALL"
-                    contract = find_best_contract(ticker, "CALL", current_price)
+                    contract = find_best_contract(ticker, "CALL", current_stock_price)
                 
-                # Check for Cash Secured Put
-                elif not has_stock:
-                    if buying_power < (current_price * 100):
+                # Cash Secured Put?
+                else:
+                    # Basic check: do we have enough BP?
+                    if buying_power < (current_stock_price * 100):
                         print(f"    [SKIP] Insufficient BP for {ticker}")
                         continue
                     side = "PUT"
-                    contract = find_best_contract(ticker, "PUT", current_price)
+                    contract = find_best_contract(ticker, "PUT", current_stock_price)
 
-                # EXECUTE IF FOUND
                 if contract:
-                    # 1. Get the Limit Price (The Bid)
-                    limit_price = get_option_bid(contract.symbol)
+                    limit_price = get_option_price(contract.symbol, side="bid")
                     
                     if limit_price < MIN_PREMIUM:
                         print(f"    [SKIP] Premium too low (${limit_price})")
                         continue
-                        
+                    
                     if side == "PUT" and buying_power < (float(contract.strike_price) * 100):
-                        print(f"    [SKIP] Strike {contract.strike_price} too expensive.")
+                        print(f"    [SKIP] Strike too expensive.")
                         continue
 
-                    print(f"    [SIGNAL] Selling {side} on {ticker} @ Limit ${limit_price}")
-
-                    # 2. Submit LIMIT Order (Not Market!)
+                    print(f"    [ENTRY] Selling {side} on {ticker} @ ${limit_price}")
                     req = LimitOrderRequest(
                         symbol=contract.symbol,
                         qty=1,
@@ -181,15 +208,12 @@ def run_wheel_bot():
                         time_in_force=TimeInForce.DAY,
                         limit_price=limit_price
                     )
-                    
                     trading_client.submit_order(order_data=req)
-                    
                     emoji = "🟢" if side == "CALL" else "🔴"
-                    send_discord(f"{emoji} **SOLD {side} {ticker}**\nStrike: ${contract.strike_price}\nLimit Price: ${limit_price}")
+                    send_discord(f"{emoji} **SOLD {side} {ticker}**\nStrike: ${contract.strike_price}\nLimit: ${limit_price}")
                     log_to_influx(f"sell_{side.lower()}", limit_price, contract.symbol, "Opened Position")
                     
-                    if side == "PUT":
-                        buying_power -= (float(contract.strike_price) * 100)
+                    if side == "PUT": buying_power -= (float(contract.strike_price) * 100)
 
             time.sleep(900)
 
