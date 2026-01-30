@@ -25,6 +25,11 @@
             "status": "active",
             "strategy": "breakout"
         },
+        "condor_bot": {
+            "script": "condor_bot.py",
+            "status": "active",
+            "strategy": "iron_condor"
+        },
         "accountant": {
             "script": "accountant.py",
             "status": "active",
