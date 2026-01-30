@@ -5,6 +5,7 @@ import requests
 import socket
 import datetime
 import os
+import shutil
 import config  # Ensure config.py has WEBHOOK_OVERSEER and INFLUX details
 
 # --- CONFIGURATION ---
@@ -60,10 +61,20 @@ def log_process_to_influx(proc):
 
 # --- MANAGEMENT LOGIC (From Overseer) ---
 def load_bot_config():
-    try:
-        if not os.path.exists(BOT_CONFIG_FILE):
-            print(f"[!] Config file {BOT_CONFIG_FILE} not found.")
+    # 1. Check if active config exists
+    if not os.path.exists(BOT_CONFIG_FILE):
+        print(f"[!] {BOT_CONFIG_FILE} missing.")
+        
+        # 2. Look for template
+        if os.path.exists("bot_config.template.json"):
+            print(f"  -> Found template. Creating new {BOT_CONFIG_FILE}...")
+            shutil.copy("bot_config.template.json", BOT_CONFIG_FILE)
+        else:
+            print("[!] No template found. Cannot start.")
             return None
+
+    # 3. Load the file
+    try:
         with open(BOT_CONFIG_FILE, 'r') as f:
             return json.load(f)
     except Exception as e:
