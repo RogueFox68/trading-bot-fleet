@@ -7,9 +7,11 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass
 
 # --- CONFIGURATION ---
+# We verify these against the specific bot scripts to ensure correct attribution
 BOT_MAPPING = {
     "survivor": ["TQQQ", "SQQQ", "SOXL", "SOXS", "FNGU", "UPRO"],
     "wheel": ["DIS", "F", "PLTR"], 
+    "condor": ["COIN", "MSTR", "TSLA", "NVDA", "NFLX"],
     "crypto": ["BTC/USD", "ETH/USD", "SOL/USD"]
 }
 
@@ -30,7 +32,8 @@ trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
 def query_influx_trades(days=30):
     """Fetches trade history from InfluxDB to calculate Realized P&L."""
     try:
-        query = f"SELECT * FROM trades, crypto_trades, survivor_trades, wheel_trades WHERE time > now() - {days}d"
+        # UPDATED: Added 'condor_trades' to the query list
+        query = f"SELECT * FROM trades, crypto_trades, survivor_trades, wheel_trades, condor_trades WHERE time > now() - {days}d"
         params = {'db': INFLUX_DB_NAME, 'q': query, 'epoch': 's'}
         response = requests.get(DB_QUERY_URL, params=params, timeout=5)
         data = response.json()
@@ -54,43 +57,36 @@ def query_influx_trades(days=30):
 def calculate_realized_pl(df):
     """
     Calculates Closed Trade P&L.
-    Simple approximation: Sum(Sell_Val) - Sum(Buy_Val) per bot.
-    Note: This assumes we eventually close positions. For a running bot,
-    FIFO is better, but this is efficient for the Pi.
     """
     scores = {}
-    
     if df.empty: return scores
 
-    # Group by Bot
+    # Group by Bot Measurement Name
     for bot, group in df.groupby('bot_type'):
-        # Filter for entry/exit actions
-        buys = group[group['action'].str.contains('buy')]
-        sells = group[group['action'].str.contains('sell')]
+        # Filter for entry/exit actions (flexible for various bot log formats)
+        buys = group[group['action'].str.contains('buy', case=False)]
+        sells = group[group['action'].str.contains('sell', case=False)]
         
-        buy_val = (buys['price'] * buys['qty']).sum()
-        sell_val = (sells['price'] * sells['qty']).sum()
+        buy_val = (buys['price'] * buys['qty']).sum() if 'qty' in buys else 0
+        sell_val = (sells['price'] * sells['qty']).sum() if 'qty' in sells else 0
         
-        # This raw metric needs to be adjusted by net quantity change 
-        # to avoid counting "Open Position Cost" as a "Realized Loss"
-        # Adjusted Realized P&L = Total Sell Val - (Avg Cost * Qty Sold)
+        # Simple approximation for Realized P&L
+        # (Total Sold Value - Cost Basis of Sold Units)
+        total_sold = sells['qty'].sum() if 'qty' in sells else 0
+        total_bought = buys['qty'].sum() if 'qty' in buys else 0
         
-        total_sold = sells['qty'].sum()
-        total_bought = buys['qty'].sum()
-        
-        if total_bought > 0:
+        realized = 0.0
+        if total_bought > 0 and total_sold > 0:
             avg_cost = buy_val / total_bought
-            # Cost of the specific units we sold
             cost_of_sold = avg_cost * total_sold
             realized = sell_val - cost_of_sold
-        else:
-            realized = 0.0
             
-        # Map measurement name to bot name
+        # --- MAPPING: Measurement Name -> Bot Name ---
         bot_name = "trend_bot" # default
         if bot == "crypto_trades": bot_name = "crypto_grid"
         elif bot == "survivor_trades": bot_name = "survivor_bot"
         elif bot == "wheel_trades": bot_name = "wheel_bot"
+        elif bot == "condor_trades": bot_name = "condor_bot" # <--- NEW
             
         scores[bot_name] = realized
 
@@ -111,28 +107,44 @@ def log_metric(measurement, tags, fields):
         print(f"[!] Influx Write Error: {e}")
 
 def get_bot_owner(symbol, asset_class):
-    # 1. Asset Class Rules (The strongest filter)
-    if asset_class == AssetClass.CRYPTO: 
-        return "crypto_grid"
-    if asset_class == AssetClass.US_OPTION: 
-        return "wheel_bot"
+    """
+    Decides which bot owns a specific live position.
+    """
+    # 1. Crypto is easy
+    if asset_class == AssetClass.CRYPTO: return "crypto_grid"
     
-    # 2. Survivor Rules (Specific Leveraged ETFs)
-    if symbol in BOT_MAPPING["survivor"]: 
-        return "survivor_bot"
-    
-    # 3. Wheel Rules (Only if it's NOT an Option, check if Wheel holds the stock)
-    # NOTE: Since Trend Bot also trades PLTR stock, we default PLTR stock to Trend Bot
-    # unless we are sure Wheel Bot was assigned it. 
-    # For now, Trend Bot is the aggressive trader, so we give stock to Trend.
-    if symbol in BOT_MAPPING["wheel"] and symbol != "PLTR": 
-        return "wheel_bot"
+    # 2. Options: Distinguish between Wheel and Condor
+    if asset_class == AssetClass.US_OPTION:
+        # Check the underlying symbol (e.g. "TSLA230120..." -> "TSLA")
+        # Alpaca symbols for options are standard, but the 'symbol' arg passed here is usually the contract name
+        # We need to extract the root. However, for simple mapping:
         
-    # 4. Default to Trend Bot (Catch-all for NVDA, COIN, TSLA, PLTR Stock)
+        root = symbol
+        # Basic attempt to find root if it's a contract string (Alpaca sometimes gives the root in a separate field, 
+        # but here we rely on the input). If 'symbol' is "TSLA", it works. 
+        # If 'symbol' is "TSLA240119P00200000", we check if it starts with the ticker.
+        
+        for ticker in BOT_MAPPING["wheel"]:
+            if symbol.startswith(ticker): return "wheel_bot"
+            
+        for ticker in BOT_MAPPING["condor"]:
+            if symbol.startswith(ticker): return "condor_bot"
+            
+        return "condor_bot" # Default aggressive options to Condor if unknown
+    
+    # 3. Stocks (Equity)
+    if symbol in BOT_MAPPING["survivor"]: return "survivor_bot"
+    
+    # Wheel bot sometimes holds stock (assignment), but usually sells covered calls.
+    # If we hold stock in DIS/F/PLTR, it's likely Wheel Bot (unless Trend Bot went rogue).
+    # Since Trend Bot doesn't trade DIS/F, this is safe.
+    if symbol in BOT_MAPPING["wheel"]: return "wheel_bot"
+    
+    # Trend Bot takes the rest (NVDA, TSLA shares, etc.)
     return "trend_bot"
 
 def run_accountant():
-    print("--- 🧾 SMART ACCOUNTANT (Realized + Unrealized) STARTED ---")
+    print("--- 🧾 SMART ACCOUNTANT (Condor Aware) STARTED ---")
 
     while True:
         try:
@@ -146,7 +158,8 @@ def run_accountant():
             
             unrealized_stats = {
                 "survivor_bot": 0.0, "trend_bot": 0.0, 
-                "wheel_bot": 0.0, "crypto_grid": 0.0
+                "wheel_bot": 0.0, "crypto_grid": 0.0,
+                "condor_bot": 0.0 # <--- NEW
             }
             allocation_stats = unrealized_stats.copy()
 
@@ -157,14 +170,14 @@ def run_accountant():
                     allocation_stats[owner] += float(p.market_value)
 
             # 3. COMBINE & REPORT
-            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] TRUE P&L UPDATE:")
+            # print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] TRUE P&L UPDATE:")
             
             for bot in unrealized_stats.keys():
                 r_pl = realized_scores.get(bot, 0.0)
                 u_pl = unrealized_stats[bot]
                 total_pl = r_pl + u_pl
                 
-                print(f"  {bot:<15} | Real: ${r_pl:>7.2f} | Paper: ${u_pl:>7.2f} | TOTAL: ${total_pl:>7.2f}")
+                # print(f"  {bot:<15} | Real: ${r_pl:>7.2f} | Paper: ${u_pl:>7.2f} | TOTAL: ${total_pl:>7.2f}")
                 
                 log_metric(
                     measurement="bot_performance",
@@ -173,7 +186,7 @@ def run_accountant():
                         "allocation": allocation_stats[bot],
                         "unrealized_pl": u_pl,
                         "realized_pl": r_pl,
-                        "total_pl": total_pl  # <--- NEW METRIC
+                        "total_pl": total_pl
                     }
                 )
             
