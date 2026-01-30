@@ -30,3 +30,4 @@ logs/
 *.db
 # Assuming you don't want to upload your heavy grafana/influx data if it's local
 influx_data/
+bot_config.json
