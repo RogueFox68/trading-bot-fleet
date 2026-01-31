@@ -1,5 +1,7 @@
 import config
 import time
+import json
+import os
 import datetime
 import requests
 import pandas as pd
@@ -13,87 +15,67 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 # --- CONFIGURATION ---
-SYMBOLS = ["NVDA", "TSLA", "COIN", "MSTR", "AMD", "PLTR", "META"]
-FAST_EMA = 7
+TARGET_FILE = "active_targets.json" # <--- NEW: Dynamic List
+STATUS_FILE = "market_status.json"
+FAST_EMA = 9
 SLOW_EMA = 21
+ADX_THRESHOLD = 25
 RISK_PER_TRADE = 0.02
-MAX_POS_SIZE = 0.25
 
-# --- CREDENTIALS ---
-API_KEY = config.API_KEY
-SECRET_KEY = config.SECRET_KEY
-PAPER = config.PAPER
-DISCORD_URL = config.WEBHOOK_TREND
-
-# --- INFLUXDB ---
-INFLUX_HOST = config.INFLUX_HOST
-INFLUX_PORT = config.INFLUX_PORT
-INFLUX_DB_NAME = config.INFLUX_DB_NAME
-
-# --- TIME CONFIG ---
+# --- CREDENTIALS & CLIENTS ---
+trading_client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=config.PAPER)
+data_client = StockHistoricalDataClient(config.API_KEY, config.SECRET_KEY)
 TIMEZONE = pytz.timezone('US/Eastern')
-MORNING_START = datetime.time(9, 45)
-LUNCH_START   = datetime.time(11, 30)
-LUNCH_END     = datetime.time(13, 30)
-CLOSE_STOP    = datetime.time(15, 45)
 
-# --- CLIENTS ---
-trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
-data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
-
+# --- INFLUX & DISCORD (Helpers) ---
 def send_discord(msg):
-    if "YOUR" in DISCORD_URL: return
-    try:
-        requests.post(DISCORD_URL, json={"content": msg})
+    if "YOUR" in config.WEBHOOK_TREND: return
+    try: requests.post(config.WEBHOOK_TREND, json={"content": msg})
     except: pass
 
 def log_to_influx(symbol, action, price, qty):
     try:
-        measurement = "trades"
-        data_str = f'{measurement},symbol={symbol} price={price},action="{action}",qty={qty}'
-        url = f"http://{INFLUX_HOST}:{INFLUX_PORT}/write?db={INFLUX_DB_NAME}"
+        data_str = f'trades,symbol={symbol} price={price},action="{action}",qty={qty}'
+        url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
         requests.post(url, data=data_str)
-    except Exception as e:
-        print(f"  [!] Failed to log to InfluxDB: {e}")
+    except: pass
+
+def get_targets():
+    """Reads the dynamic list from Sector Scout."""
+    default = ["NVDA", "TSLA", "COIN"] # Fallback
+    if not os.path.exists(TARGET_FILE): return default
+    try:
+        with open(TARGET_FILE, 'r') as f:
+            data = json.load(f)
+            return data.get("targets", default)
+    except: return default
+
+def get_market_regime():
+    if not os.path.exists(STATUS_FILE): return "UNKNOWN"
+    try:
+        with open(STATUS_FILE, 'r') as f:
+            return json.load(f).get("regime", "UNKNOWN")
+    except: return "UNKNOWN"
 
 def get_data_alpaca(symbol):
     try:
-        start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=5)
-        req = StockBarsRequest(
-            symbol_or_symbols=[symbol],
-            timeframe=TimeFrame(15, TimeFrameUnit.Minute),
-            start=start_time,
-            limit=200,
-            adjustment='all'
-        )
+        # Get enough data for EMA21 and ADX
+        start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=10)
+        req = StockBarsRequest(symbol_or_symbols=[symbol], timeframe=TimeFrame(15, TimeFrameUnit.Minute), start=start_time, limit=500)
         bars = data_client.get_stock_bars(req)
         if not bars.data: return None
-        df = bars.df
-        if isinstance(df.index, pd.MultiIndex): df = df.xs(symbol)
+        df = bars.df.xs(symbol)
         df.index = df.index.tz_convert('US/Eastern')
         return df
-    except Exception as e:
-        print(f"  [!] Alpaca Data Error {symbol}: {e}")
-        return None
-
-def calculate_indicators(df):
-    df['ema7'] = ta.ema(df['close'], length=FAST_EMA)
-    df['ema21'] = ta.ema(df['close'], length=SLOW_EMA)
-    return df
-
-def check_time_rules():
-    now = datetime.datetime.now(TIMEZONE).time()
-    if MORNING_START <= now <= LUNCH_START: return True
-    if LUNCH_END <= now <= CLOSE_STOP: return True
-    return False
+    except: return None
 
 def run_trend_bot():
-    print(f"--- TREND SNIPER (Elite + Safety Cap) STARTED ---")
-    send_discord("**Trend Sniper (Elite) Online**")
-    log_to_influx("SYSTEM", "startup", 0, 0)
-
+    print(f"--- TREND SNIPER (Dynamic Hunter) STARTED ---")
+    send_discord("**Trend Sniper V3 (Dynamic)** Online")
+    
     while True:
         try:
+            # 1. Check Clock
             try:
                 clock = trading_client.get_clock()
                 if not clock.is_open:
@@ -102,116 +84,109 @@ def run_trend_bot():
                     continue
             except: pass
 
-            can_open_new = check_time_rules()
+            # 2. Load Intel
+            symbols = get_targets()
+            global_regime = get_market_regime()
+            
             account = trading_client.get_account()
             equity = float(account.portfolio_value)
-            buying_power = float(account.buying_power)
-
             positions = trading_client.get_all_positions()
             pos_dict = {p.symbol: p for p in positions}
-            
-            # --- HARD STOP CHECK (The Fix is Here) ---
-            for p in positions:
-                # FIX: Explicitly ignore CRYPTO and OPTION assets
-                # This prevents it from seeing "BTCUSD" and selling it.
-                if p.asset_class == AssetClass.CRYPTO: continue 
-                if p.asset_class == AssetClass.US_OPTION: continue
-                
-                # Also ignore specific Survivor symbols just in case
-                if p.symbol in ["TQQQ", "SQQQ", "SOXL", "SOXS", "FNGU", "UPRO"]: continue
 
-                entry_price = float(p.avg_entry_price)
-                current_price = float(p.current_price)
-                pct_diff = (current_price - entry_price) / entry_price
-                
-                if pct_diff < -0.035:
-                    print(f"💥 HARD STOP: {p.symbol} down {pct_diff*100:.2f}%.")
-                    req = MarketOrderRequest(symbol=p.symbol, qty=float(p.qty), side=OrderSide.SELL, time_in_force=TimeInForce.GTC)
-                    trading_client.submit_order(order_data=req)
-                    send_discord(f"💥 **HARD STOP** {p.symbol}")
-                    continue
+            print(f"\n[{datetime.datetime.now(TIMEZONE).strftime('%H:%M')}] Regime: {global_regime} | Targets: {len(symbols)}")
 
-            # --- PREPARE SCAN LIST ---
-            # FIX: Ensure we don't accidentally add Crypto/Options to the scan list
-            held_tickers = []
-            for p in positions:
-                if p.asset_class == AssetClass.US_EQUITY and \
-                   p.symbol not in ["TQQQ", "SQQQ", "SOXL", "SOXS", "FNGU", "UPRO"]:
-                    held_tickers.append(p.symbol)
-
-            scan_list = list(set(SYMBOLS + held_tickers))
-
-            print(f"\nScanning {len(scan_list)} Assets ({'OPEN' if can_open_new else 'PAUSED'}) at {datetime.datetime.now(TIMEZONE).strftime('%H:%M')}...")
+            # 3. Scan Targets
+            # We scan the Dynamic List + Anything we currently hold (to manage exits)
+            scan_list = list(set(symbols + [p.symbol for p in positions if p.asset_class == AssetClass.US_EQUITY]))
 
             for symbol in scan_list:
-                df = get_data_alpaca(symbol)
-                if df is None or len(df) < 30: continue
-
-                df = calculate_indicators(df)
-                signal_candle = df.iloc[-2] 
-                execution_candle = df.iloc[-1]
-                price = execution_candle['close'] 
+                if symbol in ["BTC/USD", "ETH/USD"]: continue # Skip crypto
                 
-                ema7 = signal_candle['ema7']
-                ema21 = signal_candle['ema21']
-                prev_ema7 = df.iloc[-3]['ema7'] 
-                prev_ema21 = df.iloc[-3]['ema21']
+                df = get_data_alpaca(symbol)
+                if df is None: continue
 
-                trend_is_up = ema7 > ema21
-                trend_is_down = ema7 < ema21
-                bullish_cross = (ema7 > ema21) and (prev_ema7 <= prev_ema21)
-                bearish_cross = (ema7 < ema21) and (prev_ema7 >= prev_ema21)
+                # Calculate Indicators
+                df['ema_fast'] = ta.ema(df['close'], length=FAST_EMA)
+                df['ema_slow'] = ta.ema(df['close'], length=SLOW_EMA)
+                adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
+                df = pd.concat([df, adx_df], axis=1)
 
-                print(f"  {symbol:<4} | Price: {price:.2f} | 7EMA: {ema7:.2f} | 21EMA: {ema21:.2f}")
+                latest = df.iloc[-1]
+                prev = df.iloc[-2]
+                
+                # Dynamic column name handling for ADX
+                adx_col = [c for c in latest.index if c.startswith('ADX')][0]
+                local_adx = float(latest[adx_col])
+                price = float(latest['close'])
+                
+                # --- THE OVERRIDE LOGIC ---
+                # Default: Obey Global Regime
+                can_trade = True
+                
+                if "CHOP" in global_regime:
+                    # override if THIS stock is trending hard (ADX > 30)
+                    if local_adx > 30:
+                        can_trade = True
+                        print(f"    ! {symbol} defying CHOP (ADX {local_adx:.1f})")
+                    else:
+                        can_trade = False
+                
+                # Signals
+                bull_cross = (latest['ema_fast'] > latest['ema_slow']) and (prev['ema_fast'] <= prev['ema_slow'])
+                bear_cross = (latest['ema_fast'] < latest['ema_slow']) and (prev['ema_fast'] >= prev['ema_slow'])
+                trend_up = latest['ema_fast'] > latest['ema_slow']
+                trend_down = latest['ema_fast'] < latest['ema_slow']
 
+                # --- EXECUTION ---
+                
+                # EXIT LOGIC (Always Active)
                 if symbol in pos_dict:
                     pos = pos_dict[symbol]
                     qty = float(pos.qty)
-                    side = pos.side
-                    if side == 'long' and trend_is_down:
-                        print(f"    [EXIT] Trend Reversal (Long) on {symbol}")
-                        req = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC)
-                        trading_client.submit_order(order_data=req)
-                        send_discord(f"📉 **CLOSE {symbol}**")
+                    side = pos.side # 'long' or 'short'
+                    
+                    if side == 'long' and bear_cross:
+                        print(f"    📉 CLOSE LONG {symbol}")
+                        trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC))
+                        send_discord(f"📉 **SELL {symbol}** (Cross)")
                         log_to_influx(symbol, "sell", price, qty)
-                    elif side == 'short' and trend_is_up:
-                        print(f"    [EXIT] Trend Reversal (Short) on {symbol}")
-                        req = MarketOrderRequest(symbol=symbol, qty=abs(qty), side=OrderSide.BUY, time_in_force=TimeInForce.GTC)
-                        trading_client.submit_order(order_data=req)
-                        send_discord(f"📈 **CLOSE {symbol}**")
+                        
+                    elif side == 'short' and bull_cross:
+                        print(f"    📈 CLOSE SHORT {symbol}")
+                        trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=abs(qty), side=OrderSide.BUY, time_in_force=TimeInForce.GTC))
+                        send_discord(f"📈 **COVER {symbol}** (Cross)")
                         log_to_influx(symbol, "buy_cover", price, abs(qty))
 
-                elif can_open_new and symbol not in pos_dict and symbol in SYMBOLS:
-                    if bullish_cross:
-                        stop_price = df['low'].iloc[-5:].min()
-                        if (price - stop_price) > 0.05:
-                            risk_qty = int((equity * RISK_PER_TRADE) / (price - stop_price))
-                            cap_qty = int((equity * MAX_POS_SIZE) / price)
-                            qty = min(risk_qty, cap_qty)
-                            if qty > 0 and (qty*price) < buying_power:
-                                print(f"    [ENTRY] LONG {symbol}")
-                                req = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
-                                trading_client.submit_order(order_data=req)
-                                send_discord(f"🚀 **BUY {symbol}**")
-                                log_to_influx(symbol, "buy", price, qty)
+                # ENTRY LOGIC (If Allowed)
+                elif can_trade and symbol in symbols:
+                    # Only take trades aligned with EMA trend and valid ADX
+                    if bull_cross and local_adx > 20:
+                        risk_amt = equity * RISK_PER_TRADE
+                        # Simple stop at recent low (approx 2% risk)
+                        stop_dist = price * 0.02
+                        qty = int(risk_amt / stop_dist)
+                        
+                        if qty > 0:
+                            print(f"    🚀 BUY SIGNAL {symbol}")
+                            trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
+                            send_discord(f"🚀 **BUY {symbol}** (Sector Play)")
+                            log_to_influx(symbol, "buy", price, qty)
                     
-                    elif bearish_cross:
-                        stop_price = df['high'].iloc[-5:].max()
-                        if (stop_price - price) > 0.05:
-                            risk_qty = int((equity * RISK_PER_TRADE) / (stop_price - price))
-                            cap_qty = int((equity * MAX_POS_SIZE) / price)
-                            qty = min(risk_qty, cap_qty)
-                            if qty > 0 and (qty*price) < buying_power:
-                                print(f"    [ENTRY] SHORT {symbol}")
-                                req = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
-                                trading_client.submit_order(order_data=req)
-                                send_discord(f"🐻 **SHORT {symbol}**")
-                                log_to_influx(symbol, "sell_short", price, qty)
+                    elif bear_cross and local_adx > 20:
+                        risk_amt = equity * RISK_PER_TRADE
+                        stop_dist = price * 0.02
+                        qty = int(risk_amt / stop_dist)
+
+                        if qty > 0:
+                            print(f"    🐻 SHORT SIGNAL {symbol}")
+                            trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
+                            send_discord(f"🐻 **SHORT {symbol}** (Sector Play)")
+                            log_to_influx(symbol, "sell_short", price, qty)
 
             time.sleep(60)
 
         except Exception as e:
-            print(f"CRITICAL: {e}")
+            print(f"Trend Bot Error: {e}")
             time.sleep(60)
 
 if __name__ == "__main__":
