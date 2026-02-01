@@ -9,8 +9,8 @@ from alpaca.data.requests import CryptoLatestTradeRequest
 
 # --- CONFIGURATION (UPDATE THESE FROM YOUR CHART) ---
 SYMBOL = "BTC/USD"       # The Coin to trade
-GRID_TOP = 99000         # The "Ceiling" of your consolidation
-GRID_BOTTOM = 88000      # The "Floor" of your consolidation
+GRID_TOP = 85000         # The "Ceiling" of your consolidation
+GRID_BOTTOM = 70000      # The "Floor" of your consolidation
 GRID_LEVELS = 6          # How many zones to slice it into
 BUDGET_PER_GRID = 50     # How much $ to buy per level (keep it small for testing)
 
