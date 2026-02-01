@@ -21,7 +21,7 @@ SECTOR_MAP = {
     "XLV": ["LLY", "UNH", "PFE"],              # Healthcare -> Pharma
     "GLD": ["GLD", "NEM", "GOLD"],             # Gold -> Miners
     "SLV": ["SLV", "AG", "PAAS"],              # Silver -> Miners
-    "BITO": ["MSTR", "COIN", "MARA"],          # Crypto -> Proxies
+    "BITO": ["BITI", "MSTR", "COIN", "MARA", "CLSK"],         # Crypto -> Proxies
     "XBI": ["LABU", "XBI"],                    # Biotech (High Vol)
     "SMH": ["SOXL", "NVDA", "TSM"]             # Semis (High Vol)
 }
