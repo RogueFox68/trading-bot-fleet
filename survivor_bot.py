@@ -1,3 +1,4 @@
+from email import utils
 import config
 import time
 import json
@@ -142,6 +143,10 @@ def run_survivor_bot():
                 else:
                     # 1. Basic Condition: OVERSOLD
                     if rsi < RSI_BUY:
+                        # [NEW] CFO CHECK
+                        if not utils.check_budget("survivor_bot", trading_client):
+                            print(f"    [SKIP] Survivor Budget Exceeded.")
+                            continue
                         # 2. Safety Filter:
                         # Only buy if the price is ABOVE the 200 SMA (Uptrend Pullback)
                         # OR if it's a Scout Target (The General confirmed the trend)

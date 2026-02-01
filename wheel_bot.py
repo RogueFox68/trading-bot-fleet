@@ -8,6 +8,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest, GetOptionContractsRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, ContractType
 import config
+import utils
 
 # --- CONFIGURATION ---
 WATCHLIST = ["DIS", "PLTR", "F"] 
@@ -182,6 +183,10 @@ def run_wheel_bot():
                 
                 # Cash Secured Put?
                 else:
+                    # [NEW] CFO CHECK
+                    if not utils.check_budget("wheel_bot", trading_client):
+                        print(f"    [SKIP] Wheel Budget Exceeded.")
+                        continue
                     # Basic check: do we have enough BP?
                     if buying_power < (current_stock_price * 100):
                         print(f"    [SKIP] Insufficient BP for {ticker}")

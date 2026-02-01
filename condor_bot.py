@@ -1,3 +1,4 @@
+from email import utils
 import config
 import time
 import datetime
@@ -167,6 +168,10 @@ def run_condor_bot():
                     # This ensures you have the collateral (Buying Power) before selling.
                     
                     print(f"    -> 🦅 FOUND CONDOR! Sending Orders...")
+
+                    if not utils.check_budget("condor_bot", trading_client):
+                        print("    [SKIP] Condor Budget Exceeded.")
+                        break # Skip this opportunity
                     
                     legs = [
                         (put_long, "PUT", OrderSide.BUY, "Long Wing"),
