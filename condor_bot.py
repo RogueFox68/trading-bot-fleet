@@ -96,10 +96,25 @@ def run_condor_bot():
             except: pass
 
             positions = trading_client.get_all_positions()
-            active_tickers = set([p.symbol.split("2")[0] for p in positions if p.asset_class == AssetClass.US_OPTION])
+  # [FIX] Only count positions that belong to Condor Bot
+            condor_positions = 0
+            active_tickers = set()
             
-            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning for Condor Opportunities...")
+            for p in positions:
+                if p.asset_class == AssetClass.US_OPTION:
+                    # Parse symbol root (e.g. "TSLA" from "TSLA2301...")
+                    # Alpaca 2022+ symbology usually puts root first
+                    root = p.symbol
+                    for i, char in enumerate(p.symbol):
+                        if char.isdigit():
+                            root = p.symbol[:i]
+                            break
+                    
+                    if utils.get_bot_owner(root, AssetClass.US_OPTION) == "condor_bot":
+                        condor_positions += 1
+                        active_tickers.add(root)
 
+            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning (Active Condors: {len(active_tickers)}/{MAX_POSITIONS})...")
             # --- MANAGEMENT: Check Existing Spreads ---
             # Simplified Management: We treat all options for a ticker as one "Unit" for display,
             # but we close individual legs if they hit profit.
