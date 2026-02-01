@@ -7,6 +7,7 @@ import requests
 import pandas as pd
 import pandas_ta as ta
 import pytz
+import utils
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass
 from alpaca.trading.requests import MarketOrderRequest
@@ -158,8 +159,12 @@ def run_trend_bot():
                         log_to_influx(symbol, "buy_cover", price, abs(qty))
 
                 # ENTRY LOGIC (If Allowed)
-                elif can_trade and symbol in symbols:
-                    # Only take trades aligned with EMA trend and valid ADX
+                elif can_open_new and symbol not in pos_dict and symbol in SYMBOLS:
+    
+                    # [NEW] CFO CHECK
+                    if not utils.check_budget("trend_bot", trading_client):
+                        print(f"    [SKIP] Trend Bot Budget Exceeded.")
+                        continue
                     if bull_cross and local_adx > 20:
                         risk_amt = equity * RISK_PER_TRADE
                         # Simple stop at recent low (approx 2% risk)
