@@ -48,11 +48,14 @@ def query_influx_trades(days=30):
                 df['bot_type'] = name
                 all_trades.append(df)
         
-# FILTER: Exclude empty DFs AND DFs that are purely NaN (Ghost Data)
+# FILTER: Exclude empty DFs AND Drop columns that are all NaN
         valid_dfs = []
         for df in all_trades:
-            if not df.empty and not df.isna().all().all():
-                valid_dfs.append(df)
+            if not df.empty:
+                # Drop columns that have NO data (all NaNs)
+                clean_df = df.dropna(axis=1, how='all')
+                if not clean_df.empty:
+                    valid_dfs.append(clean_df)
         
         if not valid_dfs: 
             return pd.DataFrame()

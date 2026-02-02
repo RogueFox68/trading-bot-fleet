@@ -204,7 +204,9 @@ def run_condor_bot():
                     # STEP 1: BUY WINGS (And Wait for Fill)
                     wings_filled = True
                     for contract, type, side, desc in wings:
-                        limit_price = get_option_price(contract.symbol, "ask") * 1.05 # Pay 5% over ask to ensure fill
+                        # Inside the loop for buying wings
+                        raw_price = get_option_price(contract.symbol, "ask") * 1.05
+                        limit_price = round(raw_price, 2) # <--- ROUND TO 2 DECIMALS
                         print(f"       Buying {desc} (${limit_price:.2f})...")
                         
                         try:
@@ -241,7 +243,9 @@ def run_condor_bot():
                     if wings_filled:
                         print("       Wings Secured. Selling Body...")
                         for contract, type, side, desc in body:
-                            limit_price = get_option_price(contract.symbol, "bid") * 0.95 # Sell 5% under bid to ensure fill
+                            # Inside the loop for selling body
+                            raw_price = get_option_price(contract.symbol, "bid") * 0.95
+                            limit_price = round(raw_price, 2) # <--- ROUND TO 2 DECIMALS
                             
                             req = LimitOrderRequest(
                                 symbol=contract.symbol, qty=1, side=side,
