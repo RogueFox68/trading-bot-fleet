@@ -182,39 +182,82 @@ def run_condor_bot():
                     # Execution: "Legging In" (Safest Order: Buy Wings First -> Sell Body)
                     # This ensures you have the collateral (Buying Power) before selling.
                     
-                    print(f"    -> 🦅 FOUND CONDOR! Sending Orders...")
+                    
+                    print(f"    -> 🦅 FOUND CONDOR! Executing Safely...")
 
                     if not utils.check_budget("condor_bot", trading_client):
                         print("    [SKIP] Condor Budget Exceeded.")
-                        break # Skip this opportunity
+                        break 
                     
-                    legs = [
-                        (put_long, "PUT", OrderSide.BUY, "Long Wing"),
-                        (call_long, "CALL", OrderSide.BUY, "Long Wing"),
-                        (put_short, "PUT", OrderSide.SELL, "Short Body"),
-                        (call_short, "CALL", OrderSide.SELL, "Short Body")
+                    # Define Wings (Protection) and Body (Risk)
+                    # We MUST fill wings first.
+                    wings = [
+                        (put_long, "PUT", OrderSide.BUY, "Long Put Wing"),
+                        (call_long, "CALL", OrderSide.BUY, "Long Call Wing")
                     ]
                     
-                    for contract, type, side, desc in legs:
-                        # Get Price
-                        limit_price = get_option_price(contract.symbol, "ask" if side == OrderSide.BUY else "bid")
-                        
-                        # Safety check for bad data
-                        if limit_price <= 0.01: limit_price = 0.05 
-                        
-                        print(f"       {side} {type} {contract.strike_price} @ ${limit_price}")
-                        req = LimitOrderRequest(
-                            symbol=contract.symbol, qty=1, side=side,
-                            time_in_force=TimeInForce.DAY, limit_price=limit_price
-                        )
-                        trading_client.submit_order(order_data=req)
-                        time.sleep(1) # Small delay to ensure sequence
+                    body = [
+                        (put_short, "PUT", OrderSide.SELL, "Short Put Body"),
+                        (call_short, "CALL", OrderSide.SELL, "Short Call Body")
+                    ]
                     
-                    send_discord(f"🦅 **OPENED CONDOR {ticker}**\nRange: ${put_short.strike_price} - ${call_short.strike_price}")
-                    log_to_influx("open_condor", ticker, price, "4 Legs Executed")
+                    # STEP 1: BUY WINGS (And Wait for Fill)
+                    wings_filled = True
+                    for contract, type, side, desc in wings:
+                        limit_price = get_option_price(contract.symbol, "ask") * 1.05 # Pay 5% over ask to ensure fill
+                        print(f"       Buying {desc} (${limit_price:.2f})...")
+                        
+                        try:
+                            # Submit Order
+                            req = LimitOrderRequest(
+                                symbol=contract.symbol, qty=1, side=side,
+                                time_in_force=TimeInForce.DAY, limit_price=limit_price
+                            )
+                            order = trading_client.submit_order(order_data=req)
+                            
+                            # POLLING LOOP: Wait up to 10 seconds for fill
+                            filled = False
+                            for _ in range(10):
+                                time.sleep(1)
+                                updated_order = trading_client.get_order_by_id(order.id)
+                                if updated_order.status == 'filled':
+                                    filled = True
+                                    print(f"       ✅ {desc} Filled!")
+                                    break
+                            
+                            if not filled:
+                                print(f"       ❌ {desc} Failed to fill in time. Aborting Condor.")
+                                # Critical: Cancel the order so we don't get filled later unexpectedly
+                                trading_client.cancel_order_by_id(order.id)
+                                wings_filled = False
+                                break
+                                
+                        except Exception as e:
+                            print(f"       Order Failed: {e}")
+                            wings_filled = False
+                            break
                     
-                    # Stop after opening one to avoid blasting the API
-                    break 
+                    # STEP 2: SELL BODY (Only if Wings are locked in)
+                    if wings_filled:
+                        print("       Wings Secured. Selling Body...")
+                        for contract, type, side, desc in body:
+                            limit_price = get_option_price(contract.symbol, "bid") * 0.95 # Sell 5% under bid to ensure fill
+                            
+                            req = LimitOrderRequest(
+                                symbol=contract.symbol, qty=1, side=side,
+                                time_in_force=TimeInForce.DAY, limit_price=limit_price
+                            )
+                            try:
+                                trading_client.submit_order(order_data=req)
+                                print(f"       ✅ {desc} Sent.")
+                            except Exception as e:
+                                print(f"       ❌ Failed to sell {desc}: {e}")
+                    
+                    else:
+                        print("    [ABORT] Wings failed to fill. Cancelling strategy for this ticker.")
+                    
+                    # Stop after one attempt per cycle
+                    break
 
             time.sleep(1800) # Check every 30 mins
 

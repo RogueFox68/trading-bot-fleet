@@ -1,5 +1,5 @@
 from alpaca.data.historical import CryptoHistoricalDataClient
-from alpaca.data.requests import CryptoBarsRequest
+from alpaca.data.requests import CryptoBarsRequest, CryptoLatestTradeRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
@@ -38,34 +38,27 @@ def log_to_influx(symbol, action, price, qty):
     except: pass
 
 def get_donchian_levels(symbol):
-    """
-    Calculates the Donchian Channel (20-day High, 10-day Low).
-    Returns (entry_level, exit_level, current_price)
-    """
-    # FIX: Explicitly ask for data starting 60 days ago
-    # This ensures we get the full 30-day history we need
+    # 1. Fetch History for Levels
     start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=60)
-
     req = CryptoBarsRequest(
         symbol_or_symbols=[symbol],
         timeframe=TimeFrame.Day,
-        start=start_time,  # <--- Critical Addition
+        start=start_time,
         limit=30
     )
     bars = data_client.get_crypto_bars(req)
     df = bars.df.loc[symbol]
     
-    # We exclude the 'current' unfinished candle for calculation
+    # Exclude current incomplete bar for levels
     completed_candles = df.iloc[:-1] 
     
-    # Safety Check: Do we actually have enough data?
-    if len(completed_candles) < LOOKBACK_ENTRY:
-        print(f"    [!] Not enough history for {symbol} (Got {len(completed_candles)} bars)")
-        return float('nan'), float('nan'), df.iloc[-1]['close']
-
     entry_high = completed_candles['high'].tail(LOOKBACK_ENTRY).max()
     exit_low = completed_candles['low'].tail(LOOKBACK_EXIT).min()
-    current_price = df.iloc[-1]['close']
+    
+    # 2. Fetch REAL-TIME Price for Execution (The Fix)
+    trade_req = CryptoLatestTradeRequest(symbol_or_symbols=symbol)
+    trade = data_client.get_crypto_latest_trade(trade_req)
+    current_price = float(trade[symbol].price)
     
     return entry_high, exit_low, current_price
 

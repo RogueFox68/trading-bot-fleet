@@ -48,8 +48,10 @@ def query_influx_trades(days=30):
                 df['bot_type'] = name
                 all_trades.append(df)
         
-        if not all_trades: return pd.DataFrame()
-        return pd.concat(all_trades)
+        valid_dfs = [df for df in all_trades if not df.empty]
+        if not valid_dfs: return pd.DataFrame()
+        return pd.concat(valid_dfs)
+    
     except Exception as e:
         print(f"[!] History Fetch Error: {e}")
         return pd.DataFrame()
