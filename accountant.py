@@ -48,9 +48,17 @@ def query_influx_trades(days=30):
                 df['bot_type'] = name
                 all_trades.append(df)
         
-        valid_dfs = [df for df in all_trades if not df.empty]
-        if not valid_dfs: return pd.DataFrame()
-        return pd.concat(valid_dfs)
+# FILTER: Exclude empty DFs AND DFs that are purely NaN (Ghost Data)
+        valid_dfs = []
+        for df in all_trades:
+            if not df.empty and not df.isna().all().all():
+                valid_dfs.append(df)
+        
+        if not valid_dfs: 
+            return pd.DataFrame()
+            
+        # CONCAT: Ignore index to prevent alignment warnings
+        return pd.concat(valid_dfs, ignore_index=True, sort=False)
     
     except Exception as e:
         print(f"[!] History Fetch Error: {e}")
