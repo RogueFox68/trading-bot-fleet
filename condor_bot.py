@@ -256,6 +256,12 @@ def run_condor_bot():
                                 print(f"       ✅ {desc} Sent.")
                             except Exception as e:
                                 print(f"       ❌ Failed to sell {desc}: {e}")
+                                
+                                # <--- ADD THIS BLOCK --->
+                                
+                        send_discord(f"🦅 **CONDOR DEPLOYED: {ticker}**\nWings Secured. Body Sold.\nRange: ${put_short.strike_price} - ${call_short.strike_price}")
+                        log_to_influx("open_condor", ticker, price, "Strategy Executed")
+                        # <---------------------->
                     
                     else:
                         print("    [ABORT] Wings failed to fill. Cancelling strategy for this ticker.")
