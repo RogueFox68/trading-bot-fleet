@@ -4,3 +4,5 @@ pandas_ta
 yfinance
 requests
 pytz
+discord.py
+brotlicffi
