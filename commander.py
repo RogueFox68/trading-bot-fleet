@@ -117,13 +117,22 @@ async def before_watchdog():
 
 # --- DISCORD COMMANDS ---
 
+# Find the on_ready function
 @bot.event
 async def on_ready():
     print(f'✅ COMMANDER ONLINE as {bot.user}')
-    watchdog_task.start() # Start the background loop
-    channel = bot.get_channel(CHANNEL_ID)
-    if channel:
+    
+    # Prevent "Task already running" error on reconnects
+    if not watchdog_task.is_running():
+        watchdog_task.start()
+
+    try:
+        # CHANGE THIS: Use fetch_channel (Async API Call) instead of get_channel (Cache)
+        # Also ensure ID is an integer
+        channel = await bot.fetch_channel(int(CHANNEL_ID))
         await channel.send("🛰️ **COMMANDER ONLINE.** Watchdog active.")
+    except Exception as e:
+        print(f"❌ Failed to send startup ping: {e}")
 
 @bot.command()
 async def status(ctx):
