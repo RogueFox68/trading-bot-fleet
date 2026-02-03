@@ -5,12 +5,13 @@ import requests
 import pandas as pd
 import pandas_ta as ta
 import datetime
+import os
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 # --- CONFIGURATION ---
-CHECK_INTERVAL = 3600  # Check every hour (Don't flicker too fast)
+CHECK_INTERVAL = 3600  # Check every hour
 CONFIG_FILE = "bot_config.json"
 MARKET_SYMBOL = "SPY"  # The benchmark
 
@@ -66,6 +67,10 @@ def get_market_data():
 def update_bot_config(regime):
     """Reads, modifies, and saves the bot_config.json based on regime."""
     try:
+        if not os.path.exists(CONFIG_FILE):
+            print(f"[!] {CONFIG_FILE} not found.")
+            return
+
         with open(CONFIG_FILE, 'r') as f:
             current_config = json.load(f)
         
@@ -73,6 +78,7 @@ def update_bot_config(regime):
         changes_made = []
 
         # --- DEFINING THE PLAYBOOK ---
+        
         # 1. BULL TREND (Easy Mode)
         if regime == "BULL_TREND":
             target_state = {
@@ -80,17 +86,19 @@ def update_bot_config(regime):
                 "survivor_bot": "active",
                 "moon_bag": "active",
                 "crypto_grid": "paused", # Don't grid against a moonshot
-                "wheel_bot": "active"    # Safe to sell puts in bull market
+                "wheel_bot": "active",   # Safe to sell puts
+                "condor_bot": "active"
             }
 
-        # 2. BEAR TREND (Hard Mode)
+        # 2. BEAR TREND (Attack Mode)
         elif regime == "BEAR_TREND":
             target_state = {
-                "trend_bot": "active",   # It can short
-                "survivor_bot": "paused", # Long only - dangerous
+                "trend_bot": "active",   # ACTIVE: It will switch to SQQQ/SPXU automatically
+                "survivor_bot": "paused", # Long only - dangerous in bear
                 "moon_bag": "paused",    # No breakouts in bear
                 "crypto_grid": "paused", # Don't catch falling knives
-                "wheel_bot": "paused"    # Don't catch falling knives
+                "wheel_bot": "paused",   # Don't sell puts in a crash
+                "condor_bot": "active"   # Condors can work if volatility is high but stable
             }
 
         # 3. CHOP / SIDEWAYS (Grind Mode)
@@ -100,7 +108,8 @@ def update_bot_config(regime):
                 "survivor_bot": "paused",
                 "moon_bag": "active",    # Crypto operates independently often
                 "crypto_grid": "active", # SHINES here
-                "wheel_bot": "active"    # SHINES here (Theta decay)
+                "wheel_bot": "active",   # SHINES here (Theta decay)
+                "condor_bot": "active"   # SHINES here
             }
 
         # --- APPLYING CHANGES ---
@@ -139,8 +148,7 @@ def run_analyst():
                 df['sma200'] = ta.sma(df['close'], length=200)
                 adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
                 
-                # ADX returns 3 columns: ADX_14, DMP_14, DMN_14. We just want ADX.
-                # Creates a column named 'ADX_14' usually.
+                # ADX returns 3 columns. Find the main ADX one.
                 adx_col = [c for c in adx_df.columns if c.startswith('ADX')][0]
                 df['adx'] = adx_df[adx_col]
 
