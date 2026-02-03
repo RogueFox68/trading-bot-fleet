@@ -16,7 +16,7 @@ HOSTNAME = socket.gethostname()
 # --- DISCORD SETUP ---
 # You must put your BOT TOKEN here or in config.py
 TOKEN = config.DISCORD_TOKEN
-CHANNEL_ID = config.DISCORD_CHANNNEL_ID 
+CHANNEL_ID = config.DISCORD_CHANNEL_ID 
 
 # Enable Message Content Intent (Required for commands)
 intents = discord.Intents.default()
