@@ -96,52 +96,82 @@ def run_condor_bot():
             except: pass
 
             positions = trading_client.get_all_positions()
-  # [FIX] Only count positions that belong to Condor Bot
-            condor_positions = 0
+# [FIX] Group positions by Root Symbol (Reassemble the Condor)
+            condor_groups = {}
             active_tickers = set()
-            
+
             for p in positions:
-                if p.asset_class == AssetClass.US_OPTION:
-                    # Parse symbol root (e.g. "TSLA" from "TSLA2301...")
-                    # Alpaca 2022+ symbology usually puts root first
-                    root = p.symbol
-                    for i, char in enumerate(p.symbol):
-                        if char.isdigit():
-                            root = p.symbol[:i]
-                            break
-                    
-                    if utils.get_bot_owner(root, AssetClass.US_OPTION) == "condor_bot":
-                        condor_positions += 1
-                        active_tickers.add(root)
+                if p.asset_class != AssetClass.US_OPTION: continue
+                
+                # Identify the root symbol (e.g. "TSLA" from "TSLA23...")
+                root = None
+                for ticker in TARGETS:
+                    if p.symbol.startswith(ticker):
+                        root = ticker
+                        break
+                
+                # Only manage if it belongs to this bot
+                if root and utils.get_bot_owner(root, AssetClass.US_OPTION) == "condor_bot":
+                    if root not in condor_groups:
+                        condor_groups[root] = []
+                    condor_groups[root].append(p)
+                    active_tickers.add(root)
 
             print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning (Active Condors: {len(active_tickers)}/{MAX_POSITIONS})...")
-            # --- MANAGEMENT: Check Existing Spreads ---
-            # Simplified Management: We treat all options for a ticker as one "Unit" for display,
-            # but we close individual legs if they hit profit.
-            # (Ideally, we close the whole spread, but leg-by-leg is safer for a simple bot V1)
-            
-            for p in positions:
-                if p.asset_class == AssetClass.US_OPTION:
-                    # Check for Take Profit
-                    entry = float(p.avg_entry_price)
-                    current = float(p.current_price) # Estimated
-                    qty = float(p.qty)
+
+            # --- MANAGEMENT: Check Net P&L of Each Condor ---
+            for root, legs in condor_groups.items():
+                total_entry_cost = 0.0  
+                total_current_value = 0.0
+                
+                for leg in legs:
+                    qty = float(leg.qty)
+                    entry_price = float(leg.avg_entry_price)
+                    current_price = float(leg.current_price)
                     
-                    # We only manage the SHORT legs (Sold positions) for profit
-                    # The Long legs are just insurance.
-                    if qty < 0 and entry > 0:
-                        profit_pct = (entry - current) / entry
-                        if profit_pct >= TAKE_PROFIT_PCT:
-                            print(f"    💰 [PROFIT] {p.symbol} reached {profit_pct*100:.1f}% profit. Closing.")
-                            # Buy to Close
-                            limit = get_option_price(p.symbol, "ask") * 1.05 # Aggressive fill
-                            req = LimitOrderRequest(
-                                symbol=p.symbol, qty=abs(int(qty)), side=OrderSide.BUY,
-                                time_in_force=TimeInForce.DAY, limit_price=limit
-                            )
-                            trading_client.submit_order(order_data=req)
-                            send_discord(f"💰 **CONDOR PROFIT**\nClosed {p.symbol} @ {profit_pct*100:.0f}% Gain")
-                            log_to_influx("close_leg", p.symbol, limit, "Take Profit")
+                    # Cost = Price * Qty * 100
+                    # For Sells (Qty < 0), this adds negative cost (Credit)
+                    total_entry_cost += (entry_price * qty * 100)
+                    total_current_value += (current_price * qty * 100)
+
+                # Iron Condor is a CREDIT strategy. 
+                # initial_credit will be positive (e.g., $100).
+                initial_credit = -total_entry_cost
+                current_debit_to_close = -total_current_value 
+                
+                # Safety: Ensure we actually received credit (valid condor)
+                if initial_credit > 0:
+                    profit = initial_credit - current_debit_to_close
+                    capture_pct = profit / initial_credit
+                    
+                    print(f"    🦅 {root} Net P&L: ${profit:.2f} ({capture_pct*100:.1f}%)")
+
+                    if capture_pct >= TAKE_PROFIT_PCT:
+                        print(f"    💰 [HARVEST] {root} hit {TAKE_PROFIT_PCT*100:.0f}% target. Closing all {len(legs)} legs.")
+                        
+                        for leg in legs:
+                            qty = float(leg.qty)
+                            side = OrderSide.BUY if qty < 0 else OrderSide.SELL
+                            
+                            # Aggressive Limit to ensure exit
+                            price = get_option_price(leg.symbol, "ask" if side == OrderSide.BUY else "bid")
+                            limit = price * 1.05 if side == OrderSide.BUY else price * 0.95
+                            
+                            try:
+                                req = LimitOrderRequest(
+                                    symbol=leg.symbol,
+                                    qty=abs(int(qty)),
+                                    side=side,
+                                    time_in_force=TimeInForce.DAY,
+                                    limit_price=round(limit, 2)
+                                )
+                                trading_client.submit_order(order_data=req)
+                                print(f"       -> Sent Close for {leg.symbol}")
+                            except Exception as e:
+                                print(f"       [!] Error closing {leg.symbol}: {e}")
+                                
+                        send_discord(f"💰 **CONDOR CLOSED: {root}**\nNet Profit: ${profit:.2f} ({capture_pct*100:.0f}%)")
+                        log_to_influx("close_condor", root, profit, "Take Profit")
 
             # --- ENTRY: Find New Condors ---
             if len(active_tickers) >= MAX_POSITIONS:
