@@ -30,8 +30,8 @@ TIMEZONE = pytz.timezone('US/Eastern')
 
 # --- INFLUX & DISCORD ---
 def send_discord(msg):
-    if "YOUR" in config.WEBHOOK_TREND: return # Reusing Trend webhook for now
-    try: requests.post(config.WEBHOOK_TREND, json={"content": msg})
+    if "YOUR" in config.WEBHOOK_SURVIVOR: return # Reusing Trend webhook for now
+    try: requests.post(config.WEBHOOK_SURVIVOR, json={"content": msg})
     except: pass
 
 def log_to_influx(symbol, action, price, qty):
