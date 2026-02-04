@@ -21,7 +21,6 @@ CORE_WATCHLIST = ["TQQQ", "SQQQ", "SOXL", "SOXS", "FNGU", "UPRO"]
 TARGET_FILE = "active_targets.json" # <--- Reading the Scout's list
 
 # Indicators
-# We are moving away from static RSI to Dynamic Bollinger Bands
 RISK_PER_TRADE = 0.05 # Aggressive sizing for mean reversion
 
 # --- CREDENTIALS & CLIENTS ---
@@ -31,8 +30,8 @@ TIMEZONE = pytz.timezone('US/Eastern')
 
 # --- INFLUX & DISCORD ---
 def send_discord(msg):
-    if "YOUR" in config.WEBHOOK_SURVIVOR: return # Reusing Trend webhook for now
-    try: requests.post(config.WEBHOOK_SURVIVOR, json={"content": msg})
+    if "YOUR" in config.WEBHOOK_TREND: return # Reusing Trend webhook for now
+    try: requests.post(config.WEBHOOK_TREND, json={"content": msg})
     except: pass
 
 def log_to_influx(symbol, action, price, qty):
@@ -97,26 +96,42 @@ def run_survivor_bot():
                 if symbol in ["BTC/USD", "ETH/USD"]: continue 
 
                 df = get_data_alpaca(symbol)
-                if df is None: continue
+                if df is None or len(df) < 20: continue
 
-                # --- INDICATORS (UPDATED) ---
+                # --- INDICATORS (UPDATED & FIXED) ---
                 # 1. Bollinger Bands (20, 2)
                 bbands = ta.bbands(df['close'], length=20, std=2.0)
+                
+                if bbands is None or bbands.empty:
+                    print(f"    [!] Failed to calc BB for {symbol}")
+                    continue
+
+                # Merge indicators into main DF
                 df = pd.concat([df, bbands], axis=1)
 
-                # 2. RSI (Still useful for extreme sanity checks)
+                # 2. RSI (Sanity Check)
                 df['rsi'] = ta.rsi(df['close'], length=14)
 
                 latest = df.iloc[-1]
                 price = float(latest['close'])
-                rsi = float(latest['rsi'])
-                
-                # Dynamic Levels from pandas_ta
-                # Names are typically BBL_length_std, BBM_..., BBU_...
-                lower_band = float(latest['BBL_20_2.0'])
-                mid_band = float(latest['BBM_20_2.0'])
-                upper_band = float(latest['BBU_20_2.0'])
-                bandwidth = float(latest['BBB_20_2.0']) # Bandwidth %
+                rsi = float(latest['rsi']) if pd.notna(latest['rsi']) else 50.0
+
+                # --- DYNAMIC COLUMN FINDER ---
+                # This fixes the 'BBL_20_2.0' vs 'BBL_20_2' error by grabbing whatever was generated
+                # bbands columns usually: [BBL, BBM, BBU, BBB, BBP]
+                try:
+                    bbl_col = [c for c in bbands.columns if c.startswith('BBL')][0] # Lower
+                    bbm_col = [c for c in bbands.columns if c.startswith('BBM')][0] # Mid
+                    bbu_col = [c for c in bbands.columns if c.startswith('BBU')][0] # Upper
+                    bbb_col = [c for c in bbands.columns if c.startswith('BBB')][0] # Bandwidth
+                except IndexError:
+                    print(f"    [!] Column Error on {symbol}. Cols: {bbands.columns}")
+                    continue
+
+                lower_band = float(latest[bbl_col])
+                mid_band = float(latest[bbm_col])
+                upper_band = float(latest[bbu_col])
+                bandwidth = float(latest[bbb_col])
 
                 # --- EXIT LOGIC ---
                 if symbol in pos_dict:
@@ -128,7 +143,7 @@ def run_survivor_bot():
                     should_sell = False
                     reason = ""
                     
-                    # Exit 1: Mean Reversion (Price hit the middle band)
+                    # Exit 1: Mean Reversion (Price touched the middle band)
                     if price >= mid_band:
                         should_sell = True
                         reason = "Mean Reverted (Hit Mid Band)"
@@ -145,9 +160,12 @@ def run_survivor_bot():
 
                     if should_sell:
                         print(f"    📉 SELLING {symbol}: {reason}")
-                        trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC))
-                        send_discord(f"💰 **SOLD {symbol}**\nReason: {reason}\nP&L: {pct_gain*100:.2f}%")
-                        log_to_influx(symbol, "sell", price, qty)
+                        try:
+                            trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC))
+                            send_discord(f"💰 **SOLD {symbol}**\nReason: {reason}\nP&L: {pct_gain*100:.2f}%")
+                            log_to_influx(symbol, "sell", price, qty)
+                        except Exception as e:
+                            print(f"    [!] Sell Error: {e}")
 
                 # --- ENTRY LOGIC (Volatility Scoop) ---
                 else:
@@ -157,7 +175,7 @@ def run_survivor_bot():
                         
                         # [CFO CHECK]
                         if not utils.check_budget("survivor_bot", trading_client):
-                            print(f"    [SKIP] Survivor Budget Exceeded.")
+                            # print(f"    [SKIP] Survivor Budget Exceeded.")
                             continue
 
                         is_scout_pick = symbol in scout_targets
