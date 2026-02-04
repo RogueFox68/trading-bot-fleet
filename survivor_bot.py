@@ -21,8 +21,7 @@ CORE_WATCHLIST = ["TQQQ", "SQQQ", "SOXL", "SOXS", "FNGU", "UPRO"]
 TARGET_FILE = "active_targets.json" # <--- Reading the Scout's list
 
 # Indicators
-RSI_BUY = 30        # Oversold (Buy the dip)
-RSI_SELL = 70       # Overbought (Sell the rip)
+# We are moving away from static RSI to Dynamic Bollinger Bands
 RISK_PER_TRADE = 0.05 # Aggressive sizing for mean reversion
 
 # --- CREDENTIALS & CLIENTS ---
@@ -32,8 +31,8 @@ TIMEZONE = pytz.timezone('US/Eastern')
 
 # --- INFLUX & DISCORD ---
 def send_discord(msg):
-    if "YOUR" in config.WEBHOOK_TREND: return # Reusing Trend webhook for now
-    try: requests.post(config.WEBHOOK_TREND, json={"content": msg})
+    if "YOUR" in config.WEBHOOK_SURVIVOR: return # Reusing Trend webhook for now
+    try: requests.post(config.WEBHOOK_SURVIVOR, json={"content": msg})
     except: pass
 
 def log_to_influx(symbol, action, price, qty):
@@ -49,8 +48,6 @@ def get_dynamic_targets():
     try:
         with open(TARGET_FILE, 'r') as f:
             data = json.load(f)
-            # Filter out ETFs from the scout list so we don't double count, 
-            # or keep them if we want to trade the underlying sector ETF.
             return data.get("targets", [])
     except: return []
 
@@ -71,8 +68,8 @@ def get_data_alpaca(symbol):
     except: return None
 
 def run_survivor_bot():
-    print(f"--- 🛡️ SURVIVOR BOT (Scout Integrated) STARTED ---")
-    send_discord("**Survivor Bot (V3)** Online\nScanning Core + Scout Targets for Dips.")
+    print(f"--- 🛡️ SURVIVOR BOT (Bollinger Bandit) STARTED ---")
+    send_discord("**Survivor Bot (V4)** Online\nStrategy: Dynamic Volatility Harvesting (Bollinger Bands)")
     
     while True:
         try:
@@ -87,7 +84,6 @@ def run_survivor_bot():
 
             # 2. Build Watchlist
             scout_targets = get_dynamic_targets()
-            # Combine Core + Scout (Remove duplicates)
             full_watchlist = list(set(CORE_WATCHLIST + scout_targets))
             
             account = trading_client.get_account()
@@ -95,7 +91,7 @@ def run_survivor_bot():
             positions = trading_client.get_all_positions()
             pos_dict = {p.symbol: p for p in positions}
 
-            print(f"\n[{datetime.datetime.now(TIMEZONE).strftime('%H:%M')}] Scanning {len(full_watchlist)} Targets (Core: {len(CORE_WATCHLIST)} | Scout: {len(scout_targets)})")
+            print(f"\n[{datetime.datetime.now(TIMEZONE).strftime('%H:%M')}] Scanning {len(full_watchlist)} Targets...")
 
             for symbol in full_watchlist:
                 if symbol in ["BTC/USD", "ETH/USD"]: continue 
@@ -103,71 +99,85 @@ def run_survivor_bot():
                 df = get_data_alpaca(symbol)
                 if df is None: continue
 
-                # Indicators
+                # --- INDICATORS (UPDATED) ---
+                # 1. Bollinger Bands (20, 2)
+                bbands = ta.bbands(df['close'], length=20, std=2.0)
+                df = pd.concat([df, bbands], axis=1)
+
+                # 2. RSI (Still useful for extreme sanity checks)
                 df['rsi'] = ta.rsi(df['close'], length=14)
-                df['sma200'] = ta.sma(df['close'], length=200) # Trend filter
-                
+
                 latest = df.iloc[-1]
                 price = float(latest['close'])
                 rsi = float(latest['rsi'])
-                sma = float(latest['sma200']) if not pd.isna(latest['sma200']) else 0
+                
+                # Dynamic Levels from pandas_ta
+                # Names are typically BBL_length_std, BBM_..., BBU_...
+                lower_band = float(latest['BBL_20_2.0'])
+                mid_band = float(latest['BBM_20_2.0'])
+                upper_band = float(latest['BBU_20_2.0'])
+                bandwidth = float(latest['BBB_20_2.0']) # Bandwidth %
 
-                # --- EXIT LOGIC (Take Profit / Stop Loss) ---
+                # --- EXIT LOGIC ---
                 if symbol in pos_dict:
                     pos = pos_dict[symbol]
                     qty = float(pos.qty)
                     entry_price = float(pos.avg_entry_price)
                     pct_gain = (price - entry_price) / entry_price
                     
-                    # Exit if Overbought (RSI > 70) OR Big Win (+5%) OR Stop Loss (-3%)
                     should_sell = False
                     reason = ""
                     
-                    if rsi > RSI_SELL:
+                    # Exit 1: Mean Reversion (Price hit the middle band)
+                    if price >= mid_band:
                         should_sell = True
-                        reason = f"RSI Overbought ({rsi:.0f})"
-                    elif pct_gain > 0.05:
+                        reason = "Mean Reverted (Hit Mid Band)"
+                    
+                    # Exit 2: Hard Stop Loss (-4%)
+                    elif pct_gain < -0.04:
                         should_sell = True
-                        reason = "Take Profit (+5%)"
-                    elif pct_gain < -0.03:
+                        reason = "Stop Loss (-4%)"
+
+                    # Exit 3: RSI Blowout (If we rocketed past upper band)
+                    elif price > upper_band and rsi > 75:
                         should_sell = True
-                        reason = "Stop Loss (-3%)"
-                        
+                        reason = "Max Extension (Upper Band)"
+
                     if should_sell:
                         print(f"    📉 SELLING {symbol}: {reason}")
                         trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC))
                         send_discord(f"💰 **SOLD {symbol}**\nReason: {reason}\nP&L: {pct_gain*100:.2f}%")
                         log_to_influx(symbol, "sell", price, qty)
 
-                # --- ENTRY LOGIC (Buy the Dip) ---
+                # --- ENTRY LOGIC (Volatility Scoop) ---
                 else:
-                    # 1. Basic Condition: OVERSOLD
-                    if rsi < RSI_BUY:
-                        # [NEW] CFO CHECK
+                    # 1. CRASH CONDITION: Price is BELOW the Lower Band
+                    # 2. VOLATILITY CONDITION: Bandwidth > 1.0 (Ensures we don't buy in dead markets)
+                    if price < lower_band and bandwidth > 1.0:
+                        
+                        # [CFO CHECK]
                         if not utils.check_budget("survivor_bot", trading_client):
                             print(f"    [SKIP] Survivor Budget Exceeded.")
                             continue
-                        # 2. Safety Filter:
-                        # Only buy if the price is ABOVE the 200 SMA (Uptrend Pullback)
-                        # OR if it's a Scout Target (The General confirmed the trend)
+
                         is_scout_pick = symbol in scout_targets
-                        is_uptrend = price > sma
                         
-                        if is_uptrend or is_scout_pick:
-                            print(f"    💎 DIP DETECTED: {symbol} (RSI {rsi:.0f})")
-                            
-                            # Size Check
-                            risk_amt = equity * RISK_PER_TRADE
-                            qty = int(risk_amt / price)
-                            
-                            if qty > 0:
-                                print(f"       -> Buying {qty} shares...")
+                        print(f"    💎 VOLATILITY SCOOP: {symbol}")
+                        print(f"       Price: {price:.2f} < Band: {lower_band:.2f} | Width: {bandwidth:.2f}")
+                        
+                        # Size Check
+                        risk_amt = equity * RISK_PER_TRADE
+                        qty = int(risk_amt / price)
+                        
+                        if qty > 0:
+                            print(f"       -> Buying {qty} shares...")
+                            try:
                                 trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
                                 source_tag = "SCOUT PICK" if is_scout_pick else "CORE"
-                                send_discord(f"💎 **BOUGHT DIP {symbol}** ({source_tag})\nRSI: {rsi:.0f}")
+                                send_discord(f"💎 **BOUGHT DIP {symbol}** ({source_tag})\nBelow Lower Band\nVol Width: {bandwidth:.2f}")
                                 log_to_influx(symbol, "buy", price, qty)
-                        else:
-                            print(f"    ⚠️ Skipping {symbol} (RSI {rsi:.0f} but Below SMA200)")
+                            except Exception as e:
+                                print(f"       Order Failed: {e}")
 
             time.sleep(60)
 
