@@ -4,6 +4,7 @@ import time
 import datetime
 import requests
 import math
+import yfinance as yf # <--- ADDED: For VIX checks
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest, GetOptionContractsRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, ContractType
@@ -14,7 +15,7 @@ import utils
 # WATCHLIST is now dynamic. See utils.get_active_targets()
 MIN_DTE = 25             
 MAX_DTE = 45
-TARGET_OTM_PCT = 0.05
+TARGET_OTM_PCT = 0.05   # Default, but now Dynamic based on VIX
 MIN_PREMIUM = 0.10      # Will not sell options for less than $10
 TAKE_PROFIT_PCT = 0.50  # Close position if we captured 50% of max profit
 
@@ -59,7 +60,17 @@ def get_option_price(symbol, side="bid"):
         print(f"  [!] Error fetching option quote for {symbol}: {e}")
         return 0.0
 
-def find_best_contract(symbol, side, current_price):
+def get_vix_level():
+    """Returns the current VIX level to gauge fear."""
+    try:
+        # Fast fetch of just the latest price
+        vix = yf.Ticker("^VIX").history(period="1d")
+        if not vix.empty:
+            return float(vix['Close'].iloc[-1])
+    except: pass
+    return 15.0 # Default to "Normal" if fetch fails
+
+def find_best_contract(symbol, side, current_price, target_otm=0.05):
     today = datetime.date.today()
     start_date = today + datetime.timedelta(days=MIN_DTE)
     end_date = today + datetime.timedelta(days=MAX_DTE)
@@ -91,7 +102,9 @@ def find_best_contract(symbol, side, current_price):
         if side == "CALL" and strike <= current_price: continue
         
         pct_otm = abs(current_price - strike) / current_price
-        score = abs(pct_otm - TARGET_OTM_PCT)
+        
+        # [UPDATED] Use the dynamic target_otm passed in arguments
+        score = abs(pct_otm - target_otm)
         
         if score < best_score:
             best_score = score
@@ -104,7 +117,7 @@ def run_wheel_bot():
     
     # Initial Ping to confirm online status
     initial_targets = utils.get_active_targets("wheel_targets")
-    if not initial_targets: initial_targets = ["F", "PLTR", "SOFI"] # Fallback display
+    if not initial_targets: initial_targets = ["F", "PLTR", "SOFI"] 
     send_discord(f"🚜 **Wheel Bot Online**\nTargeting 50% Profit on: {initial_targets}")
     
     while True:
@@ -124,10 +137,19 @@ def run_wheel_bot():
             # --- DYNAMIC TARGETING ---
             active_targets = utils.get_active_targets("wheel_targets")
             if not active_targets:
-                # Fallback to high-liquidity staples if Scout is empty
                 active_targets = ["F", "PLTR", "SOFI"]
 
-            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning {len(active_targets)} Targets (Harvest Mode)...")
+            # [SHIELD 1] GET VIX FOR DYNAMIC SPACING
+            current_vix = get_vix_level()
+            
+            # If VIX is high (>20), we demand 10% OTM. If low, 5% OTM.
+            dynamic_otm = 0.10 if current_vix > 20.0 else 0.05
+            vix_msg = f"VIX: {current_vix:.2f} | Spacing: {dynamic_otm*100:.0f}%"
+
+            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning {len(active_targets)} Targets | {vix_msg}")
+
+            # [SHIELD 2] LADDERING - Track new positions this cycle
+            opened_this_cycle = 0
 
             for ticker in active_targets:
                 stock_qty = 0
@@ -183,7 +205,9 @@ def run_wheel_bot():
                 # Covered Call?
                 if stock_qty >= 100:
                     side = "CALL"
-                    contract = find_best_contract(ticker, "CALL", current_stock_price)
+                    # For calls, we usually stay aggressive, or we can use dynamic_otm too. 
+                    # Let's stick to standard 5% for upside caps to get premium.
+                    contract = find_best_contract(ticker, "CALL", current_stock_price, target_otm=0.05)
                 
                 # Cash Secured Put?
                 else:
@@ -195,8 +219,10 @@ def run_wheel_bot():
                     if buying_power < (current_stock_price * 100):
                         print(f"    [SKIP] Insufficient BP for {ticker}")
                         continue
+                        
                     side = "PUT"
-                    contract = find_best_contract(ticker, "PUT", current_stock_price)
+                    # [SHIELD 1 APPLIED] Use dynamic OTM
+                    contract = find_best_contract(ticker, "PUT", current_stock_price, target_otm=dynamic_otm)
 
                 if contract:
                     limit_price = get_option_price(contract.symbol, side="bid")
@@ -205,9 +231,20 @@ def run_wheel_bot():
                         print(f"    [SKIP] Premium too low (${limit_price})")
                         continue
                     
-                    if side == "PUT" and buying_power < (float(contract.strike_price) * 100):
-                        print(f"    [SKIP] Strike too expensive.")
-                        continue
+                    if side == "PUT":
+                        if buying_power < (float(contract.strike_price) * 100):
+                            print(f"    [SKIP] Strike too expensive.")
+                            continue
+
+                        # [SHIELD 3] FALLING KNIFE PROTECTION
+                        # Ensure the buffer hasn't shrunk significantly since the scan
+                        strike_price = float(contract.strike_price)
+                        safety_buffer = (current_stock_price - strike_price) / current_stock_price
+                        
+                        # If we wanted 5% OTM but we only have 2.5% now, price is crashing. Abort.
+                        if safety_buffer < (dynamic_otm * 0.5):
+                             print(f"    [SKIP] 🔪 Falling Knife! Buffer shrank to {safety_buffer*100:.1f}%")
+                             continue
 
                     print(f"    [ENTRY] Selling {side} on {ticker} @ ${limit_price}")
                     req = LimitOrderRequest(
@@ -224,6 +261,12 @@ def run_wheel_bot():
                     log_to_influx(f"sell_{side.lower()}", limit_price, contract.symbol, "Opened Position")
                     
                     if side == "PUT": buying_power -= (float(contract.strike_price) * 100)
+                    
+                    # [SHIELD 2] PACING (Laddering)
+                    opened_this_cycle += 1
+                    if opened_this_cycle >= 1:
+                        print("    [PACING] Opened 1 position. Sleeping to ladder entries.")
+                        break # Stop scanning, sleep, and resume later
 
             time.sleep(900)
 
