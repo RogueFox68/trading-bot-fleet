@@ -42,13 +42,9 @@ def log_to_influx(symbol, action, price, qty):
     except: pass
 
 def get_dynamic_targets():
-    """Reads the 'Hot Sector' list from the Scout."""
-    if not os.path.exists(TARGET_FILE): return []
-    try:
-        with open(TARGET_FILE, 'r') as f:
-            data = json.load(f)
-            return data.get("targets", [])
-    except: return []
+    """Reads the 'Trend' list from the Scout."""
+    # Survivor likes high volatility, so it shares targets with Trend Bot
+    return utils.get_active_targets("trend_targets")
 
 def get_data_alpaca(symbol):
     try:

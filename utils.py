@@ -73,3 +73,19 @@ def check_budget(bot_name, trading_client):
     except Exception as e:
         print(f"  [CFO] Budget Check Error: {e}")
         return True # Default to allow if file error
+    
+    # utils.py - Add this function at the bottom
+
+def get_active_targets(strategy_key):
+    """
+    Reads active_targets.json and returns the list for the specific strategy.
+    strategy_key examples: 'wheel_targets', 'condor_targets', 'trend_targets'
+    """
+    try:
+        with open("active_targets.json", "r") as f:
+            data = json.load(f)
+            # Return the specific list, or empty if not found
+            return data.get(strategy_key, [])
+    except Exception as e:
+        print(f"  [Utils] Error reading targets for {strategy_key}: {e}")
+        return []

@@ -11,7 +11,7 @@ import config
 import utils
 
 # --- CONFIGURATION ---
-WATCHLIST = ["DIS", "PLTR", "F"] 
+# WATCHLIST is now dynamic. See utils.get_active_targets()
 MIN_DTE = 25             
 MAX_DTE = 45
 TARGET_OTM_PCT = 0.05
@@ -101,7 +101,11 @@ def find_best_contract(symbol, side, current_price):
 
 def run_wheel_bot():
     print(f"--- 🚜 FLEET WHEEL BOT (Harvest Mode) STARTED ---")
-    send_discord(f"🚜 **Wheel Bot Online**\nTargeting 50% Profit on: {WATCHLIST}")
+    
+    # Initial Ping to confirm online status
+    initial_targets = utils.get_active_targets("wheel_targets")
+    if not initial_targets: initial_targets = ["F", "PLTR", "SOFI"] # Fallback display
+    send_discord(f"🚜 **Wheel Bot Online**\nTargeting 50% Profit on: {initial_targets}")
     
     while True:
         try:
@@ -116,10 +120,16 @@ def run_wheel_bot():
             account = trading_client.get_account()
             buying_power = float(account.buying_power)
             all_positions = trading_client.get_all_positions()
+            
+            # --- DYNAMIC TARGETING ---
+            active_targets = utils.get_active_targets("wheel_targets")
+            if not active_targets:
+                # Fallback to high-liquidity staples if Scout is empty
+                active_targets = ["F", "PLTR", "SOFI"]
 
-            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning Portfolio & Watchlist...")
+            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning {len(active_targets)} Targets (Harvest Mode)...")
 
-            for ticker in WATCHLIST:
+            for ticker in active_targets:
                 stock_qty = 0
                 active_option = None
                 
@@ -135,20 +145,16 @@ def run_wheel_bot():
                 # 2. MANAGE EXISTING OPTION (TAKE PROFIT)
                 if active_option:
                     entry_price = float(active_option.avg_entry_price)
-                    # Note: p.current_price is estimated. For real logic, we might want to fetch quote, 
-                    # but for % check, the estimation is usually fine.
                     current_opt_price = float(active_option.current_price) 
                     qty = float(active_option.qty) # Negative for short
                     
                     if entry_price > 0:
-                        # Calculate how much of the premium we have kept
-                        # Example: Sold for 1.00, now 0.40. Capture = (1.00 - 0.40) / 1.00 = 60%
                         capture_pct = (entry_price - current_opt_price) / entry_price
                         
                         print(f"  {ticker:<4} | Existing Option: {active_option.symbol} | Profit: {capture_pct*100:.1f}%")
                         
                         if capture_pct >= TAKE_PROFIT_PCT:
-                            print(f"    💰 [HARVEST] Profit Target Hit! Closing {active_option.symbol}")
+                            print(f"    🚜 [HARVEST] Profit Target Hit! Closing {active_option.symbol}")
                             
                             # Get real ASK price for the Limit Order
                             close_price = get_option_price(active_option.symbol, side="ask")
@@ -156,21 +162,19 @@ def run_wheel_bot():
                             
                             req = LimitOrderRequest(
                                 symbol=active_option.symbol,
-                                qty=abs(int(qty)), # Buy back the positive amount
+                                qty=abs(int(qty)), 
                                 side=OrderSide.BUY,
                                 time_in_force=TimeInForce.DAY,
                                 limit_price=close_price
                             )
                             trading_client.submit_order(order_data=req)
-                            send_discord(f"💰 **TOOK PROFIT {ticker}**\nClosed @ ${close_price} ({capture_pct*100:.0f}% Cap)")
+                            send_discord(f"🚜 **TOOK PROFIT {ticker}**\nClosed @ ${close_price} ({capture_pct*100:.0f}% Cap)")
                             log_to_influx("buy_close", close_price, active_option.symbol, "Take Profit")
-                            # Don't open a new one same loop
                             continue 
                     
-                    # If we have an option and didn't close it, we are done with this ticker for now
                     continue
 
-                # 3. OPEN NEW POSITIONS (If no option exists)
+                # 3. OPEN NEW POSITIONS
                 print(f"  {ticker:<4} | ${current_stock_price:>7.2f} | No Active Option. Hunting...")
 
                 contract = None
@@ -183,11 +187,11 @@ def run_wheel_bot():
                 
                 # Cash Secured Put?
                 else:
-                    # [NEW] CFO CHECK
+                    # CFO CHECK
                     if not utils.check_budget("wheel_bot", trading_client):
                         print(f"    [SKIP] Wheel Budget Exceeded.")
                         continue
-                    # Basic check: do we have enough BP?
+                    # Basic BP check
                     if buying_power < (current_stock_price * 100):
                         print(f"    [SKIP] Insufficient BP for {ticker}")
                         continue
@@ -214,7 +218,8 @@ def run_wheel_bot():
                         limit_price=limit_price
                     )
                     trading_client.submit_order(order_data=req)
-                    emoji = "🟢" if side == "CALL" else "🔴"
+                    
+                    emoji = "📞" if side == "CALL" else "📉"
                     send_discord(f"{emoji} **SOLD {side} {ticker}**\nStrike: ${contract.strike_price}\nLimit: ${limit_price}")
                     log_to_influx(f"sell_{side.lower()}", limit_price, contract.symbol, "Opened Position")
                     

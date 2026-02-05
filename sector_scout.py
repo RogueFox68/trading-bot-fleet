@@ -1,134 +1,92 @@
+# sector_scout.py
 import config
 import time
 import json
-import requests
-import pandas as pd
+import yfinance as yf
 import pandas_ta as ta
 import datetime
-import math
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
 
 # --- CONFIGURATION ---
-CHECK_INTERVAL = 3600  # Run hourly
 TARGET_FILE = "active_targets.json"
-MAX_TARGETS = 15       # Only send the Top 15 most volatile stocks to the fleet
-MIN_PRICE = 20.0       # Avoid penny stocks
-MIN_VOLUME = 1000000   # Liquidity filter
 
-# --- CLIENT ---
-data_client = StockHistoricalDataClient(config.API_KEY, config.SECRET_KEY)
+# --- THE UNIVERSES ---
+# 1. IRON CONDOR: Indices & Boring Giants (Low Vol, Sideways)
+UNIVERSE_CONDOR = ["SPY", "QQQ", "IWM", "DIA", "TLT", "KO", "MCD", "JNJ", "PG", "WM"]
 
-def get_sp500_tickers():
-    """Scrapes Wikipedia for the current S&P 500 list."""
+# 2. THE WHEEL: Stocks you want to own (Moderate Vol, Liquidity)
+UNIVERSE_WHEEL = ["AAPL", "AMD", "F", "T", "PLTR", "SOFI", "BAC", "PFE", "DIS", "AMZN"]
+
+# 3. TREND / SURVIVOR: High Beta Soldiers (Momentum)
+UNIVERSE_TREND = ["NVDA", "TSLA", "MSTR", "COIN", "SMCI", "META", "NFLX"]
+
+def get_technical_status(tickers):
+    """Scans a list of tickers and returns metrics."""
+    results = {}
     try:
-        url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-        tables = pd.read_html(url)
-        df = tables[0]
-        tickers = df['Symbol'].tolist()
-        # Clean tickers (e.g., BRK.B -> BRK-B for some APIs, but Alpaca usually likes standardized)
-        return [t.replace('.', '-') for t in tickers]
-    except Exception as e:
-        print(f"Error fetching S&P 500: {e}")
-        # Fallback list if wiki fails
-        return ["NVDA", "TSLA", "AMD", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "NFLX", "COIN"]
-
-def get_volatility_rank(tickers):
-    """Fetches data and calculates volatility (NATR)."""
-    print(f"  -> Analyzing {len(tickers)} tickers for volatility...")
-    
-    ranked_list = []
-    
-    # Chunking to respect API limits (Alpaca handles multi-symbol well, but let's be safe on the Pi)
-    chunk_size = 50
-    start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=10)
-
-    for i in range(0, len(tickers), chunk_size):
-        chunk = tickers[i:i+chunk_size]
-        try:
-            req = StockBarsRequest(
-                symbol_or_symbols=chunk,
-                timeframe=TimeFrame.Day,
-                start=start_time,
-                limit=10,
-                adjustment='all'
-            )
-            bars = data_client.get_stock_bars(req)
-            
-            for symbol in chunk:
-                if symbol not in bars.df.index.get_level_values(0): continue
-                
-                df = bars.df.xs(symbol)
-                if df.empty or len(df) < 10: continue
-                
-                # Check Liquidity (Volume of last bar)
-                if df['volume'].iloc[-1] < MIN_VOLUME: continue
-                if df['close'].iloc[-1] < MIN_PRICE: continue
-
-                # Calculate NATR (Normalized Average True Range)
-                # This gives us volatility as a % of price, allowing fair comparison between stocks
-                df.ta.natr(length=7, append=True)
-                
-                # Get latest NATR
-                natr_col = f"NATR_7"
-                if natr_col in df.columns:
-                    vol_score = df[natr_col].iloc[-1]
-                    ranked_list.append((symbol, vol_score))
-                    
-        except Exception as e:
-            print(f"    Error processing chunk {i}: {e}")
-            continue
-            
-    # Sort by Volatility (Highest First)
-    ranked_list.sort(key=lambda x: x[1], reverse=True)
-    return ranked_list[:MAX_TARGETS]
-
-def update_targets(active_tuples):
-    """Writes the approved hit list."""
-    try:
-        # Extract just the symbols
-        targets = [x[0] for x in active_tuples]
+        # Bulk download for speed
+        data = yf.download(tickers, period="60d", interval="1d", group_by='ticker', progress=False)
         
-        # Always keep Inverse ETFs for hedging in a crash
-        hedges = ["SQQQ", "SPXU", "SOXS"]
-        final_list = list(set(targets + hedges))
-        
-        with open(TARGET_FILE, 'w') as f:
-            json.dump({
-                "targets": final_list, 
-                "details": active_tuples, # Save scores for debugging
-                "updated": str(datetime.datetime.now())
-            }, f)
-        print(f"  -> 🎯 Updated Targets: {final_list}")
+        for ticker in tickers:
+            try:
+                df = data[ticker].dropna()
+                if len(df) < 50: continue
+                
+                # Indicators
+                adx = ta.adx(df['High'], df['Low'], df['Close'], length=14)['ADX_14'].iloc[-1]
+                rsi = ta.rsi(df['Close'], length=14).iloc[-1]
+                
+                results[ticker] = {"adx": adx, "rsi": rsi}
+            except: continue
+            
     except Exception as e:
-        print(f"Error writing targets: {e}")
+        print(f"Scan Error: {e}")
+        
+    return results
 
 def run_scout():
-    print("--- 🔭 SECTOR SCOUT (S&P 500 Volatility Mode) STARTED ---")
+    print("--- 🔭 SECTOR SCOUT V2 (Target Commander) STARTED ---")
     
     while True:
         try:
-            now = datetime.datetime.now()
-            # Market hours check (extended slightly)
-            if now.hour < 7 or now.hour > 19:
-                print("Sleeping until market hours...", end='\r')
-                time.sleep(60)
-                continue
+            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning Universes...")
+            
+            final_targets = {
+                "condor_targets": [],
+                "wheel_targets": [],
+                "trend_targets": [],
+                "updated": str(datetime.datetime.now())
+            }
 
-            print(f"\n[{now.strftime('%H:%M')}] Scouring S&P 500...")
-            
-            tickers = get_sp500_tickers()
-            top_volatile = get_volatility_rank(tickers)
-            
-            print("  🔥 Top Volatility Targets:")
-            for sym, score in top_volatile:
-                print(f"     {sym:<5} | Volatility: {score:.2f}%")
+            # 1. SCAN CONDOR TARGETS
+            # Criteria: ADX < 25 (Sideways) AND RSI between 40-60 (Stable)
+            stats = get_technical_status(UNIVERSE_CONDOR)
+            for t, s in stats.items():
+                if s['adx'] < 25 and 40 < s['rsi'] < 60:
+                    final_targets["condor_targets"].append(t)
 
-            update_targets(top_volatile)
-            
-            # Sleep 1 hour (Analysis is heavy)
-            time.sleep(CHECK_INTERVAL)
+            # 2. SCAN WHEEL TARGETS
+            # Criteria: RSI < 55 (Not overbought, safe to sell puts)
+            stats = get_technical_status(UNIVERSE_WHEEL)
+            for t, s in stats.items():
+                if s['rsi'] < 55:
+                    final_targets["wheel_targets"].append(t)
+
+            # 3. SCAN TREND TARGETS
+            # Criteria: ADX > 25 (Trending)
+            stats = get_technical_status(UNIVERSE_TREND)
+            for t, s in stats.items():
+                if s['adx'] > 25:
+                    final_targets["trend_targets"].append(t)
+
+            # SAVE TO FILE
+            with open(TARGET_FILE, 'w') as f:
+                json.dump(final_targets, f, indent=4)
+                
+            print(f"  🦅 Condor Targets: {final_targets['condor_targets']}")
+            print(f"  🚜 Wheel Targets:  {final_targets['wheel_targets']}")
+            print(f"  🏹 Trend Targets:  {final_targets['trend_targets']}")
+
+            time.sleep(3600) # Run every hour
 
         except Exception as e:
             print(f"Scout Error: {e}")

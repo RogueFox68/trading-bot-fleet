@@ -1,3 +1,4 @@
+# market_analyst.py
 import config
 import time
 import json
@@ -6,70 +7,40 @@ import pandas as pd
 import pandas_ta as ta
 import datetime
 import os
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+import yfinance as yf # Utilizing yfinance for VIX data
 
 # --- CONFIGURATION ---
-CHECK_INTERVAL = 3600  # Check every hour
+CHECK_INTERVAL = 3600  # Run hourly
 CONFIG_FILE = "bot_config.json"
-MARKET_SYMBOL = "SPY"  # The benchmark
+MARKET_SYMBOL = "SPY" 
 
-# --- INFLUXDB ---
-INFLUX_HOST = config.INFLUX_HOST
-INFLUX_PORT = config.INFLUX_PORT
-INFLUX_DB_NAME = config.INFLUX_DB_NAME
-
-# --- CLIENT ---
-data_client = StockHistoricalDataClient(config.API_KEY, config.SECRET_KEY)
-
+# --- WEBHOOK ---
 def send_discord(msg):
     if "YOUR" in config.WEBHOOK_OVERSEER: return
     try:
-        # Use the Overseer webhook for "Management" announcements
         requests.post(config.WEBHOOK_OVERSEER, json={
             "content": msg, "username": "Market Analyst 🧠"
         })
     except: pass
 
-def log_regime(regime, adx, price, sma):
-    """Log the current regime to InfluxDB for Grafana"""
-    try:
-        data_str = f'market_regime,symbol=SPY regime="{regime}",adx={adx},price={price},sma200={sma}'
-        url = f"http://{INFLUX_HOST}:{INFLUX_PORT}/write?db={INFLUX_DB_NAME}"
-        requests.post(url, data=data_str)
-    except Exception as e:
-        print(f"[!] Influx Error: {e}")
-
 def get_market_data():
-    """Fetch 300 days of SPY data to calculate 200 SMA and ADX."""
+    """Fetches SPY for Trend and VIX for Volatility."""
     try:
-        start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=400)
-        req = StockBarsRequest(
-            symbol_or_symbols=[MARKET_SYMBOL],
-            timeframe=TimeFrame.Day,
-            start=start_time,
-            limit=None,
-            adjustment='all'
-        )
-        bars = data_client.get_stock_bars(req)
-        if not bars.data: return None
+        # 1. Fetch SPY from Alpaca (or YF) for Trend
+        spy = yf.download("SPY", period="1y", interval="1d", progress=False)
         
-        df = bars.df
-        if isinstance(df.index, pd.MultiIndex):
-            df = df.xs(MARKET_SYMBOL)
+        # 2. Fetch VIX from Yahoo Finance (Crucial for Option Sellers)
+        vix = yf.download("^VIX", period="5d", interval="1d", progress=False)
         
-        return df
+        return spy, vix
     except Exception as e:
         print(f"[!] Data Fetch Error: {e}")
-        return None
+        return None, None
 
-def update_bot_config(regime):
-    """Reads, modifies, and saves the bot_config.json based on regime."""
+def update_bot_config(regime, vix_val):
+    """Updates bot_config.json based on Regime AND Volatility."""
     try:
-        if not os.path.exists(CONFIG_FILE):
-            print(f"[!] {CONFIG_FILE} not found.")
-            return
+        if not os.path.exists(CONFIG_FILE): return
 
         with open(CONFIG_FILE, 'r') as f:
             current_config = json.load(f)
@@ -77,108 +48,89 @@ def update_bot_config(regime):
         bots = current_config['bots']
         changes_made = []
 
-        # --- DEFINING THE PLAYBOOK ---
+        # --- THE NEW PLAYBOOK ---
         
-        # 1. BULL TREND (Easy Mode)
-        if regime == "BULL_TREND":
-            target_state = {
-                "trend_bot": "active",
-                "survivor_bot": "active",
-                "moon_bag": "active",
-                "crypto_grid": "paused", # Don't grid against a moonshot
-                "wheel_bot": "active",   # Safe to sell puts
-                "condor_bot": "active"
-            }
+        # DEFAULT: Everything Active
+        target_state = {k: "active" for k in bots.keys()}
 
-        # 2. BEAR TREND (Attack Mode)
-        elif regime == "BEAR_TREND":
-            target_state = {
-                "trend_bot": "active",   # ACTIVE: It will switch to SQQQ/SPXU automatically
-                "survivor_bot": "paused", # Long only - dangerous in bear
-                "moon_bag": "paused",    # No breakouts in bear
-                "crypto_grid": "paused", # Don't catch falling knives
-                "wheel_bot": "paused",   # Don't sell puts in a crash
-                "condor_bot": "active"   # Condors can work if volatility is high but stable
-            }
+        # 1. HIGH VOLATILITY SAFETY BREAKER (VIX > 25)
+        # When fear is high, options move wildly. Kill the income bots.
+        if vix_val > 25:
+            target_state["condor_bot"] = "paused" # Wings will get blown out
+            target_state["wheel_bot"] = "paused"  # Risk of assignment is too high
+            target_state["crypto_grid"] = "paused" 
+            regime = "FEAR_UNCERTAINTY"
 
-        # 3. CHOP / SIDEWAYS (Grind Mode)
-        else: # "CHOP"
-            target_state = {
-                "trend_bot": "paused",   # Whipsaw killer!
-                "survivor_bot": "paused",
-                "moon_bag": "active",    # Crypto operates independently often
-                "crypto_grid": "active", # SHINES here
-                "wheel_bot": "active",   # SHINES here (Theta decay)
-                "condor_bot": "active"   # SHINES here
-            }
+        # 2. BULL TREND (ADX > 25, Price > SMA)
+        elif "BULL" in regime:
+            target_state["crypto_grid"] = "paused" # Don't grid against a moonshot
+            # Wheel is safe in Bull markets (selling puts)
+            # Condor is risky in strong trends, prefer paused or wide wings
+            target_state["condor_bot"] = "paused" 
 
-        # --- APPLYING CHANGES ---
+        # 3. BEAR TREND (ADX > 25, Price < SMA)
+        elif "BEAR" in regime:
+            target_state["survivor_bot"] = "paused" # Don't catch falling knives
+            target_state["wheel_bot"] = "paused"
+            target_state["moon_bag"] = "paused"
+
+        # 4. CALM SIDEWAYS (The "Goldilocks" Zone for Condors)
+        elif regime == "SIDEWAYS":
+            target_state["trend_bot"] = "paused" # Whipsaw risk
+            # This is where Condor and Grid Bot shine
+
+        # --- APPLY UPDATES ---
         for bot_name, desired_status in target_state.items():
-            if bot_name in bots:
-                if bots[bot_name]['status'] != desired_status:
-                    bots[bot_name]['status'] = desired_status
-                    changes_made.append(f"{bot_name} -> {desired_status}")
+            if bot_name in bots and bots[bot_name]['status'] != desired_status:
+                bots[bot_name]['status'] = desired_status
+                changes_made.append(f"{bot_name} -> {desired_status}")
 
-        # Update Market Condition Tag
         current_config['global_settings']['market_condition'] = regime
-
-        # SAVE (Only if changed)
+        
         if changes_made:
             with open(CONFIG_FILE, 'w') as f:
                 json.dump(current_config, f, indent=4)
-            
-            msg = f"**Regime Shift Detected: {regime}**\nAdjusting Fleet:\n" + "\n".join(changes_made)
-            print(msg)
-            send_discord(msg)
+            send_discord(f"**Regime Update: {regime} (VIX: {vix_val:.2f})**\n" + "\n".join(changes_made))
         else:
-            print(f"  Regime {regime} holds. No changes.")
+            print(f"  Regime {regime} (VIX {vix_val:.2f}) holds. No changes.")
 
     except Exception as e:
         print(f"[!] Config Update Error: {e}")
 
 def run_analyst():
-    print("--- 🧠 MARKET ANALYST (Regime Detection) STARTED ---")
-    send_discord("🧠 **Analyst Online**\nWatching SPY for Trends...")
-
+    print("--- 🧠 MARKET ANALYST V2 (VIX Aware) STARTED ---")
+    
     while True:
         try:
-            df = get_market_data()
-            if df is not None:
-                # Calculate Indicators
-                df['sma200'] = ta.sma(df['close'], length=200)
-                adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
-                
-                # ADX returns 3 columns. Find the main ADX one.
-                adx_col = [c for c in adx_df.columns if c.startswith('ADX')][0]
-                df['adx'] = adx_df[adx_col]
+            spy_df, vix_df = get_market_data()
+            
+            if spy_df is not None and not spy_df.empty:
+                # Indicators
+                spy_df['sma200'] = ta.sma(spy_df['Close'], length=200)
+                adx_df = ta.adx(spy_df['High'], spy_df['Low'], spy_df['Close'], length=14)
+                spy_df['adx'] = adx_df['ADX_14']
 
-                # Get Latest Values
-                latest = df.iloc[-1]
-                price = float(latest['close'])
+                latest = spy_df.iloc[-1]
+                price = float(latest['Close'])
                 sma = float(latest['sma200'])
                 adx = float(latest['adx'])
-
-                # --- DETERMINE REGIME ---
-                regime = "CHOP" # Default
                 
+                vix_val = float(vix_df['Close'].iloc[-1])
+
+                # Regime Logic
                 if adx > 25:
-                    if price > sma:
-                        regime = "BULL_TREND"
-                    else:
-                        regime = "BEAR_TREND"
+                    regime = "BULL_TREND" if price > sma else "BEAR_TREND"
                 else:
-                    regime = "CHOP"
+                    regime = "SIDEWAYS"
 
-                print(f"[{datetime.datetime.now().strftime('%H:%M')}] Analysis: SPY=${price:.2f} | SMA=${sma:.2f} | ADX={adx:.1f} | Regime: {regime}")
+                print(f"[{datetime.datetime.now().strftime('%H:%M')}] SPY=${price:.0f} | ADX={adx:.0f} | VIX={vix_val:.2f} | Regime: {regime}")
                 
-                log_regime(regime, adx, price, sma)
-                update_bot_config(regime)
+                update_bot_config(regime, vix_val)
 
-            # Sleep 1 hour
             time.sleep(CHECK_INTERVAL)
 
         except Exception as e:
-            print(f"[!] Critical Error: {e}")
+            print(f"[!] Analyst Error: {e}")
             time.sleep(60)
 
 if __name__ == "__main__":

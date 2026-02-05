@@ -52,28 +52,19 @@ def get_market_regime():
 def get_dynamic_targets(regime):
     """
     Returns the correct weapon for the current battle.
-    - BULL: Use Sector Scout targets (Tech, Energy, etc.)
-    - BEAR: Use Inverse ETFs (SQQQ, SPXU)
     """
-    # 1. BEAR MODE: Short the market
+    # 1. BEAR MODE: Short the market (Keep this logic!)
     if regime == "BEAR_TREND":
-        print("    [TARGETS] 🐻 BEAR MODE: Loaded Inverse ETFs.")
+        print("    [TARGETS] BEAR MODE: Loaded Inverse ETFs.")
         return ["SQQQ", "SPXU", "UVXY", "SOXS"]
 
-    # 2. BULL/CHOP MODE: Use Sector Scout Picks
-    if not os.path.exists(TARGET_FILE):
-        return ["NVDA", "TSLA", "COIN"] # Fallback
+    # 2. BULL/CHOP MODE: Use Sector Scout Trend Targets
+    targets = utils.get_active_targets("trend_targets")
     
-    try:
-        with open(TARGET_FILE, 'r') as f:
-            data = json.load(f)
-            targets = data.get("targets", [])
-            # If Sector Scout is sleeping/empty, default to Generals
-            if not targets:
-                return ["NVDA", "AMD", "MSFT", "META"]
-            return targets
-    except:
-        return ["NVDA", "TSLA", "COIN"]
+    if not targets:
+        return ["NVDA", "AMD", "MSFT", "META"] # Generals Fallback
+        
+    return targets
 
 def get_data_alpaca(symbol):
     try:

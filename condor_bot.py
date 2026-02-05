@@ -11,7 +11,13 @@ from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDa
 from alpaca.data.requests import StockLatestTradeRequest, OptionLatestQuoteRequest
 
 # --- CONFIGURATION ---
-TARGETS = ["COIN", "MSTR", "TSLA", "NVDA", "NFLX"] 
+def get_targets():
+    try:
+        with open("active_targets.json", "r") as f:
+            return json.load(f).get("condor_targets", [])
+    except: return []
+
+TARGETS = get_targets()
 MIN_DTE = 25              # Days to Expiration (Start)
 MAX_DTE = 45              # Days to Expiration (End)
 WING_WIDTH_PCT = 0.05     # How wide the spread wings are (Protection)
