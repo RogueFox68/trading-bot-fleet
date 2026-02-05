@@ -1,33 +1,37 @@
 import config
 import time
 import requests
+import json
+import math
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.data.historical import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoLatestTradeRequest
 
-# --- CONFIGURATION (UPDATE THESE FROM YOUR CHART) ---
-SYMBOL = "BTC/USD"       # The Coin to trade
-GRID_TOP = 85000         # The "Ceiling" of your consolidation
-GRID_BOTTOM = 70000      # The "Floor" of your consolidation
-GRID_LEVELS = 6          # How many zones to slice it into
-BUDGET_PER_GRID = 50     # How much $ to buy per level (keep it small for testing)
+# --- CONFIGURATION ---
+SYMBOL = "BTC/USD"
+GRID_WIDTH_PCT = 0.15    # Grid covers +/- 15% of current price
+GRID_LEVELS = 8          # More levels = Finer scalping
+BUDGET_PER_GRID = 50     # $50 per slice
+RECALIBRATE_DELAY = 4    # Cycles out of zone before resetting (Prevent jitter)
 
 # --- CREDENTIALS ---
 API_KEY = config.API_KEY
 SECRET_KEY = config.SECRET_KEY
 PAPER = config.PAPER
 DISCORD_URL = config.WEBHOOK_CRYPTO
-
-# --- INFLUXDB (For Grafana) ---
-INFLUX_HOST = config.INFLUX_HOST
-INFLUX_PORT = config.INFLUX_PORT
-INFLUX_DB_NAME = config.INFLUX_DB_NAME
+CONFIG_FILE = "bot_config.json"
 
 # --- CLIENTS ---
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
 data_client = CryptoHistoricalDataClient()
+
+# --- STATE VARIABLES (Dynamic) ---
+# We no longer hardcode these. They are calculated at runtime.
+grid_top = 0
+grid_bottom = 0
+zone_size = 0
 
 def send_discord(msg):
     if "YOUR" in DISCORD_URL: return
@@ -36,19 +40,22 @@ def send_discord(msg):
     except: pass
 
 def log_to_influx(symbol, action, price, qty):
-    """Writes trade data to InfluxDB with error reporting"""
     try:
-        measurement = "crypto_trades"
-        data_str = f'{measurement},symbol={symbol} price={price},action="{action}",qty={qty}'
-        url = f"http://{INFLUX_HOST}:{INFLUX_PORT}/write?db={INFLUX_DB_NAME}"
+        data_str = f'crypto_trades,symbol={symbol} price={price},action="{action}",qty={qty}'
+        url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
         requests.post(url, data=data_str)
-    except Exception as e:
-        print(f"  [!] Failed to log to InfluxDB: {e}")
+    except: pass
+
+def get_market_regime():
+    """Reads the 'Weather' from the Market Analyst."""
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            data = json.load(f)
+            return data.get('global_settings', {}).get('market_condition', 'SIDEWAYS')
+    except:
+        return "SIDEWAYS" # Default to trading if analyst is offline
 
 def get_crypto_price(symbol):
-    """
-    Fetches the latest trade price from Alpaca (Replacing Coinbase).
-    """
     try:
         req = CryptoLatestTradeRequest(symbol_or_symbols=symbol)
         res = data_client.get_crypto_latest_trade(req)
@@ -57,63 +64,107 @@ def get_crypto_price(symbol):
         print(f"  [!] Price Error {symbol}: {e}")
         return None
 
+def recalibrate_grid(current_price):
+    """Centers the grid around the NEW price."""
+    global grid_top, grid_bottom, zone_size
+    
+    # Grid spans +/- WIDTH_PCT
+    grid_top = current_price * (1 + GRID_WIDTH_PCT)
+    grid_bottom = current_price * (1 - GRID_WIDTH_PCT)
+    zone_size = (grid_top - grid_bottom) / GRID_LEVELS
+    
+    msg = (f"♻️ **Grid Recalibrated**\n"
+           f"Center: ${current_price:,.0f}\n"
+           f"Range: ${grid_bottom:,.0f} - ${grid_top:,.0f}")
+    print(f"\n    [RECALIBRATE] {msg}")
+    send_discord(msg)
+
 def run_grid_bot():
-    print(f"--- CRYPTO GRID BOT ({SYMBOL}) STARTED ---")
-    print(f"Range: ${GRID_BOTTOM} - ${GRID_TOP} | Levels: {GRID_LEVELS}")
-    send_discord(f"🕸️ **Grid Bot Online**...")
-
-    log_to_influx(SYMBOL, "startup", 0, 0)
-
-    # Calculate Grid Zones
-    zone_size = (GRID_TOP - GRID_BOTTOM) / GRID_LEVELS
-    previous_zone = -1 # Start unknown
+    print(f"--- 🕸️ CRYPTO GRID BOT V2 (Auto-Tuning) ---")
+    
+    # 1. Initial Setup
+    price = get_crypto_price(SYMBOL)
+    while price is None:
+        time.sleep(10)
+        price = get_crypto_price(SYMBOL)
+        
+    recalibrate_grid(price)
+    
+    previous_zone = GRID_LEVELS // 2 # Assume we start in the middle
+    out_of_bounds_counter = 0
 
     while True:
         try:
+            # 2. Get Data
             price = get_crypto_price(SYMBOL)
+            regime = get_market_regime()
+            
             if price is None:
-                time.sleep(60)
+                time.sleep(30)
                 continue
 
-            # Calculate which "Zone" we are in (0 is bottom, 4 is top)
-            if price < GRID_BOTTOM:
-                current_zone = -1 # Below Range (Danger!)
-            elif price > GRID_TOP:
-                current_zone = GRID_LEVELS # Above Range (Moon!)
+            # 3. Determine Zone
+            if price < grid_bottom:
+                current_zone = -1
+                out_of_bounds_counter += 1
+            elif price > grid_top:
+                current_zone = GRID_LEVELS + 1
+                out_of_bounds_counter += 1
             else:
-                current_zone = int((price - GRID_BOTTOM) / zone_size)
+                current_zone = int((price - grid_bottom) / zone_size)
+                out_of_bounds_counter = 0 # Reset if we are back in range
 
-            print(f"  {SYMBOL} | Price: ${price:,.2f} | Zone: {current_zone} (Prev: {previous_zone})", end='\r')
+            # 4. Status Display
+            status_msg = f"  {SYMBOL} ${price:,.0f} | Zone: {current_zone} | Regime: {regime}"
+            if out_of_bounds_counter > 0:
+                status_msg += f" | OOB: {out_of_bounds_counter}/{RECALIBRATE_DELAY}"
+            print(status_msg, end='\r')
 
-            # --- TRADING LOGIC ---
-            # Only trade if we CHANGED zones
-            if current_zone != previous_zone and previous_zone != -1:
+            # 5. AUTO-RECALIBRATE LOGIC
+            # If we are lost in the woods for too long, move the base.
+            if out_of_bounds_counter >= RECALIBRATE_DELAY:
+                recalibrate_grid(price)
+                # Reset logic so we don't trigger a fake trade immediately
+                previous_zone = GRID_LEVELS // 2 
+                out_of_bounds_counter = 0
+                time.sleep(5)
+                continue
 
-                # 1. PRICE DROPPED A ZONE -> BUY (Accumulate)
+            # 6. TRADING LOGIC
+            if current_zone != previous_zone and 0 <= current_zone <= GRID_LEVELS:
+                
+                # PRICE DROP -> BUY (Accumulate)
                 if current_zone < previous_zone:
-                    print(f"\n    [BUY] Price dropped to Zone {current_zone}")
-                    qty = BUDGET_PER_GRID / price
-                    req = MarketOrderRequest(symbol=SYMBOL, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC)
-                    trading_client.submit_order(order_data=req)
+                    # TREND FILTER: Don't buy if the Analyst says BEAR_TREND
+                    if "BEAR" in regime:
+                        print(f"\n    [SKIP] Bear Trend Detected. Buying Paused in Zone {current_zone}.")
+                    else:
+                        print(f"\n    [BUY] Dropped to Zone {current_zone}")
+                        
+                        # Check Cash
+                        acct = trading_client.get_account()
+                        if float(acct.buying_power) > BUDGET_PER_GRID:
+                            qty = BUDGET_PER_GRID / price
+                            req = MarketOrderRequest(symbol=SYMBOL, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC)
+                            trading_client.submit_order(order_data=req)
+                            
+                            send_discord(f"🟢 **GRID BUY {SYMBOL}**\nPrice: ${price:,.2f}\nZone: {current_zone}")
+                            log_to_influx(SYMBOL, "grid_buy", price, qty)
+                        else:
+                            print("    [!] Insufficient Buying Power.")
 
-                    send_discord(f"🟢 **GRID BUY {SYMBOL}**\nPrice: ${price:,.2f}\nZone: {current_zone}")
-                    log_to_influx(SYMBOL, "grid_buy", price, qty)
-
-                # 2. PRICE ROSE A ZONE -> SELL (Take Profit)
+                # PRICE RISE -> SELL (Take Profit)
                 elif current_zone > previous_zone:
-                    print(f"\n    [SELL] Price rose to Zone {current_zone}")
-                    qty_to_sell = BUDGET_PER_GRID / price
+                    print(f"\n    [SELL] Rose to Zone {current_zone}")
                     
-                    # Check if we actually have it first
+                    # Verify Inventory
+                    qty_to_sell = BUDGET_PER_GRID / price
                     current_qty_held = 0.0
                     try:
-                        # Alpaca stores positions as "BTCUSD", not "BTC/USD"
-                        pos_symbol = SYMBOL.replace("/", "") 
+                        pos_symbol = SYMBOL.replace("/", "")
                         pos = trading_client.get_open_position(pos_symbol)
                         current_qty_held = float(pos.qty)
-                    except:
-                        # If 404 (Position Not Found), we hold 0.
-                        current_qty_held = 0.0
+                    except: pass
                     
                     if current_qty_held >= qty_to_sell:
                         req = MarketOrderRequest(symbol=SYMBOL, qty=qty_to_sell, side=OrderSide.SELL, time_in_force=TimeInForce.GTC)
@@ -122,16 +173,13 @@ def run_grid_bot():
                         send_discord(f"🔴 **GRID SELL {SYMBOL}**\nPrice: ${price:,.2f}\nZone: {current_zone}")
                         log_to_influx(SYMBOL, "grid_sell", price, qty_to_sell)
                     else:
-                        print(f"    [!] Signal to Sell, but insufficient qty. Held: {current_qty_held}")
+                        print(f"    [!] Ghost Signal. No inventory to sell.")
 
-            # Update State
             previous_zone = current_zone
-
-            # Crypto moves fast, check every 30 seconds
             time.sleep(30)
 
         except Exception as e:
-            print(f"CRITICAL: {e}")
+            print(f"\n[!] Grid Error: {e}")
             time.sleep(60)
 
 if __name__ == "__main__":
