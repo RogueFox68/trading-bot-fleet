@@ -207,6 +207,15 @@ def run_wheel_bot():
                     side = "CALL"
                     # For calls, we usually stay aggressive, or we can use dynamic_otm too. 
                     # Let's stick to standard 5% for upside caps to get premium.
+                    # ... inside run_wheel_bot ...
+                    # Before find_best_contract ...
+
+                    # Calculate rough requirement (Stock Price * 100)
+                    approx_cost = current_stock_price * 100
+
+                    if buying_power < approx_cost:
+                        print(f"    [SKIP] {ticker}: Insufficient BP (Need ${approx_cost:.0f}, Have ${buying_power:.0f})")
+                        continue
                     contract = find_best_contract(ticker, "CALL", current_stock_price, target_otm=0.05)
                 
                 # Cash Secured Put?

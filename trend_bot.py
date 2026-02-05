@@ -174,6 +174,19 @@ def run_trend_bot():
                             # Stop loss approx 2% away
                             qty = int(risk_amt / (price * 0.02))
                             
+                            # ... inside the trade loop ...
+                            if current_price > 0:
+                                qty = position_size // current_price
+                            else:
+                                qty = 0
+
+                            # ADD THIS SAFETY CHECK
+                            if qty < 1:
+                                print(f"    [SKIP] Budget ${position_size} too low for {ticker} @ ${current_price}")
+                                continue # Skip to next target
+
+                            # Proceed to submit order...
+                            
                             if qty > 0:
                                 print(f"    🚀 BUY SIGNAL {symbol}")
                                 try:
