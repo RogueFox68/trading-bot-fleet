@@ -94,23 +94,21 @@ def run_survivor_bot():
                 df = get_data_alpaca(symbol)
                 if df is None or len(df) < 20: continue
 
-                # --- INDICATORS (UPDATED & FIXED) ---
-                # 1. Bollinger Bands (20, 2)
-                bbands = ta.bbands(df['close'], length=20, std=2.0)
-                
-                if bbands is None or bbands.empty:
-                    print(f"    [!] Failed to calc BB for {symbol}")
-                    continue
+                # --- TECHNICAL INDICATORS (Manual Calculation) ---
+                # We calculate manually to bypass 'numba' crashes on Raspberry Pi
+                sma20 = df['close'].rolling(window=20).mean()
+                std20 = df['close'].rolling(window=20).std()
 
-                # Merge indicators into main DF
-                df = pd.concat([df, bbands], axis=1)
-
-                # 2. RSI (Sanity Check)
-                df['rsi'] = ta.rsi(df['close'], length=14)
+                # Calculate Bands
+                df['lower_band'] = sma20 - (2.0 * std20)
+                df['upper_band'] = sma20 + (2.0 * std20)
+                df['sma200'] = ta.sma(df['close'], length=200)
 
                 latest = df.iloc[-1]
+
+                # 2. Extract Values
                 price = float(latest['close'])
-                rsi = float(latest['rsi']) if pd.notna(latest['rsi']) else 50.0
+                lower_band = float(latest['lower_band']) # Use our manual column
 
                 # --- DYNAMIC COLUMN FINDER ---
                 # This fixes the 'BBL_20_2.0' vs 'BBL_20_2' error by grabbing whatever was generated
