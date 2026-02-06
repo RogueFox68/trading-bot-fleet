@@ -6,31 +6,24 @@ import os
 import datetime
 import requests
 import pandas as pd
-import pandas_ta as ta
-import pytz
+import pandas_ta as ta # Still used for SMA200, but not BBands
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass
+from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 # --- CONFIGURATION ---
-# Core leveraged ETFs we ALWAYS watch (High Volatility is their nature)
+# Core leveraged ETFs (High Volatility)
 CORE_WATCHLIST = ["TQQQ", "SQQQ", "SOXL", "SOXS", "FNGU", "UPRO"]
-TARGET_FILE = "active_targets.json" # <--- Reading the Scout's list
 
-# Indicators
-RISK_PER_TRADE = 0.05 # Aggressive sizing for mean reversion
-
-# --- CREDENTIALS & CLIENTS ---
+# --- CREDENTIALS ---
 trading_client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=config.PAPER)
 data_client = StockHistoricalDataClient(config.API_KEY, config.SECRET_KEY)
-TIMEZONE = pytz.timezone('US/Eastern')
 
-# --- INFLUX & DISCORD ---
 def send_discord(msg):
-    if "YOUR" in config.WEBHOOK_SURVIVOR: return # Reusing Trend webhook for now
+    if "YOUR" in config.WEBHOOK_SURVIVOR: return 
     try: requests.post(config.WEBHOOK_SURVIVOR, json={"content": msg})
     except: pass
 
@@ -41,30 +34,27 @@ def log_to_influx(symbol, action, price, qty):
         requests.post(url, data=data_str)
     except: pass
 
-def get_dynamic_targets():
-    """Reads the 'Trend' list from the Scout."""
-    # Survivor likes high volatility, so it shares targets with Trend Bot
-    return utils.get_active_targets("trend_targets")
-
 def get_data_alpaca(symbol):
     try:
-        start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=20)
+        # Fetch enough data for SMA200 + Bollinger Bands
+        start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=60)
         req = StockBarsRequest(
             symbol_or_symbols=[symbol],
-            timeframe=TimeFrame(15, TimeFrameUnit.Minute), # 15m candles for intraday dips
+            timeframe=TimeFrame(15, TimeFrameUnit.Minute), 
             start=start_time,
-            limit=200
+            limit=500
         )
         bars = data_client.get_stock_bars(req)
         if not bars.data: return None
         df = bars.df.xs(symbol)
-        df.index = df.index.tz_convert('US/Eastern')
+        
+        # Helper to handle timezone if needed, but usually raw is fine for indicators
         return df
     except: return None
 
 def run_survivor_bot():
-    print(f"--- 🛡️ SURVIVOR BOT (Bollinger Bandit) STARTED ---")
-    send_discord("**Survivor Bot (V4)** Online\nStrategy: Dynamic Volatility Harvesting (Bollinger Bands)")
+    print(f"--- 🛡️ SURVIVOR BOT (Bollinger Bandit V2) STARTED ---")
+    send_discord("**Survivor Bot** Online\nLogic: Manual Bollinger Bands (Pi Safe)")
     
     while True:
         try:
@@ -77,16 +67,16 @@ def run_survivor_bot():
                     continue
             except: pass
 
-            # 2. Build Watchlist
-            scout_targets = get_dynamic_targets()
+            # 2. Build Watchlist (Core + Trend Targets from Scout)
+            # Survivor likes high volatility, so it shares the Trend list
+            scout_targets = utils.get_active_targets("trend_targets")
             full_watchlist = list(set(CORE_WATCHLIST + scout_targets))
             
-            account = trading_client.get_account()
-            equity = float(account.portfolio_value)
+            # 3. Account Data
             positions = trading_client.get_all_positions()
             pos_dict = {p.symbol: p for p in positions}
 
-            print(f"\n[{datetime.datetime.now(TIMEZONE).strftime('%H:%M')}] Scanning {len(full_watchlist)} Targets...")
+            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning {len(full_watchlist)} Targets...")
 
             for symbol in full_watchlist:
                 if symbol in ["BTC/USD", "ETH/USD"]: continue 
@@ -94,40 +84,33 @@ def run_survivor_bot():
                 df = get_data_alpaca(symbol)
                 if df is None or len(df) < 20: continue
 
-                # --- TECHNICAL INDICATORS (Manual Calculation) ---
-                # We calculate manually to bypass 'numba' crashes on Raspberry Pi
-                sma20 = df['close'].rolling(window=20).mean()
-                std20 = df['close'].rolling(window=20).std()
-
-                # Calculate Bands
-                df['lower_band'] = sma20 - (2.0 * std20)
-                df['upper_band'] = sma20 + (2.0 * std20)
+                # --- MANUAL BOLLINGER BANDS CALCULATION ---
+                # This bypasses the broken 'numba' dependency on the Pi
+                
+                # 1. Middle Band = 20 SMA
+                df['middle_band'] = df['close'].rolling(window=20).mean()
+                
+                # 2. Standard Deviation
+                df['std_dev'] = df['close'].rolling(window=20).std()
+                
+                # 3. Upper & Lower Bands (2 Std Devs)
+                df['upper_band'] = df['middle_band'] + (2.0 * df['std_dev'])
+                df['lower_band'] = df['middle_band'] - (2.0 * df['std_dev'])
+                
+                # 4. Trend Filter (200 SMA)
                 df['sma200'] = ta.sma(df['close'], length=200)
 
+                # Get Latest Candle
                 latest = df.iloc[-1]
-
-                # 2. Extract Values
                 price = float(latest['close'])
-                lower_band = float(latest['lower_band']) # Use our manual column
+                lower_band = float(latest['lower_band'])
+                upper_band = float(latest['upper_band'])
+                # Handle SMA NaN early in history
+                sma200 = float(latest['sma200']) if not pd.isna(latest['sma200']) else 0
 
-                # --- DYNAMIC COLUMN FINDER ---
-                # This fixes the 'BBL_20_2.0' vs 'BBL_20_2' error by grabbing whatever was generated
-                # bbands columns usually: [BBL, BBM, BBU, BBB, BBP]
-                try:
-                    bbl_col = [c for c in bbands.columns if c.startswith('BBL')][0] # Lower
-                    bbm_col = [c for c in bbands.columns if c.startswith('BBM')][0] # Mid
-                    bbu_col = [c for c in bbands.columns if c.startswith('BBU')][0] # Upper
-                    bbb_col = [c for c in bbands.columns if c.startswith('BBB')][0] # Bandwidth
-                except IndexError:
-                    print(f"    [!] Column Error on {symbol}. Cols: {bbands.columns}")
-                    continue
-
-                lower_band = float(latest[bbl_col])
-                mid_band = float(latest[bbm_col])
-                upper_band = float(latest[bbu_col])
-                bandwidth = float(latest[bbb_col])
-
-                # --- EXIT LOGIC ---
+                # --- LOGIC: MEAN REVERSION ---
+                
+                # EXIT LOGIC (Sell the Rip)
                 if symbol in pos_dict:
                     pos = pos_dict[symbol]
                     qty = float(pos.qty)
@@ -137,59 +120,50 @@ def run_survivor_bot():
                     should_sell = False
                     reason = ""
                     
-                    # Exit 1: Mean Reversion (Price touched the middle band)
-                    if price >= mid_band:
+                    # Sell if Price hits Upper Band OR Stop Loss (-3%)
+                    if price >= upper_band:
                         should_sell = True
-                        reason = "Mean Reverted (Hit Mid Band)"
-                    
-                    # Exit 2: Hard Stop Loss (-4%)
-                    elif pct_gain < -0.04:
+                        reason = f"Upper Band Hit (${upper_band:.2f})"
+                    elif pct_gain < -0.03:
                         should_sell = True
-                        reason = "Stop Loss (-4%)"
-
-                    # Exit 3: RSI Blowout (If we rocketed past upper band)
-                    elif price > upper_band and rsi > 75:
-                        should_sell = True
-                        reason = "Max Extension (Upper Band)"
-
+                        reason = "Stop Loss (-3%)"
+                        
                     if should_sell:
                         print(f"    📉 SELLING {symbol}: {reason}")
-                        try:
-                            trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC))
-                            send_discord(f"💰 **SOLD {symbol}**\nReason: {reason}\nP&L: {pct_gain*100:.2f}%")
-                            log_to_influx(symbol, "sell", price, qty)
-                        except Exception as e:
-                            print(f"    [!] Sell Error: {e}")
+                        trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC))
+                        send_discord(f"💰 **SOLD {symbol}**\nReason: {reason}\nP&L: {pct_gain*100:.2f}%")
+                        log_to_influx(symbol, "sell", price, qty)
 
-                # --- ENTRY LOGIC (Volatility Scoop) ---
+                # ENTRY LOGIC (Buy the Dip)
                 else:
-                    # 1. CRASH CONDITION: Price is BELOW the Lower Band
-                    # 2. VOLATILITY CONDITION: Bandwidth > 1.0 (Ensures we don't buy in dead markets)
-                    if price < lower_band and bandwidth > 1.0:
+                    # Buy if Price touches Lower Band
+                    if price <= lower_band:
                         
-                        # [CFO CHECK]
+                        # CFO CHECK
                         if not utils.check_budget("survivor_bot", trading_client):
-                            # print(f"    [SKIP] Survivor Budget Exceeded.")
+                            print(f"    [SKIP] Survivor Budget Exceeded.")
                             continue
-
-                        is_scout_pick = symbol in scout_targets
-                        
-                        print(f"    💎 VOLATILITY SCOOP: {symbol}")
-                        print(f"       Price: {price:.2f} < Band: {lower_band:.2f} | Width: {bandwidth:.2f}")
-                        
-                        # Size Check
-                        risk_amt = equity * RISK_PER_TRADE
-                        qty = int(risk_amt / price)
-                        
-                        if qty > 0:
-                            print(f"       -> Buying {qty} shares...")
-                            try:
+                            
+                        # Trend Filter: Only buy dips in an Uptrend (Price > SMA200)
+                        # Exception: If it's a Core Volatility ETF, we might ignore trend, 
+                        # but for safety let's keep the SMA filter.
+                        if price > sma200:
+                            print(f"    💎 BAND TOUCH: {symbol} (${price:.2f} <= ${lower_band:.2f})")
+                            
+                            # Size: $1000 fixed for testing or dynamic based on equity
+                            account = trading_client.get_account()
+                            equity = float(account.portfolio_value)
+                            risk_amt = equity * 0.05 # 5% per trade
+                            qty = int(risk_amt / price)
+                            
+                            if qty > 0:
+                                print(f"       -> Buying {qty} shares...")
                                 trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                                source_tag = "SCOUT PICK" if is_scout_pick else "CORE"
-                                send_discord(f"💎 **BOUGHT DIP {symbol}** ({source_tag})\nBelow Lower Band\nVol Width: {bandwidth:.2f}")
+                                send_discord(f"💎 **BOUGHT DIP {symbol}**\nPrice: ${price:.2f}\nLower Band: ${lower_band:.2f}")
                                 log_to_influx(symbol, "buy", price, qty)
-                            except Exception as e:
-                                print(f"       Order Failed: {e}")
+                        else:
+                            # Debug print so we know it sees the dip but rejects it
+                            pass 
 
             time.sleep(60)
 
