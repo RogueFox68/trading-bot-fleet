@@ -6,12 +6,19 @@ import pandas as pd
 import pandas_ta as ta
 import datetime
 import os
-import yfinance as yf # Added for VIX & Data
+import yfinance as yf # Replaces Alpaca for VIX access
 
 # --- CONFIGURATION ---
-CHECK_INTERVAL = 900   # 15 Minutes (Was 3600)
+CHECK_INTERVAL = 900   # 15 Minutes (Increased tempo from 3600)
 CONFIG_FILE = "bot_config.json"
 MARKET_SYMBOL = "SPY"
+
+# --- INFLUXDB ---
+INFLUX_HOST = config.INFLUX_HOST
+INFLUX_PORT = config.INFLUX_PORT
+INFLUX_DB_NAME = config.INFLUX_DB_NAME
+# Pre-build the URL for efficiency
+INFLUX_URL = f"http://{INFLUX_HOST}:{INFLUX_PORT}/write?db={INFLUX_DB_NAME}"
 
 # --- WEBHOOK ---
 def send_discord(msg):
@@ -22,20 +29,36 @@ def send_discord(msg):
         })
     except: pass
 
-def get_market_data():
+def log_to_influx(price, vix, adx, regime, sma, ema):
     """
-    Fetches SPY (Price) and VIX (Fear).
-    Using yfinance for both to ensure aligned timestamps and easy VIX access.
+    Writes Market Health to InfluxDB for Grafana.
+    Includes 'regime_score' for numeric graphing (1=Bull, -1=Bear).
     """
     try:
-        # Fetch 1 year of history to ensure valid SMA200 calculation
-        # We use interval="1d" because we are looking for daily trends, even if checking intraday.
-        # (For true intraday "elevator" detection, we could use 1h data, 
-        # but 1d candles checked every 15m is standard for 'Day Swing' strategies)
+        # Map Regime to Number for Grafana Gauges
+        if "BULL" in regime: regime_score = 1
+        elif "BEAR" in regime: regime_score = -1
+        else: regime_score = 0
         
+        # Line Protocol: measurement,tags fields timestamp
+        # We log everything: Price, VIX, ADX, SMA, EMA, and the Score
+        data_str = (f'market_stats,symbol=SPY '
+                    f'price={price},vix={vix},adx={adx},sma200={sma},ema20={ema},'
+                    f'regime_score={regime_score},regime_str="{regime}"')
+        
+        requests.post(INFLUX_URL, data=data_str)
+    except Exception as e:
+        print(f"  [!] Influx Write Error: {e}")
+
+def get_market_data():
+    """
+    Fetches SPY and VIX. 
+    Uses yfinance to get both datasets in a single aligned call.
+    """
+    try:
         tickers = ["SPY", "^VIX"]
+        # Fetch 2 years to ensure valid SMA200 calculation
         data = yf.download(tickers, period="2y", interval="1d", group_by='ticker', progress=False)
-        
         return data["SPY"], data["^VIX"]
     except Exception as e:
         print(f"[!] Data Fetch Error: {e}")
@@ -43,7 +66,9 @@ def get_market_data():
 
 def update_bot_config(regime, vix_val, climate):
     """
-    Updates bot_config.json based on Regime (Weather) AND Volatility.
+    Updates bot_config.json based on:
+    1. VIX (Fear) - The 'Shields'
+    2. EMA20 (Weather) - The 'Fast Trend'
     """
     try:
         if not os.path.exists(CONFIG_FILE): return
@@ -56,44 +81,48 @@ def update_bot_config(regime, vix_val, climate):
 
         # --- THE PLAYBOOK ---
         
-        # 1. DEFAULT STATE: Assume Active
+        # Start by assuming everyone is ACTIVE, then we disqualify them
         target_state = {k: "active" for k in bots.keys()}
 
-        # 2. VIX OVERRIDE (The "Hurricane" Protocol)
+        # 1. HURRICANE PROTOCOL (High VIX > 25)
+        # If fear is high, we kill the income bots immediately.
         if vix_val > 25:
-            target_state["condor_bot"] = "paused"  # Wings will break
-            target_state["wheel_bot"] = "paused"   # Don't catch knives
-            target_state["crypto_grid"] = "paused" # Crypto correlates to VIX often
-            target_state["survivor_bot"] = "paused"
+            target_state["condor_bot"] = "paused"   # Wings will break
+            target_state["wheel_bot"] = "paused"    # Don't catch knives
+            target_state["crypto_grid"] = "paused"  # Correlation to VIX is high
+            target_state["survivor_bot"] = "paused" # Too volatile
+            target_state["moon_bag"] = "paused"
             
-            # Trend Bot thrives in chaos if it can short (Inverse ETFs)
-            target_state["trend_bot"] = "active" 
+            # Trend Bot is the only one allowed to hunt in a hurricane
+            target_state["trend_bot"] = "active"
             
             forced_regime = "CRITICAL_VOLATILITY"
 
+        # 2. STANDARD PROTOCOLS (Normal Volatility)
         else:
             forced_regime = regime
             
-            # 3. WEATHER BASED DEPLOYMENT
             if regime == "BEAR_TREND":
-                # "Elevator Down" - Fast Moving Downside
-                target_state["survivor_bot"] = "paused" # Too dangerous
-                target_state["wheel_bot"] = "paused"    # Too dangerous
-                target_state["moon_bag"] = "paused"     # No breakouts likely
-                target_state["trend_bot"] = "active"    # HUNT! (Using Inverse ETFs)
-                target_state["condor_bot"] = "active"   # Okay if VIX < 25 (Wide wings)
+                # Elevator Down (Price < EMA20)
+                target_state["survivor_bot"] = "paused" # Long only - dangerous
+                target_state["wheel_bot"] = "paused"    # Selling puts is suicide
+                target_state["moon_bag"] = "paused"
+                target_state["trend_bot"] = "active"    # HUNTING (Inverse ETFs)
+                target_state["condor_bot"] = "active"   # Valid if VIX < 25
+                target_state["crypto_grid"] = "active"  # Valid (Auto-tunes)
 
             elif regime == "BULL_TREND":
-                # "Stairs Up"
-                target_state["crypto_grid"] = "paused" # Don't grid a rocket
+                # Stairs Up (Price > EMA20 & Trending)
+                target_state["crypto_grid"] = "paused"  # Don't grid a rocket
                 target_state["trend_bot"] = "active"
                 target_state["survivor_bot"] = "active"
                 target_state["wheel_bot"] = "active"
+                target_state["moon_bag"] = "active"
 
             else: # SIDEWAYS / CHOP
-                target_state["trend_bot"] = "paused"   # Whipsaw City
+                target_state["trend_bot"] = "paused"    # Whipsaw risk
                 target_state["survivor_bot"] = "paused"
-                target_state["condor_bot"] = "active"  # The golden time
+                target_state["condor_bot"] = "active"   # GOLDEN TIME
                 target_state["wheel_bot"] = "active"
                 target_state["crypto_grid"] = "active"
 
@@ -124,26 +153,27 @@ def update_bot_config(regime, vix_val, climate):
         print(f"[!] Config Update Error: {e}")
 
 def run_analyst():
-    print("--- 🧠 MARKET ANALYST V3 (Fast Bear) STARTED ---")
+    print("--- 🧠 MARKET ANALYST V4 (Fast Bear + Grafana) STARTED ---")
     print(f"    Checking every {CHECK_INTERVAL/60:.0f} mins | Indicators: EMA20, SMA200, VIX")
-    
+    send_discord("🧠 **Analyst V4 Online**\nMonitoring Weather (EMA20) & Fear (VIX)...")
+
     while True:
         try:
             spy_df, vix_df = get_market_data()
             
             if spy_df is not None and not spy_df.empty:
                 # --- CALCULATE INDICATORS ---
-                # 1. The Climate (200 SMA)
+                # 1. The Climate (200 SMA) - Long Term
                 spy_df['sma200'] = ta.sma(spy_df['Close'], length=200)
                 
-                # 2. The Weather (20 EMA) - The "Fast" line
+                # 2. The Weather (20 EMA) - Short Term (Fast Bear Detection)
                 spy_df['ema20'] = ta.ema(spy_df['Close'], length=20)
                 
                 # 3. Trend Strength (ADX)
                 adx_df = ta.adx(spy_df['High'], spy_df['Low'], spy_df['Close'], length=14)
                 spy_df['adx'] = adx_df['ADX_14']
 
-                # Get Latest
+                # Get Latest Data Points
                 latest = spy_df.iloc[-1]
                 price = float(latest['Close'])
                 sma200 = float(latest['sma200'])
@@ -154,26 +184,27 @@ def run_analyst():
 
                 # --- REGIME DEFINITION ---
                 
-                # Climate Check (Informational Only)
+                # Climate: Just for context (Are we in a secular Bull or Bear?)
                 climate = "MACRO_BULL" if price > sma200 else "MACRO_BEAR"
                 
-                # Weather Check (Operational)
-                # If Price is below the 20 EMA, we are in a short-term downtrend (Elevator Down)
+                # Weather: The Actionable Signal
+                # Rule 1: If Price < 20 EMA, the elevator is going down. BEAR.
                 if price < ema20:
                     regime = "BEAR_TREND"
-                # If Price is above 20 EMA, check if it's trending or chopping
+                # Rule 2: If Price > 20 EMA, check if we are Trending or Chopping
                 elif price > ema20:
                     if adx > 25:
                         regime = "BULL_TREND"
                     else:
                         regime = "SIDEWAYS"
                 
-                print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Analysis:")
-                print(f"  Price: ${price:.2f} | VIX: {vix_val:.2f}")
-                print(f"  Weather (EMA20): ${ema20:.2f} -> {regime}")
-                print(f"  Climate (SMA200): ${sma200:.2f} -> {climate}")
+                print(f"[{datetime.datetime.now().strftime('%H:%M')}] {regime} | VIX: {vix_val:.2f} | Sending to InfluxDB...")
                 
+                # 1. UPDATE FLEET CONFIG
                 update_bot_config(regime, vix_val, climate)
+                
+                # 2. UPDATE GRAFANA
+                log_to_influx(price, vix_val, adx, regime, sma200, ema20)
 
             time.sleep(CHECK_INTERVAL)
 
