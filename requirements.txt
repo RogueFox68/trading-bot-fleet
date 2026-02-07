@@ -5,4 +5,3 @@ yfinance
 requests
 pytz
 discord.py
-brotlicffi
