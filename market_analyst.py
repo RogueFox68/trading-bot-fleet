@@ -3,7 +3,7 @@ import time
 import json
 import requests
 import pandas as pd
-import pandas_ta as ta
+import numpy as np
 import datetime
 import os
 import yfinance as yf
@@ -19,6 +19,41 @@ INFLUX_PORT = config.INFLUX_PORT
 INFLUX_DB_NAME = config.INFLUX_DB_NAME
 INFLUX_URL = f"http://{INFLUX_HOST}:{INFLUX_PORT}/write?db={INFLUX_DB_NAME}"
 
+# --- NATIVE MATH ENGINE (The Fix) ---
+class TechnicalMath:
+    @staticmethod
+    def get_sma(series, window):
+        return series.rolling(window=window).mean()
+
+    @staticmethod
+    def get_ema(series, window):
+        return series.ewm(span=window, adjust=False).mean()
+
+    @staticmethod
+    def get_atr(high, low, close, window=14):
+        h_l = high - low
+        h_pc = (high - close.shift(1)).abs()
+        l_pc = (low - close.shift(1)).abs()
+        tr = pd.concat([h_l, h_pc, l_pc], axis=1).max(axis=1)
+        return tr.ewm(alpha=1/window, adjust=False).mean()
+
+    @staticmethod
+    def get_adx(high, low, close, window=14):
+        plus_dm = high.diff()
+        minus_dm = low.diff()
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm > 0] = 0
+        
+        tr = TechnicalMath.get_atr(high, low, close, window)
+        
+        # Avoid division by zero
+        tr = tr.replace(0, np.nan)
+        
+        plus_di = 100 * (plus_dm.ewm(alpha=1/window, adjust=False).mean() / tr)
+        minus_di = 100 * (minus_dm.abs().ewm(alpha=1/window, adjust=False).mean() / tr)
+        dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
+        return dx.ewm(alpha=1/window, adjust=False).mean()
+
 # --- WEBHOOK ---
 def send_discord(msg):
     if "YOUR" in config.WEBHOOK_OVERSEER: return
@@ -31,7 +66,6 @@ def send_discord(msg):
 def log_to_influx(price, vix, adx, regime, sma, ema):
     """
     Writes Market Health to InfluxDB.
-    CORRECTED: Uses 'market_regime' and 'regime' to match Grafana Dashboard.
     """
     try:
         # Map Regime to Number for future Gauges (1=Bull, -1=Bear)
@@ -40,7 +74,6 @@ def log_to_influx(price, vix, adx, regime, sma, ema):
         else: regime_score = 0
         
         # Line Protocol: measurement,tags fields timestamp
-        # CRITICAL FIX: measurement='market_regime', field='regime' (String)
         data_str = (f'market_regime,symbol=SPY '
                     f'price={price},vix={vix},adx={adx},sma200={sma},ema20={ema},'
                     f'regime_score={regime_score},regime="{regime}"')
@@ -53,7 +86,8 @@ def get_market_data():
     """Fetches SPY and VIX via yfinance."""
     try:
         tickers = ["SPY", "^VIX"]
-        data = yf.download(tickers, period="2y", interval="1d", group_by='ticker', progress=False)
+        # auto_adjust=True fixes some data anomalies
+        data = yf.download(tickers, period="2y", interval="1d", group_by='ticker', progress=False, auto_adjust=True)
         return data["SPY"], data["^VIX"]
     except Exception as e:
         print(f"[!] Data Fetch Error: {e}")
@@ -135,7 +169,7 @@ def update_bot_config(regime, vix_val, climate):
         print(f"[!] Config Update Error: {e}")
 
 def run_analyst():
-    print("--- 🧠 MARKET ANALYST V4 (Grafana Fixed) STARTED ---")
+    print("--- 🧠 MARKET ANALYST V4 (Native Math) STARTED ---")
     print(f"    Checking every {CHECK_INTERVAL/60:.0f} mins | Indicators: EMA20, SMA200, VIX")
     send_discord("🧠 **Analyst V4 Online**\nMonitoring Weather (EMA20) & Fear (VIX)...")
 
@@ -144,11 +178,10 @@ def run_analyst():
             spy_df, vix_df = get_market_data()
             
             if spy_df is not None and not spy_df.empty:
-                # Indicators
-                spy_df['sma200'] = ta.sma(spy_df['Close'], length=200)
-                spy_df['ema20'] = ta.ema(spy_df['Close'], length=20)
-                adx_df = ta.adx(spy_df['High'], spy_df['Low'], spy_df['Close'], length=14)
-                spy_df['adx'] = adx_df['ADX_14']
+                # --- REPLACED PANDAS_TA WITH NATIVE MATH ---
+                spy_df['sma200'] = TechnicalMath.get_sma(spy_df['Close'], 200)
+                spy_df['ema20'] = TechnicalMath.get_ema(spy_df['Close'], 20)
+                spy_df['adx'] = TechnicalMath.get_adx(spy_df['High'], spy_df['Low'], spy_df['Close'], 14)
 
                 latest = spy_df.iloc[-1]
                 price = float(latest['Close'])
