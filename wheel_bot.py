@@ -4,7 +4,7 @@ import time
 import datetime
 import requests
 import math
-import yfinance as yf # <--- ADDED: For VIX checks
+import yfinance as yf
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest, GetOptionContractsRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, ContractType
@@ -12,12 +12,11 @@ import config
 import utils
 
 # --- CONFIGURATION ---
-# WATCHLIST is now dynamic. See utils.get_active_targets()
 MIN_DTE = 25             
 MAX_DTE = 45
-TARGET_OTM_PCT = 0.05   # Default, but now Dynamic based on VIX
-MIN_PREMIUM = 0.10      # Will not sell options for less than $10
-TAKE_PROFIT_PCT = 0.50  # Close position if we captured 50% of max profit
+TARGET_OTM_PCT = 0.05   
+MIN_PREMIUM = 0.10      
+TAKE_PROFIT_PCT = 0.50  
 
 # --- CLIENTS ---
 trading_client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=config.PAPER)
@@ -48,9 +47,6 @@ def get_current_price(symbol):
         return 0.0
 
 def get_option_price(symbol, side="bid"):
-    """
-    Fetches the current BID (for selling) or ASK (for buying/closing).
-    """
     try:
         req = OptionLatestQuoteRequest(symbol_or_symbols=symbol)
         res = option_data_client.get_option_latest_quote(req)
@@ -61,16 +57,13 @@ def get_option_price(symbol, side="bid"):
         return 0.0
 
 def get_vix_level():
-    """Returns the current VIX level to gauge fear."""
     try:
-        # Fast fetch of just the latest price
         vix = yf.Ticker("^VIX").history(period="1d")
-        if not vix.empty:
-            return float(vix['Close'].iloc[-1])
+        if not vix.empty: return float(vix['Close'].iloc[-1])
     except: pass
-    return 15.0 # Default to "Normal" if fetch fails
+    return 15.0 
 
-def find_best_contract(symbol, side, current_price, target_otm=0.05):
+def find_best_contract(symbol, side, current_price, target_otm=0.05, min_strike=0.0):
     today = datetime.date.today()
     start_date = today + datetime.timedelta(days=MIN_DTE)
     end_date = today + datetime.timedelta(days=MAX_DTE)
@@ -98,12 +91,16 @@ def find_best_contract(symbol, side, current_price, target_otm=0.05):
 
     for c in available:
         strike = float(c.strike_price)
+        
+        # BASIC FILTERING
         if side == "PUT" and strike >= current_price: continue
         if side == "CALL" and strike <= current_price: continue
         
+        # COST BASIS PROTECTION (Crucial for Assigned Stocks)
+        if side == "CALL" and min_strike > 0 and strike < min_strike:
+            continue 
+
         pct_otm = abs(current_price - strike) / current_price
-        
-        # [UPDATED] Use the dynamic target_otm passed in arguments
         score = abs(pct_otm - target_otm)
         
         if score < best_score:
@@ -113,12 +110,11 @@ def find_best_contract(symbol, side, current_price, target_otm=0.05):
     return best_contract
 
 def run_wheel_bot():
-    print(f"--- 🚜 FLEET WHEEL BOT (Harvest Mode) STARTED ---")
+    print(f"--- 🚜 FLEET WHEEL BOT (Cost Basis Aware) STARTED ---")
     
-    # Initial Ping to confirm online status
     initial_targets = utils.get_active_targets("wheel_targets")
     if not initial_targets: initial_targets = ["F", "PLTR", "SOFI"] 
-    send_discord(f"🚜 **Wheel Bot Online**\nTargeting 50% Profit on: {initial_targets}")
+    send_discord(f"🚜 **Wheel Bot Online**\nTargets: {initial_targets}")
     
     while True:
         try:
@@ -134,31 +130,27 @@ def run_wheel_bot():
             buying_power = float(account.buying_power)
             all_positions = trading_client.get_all_positions()
             
-            # --- DYNAMIC TARGETING ---
             active_targets = utils.get_active_targets("wheel_targets")
-            if not active_targets:
-                active_targets = ["F", "PLTR", "SOFI"]
+            if not active_targets: active_targets = ["F", "PLTR", "SOFI"]
 
-            # [SHIELD 1] GET VIX FOR DYNAMIC SPACING
             current_vix = get_vix_level()
-            
-            # If VIX is high (>20), we demand 10% OTM. If low, 5% OTM.
             dynamic_otm = 0.10 if current_vix > 20.0 else 0.05
             vix_msg = f"VIX: {current_vix:.2f} | Spacing: {dynamic_otm*100:.0f}%"
 
             print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning {len(active_targets)} Targets | {vix_msg}")
 
-            # [SHIELD 2] LADDERING - Track new positions this cycle
             opened_this_cycle = 0
 
             for ticker in active_targets:
                 stock_qty = 0
+                avg_entry = 0.0
                 active_option = None
                 
                 # 1. SCAN EXISTING POSITIONS
                 for p in all_positions:
                     if p.symbol == ticker and p.asset_class == AssetClass.US_EQUITY:
                         stock_qty = float(p.qty)
+                        avg_entry = float(p.avg_entry_price)
                     elif p.symbol.startswith(ticker) and p.asset_class == AssetClass.US_OPTION:
                         active_option = p
                 
@@ -168,32 +160,24 @@ def run_wheel_bot():
                 if active_option:
                     entry_price = float(active_option.avg_entry_price)
                     current_opt_price = float(active_option.current_price) 
-                    qty = float(active_option.qty) # Negative for short
+                    qty = float(active_option.qty) 
                     
                     if entry_price > 0:
                         capture_pct = (entry_price - current_opt_price) / entry_price
-                        
-                        print(f"  {ticker:<4} | Existing Option: {active_option.symbol} | Profit: {capture_pct*100:.1f}%")
+                        print(f"  {ticker:<4} | Option: {active_option.symbol} | Profit: {capture_pct*100:.1f}%")
                         
                         if capture_pct >= TAKE_PROFIT_PCT:
                             print(f"    🚜 [HARVEST] Profit Target Hit! Closing {active_option.symbol}")
-                            
-                            # Get real ASK price for the Limit Order
                             close_price = get_option_price(active_option.symbol, side="ask")
-                            if close_price == 0: close_price = current_opt_price * 1.05 # Safety fallback
+                            if close_price == 0: close_price = current_opt_price * 1.05 
                             
                             req = LimitOrderRequest(
-                                symbol=active_option.symbol,
-                                qty=abs(int(qty)), 
-                                side=OrderSide.BUY,
-                                time_in_force=TimeInForce.DAY,
-                                limit_price=close_price
+                                symbol=active_option.symbol, qty=abs(int(qty)), side=OrderSide.BUY,
+                                time_in_force=TimeInForce.DAY, limit_price=close_price
                             )
                             trading_client.submit_order(order_data=req)
                             send_discord(f"🚜 **TOOK PROFIT {ticker}**\nClosed @ ${close_price} ({capture_pct*100:.0f}% Cap)")
-                            log_to_influx("buy_close", close_price, active_option.symbol, "Take Profit")
                             continue 
-                    
                     continue
 
                 # 3. OPEN NEW POSITIONS
@@ -202,35 +186,38 @@ def run_wheel_bot():
                 contract = None
                 side = None
 
-                # Covered Call?
+                # --- CASE A: COVERED CALL (We own the shares) ---
                 if stock_qty >= 100:
                     side = "CALL"
-                    # For calls, we usually stay aggressive, or we can use dynamic_otm too. 
-                    # Let's stick to standard 5% for upside caps to get premium.
-                    # ... inside run_wheel_bot ...
-                    # Before find_best_contract ...
+                    
+                    # [SAFETY CHECK] COST BASIS PROTECTION
+                    # We usually want to sell a strike ABOVE our entry price.
+                    # If Current Price < Entry Price, we might need to wait (Baghold)
+                    # or sell at Entry Price to break even.
+                    
+                    min_strike_req = avg_entry
+                    print(f"    [INFO] Own Shares @ ${avg_entry:.2f}. Min Strike set to ${min_strike_req:.2f}")
 
-                    # Calculate rough requirement (Stock Price * 100)
-                    approx_cost = current_stock_price * 100
-
-                    if buying_power < approx_cost:
-                        print(f"    [SKIP] {ticker}: Insufficient BP (Need ${approx_cost:.0f}, Have ${buying_power:.0f})")
+                    # If stock crashed 30%, asking for the old entry price might yield $0 premium.
+                    # In that case, find_best_contract returns None, and we HOLD. (Correct behavior).
+                    
+                    contract = find_best_contract(ticker, "CALL", current_stock_price, 
+                                                  target_otm=0.05, min_strike=min_strike_req)
+                    
+                    if not contract:
+                        print(f"    [SKIP] No calls available above cost basis (${min_strike_req:.2f}). Holding.")
                         continue
-                    contract = find_best_contract(ticker, "CALL", current_stock_price, target_otm=0.05)
-                
-                # Cash Secured Put?
+
+                # --- CASE B: CASH SECURED PUT (We want to buy) ---
                 else:
-                    # CFO CHECK
-                    if not utils.check_budget("wheel_bot", trading_client):
-                        print(f"    [SKIP] Wheel Budget Exceeded.")
-                        continue
-                    # Basic BP check
-                    if buying_power < (current_stock_price * 100):
-                        print(f"    [SKIP] Insufficient BP for {ticker}")
+                    if not utils.check_budget("wheel_bot", trading_client): continue
+                    
+                    approx_cost = current_stock_price * 100
+                    if buying_power < approx_cost:
+                        print(f"    [SKIP] Insufficient BP (Need ${approx_cost:.0f})")
                         continue
                         
                     side = "PUT"
-                    # [SHIELD 1 APPLIED] Use dynamic OTM
                     contract = find_best_contract(ticker, "PUT", current_stock_price, target_otm=dynamic_otm)
 
                 if contract:
@@ -244,38 +231,30 @@ def run_wheel_bot():
                         if buying_power < (float(contract.strike_price) * 100):
                             print(f"    [SKIP] Strike too expensive.")
                             continue
-
-                        # [SHIELD 3] FALLING KNIFE PROTECTION
-                        # Ensure the buffer hasn't shrunk significantly since the scan
+                        
+                        # Falling Knife Check
                         strike_price = float(contract.strike_price)
                         safety_buffer = (current_stock_price - strike_price) / current_stock_price
-                        
-                        # If we wanted 5% OTM but we only have 2.5% now, price is crashing. Abort.
                         if safety_buffer < (dynamic_otm * 0.5):
                              print(f"    [SKIP] 🔪 Falling Knife! Buffer shrank to {safety_buffer*100:.1f}%")
                              continue
 
                     print(f"    [ENTRY] Selling {side} on {ticker} @ ${limit_price}")
                     req = LimitOrderRequest(
-                        symbol=contract.symbol,
-                        qty=1,
-                        side=OrderSide.SELL,
-                        time_in_force=TimeInForce.DAY,
-                        limit_price=limit_price
+                        symbol=contract.symbol, qty=1, side=OrderSide.SELL,
+                        time_in_force=TimeInForce.DAY, limit_price=limit_price
                     )
                     trading_client.submit_order(order_data=req)
                     
                     emoji = "📞" if side == "CALL" else "📉"
-                    send_discord(f"{emoji} **SOLD {side} {ticker}**\nStrike: ${contract.strike_price}\nLimit: ${limit_price}")
-                    log_to_influx(f"sell_{side.lower()}", limit_price, contract.symbol, "Opened Position")
+                    send_discord(f"{emoji} **SOLD {side} {ticker}**\nStrike: ${contract.strike_price}\nLimit: ${limit_price}\nCost Basis Protected: {'YES' if side=='CALL' else 'N/A'}")
                     
                     if side == "PUT": buying_power -= (float(contract.strike_price) * 100)
                     
-                    # [SHIELD 2] PACING (Laddering)
                     opened_this_cycle += 1
                     if opened_this_cycle >= 1:
-                        print("    [PACING] Opened 1 position. Sleeping to ladder entries.")
-                        break # Stop scanning, sleep, and resume later
+                        print("    [PACING] Opened 1 position. Sleeping.")
+                        break 
 
             time.sleep(900)
 
