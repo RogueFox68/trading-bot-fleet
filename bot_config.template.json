@@ -1,43 +1,51 @@
 {
     "bots": {
-        "crypto_grid": {
-            "script": "crypto_grid.py",
-            "status": "active",
-            "strategy": "neutral"
-        },
-        "survivor_bot": {
-            "script": "survivor_bot.py",
-            "status": "active",
-            "strategy": "long_only"
-        },
         "wheel_bot": {
             "script": "wheel_bot.py",
             "status": "active",
-            "strategy": "conservative"
+            "strategy": "conservative",
+            "allocation": 0.40
         },
         "trend_bot": {
             "script": "trend_bot.py",
             "status": "active",
-            "strategy": "aggressive"
+            "strategy": "aggressive",
+            "allocation": 0.25
         },
-        "moon_bag": {
-            "script": "crypto_breakout.py",
+        "survivor_bot": {
+            "script": "survivor_bot.py",
             "status": "active",
-            "strategy": "breakout"
+            "strategy": "long_only",
+            "allocation": 0.15
         },
         "condor_bot": {
             "script": "condor_bot.py",
             "status": "active",
-            "strategy": "iron_condor"
+            "strategy": "iron_condor",
+            "allocation": 0.10
+        },
+        "crypto_grid": {
+            "script": "crypto_grid.py",
+            "status": "active",
+            "strategy": "neutral",
+            "allocation": 0.10
+        },
+        "moon_bag": {
+            "script": "crypto_breakout.py",
+            "status": "active",
+            "strategy": "breakout",
+            "allocation": 0.10
         },
         "accountant": {
             "script": "accountant.py",
             "status": "active",
-            "strategy": "reporting"
+            "strategy": "reporting",
+            "allocation": 0.0
         }
     },
     "global_settings": {
-        "market_condition": "normal",
-        "emergency_stop": false
+        "market_condition": "SIDEWAYS",
+        "emergency_stop": false,
+        "macro_climate": "MACRO_BULL"
     }
 }
