@@ -3,6 +3,8 @@ import config
 import time
 import datetime
 import requests
+import json
+import os
 import math
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest, GetOptionContractsRequest
@@ -11,7 +13,9 @@ from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDa
 from alpaca.data.requests import StockLatestTradeRequest, OptionLatestQuoteRequest
 
 # --- CONFIGURATION ---
-TARGETS = ["COIN", "MSTR", "TSLA", "NVDA", "NFLX"] 
+TARGET_FILE = "active_targets.json"
+STATIC_TARGETS = ["COIN", "MSTR", "TSLA", "NVDA", "NFLX"] 
+
 MIN_DTE = 25              
 MAX_DTE = 45              
 WING_WIDTH_PCT = 0.05     
@@ -24,7 +28,6 @@ trading_client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=config.P
 data_client = StockHistoricalDataClient(config.API_KEY, config.SECRET_KEY)
 option_data_client = OptionHistoricalDataClient(config.API_KEY, config.SECRET_KEY)
 
-# --- WEBHOOK ---
 WEBHOOK_URL = getattr(config, 'WEBHOOK_CONDOR') 
 
 def send_discord(msg):
@@ -39,6 +42,19 @@ def log_to_influx(action, symbol, price, detail):
         url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
         requests.post(url, data=data_str, timeout=2)
     except: pass
+
+def get_condor_targets():
+    """Reads the AI-generated target list."""
+    if not os.path.exists(TARGET_FILE):
+        return STATIC_TARGETS
+    try:
+        with open(TARGET_FILE, 'r') as f:
+            data = json.load(f)
+            targets = data.get("condor_targets", [])
+            if not targets: return STATIC_TARGETS
+            return targets
+    except:
+        return STATIC_TARGETS
 
 def get_current_price(symbol):
     try:
@@ -89,7 +105,6 @@ def run_condor_bot():
             try:
                 clock = trading_client.get_clock()
                 if not clock.is_open:
-                    # [FIX] Sleep 15 mins instead of 1 min to prevent log spam
                     print("Market Closed. Sleeping 15m...", end='\r')
                     time.sleep(900)
                     continue
@@ -99,6 +114,7 @@ def run_condor_bot():
             condor_positions = 0
             active_tickers = set()
             
+            # Count active condors
             for p in positions:
                 if p.asset_class == AssetClass.US_OPTION:
                     root = p.symbol
@@ -106,14 +122,15 @@ def run_condor_bot():
                         if char.isdigit():
                             root = p.symbol[:i]
                             break
-                    
                     if utils.get_bot_owner(root, AssetClass.US_OPTION) == "condor_bot":
                         condor_positions += 1
                         active_tickers.add(root)
 
-            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning (Active Condors: {len(active_tickers)}/{MAX_POSITIONS})...")
+            # 2. LOAD TARGETS DYNAMICALLY
+            targets = get_condor_targets()
+            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning {len(targets)} Targets (Active: {len(active_tickers)}/{MAX_POSITIONS})...")
             
-            # --- MANAGEMENT: Check Existing Spreads ---
+            # --- MANAGEMENT ---
             for p in positions:
                 if p.asset_class == AssetClass.US_OPTION:
                     entry = float(p.avg_entry_price)
@@ -133,11 +150,11 @@ def run_condor_bot():
                             send_discord(f"💰 **CONDOR PROFIT**\nClosed {p.symbol} @ {profit_pct*100:.0f}% Gain")
                             log_to_influx("close_leg", p.symbol, limit, "Take Profit")
 
-            # --- ENTRY: Find New Condors ---
+            # --- ENTRY ---
             if len(active_tickers) >= MAX_POSITIONS:
                 print("    Max positions reached. Skipping entry.")
             else:
-                for ticker in TARGETS:
+                for ticker in targets:
                     if ticker in active_tickers: continue
                     
                     price = get_current_price(ticker)
@@ -172,7 +189,6 @@ def run_condor_bot():
                         (put_long, "PUT", OrderSide.BUY, "Long Put Wing"),
                         (call_long, "CALL", OrderSide.BUY, "Long Call Wing")
                     ]
-                    
                     body = [
                         (put_short, "PUT", OrderSide.SELL, "Short Put Body"),
                         (call_short, "CALL", OrderSide.SELL, "Short Call Body")
@@ -206,7 +222,6 @@ def run_condor_bot():
                                 trading_client.cancel_order_by_id(order.id)
                                 wings_filled = False
                                 break
-                                
                         except Exception as e:
                             print(f"       Order Failed: {e}")
                             wings_filled = False
@@ -231,10 +246,8 @@ def run_condor_bot():
                                 
                         send_discord(f"🦅 **CONDOR DEPLOYED: {ticker}**\nWings Secured. Body Sold.\nRange: ${put_short.strike_price} - ${call_short.strike_price}")
                         log_to_influx("open_condor", ticker, price, "Strategy Executed")
-                    
                     else:
-                        print("    [ABORT] Wings failed to fill. Cancelling strategy for this ticker.")
-                    
+                        print("    [ABORT] Wings failed to fill.")
                     break
 
             time.sleep(1800)

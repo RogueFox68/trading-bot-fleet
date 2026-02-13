@@ -3,6 +3,8 @@ from alpaca.data.requests import StockLatestTradeRequest, OptionLatestQuoteReque
 import time
 import datetime
 import requests
+import json
+import os
 import math
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest, GetOptionContractsRequest
@@ -11,12 +13,15 @@ import config
 import utils
 
 # --- CONFIGURATION ---
-WATCHLIST = ["DIS", "PLTR", "F"] 
+TARGET_FILE = "active_targets.json"
+# Fallback if JSON fails
+STATIC_WATCHLIST = ["DIS", "PLTR", "F"] 
+
 MIN_DTE = 25             
 MAX_DTE = 45
 TARGET_OTM_PCT = 0.05
-MIN_PREMIUM = 0.10      # Will not sell options for less than $10
-TAKE_PROFIT_PCT = 0.50  # Close position if we captured 50% of max profit
+MIN_PREMIUM = 0.10      
+TAKE_PROFIT_PCT = 0.50  
 
 # --- CLIENTS ---
 trading_client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=config.PAPER)
@@ -26,7 +31,7 @@ option_data_client = OptionHistoricalDataClient(config.API_KEY, config.SECRET_KE
 def send_discord(msg):
     if "YOUR" in config.WEBHOOK_WHEEL: return
     try:
-        payload = {"content": msg, "username": "WheelBot 囿"}
+        payload = {"content": msg, "username": "WheelBot 🚜"}
         requests.post(config.WEBHOOK_WHEEL, json=payload)
     except: pass
 
@@ -36,6 +41,19 @@ def log_to_influx(action, price, symbol, detail):
         url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
         requests.post(url, data=data_str)
     except: pass
+
+def get_wheel_targets():
+    """Reads the AI-generated target list."""
+    if not os.path.exists(TARGET_FILE):
+        return STATIC_WATCHLIST
+    try:
+        with open(TARGET_FILE, 'r') as f:
+            data = json.load(f)
+            targets = data.get("wheel_targets", [])
+            if not targets: return STATIC_WATCHLIST
+            return targets
+    except:
+        return STATIC_WATCHLIST
 
 def get_current_price(symbol):
     try:
@@ -47,9 +65,6 @@ def get_current_price(symbol):
         return 0.0
 
 def get_option_price(symbol, side="bid"):
-    """
-    Fetches the current BID (for selling) or ASK (for buying/closing).
-    """
     try:
         req = OptionLatestQuoteRequest(symbol_or_symbols=symbol)
         res = option_data_client.get_option_latest_quote(req)
@@ -100,8 +115,8 @@ def find_best_contract(symbol, side, current_price):
     return best_contract
 
 def run_wheel_bot():
-    print(f"--- 囿 FLEET WHEEL BOT (Harvest Mode) STARTED ---")
-    send_discord(f"囿 **Wheel Bot Online**\nTargeting 50% Profit on: {WATCHLIST}")
+    print(f"--- 🚜 FLEET WHEEL BOT (Harvest Mode) STARTED ---")
+    send_discord(f"🚜 **Wheel Bot Online**\nSyncing with Sector Scout...")
     
     while True:
         try:
@@ -113,15 +128,17 @@ def run_wheel_bot():
                     continue
             except: pass
 
-            # Note: We fetch account here, but we will RE-FETCH inside the loop for accuracy
-            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning Portfolio & Watchlist...")
+            # 1. LOAD TARGETS DYNAMICALLY
+            targets = get_wheel_targets()
+            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning {len(targets)} Targets...")
+
             all_positions = trading_client.get_all_positions()
 
-            for ticker in WATCHLIST:
+            for ticker in targets:
                 stock_qty = 0
                 active_option = None
                 
-                # 1. SCAN EXISTING POSITIONS
+                # Check positions
                 for p in all_positions:
                     if p.symbol == ticker and p.asset_class == AssetClass.US_EQUITY:
                         stock_qty = float(p.qty)
@@ -138,10 +155,10 @@ def run_wheel_bot():
                     
                     if entry_price > 0:
                         capture_pct = (entry_price - current_opt_price) / entry_price
-                        print(f"  {ticker:<4} | Existing Option: {active_option.symbol} | Profit: {capture_pct*100:.1f}%")
+                        print(f"  {ticker:<4} | Option: {active_option.symbol} | Profit: {capture_pct*100:.1f}%")
                         
                         if capture_pct >= TAKE_PROFIT_PCT:
-                            print(f"    腸 [HARVEST] Profit Target Hit! Closing {active_option.symbol}")
+                            print(f"    💵 [HARVEST] Profit Target Hit! Closing {active_option.symbol}")
                             
                             close_price = get_option_price(active_option.symbol, side="ask")
                             if close_price == 0: close_price = current_opt_price * 1.05
@@ -154,18 +171,18 @@ def run_wheel_bot():
                                 limit_price=close_price
                             )
                             trading_client.submit_order(order_data=req)
-                            send_discord(f"腸 **TOOK PROFIT {ticker}**\nClosed @ ${close_price} ({capture_pct*100:.0f}% Cap)")
+                            send_discord(f"💵 **TOOK PROFIT {ticker}**\nClosed @ ${close_price} ({capture_pct*100:.0f}% Cap)")
                             log_to_influx("buy_close", close_price, active_option.symbol, "Take Profit")
                             continue 
                     continue
 
-                # 3. OPEN NEW POSITIONS (If no option exists)
+                # 3. OPEN NEW POSITIONS
                 print(f"  {ticker:<4} | ${current_stock_price:>7.2f} | No Active Option. Hunting...")
 
                 contract = None
                 side = None
 
-                # [FIX] Real-Time Account Fetch for accurate Buying Power
+                # [FIX] Real-Time Buying Power Check
                 acc = trading_client.get_account()
                 real_bp = float(acc.options_buying_power)
 
@@ -176,14 +193,12 @@ def run_wheel_bot():
                 
                 # Cash Secured Put?
                 else:
-                    # [NEW] CFO CHECK
+                    # Budget Check
                     if not utils.check_budget("wheel_bot", trading_client):
-                        # Skip if global budget is hit
                         continue
 
-                    # [FIX] Check against REAL BP, not estimated
                     if real_bp < (current_stock_price * 100):
-                        print(f"    [SKIP] Insufficient Real-Time BP (${real_bp:.0f}) for {ticker}")
+                        print(f"    [SKIP] Insufficient BP (Need ${current_stock_price*100:.0f})")
                         continue
 
                     side = "PUT"
@@ -196,9 +211,8 @@ def run_wheel_bot():
                         print(f"    [SKIP] Premium too low (${limit_price})")
                         continue
                     
-                    # [FIX] Double check BP specifically for this contract strike
                     if side == "PUT" and real_bp < (float(contract.strike_price) * 100):
-                        print(f"    [SKIP] Strike too expensive for current BP.")
+                        print(f"    [SKIP] Strike too expensive.")
                         continue
 
                     print(f"    [ENTRY] Selling {side} on {ticker} @ ${limit_price}")
@@ -210,7 +224,7 @@ def run_wheel_bot():
                         limit_price=limit_price
                     )
                     trading_client.submit_order(order_data=req)
-                    emoji = "泙" if side == "CALL" else "閥"
+                    emoji = "🟢" if side == "CALL" else "🔴"
                     send_discord(f"{emoji} **SOLD {side} {ticker}**\nStrike: ${contract.strike_price}\nLimit: ${limit_price}")
                     log_to_influx(f"sell_{side.lower()}", limit_price, contract.symbol, "Opened Position")
 
