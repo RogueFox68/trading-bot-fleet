@@ -21,7 +21,8 @@ MIN_DTE = 25
 MAX_DTE = 45
 TARGET_OTM_PCT = 0.05
 MIN_PREMIUM = 0.10      
-TAKE_PROFIT_PCT = 0.50  
+TAKE_PROFIT_PCT = 0.50 
+MAX_SPREAD_PCT = 0.25   # [NEW] If (Ask-Bid)/Ask > 25%, spread is too wide. Skip.
 
 # --- CLIENTS ---
 trading_client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=config.PAPER)
@@ -64,15 +65,42 @@ def get_current_price(symbol):
         print(f"  [!] Error price {symbol}: {e}")
         return 0.0
 
-def get_option_price(symbol, side="bid"):
+def get_option_data(symbol):
+    """
+    [FIX] Returns full quote object (Bid, Ask) instead of just one side.
+    """
     try:
         req = OptionLatestQuoteRequest(symbol_or_symbols=symbol)
         res = option_data_client.get_option_latest_quote(req)
-        quote = res[symbol]
-        return float(quote.bid_price) if side == "bid" else float(quote.ask_price)
+        return res[symbol]
     except Exception as e:
         print(f"  [!] Error fetching option quote for {symbol}: {e}")
-        return 0.0
+        return None
+
+def calculate_smart_price(quote, side):
+    """
+    [FIX] Calculates the Midpoint Price.
+    If spread is too wide, returns None to signal 'Unsafe'.
+    """
+    bid = float(quote.bid_price)
+    ask = float(quote.ask_price)
+    
+    if ask == 0: return None
+    
+    spread = ask - bid
+    spread_pct = spread / ask
+    midpoint = (bid + ask) / 2
+    
+    # 1. Safety Check: Liquidity
+    if spread_pct > MAX_SPREAD_PCT:
+        print(f"    [SKIP] Spread too wide ({spread_pct*100:.1f}%). Bid: {bid} Ask: {ask}")
+        return None
+        
+    # 2. Rounding (Options usually tick in $0.05 or $0.01)
+    # We round to 2 decimals standard.
+    smart_price = round(midpoint, 2)
+    
+    return smart_price
 
 def find_best_contract(symbol, side, current_price):
     today = datetime.date.today()
@@ -115,7 +143,7 @@ def find_best_contract(symbol, side, current_price):
     return best_contract
 
 def run_wheel_bot():
-    print(f"--- 🚜 FLEET WHEEL BOT (Harvest Mode) STARTED ---")
+    print(f"--- 🚜 FLEET WHEEL BOT (Smart Pricing V2) STARTED ---")
     send_discord(f"🚜 **Wheel Bot Online**\nSyncing with Sector Scout...")
     
     while True:
@@ -128,7 +156,6 @@ def run_wheel_bot():
                     continue
             except: pass
 
-            # 1. LOAD TARGETS DYNAMICALLY
             targets = get_wheel_targets()
             print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning {len(targets)} Targets...")
 
@@ -160,9 +187,15 @@ def run_wheel_bot():
                         if capture_pct >= TAKE_PROFIT_PCT:
                             print(f"    💵 [HARVEST] Profit Target Hit! Closing {active_option.symbol}")
                             
-                            close_price = get_option_price(active_option.symbol, side="ask")
-                            if close_price == 0: close_price = current_opt_price * 1.05
+                            # [FIX] Get Smart Midpoint for Closing
+                            quote = get_option_data(active_option.symbol)
+                            close_price = calculate_smart_price(quote, "BUY")
                             
+                            # Fallback if spread is bad, we might have to force close, but for now let's be safe
+                            if close_price is None:
+                                print(f"    [WAIT] Spread too wide to close safely.")
+                                continue
+
                             req = LimitOrderRequest(
                                 symbol=active_option.symbol,
                                 qty=abs(int(qty)),
@@ -182,7 +215,6 @@ def run_wheel_bot():
                 contract = None
                 side = None
 
-                # [FIX] Real-Time Buying Power Check
                 acc = trading_client.get_account()
                 real_bp = float(acc.options_buying_power)
 
@@ -193,7 +225,6 @@ def run_wheel_bot():
                 
                 # Cash Secured Put?
                 else:
-                    # Budget Check
                     if not utils.check_budget("wheel_bot", trading_client):
                         continue
 
@@ -205,8 +236,13 @@ def run_wheel_bot():
                     contract = find_best_contract(ticker, "PUT", current_stock_price)
 
                 if contract:
-                    limit_price = get_option_price(contract.symbol, side="bid")
+                    # [FIX] Get Full Quote & Calculate Midpoint
+                    quote = get_option_data(contract.symbol)
+                    if not quote: continue
                     
+                    limit_price = calculate_smart_price(quote, side)
+                    if limit_price is None: continue # Spread too wide
+
                     if limit_price < MIN_PREMIUM:
                         print(f"    [SKIP] Premium too low (${limit_price})")
                         continue
@@ -215,7 +251,7 @@ def run_wheel_bot():
                         print(f"    [SKIP] Strike too expensive.")
                         continue
 
-                    print(f"    [ENTRY] Selling {side} on {ticker} @ ${limit_price}")
+                    print(f"    [ENTRY] Selling {side} on {ticker} @ ${limit_price} (Midpoint)")
                     req = LimitOrderRequest(
                         symbol=contract.symbol,
                         qty=1,
@@ -225,7 +261,7 @@ def run_wheel_bot():
                     )
                     trading_client.submit_order(order_data=req)
                     emoji = "🟢" if side == "CALL" else "🔴"
-                    send_discord(f"{emoji} **SOLD {side} {ticker}**\nStrike: ${contract.strike_price}\nLimit: ${limit_price}")
+                    send_discord(f"{emoji} **SOLD {side} {ticker}**\nStrike: ${contract.strike_price}\nLimit: ${limit_price} (Mid)")
                     log_to_influx(f"sell_{side.lower()}", limit_price, contract.symbol, "Opened Position")
 
             time.sleep(900)
