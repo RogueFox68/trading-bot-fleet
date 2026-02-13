@@ -6,15 +6,15 @@ import requests
 import json
 import os
 import math
+import re
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import LimitOrderRequest, GetOptionContractsRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, ContractType
+from alpaca.trading.requests import LimitOrderRequest, GetOptionContractsRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, ContractType, QueryOrderStatus
 import config
 import utils
 
 # --- CONFIGURATION ---
 TARGET_FILE = "active_targets.json"
-# Fallback if JSON fails
 STATIC_WATCHLIST = ["DIS", "PLTR", "F"] 
 
 MIN_DTE = 25             
@@ -22,7 +22,7 @@ MAX_DTE = 45
 TARGET_OTM_PCT = 0.05
 MIN_PREMIUM = 0.10      
 TAKE_PROFIT_PCT = 0.50 
-MAX_SPREAD_PCT = 0.25   # [NEW] If (Ask-Bid)/Ask > 25%, spread is too wide. Skip.
+MAX_SPREAD_PCT = 0.25   
 
 # --- CLIENTS ---
 trading_client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=config.PAPER)
@@ -44,7 +44,6 @@ def log_to_influx(action, price, symbol, detail):
     except: pass
 
 def get_wheel_targets():
-    """Reads the AI-generated target list."""
     if not os.path.exists(TARGET_FILE):
         return STATIC_WATCHLIST
     try:
@@ -66,9 +65,6 @@ def get_current_price(symbol):
         return 0.0
 
 def get_option_data(symbol):
-    """
-    [FIX] Returns full quote object (Bid, Ask) instead of just one side.
-    """
     try:
         req = OptionLatestQuoteRequest(symbol_or_symbols=symbol)
         res = option_data_client.get_option_latest_quote(req)
@@ -78,10 +74,6 @@ def get_option_data(symbol):
         return None
 
 def calculate_smart_price(quote, side):
-    """
-    [FIX] Calculates the Midpoint Price.
-    If spread is too wide, returns None to signal 'Unsafe'.
-    """
     bid = float(quote.bid_price)
     ask = float(quote.ask_price)
     
@@ -91,16 +83,11 @@ def calculate_smart_price(quote, side):
     spread_pct = spread / ask
     midpoint = (bid + ask) / 2
     
-    # 1. Safety Check: Liquidity
     if spread_pct > MAX_SPREAD_PCT:
         print(f"    [SKIP] Spread too wide ({spread_pct*100:.1f}%). Bid: {bid} Ask: {ask}")
         return None
         
-    # 2. Rounding (Options usually tick in $0.05 or $0.01)
-    # We round to 2 decimals standard.
-    smart_price = round(midpoint, 2)
-    
-    return smart_price
+    return round(midpoint, 2)
 
 def find_best_contract(symbol, side, current_price):
     today = datetime.date.today()
@@ -142,8 +129,31 @@ def find_best_contract(symbol, side, current_price):
             
     return best_contract
 
+def get_open_order_tickers():
+    """
+    Returns a set of tickers that currently have OPEN orders.
+    Parses option symbols (e.g., AMD230120P...) back to AMD.
+    """
+    params = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500)
+    orders = trading_client.get_orders(filter=params)
+    busy_tickers = set()
+    
+    for o in orders:
+        sym = o.symbol
+        # Regex to strip the option suffix (e.g. "AAPL230616C00150000" -> "AAPL")
+        # Matches the start of string until the first digit
+        match = re.match(r"^([A-Z]+)\d", sym)
+        if match:
+            root = match.group(1)
+            busy_tickers.add(root)
+        else:
+            # Regular stock order
+            busy_tickers.add(sym)
+            
+    return busy_tickers
+
 def run_wheel_bot():
-    print(f"--- 🚜 FLEET WHEEL BOT (Smart Pricing V2) STARTED ---")
+    print(f"--- 🚜 FLEET WHEEL BOT (Smart Pricing + Order Awareness) STARTED ---")
     send_discord(f"🚜 **Wheel Bot Online**\nSyncing with Sector Scout...")
     
     while True:
@@ -157,11 +167,20 @@ def run_wheel_bot():
             except: pass
 
             targets = get_wheel_targets()
-            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning {len(targets)} Targets...")
+            
+            # [FIX] Get list of tickers that already have pending orders
+            busy_tickers = get_open_order_tickers()
+            
+            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning {len(targets)} Targets (Busy: {len(busy_tickers)})")
 
             all_positions = trading_client.get_all_positions()
 
             for ticker in targets:
+                # [FIX] Skip if we already have an open order for this ticker
+                if ticker in busy_tickers:
+                    print(f"  {ticker:<4} | [SKIP] Open Order Exists.")
+                    continue
+
                 stock_qty = 0
                 active_option = None
                 
@@ -178,7 +197,7 @@ def run_wheel_bot():
                 if active_option:
                     entry_price = float(active_option.avg_entry_price)
                     current_opt_price = float(active_option.current_price) 
-                    qty = float(active_option.qty) # Negative for short
+                    qty = float(active_option.qty) 
                     
                     if entry_price > 0:
                         capture_pct = (entry_price - current_opt_price) / entry_price
@@ -187,11 +206,9 @@ def run_wheel_bot():
                         if capture_pct >= TAKE_PROFIT_PCT:
                             print(f"    💵 [HARVEST] Profit Target Hit! Closing {active_option.symbol}")
                             
-                            # [FIX] Get Smart Midpoint for Closing
                             quote = get_option_data(active_option.symbol)
                             close_price = calculate_smart_price(quote, "BUY")
                             
-                            # Fallback if spread is bad, we might have to force close, but for now let's be safe
                             if close_price is None:
                                 print(f"    [WAIT] Spread too wide to close safely.")
                                 continue
@@ -236,12 +253,11 @@ def run_wheel_bot():
                     contract = find_best_contract(ticker, "PUT", current_stock_price)
 
                 if contract:
-                    # [FIX] Get Full Quote & Calculate Midpoint
                     quote = get_option_data(contract.symbol)
                     if not quote: continue
                     
                     limit_price = calculate_smart_price(quote, side)
-                    if limit_price is None: continue # Spread too wide
+                    if limit_price is None: continue 
 
                     if limit_price < MIN_PREMIUM:
                         print(f"    [SKIP] Premium too low (${limit_price})")
