@@ -11,26 +11,20 @@ from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDa
 from alpaca.data.requests import StockLatestTradeRequest, OptionLatestQuoteRequest
 
 # --- CONFIGURATION ---
-def get_targets():
-    try:
-        with open("active_targets.json", "r") as f:
-            return json.load(f).get("condor_targets", [])
-    except: return []
-
-TARGETS = get_targets()
-MIN_DTE = 25              # Days to Expiration (Start)
-MAX_DTE = 45              # Days to Expiration (End)
-WING_WIDTH_PCT = 0.05     # How wide the spread wings are (Protection)
-SHORT_OTM_PCT = 0.08      # Sell the "Body" 8% away from price (~20 Delta)
-TAKE_PROFIT_PCT = 0.50    # Close spread at 50% profit
-MAX_POSITIONS = 3         # Don't overleverage
+TARGETS = ["COIN", "MSTR", "TSLA", "NVDA", "NFLX"] 
+MIN_DTE = 25              
+MAX_DTE = 45              
+WING_WIDTH_PCT = 0.05     
+SHORT_OTM_PCT = 0.08      
+TAKE_PROFIT_PCT = 0.50    
+MAX_POSITIONS = 3         
 
 # --- CLIENTS ---
 trading_client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=config.PAPER)
 data_client = StockHistoricalDataClient(config.API_KEY, config.SECRET_KEY)
 option_data_client = OptionHistoricalDataClient(config.API_KEY, config.SECRET_KEY)
 
-# --- WEBHOOK (Reuse Wheel or generic) ---
+# --- WEBHOOK ---
 WEBHOOK_URL = getattr(config, 'WEBHOOK_CONDOR') 
 
 def send_discord(msg):
@@ -61,7 +55,6 @@ def get_option_price(symbol, side="bid"):
     except: return 0.0
 
 def find_strike(symbol, type, expiry_start, expiry_end, target_price, is_buy=False):
-    """Finds the contract closest to the target price."""
     req = GetOptionContractsRequest(
         underlying_symbols=[symbol],
         status="active",
@@ -96,88 +89,49 @@ def run_condor_bot():
             try:
                 clock = trading_client.get_clock()
                 if not clock.is_open:
-                    print("Market Closed. Sleeping...", end='\r')
-                    time.sleep(60)
+                    # [FIX] Sleep 15 mins instead of 1 min to prevent log spam
+                    print("Market Closed. Sleeping 15m...", end='\r')
+                    time.sleep(900)
                     continue
             except: pass
 
             positions = trading_client.get_all_positions()
-# [FIX] Group positions by Root Symbol (Reassemble the Condor)
-            condor_groups = {}
+            condor_positions = 0
             active_tickers = set()
-
+            
             for p in positions:
-                if p.asset_class != AssetClass.US_OPTION: continue
-                
-                # Identify the root symbol (e.g. "TSLA" from "TSLA23...")
-                root = None
-                for ticker in TARGETS:
-                    if p.symbol.startswith(ticker):
-                        root = ticker
-                        break
-                
-                # Only manage if it belongs to this bot
-                if root and utils.get_bot_owner(root, AssetClass.US_OPTION) == "condor_bot":
-                    if root not in condor_groups:
-                        condor_groups[root] = []
-                    condor_groups[root].append(p)
-                    active_tickers.add(root)
+                if p.asset_class == AssetClass.US_OPTION:
+                    root = p.symbol
+                    for i, char in enumerate(p.symbol):
+                        if char.isdigit():
+                            root = p.symbol[:i]
+                            break
+                    
+                    if utils.get_bot_owner(root, AssetClass.US_OPTION) == "condor_bot":
+                        condor_positions += 1
+                        active_tickers.add(root)
 
             print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning (Active Condors: {len(active_tickers)}/{MAX_POSITIONS})...")
-
-            # --- MANAGEMENT: Check Net P&L of Each Condor ---
-            for root, legs in condor_groups.items():
-                total_entry_cost = 0.0  
-                total_current_value = 0.0
-                
-                for leg in legs:
-                    qty = float(leg.qty)
-                    entry_price = float(leg.avg_entry_price)
-                    current_price = float(leg.current_price)
+            
+            # --- MANAGEMENT: Check Existing Spreads ---
+            for p in positions:
+                if p.asset_class == AssetClass.US_OPTION:
+                    entry = float(p.avg_entry_price)
+                    current = float(p.current_price)
+                    qty = float(p.qty)
                     
-                    # Cost = Price * Qty * 100
-                    # For Sells (Qty < 0), this adds negative cost (Credit)
-                    total_entry_cost += (entry_price * qty * 100)
-                    total_current_value += (current_price * qty * 100)
-
-                # Iron Condor is a CREDIT strategy. 
-                # initial_credit will be positive (e.g., $100).
-                initial_credit = -total_entry_cost
-                current_debit_to_close = -total_current_value 
-                
-                # Safety: Ensure we actually received credit (valid condor)
-                if initial_credit > 0:
-                    profit = initial_credit - current_debit_to_close
-                    capture_pct = profit / initial_credit
-                    
-                    print(f"    🦅 {root} Net P&L: ${profit:.2f} ({capture_pct*100:.1f}%)")
-
-                    if capture_pct >= TAKE_PROFIT_PCT:
-                        print(f"    💰 [HARVEST] {root} hit {TAKE_PROFIT_PCT*100:.0f}% target. Closing all {len(legs)} legs.")
-                        
-                        for leg in legs:
-                            qty = float(leg.qty)
-                            side = OrderSide.BUY if qty < 0 else OrderSide.SELL
-                            
-                            # Aggressive Limit to ensure exit
-                            price = get_option_price(leg.symbol, "ask" if side == OrderSide.BUY else "bid")
-                            limit = price * 1.05 if side == OrderSide.BUY else price * 0.95
-                            
-                            try:
-                                req = LimitOrderRequest(
-                                    symbol=leg.symbol,
-                                    qty=abs(int(qty)),
-                                    side=side,
-                                    time_in_force=TimeInForce.DAY,
-                                    limit_price=round(limit, 2)
-                                )
-                                trading_client.submit_order(order_data=req)
-                                print(f"       -> Sent Close for {leg.symbol}")
-                            except Exception as e:
-                                print(f"       [!] Error closing {leg.symbol}: {e}")
-                                
-                        send_discord(f"💰 **CONDOR CLOSED: {root}**\nNet Profit: ${profit:.2f} ({capture_pct*100:.0f}%)")
-                        log_to_influx("close_condor", root, profit, "Take Profit")
+                    if qty < 0 and entry > 0:
+                        profit_pct = (entry - current) / entry
+                        if profit_pct >= TAKE_PROFIT_PCT:
+                            print(f"    💰 [PROFIT] {p.symbol} reached {profit_pct*100:.1f}% profit. Closing.")
+                            limit = get_option_price(p.symbol, "ask") * 1.05 
+                            req = LimitOrderRequest(
+                                symbol=p.symbol, qty=abs(int(qty)), side=OrderSide.BUY,
+                                time_in_force=TimeInForce.DAY, limit_price=limit
+                            )
+                            trading_client.submit_order(order_data=req)
+                            send_discord(f"💰 **CONDOR PROFIT**\nClosed {p.symbol} @ {profit_pct*100:.0f}% Gain")
+                            log_to_influx("close_leg", p.symbol, limit, "Take Profit")
 
             # --- ENTRY: Find New Condors ---
             if len(active_tickers) >= MAX_POSITIONS:
@@ -191,12 +145,6 @@ def run_condor_bot():
                     
                     print(f"  Analysing {ticker} (${price:.2f})...")
                     
-                    # Calculate Strikes
-                    # Short Put (Body): Price - 8%
-                    # Long Put (Wing): Price - 13%
-                    # Short Call (Body): Price + 8%
-                    # Long Call (Wing): Price + 13%
-                    
                     put_short_price = price * (1 - SHORT_OTM_PCT)
                     put_long_price = price * (1 - (SHORT_OTM_PCT + WING_WIDTH_PCT))
                     call_short_price = price * (1 + SHORT_OTM_PCT)
@@ -205,7 +153,6 @@ def run_condor_bot():
                     start_date = datetime.date.today() + datetime.timedelta(days=MIN_DTE)
                     end_date = datetime.date.today() + datetime.timedelta(days=MAX_DTE)
                     
-                    # Fetch Contracts
                     put_short = find_strike(ticker, "PUT", start_date, end_date, put_short_price)
                     put_long = find_strike(ticker, "PUT", start_date, end_date, put_long_price)
                     call_short = find_strike(ticker, "CALL", start_date, end_date, call_short_price)
@@ -215,18 +162,12 @@ def run_condor_bot():
                         print("    -> Failed to find all 4 legs.")
                         continue
                         
-                    # Execution: "Legging In" (Safest Order: Buy Wings First -> Sell Body)
-                    # This ensures you have the collateral (Buying Power) before selling.
-                    
-                    
                     print(f"    -> 🦅 FOUND CONDOR! Executing Safely...")
 
                     if not utils.check_budget("condor_bot", trading_client):
                         print("    [SKIP] Condor Budget Exceeded.")
                         break 
                     
-                    # Define Wings (Protection) and Body (Risk)
-                    # We MUST fill wings first.
                     wings = [
                         (put_long, "PUT", OrderSide.BUY, "Long Put Wing"),
                         (call_long, "CALL", OrderSide.BUY, "Long Call Wing")
@@ -237,23 +178,20 @@ def run_condor_bot():
                         (call_short, "CALL", OrderSide.SELL, "Short Call Body")
                     ]
                     
-                    # STEP 1: BUY WINGS (And Wait for Fill)
+                    # STEP 1: BUY WINGS
                     wings_filled = True
                     for contract, type, side, desc in wings:
-                        # Inside the loop for buying wings
                         raw_price = get_option_price(contract.symbol, "ask") * 1.05
-                        limit_price = round(raw_price, 2) # <--- ROUND TO 2 DECIMALS
+                        limit_price = round(raw_price, 2)
                         print(f"       Buying {desc} (${limit_price:.2f})...")
                         
                         try:
-                            # Submit Order
                             req = LimitOrderRequest(
                                 symbol=contract.symbol, qty=1, side=side,
                                 time_in_force=TimeInForce.DAY, limit_price=limit_price
                             )
                             order = trading_client.submit_order(order_data=req)
                             
-                            # POLLING LOOP: Wait up to 10 seconds for fill
                             filled = False
                             for _ in range(10):
                                 time.sleep(1)
@@ -265,7 +203,6 @@ def run_condor_bot():
                             
                             if not filled:
                                 print(f"       ❌ {desc} Failed to fill in time. Aborting Condor.")
-                                # Critical: Cancel the order so we don't get filled later unexpectedly
                                 trading_client.cancel_order_by_id(order.id)
                                 wings_filled = False
                                 break
@@ -275,13 +212,12 @@ def run_condor_bot():
                             wings_filled = False
                             break
                     
-                    # STEP 2: SELL BODY (Only if Wings are locked in)
+                    # STEP 2: SELL BODY
                     if wings_filled:
                         print("       Wings Secured. Selling Body...")
                         for contract, type, side, desc in body:
-                            # Inside the loop for selling body
                             raw_price = get_option_price(contract.symbol, "bid") * 0.95
-                            limit_price = round(raw_price, 2) # <--- ROUND TO 2 DECIMALS
+                            limit_price = round(raw_price, 2)
                             
                             req = LimitOrderRequest(
                                 symbol=contract.symbol, qty=1, side=side,
@@ -293,19 +229,15 @@ def run_condor_bot():
                             except Exception as e:
                                 print(f"       ❌ Failed to sell {desc}: {e}")
                                 
-                                # <--- ADD THIS BLOCK --->
-                                
                         send_discord(f"🦅 **CONDOR DEPLOYED: {ticker}**\nWings Secured. Body Sold.\nRange: ${put_short.strike_price} - ${call_short.strike_price}")
                         log_to_influx("open_condor", ticker, price, "Strategy Executed")
-                        # <---------------------->
                     
                     else:
                         print("    [ABORT] Wings failed to fill. Cancelling strategy for this ticker.")
                     
-                    # Stop after one attempt per cycle
                     break
 
-            time.sleep(1800) # Check every 30 mins
+            time.sleep(1800)
 
         except Exception as e:
             print(f"Critical Error: {e}")
