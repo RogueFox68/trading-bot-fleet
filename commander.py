@@ -6,7 +6,10 @@ import time
 import os
 import requests
 import socket
+import asyncio
+import datetime
 import config  # Ensure your config.py has your keys
+from alpaca.trading.client import TradingClient
 
 # --- CONFIGURATION ---
 BOT_CONFIG_FILE = "bot_config.json"
@@ -18,10 +21,20 @@ HOSTNAME = socket.gethostname()
 TOKEN = config.DISCORD_TOKEN
 CHANNEL_ID = config.DISCORD_CHANNEL_ID 
 
+# --- GLOBALS ---
+LAST_STALE_ALERT = 0
+STALE_ALERT_COOLDOWN = 3600  # 1 Hour
+
 # Enable Message Content Intent (Required for commands)
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
+
+# --- ALPACA CLIENT (For Status) ---
+try:
+    trading_client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=config.PAPER)
+except:
+    trading_client = None
 
 # --- ORIGINAL SUPERVISOR LOGIC ---
 
@@ -58,7 +71,7 @@ def load_bot_config():
     except:
         return None
 
-def manage_fleet(pm2_list, bot_config):
+async def manage_fleet(pm2_list, bot_config):
     """Auto-Restarts bots based on config."""
     if not bot_config: return
 
@@ -76,6 +89,17 @@ def manage_fleet(pm2_list, bot_config):
                 subprocess.run(['pm2', 'start', script, '--name', bot_name])
                 print(f"  [+] Launching {bot_name}...")
             elif actual_status in ['stopped', 'errored']:
+                # [NEW] Alert BEFORE restart
+                try:
+                    channel = bot.get_channel(int(CHANNEL_ID))
+                    if channel:
+                        await channel.send(
+                            f"⚠️ **{bot_name.upper()} CRASHED**\n"
+                            f"Status: {actual_status}\n"
+                            f"Auto-restarting..."
+                        )
+                except: pass
+                
                 subprocess.run(['pm2', 'restart', bot_name])
                 print(f"  [!] Reviving {bot_name}...")
 
@@ -89,6 +113,7 @@ def manage_fleet(pm2_list, bot_config):
 @tasks.loop(seconds=CHECK_INTERVAL)
 async def watchdog_task():
     """Runs every 60s: Logs to Influx & Enforces Config."""
+    global LAST_STALE_ALERT
     try:
         # 1. Get PM2 Status
         result = subprocess.run(['pm2', 'jlist'], stdout=subprocess.PIPE, text=True)
@@ -106,33 +131,38 @@ async def watchdog_task():
                 # Panic logic handled by config, but we can enforce it here too if needed
                 pass
             else:
-                manage_fleet(pm2_list, config_data)
+                await manage_fleet(pm2_list, config_data) # UPDATED: await async function
                 
     except Exception as e:
         print(f"[!] Watchdog Error: {e}")
 
-    # [NEW] Stale Target Check
+    # [NEW] Stale Target Check with Cooldown
     try:
         target_file = "active_targets.json"
-        # We need to know where this file lives essentially. 
-        # Commander is in fleet/ which should have it.
+        
         if os.path.exists(target_file):
             file_age = time.time() - os.path.getmtime(target_file)
             if file_age > 86400: # 24 Hours
-                try:
-                    channel = await bot.fetch_channel(int(CHANNEL_ID))
-                    await channel.send(
-                        f"⚠️ **STALE TARGETS DETECTED**\n"
-                        f"File age: {file_age/3600:.1f} hours\n"
-                        f"Bots are using fallback watchlists."
-                    )
-                except: pass
+                # Check Cooldown
+                if (time.time() - LAST_STALE_ALERT) > STALE_ALERT_COOLDOWN:
+                    try:
+                        channel = await bot.fetch_channel(int(CHANNEL_ID))
+                        await channel.send(
+                            f"⚠️ **STALE TARGETS DETECTED**\n"
+                            f"File age: {file_age/3600:.1f} hours\n"
+                            f"Bots are using fallback watchlists."
+                        )
+                        LAST_STALE_ALERT = time.time()
+                    except: pass
         else:
              # If missing entirely
-             try:
-                channel = await bot.fetch_channel(int(CHANNEL_ID))
-                await channel.send("🚨 **TARGETS FILE MISSING**\nCheck 5080 scanner!")
-             except: pass
+             # We might want cooldown here too, but missing file is more critical
+             if (time.time() - LAST_STALE_ALERT) > STALE_ALERT_COOLDOWN:
+                 try:
+                    channel = await bot.fetch_channel(int(CHANNEL_ID))
+                    await channel.send("🚨 **TARGETS FILE MISSING**\nCheck 5080 scanner!")
+                    LAST_STALE_ALERT = time.time()
+                 except: pass
 
     except Exception as e:
         print(f"[!] Stale Check Error: {e}")
@@ -163,15 +193,54 @@ async def on_ready():
 @bot.command()
 async def status(ctx):
     """/status - detailed fleet report"""
+    # 1. Get PM2 Status
     result = subprocess.run(['pm2', 'jlist'], stdout=subprocess.PIPE, text=True)
     process_list = json.loads(result.stdout)
     
-    msg = "🤖 **FLEET STATUS**\n"
+    # 2. Get Account Equity
+    equity_str = "N/A"
+    if trading_client:
+        try:
+            acct = trading_client.get_account()
+            equity_val = float(acct.portfolio_value)
+            equity_str = f"${equity_val:,.2f}"
+        except: pass
+
+    # 3. Get Target File Age
+    target_age_str = "Missing ❌"
+    if os.path.exists("active_targets.json"):
+        age_hours = (time.time() - os.path.getmtime("active_targets.json")) / 3600
+        target_age_str = f"{age_hours:.1f}h"
+        if age_hours > 24: target_age_str += " ⚠️"
+        else: target_age_str += " ✅"
+
+    msg = f"🤖 **FLEET STATUS**\n"
+    msg += f"💰 **Equity**: {equity_str}\n"
+    msg += f"📁 **Targets**: {target_age_str}\n"
+    msg += "--------------------------------\n"
+
     for proc in process_list:
         name = proc['name']
-        status = proc['pm2_env']['status']
+        env = proc['pm2_env']
+        status = env['status']
         icon = "🟢" if status == "online" else "🔴"
-        msg += f"{icon} **{name}**: {status}\n"
+        
+        # Uptime
+        uptime_str = "0s"
+        if status == 'online':
+            uptime_ms = int((time.time() * 1000) - env.get('pm_uptime', time.time()*1000))
+            uptime_min = uptime_ms / 60000
+            if uptime_min > 60:
+                uptime_str = f"{uptime_min/60:.1f}h"
+            else:
+                 uptime_str = f"{uptime_min:.0f}m"
+
+        restarts = env.get('restart_time', 0)
+        
+        msg += f"{icon} **{name}**\n"
+        msg += f"   Status: {status}\n"
+        msg += f"   Uptime: {uptime_str} | Restarts: {restarts}\n"
+
     await ctx.send(msg)
 
 @bot.command()
