@@ -9,6 +9,10 @@ import time  # <--- FIXED: Added missing import
 import requests
 import pandas as pd
 import config
+from logger import get_logger
+
+# --- LOGGING ---
+logger = get_logger("moon_bot")
 
 # --- CONFIGURATION ---
 SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD"] 
@@ -28,7 +32,7 @@ def send_discord(msg):
         webhook = getattr(config, 'WEBHOOK_MOONBAG')
         requests.post(webhook, json=payload)
     except Exception as e:
-        print(f"[!] Discord Error: {e}")
+        logger.error(f"[!] Discord Error: {e}")
 
 def log_to_influx(symbol, action, price, qty):
     try:
@@ -38,32 +42,36 @@ def log_to_influx(symbol, action, price, qty):
     except: pass
 
 def get_donchian_levels(symbol):
-    # 1. Fetch History for Levels
-    start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=60)
-    req = CryptoBarsRequest(
-        symbol_or_symbols=[symbol],
-        timeframe=TimeFrame.Day,
-        start=start_time,
-        limit=30
-    )
-    bars = data_client.get_crypto_bars(req)
-    df = bars.df.loc[symbol]
-    
-    # Exclude current incomplete bar for levels
-    completed_candles = df.iloc[:-1] 
-    
-    entry_high = completed_candles['high'].tail(LOOKBACK_ENTRY).max()
-    exit_low = completed_candles['low'].tail(LOOKBACK_EXIT).min()
-    
-    # 2. Fetch REAL-TIME Price for Execution (The Fix)
-    trade_req = CryptoLatestTradeRequest(symbol_or_symbols=symbol)
-    trade = data_client.get_crypto_latest_trade(trade_req)
-    current_price = float(trade[symbol].price)
-    
-    return entry_high, exit_low, current_price
+    try:
+        # 1. Fetch History for Levels
+        start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=60)
+        req = CryptoBarsRequest(
+            symbol_or_symbols=[symbol],
+            timeframe=TimeFrame.Day,
+            start=start_time,
+            limit=30
+        )
+        bars = data_client.get_crypto_bars(req)
+        df = bars.df.loc[symbol]
+        
+        # Exclude current incomplete bar for levels
+        completed_candles = df.iloc[:-1] 
+        
+        entry_high = completed_candles['high'].tail(LOOKBACK_ENTRY).max()
+        exit_low = completed_candles['low'].tail(LOOKBACK_EXIT).min()
+        
+        # 2. Fetch REAL-TIME Price for Execution (The Fix)
+        trade_req = CryptoLatestTradeRequest(symbol_or_symbols=symbol)
+        trade = data_client.get_crypto_latest_trade(trade_req)
+        current_price = float(trade[symbol].price)
+        
+        return entry_high, exit_low, current_price
+    except Exception as e:
+        logger.error(f"Data Error {symbol}: {e}")
+        return None, None, None
 
 def run_breakout_bot():
-    print("--- 🚀 MOON BAG BREAKOUT BOT STARTED ---")
+    logger.info("--- 🚀 MOON BAG BREAKOUT BOT STARTED ---")
     send_discord("🚀 **Moon Bag Bot Online**\nStrategy: Donchian Breakout (20/10)")
     
     while True:
@@ -76,26 +84,28 @@ def run_breakout_bot():
             positions = trading_client.get_all_positions()
             pos_dict = {p.symbol: float(p.qty) for p in positions}
 
-            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning Markets...")
+            logger.info(f"Scanning Markets... Equity: ${equity:,.2f}")
 
             for symbol in SYMBOLS:
                 try:
                     entry_high, exit_low, current_price = get_donchian_levels(symbol)
+                    if current_price is None: continue
+
                     qty_held = pos_dict.get(symbol, 0)
                     
-                    print(f"  {symbol:<8} | Price: ${current_price:,.2f} | Breakout: ${entry_high:,.2f} | Stop: ${exit_low:,.2f}")
+                    logger.info(f"  {symbol:<8} | Price: ${current_price:,.2f} | Breakout: ${entry_high:,.2f} | Stop: ${exit_low:,.2f}")
 
                     # --- ENTRY LOGIC ---
                     if qty_held == 0:
                         if current_price > entry_high:
-                            print(f"    [SIGNAL] BREAKOUT! Price ${current_price} > ${entry_high}")
+                            logger.info(f"    [SIGNAL] BREAKOUT! Price ${current_price} > ${entry_high}")
                             
                             # Calculate Size
                             target_val = equity * RISK_PCT
                             qty_to_buy = target_val / current_price
                             
                             if (qty_to_buy * current_price) > buying_power:
-                                print("    [!] Insufficient Buying Power")
+                                logger.info("    [!] Insufficient Buying Power")
                                 continue
 
                             req = MarketOrderRequest(
@@ -112,7 +122,7 @@ def run_breakout_bot():
                     # --- EXIT LOGIC ---
                     elif qty_held > 0:
                         if current_price < exit_low:
-                            print(f"    [SIGNAL] TRAILING STOP! Price ${current_price} < ${exit_low}")
+                            logger.info(f"    [SIGNAL] TRAILING STOP! Price ${current_price} < ${exit_low}")
                             
                             req = MarketOrderRequest(
                                 symbol=symbol,
@@ -125,16 +135,16 @@ def run_breakout_bot():
                             send_discord(f"🛑 **STOP LOSS: {symbol}**\nPrice: ${current_price}\nTrend broken.")
                             log_to_influx(symbol, "sell_breakout", current_price, qty_held)
                         else:
-                            print(f"    [HOLD] Riding the trend.")
+                            logger.info(f"    [HOLD] Riding the trend.")
 
                 except Exception as e:
-                    print(f"    [!] Error {symbol}: {e}")
+                    logger.error(f"    [!] Error {symbol}: {e}")
 
             # Sleep for 1 hour (Crypto markets move 24/7)
             time.sleep(3600)
 
         except Exception as e:
-            print(f"Global Error: {e}")
+            logger.error(f"Global Error: {e}", exc_info=True)
             time.sleep(60)
 
 if __name__ == "__main__":

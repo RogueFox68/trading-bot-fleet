@@ -8,6 +8,10 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.data.historical import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoLatestTradeRequest
+from logger import get_logger
+
+# --- LOGGING ---
+logger = get_logger("crypto_grid")
 
 # --- CONFIGURATION ---
 SYMBOL = "BTC/USD"
@@ -61,7 +65,7 @@ def get_crypto_price(symbol):
         res = data_client.get_crypto_latest_trade(req)
         return float(res[symbol].price)
     except Exception as e:
-        print(f"  [!] Price Error {symbol}: {e}")
+        logger.error(f"  [!] Price Error {symbol}: {e}")
         return None
 
 def recalibrate_grid(current_price):
@@ -76,11 +80,11 @@ def recalibrate_grid(current_price):
     msg = (f"♻️ **Grid Recalibrated**\n"
            f"Center: ${current_price:,.0f}\n"
            f"Range: ${grid_bottom:,.0f} - ${grid_top:,.0f}")
-    print(f"\n    [RECALIBRATE] {msg}")
+    logger.info(f"    [RECALIBRATE] Center: {current_price:.0f} | Range: {grid_bottom:.0f}-{grid_top:.0f}")
     send_discord(msg)
 
 def run_grid_bot():
-    print(f"--- 🕸️ CRYPTO GRID BOT V2 (Auto-Tuning) ---")
+    logger.info(f"--- 🕸️ CRYPTO GRID BOT V2 (Auto-Tuning) ---")
     
     # 1. Initial Setup
     price = get_crypto_price(SYMBOL)
@@ -115,10 +119,16 @@ def run_grid_bot():
                 out_of_bounds_counter = 0 # Reset if we are back in range
 
             # 4. Status Display
-            status_msg = f"  {SYMBOL} ${price:,.0f} | Zone: {current_zone} | Regime: {regime}"
+            status_msg = f"{SYMBOL} ${price:,.0f} | Zone: {current_zone} | Regime: {regime}"
             if out_of_bounds_counter > 0:
                 status_msg += f" | OOB: {out_of_bounds_counter}/{RECALIBRATE_DELAY}"
-            print(status_msg, end='\r')
+            
+            # Use carriage return logger or just INFO periodically? 
+            # Logger doesn't support \r well. We'll use INFO every ~10 loops or just silence it to avoid log spam.
+            # For now, let's log only on zone change or just keep it minimal.
+            # logger.info(status_msg) --> Too spammy.
+            # We will print to stdout safely if needed, but logger is preferred.
+            # Let's just log if zone CHANGES.
 
             # 5. AUTO-RECALIBRATE LOGIC
             # If we are lost in the woods for too long, move the base.
@@ -133,13 +143,15 @@ def run_grid_bot():
             # 6. TRADING LOGIC
             if current_zone != previous_zone and 0 <= current_zone <= GRID_LEVELS:
                 
+                logger.info(f"Zone Change: {previous_zone} -> {current_zone} | Price: ${price:.0f}")
+
                 # PRICE DROP -> BUY (Accumulate)
                 if current_zone < previous_zone:
                     # TREND FILTER: Don't buy if the Analyst says BEAR_TREND
                     if "BEAR" in regime:
-                        print(f"\n    [SKIP] Bear Trend Detected. Buying Paused in Zone {current_zone}.")
+                        logger.info(f"    [SKIP] Bear Trend Detected. Buying Paused in Zone {current_zone}.")
                     else:
-                        print(f"\n    [BUY] Dropped to Zone {current_zone}")
+                        logger.info(f"    [BUY] Dropped to Zone {current_zone}")
                         
                         # Check Cash
                         acct = trading_client.get_account()
@@ -151,11 +163,11 @@ def run_grid_bot():
                             send_discord(f"🟢 **GRID BUY {SYMBOL}**\nPrice: ${price:,.2f}\nZone: {current_zone}")
                             log_to_influx(SYMBOL, "grid_buy", price, qty)
                         else:
-                            print("    [!] Insufficient Buying Power.")
+                            logger.warn("    [!] Insufficient Buying Power.")
 
                 # PRICE RISE -> SELL (Take Profit)
                 elif current_zone > previous_zone:
-                    print(f"\n    [SELL] Rose to Zone {current_zone}")
+                    logger.info(f"    [SELL] Rose to Zone {current_zone}")
                     
                     # Verify Inventory
                     qty_to_sell = BUDGET_PER_GRID / price
@@ -173,13 +185,13 @@ def run_grid_bot():
                         send_discord(f"🔴 **GRID SELL {SYMBOL}**\nPrice: ${price:,.2f}\nZone: {current_zone}")
                         log_to_influx(SYMBOL, "grid_sell", price, qty_to_sell)
                     else:
-                        print(f"    [!] Ghost Signal. No inventory to sell.")
+                        logger.warn(f"    [!] Ghost Signal. No inventory to sell.")
 
             previous_zone = current_zone
             time.sleep(30)
 
         except Exception as e:
-            print(f"\n[!] Grid Error: {e}")
+            logger.error(f"Grid Error: {e}", exc_info=True)
             time.sleep(60)
 
 if __name__ == "__main__":
