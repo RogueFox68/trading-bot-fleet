@@ -5,7 +5,8 @@ import os
 import datetime
 import requests
 import pandas as pd
-import pandas_ta as ta
+import ta
+from ta.trend import EMAIndicator, ADXIndicator
 import pytz
 import utils
 from alpaca.trading.client import TradingClient
@@ -18,6 +19,10 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 # --- CONFIGURATION ---
 TARGET_FILE = "active_targets.json"
 CONFIG_FILE = "bot_config.json"
+
+# --- LOGGING ---
+from logger import get_logger
+logger = get_logger("trend_bot")
 FAST_EMA = 9
 SLOW_EMA = 21
 RISK_PER_TRADE = 0.02
@@ -77,7 +82,7 @@ def get_data_alpaca(symbol):
     except: return None
 
 def run_trend_bot():
-    print(f"--- 昌 TREND SNIPER (Target Locked) STARTED ---")
+    logger.info(f"--- 昌 TREND SNIPER (Target Locked) STARTED ---")
     send_discord("**Trend Sniper V4.1** Online\nOwnership Logic Active.")
     
     while True:
@@ -86,14 +91,14 @@ def run_trend_bot():
             try:
                 clock = trading_client.get_clock()
                 if not clock.is_open:
-                    print(f"[{datetime.datetime.now().strftime('%H:%M')}] Market Closed.", end='\r')
+                    logger.info(f"Market Closed. Sleeping...")
                     time.sleep(900)
                     continue
             except: pass
 
             # 2. [FIX] CFO Check OUTSIDE loop
             if not utils.check_budget("trend_bot", trading_client):
-                 print(f"[{datetime.datetime.now().strftime('%H:%M')}] Trend Budget Paused.")
+                 logger.info(f"Trend Budget Paused.")
                  time.sleep(300)
                  continue
 
@@ -105,7 +110,7 @@ def run_trend_bot():
             positions = trading_client.get_all_positions()
             pos_dict = {p.symbol: p for p in positions}
 
-            print(f"\n[{datetime.datetime.now(TIMEZONE).strftime('%H:%M')}] Regime: {global_regime} | Targets: {len(targets)}")
+            logger.info(f"Regime: {global_regime} | Targets: {len(targets)}")
 
             # 3. Only scan OUR targets + OUR existing positions
             # We filter existing positions to only those relevant to Trend Bot strategies
@@ -115,18 +120,20 @@ def run_trend_bot():
             for symbol in scan_list:
                 if symbol in ["BTC/USD", "ETH/USD"]: continue 
                 if "/" in symbol: continue 
-
+                
+                # Retrieve Data
                 df = get_data_alpaca(symbol)
                 if df is None: continue
 
-                # Indicators
-                df['ema_fast'] = ta.ema(df['close'], length=FAST_EMA)
-                df['ema_slow'] = ta.ema(df['close'], length=SLOW_EMA)
-                adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
+                # --- INDICATORS (Switched to 'ta' lib) ---
+                # EMA
+                df['ema_fast'] = EMAIndicator(close=df['close'], window=FAST_EMA).ema_indicator()
+                df['ema_slow'] = EMAIndicator(close=df['close'], window=SLOW_EMA).ema_indicator()
                 
-                # ADX Column Fix
-                adx_col = [c for c in adx_df.columns if c.startswith('ADX')][0]
-                df['adx'] = adx_df[adx_col]
+                # ADX
+                # adx_indicator.adx() returns the ADX line
+                adx_indicator = ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=14)
+                df['adx'] = adx_indicator.adx()
 
                 latest = df.iloc[-1]
                 prev = df.iloc[-2]
@@ -147,7 +154,7 @@ def run_trend_bot():
                     
                     # Exit Longs on Bear Cross
                     if bull_cross == False and bear_cross == True:
-                        print(f"    悼 CLOSE LONG {symbol}")
+                        logger.info(f"    悼 CLOSE LONG {symbol}")
                         trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC))
                         send_discord(f"悼 **SELL {symbol}** (Cross)\nPrice: ${price:.2f}")
                         log_to_influx(symbol, "sell", price, qty)
@@ -167,18 +174,18 @@ def run_trend_bot():
                             qty = int(risk_amt / (price * 0.02))
                             
                             if qty > 0:
-                                print(f"    噫 BUY SIGNAL {symbol}")
+                                logger.info(f"    噫 BUY SIGNAL {symbol}")
                                 try:
                                     trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
                                     send_discord(f"噫 **BUY {symbol}**\nRegime: {global_regime}\nADX: {local_adx:.0f}")
                                     log_to_influx(symbol, "buy", price, qty)
                                 except Exception as e:
-                                    print(f"    [!] Order Error: {e}")
+                                    logger.error(f"    [!] Order Error: {e}")
 
             time.sleep(60)
 
         except Exception as e:
-            print(f"Trend Bot Error: {e}")
+            logger.error(f"Trend Bot Error: {e}", exc_info=True)
             time.sleep(60)
 
 if __name__ == "__main__":

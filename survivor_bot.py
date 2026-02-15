@@ -1,12 +1,17 @@
 import utils
 import config
+import utils
+import config
+from logger import get_logger
 import time
 import json
 import os
 import datetime
 import requests
 import pandas as pd
-import pandas_ta as ta
+import ta
+from ta.momentum import RSIIndicator
+from ta.trend import SMAIndicator
 import pytz
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass
@@ -23,6 +28,9 @@ TARGET_FILE = "active_targets.json"
 RSI_BUY = 30        
 RSI_SELL = 70       
 RISK_PER_TRADE = 0.05 
+
+# --- LOGGING ---
+logger = get_logger("survivor_bot")
 
 # --- CREDENTIALS ---
 trading_client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=config.PAPER)
@@ -86,7 +94,7 @@ def get_data_alpaca(symbol):
     except: return None
 
 def run_survivor_bot():
-    print(f"--- 🛡️ SURVIVOR BOT (Segregated) STARTED ---")
+    logger.info(f"--- 🛡️ SURVIVOR BOT (Segregated) STARTED ---")
     send_discord("**Survivor Bot V3.1** Online\nSegregation Protocol Active.")
     
     while True:
@@ -95,14 +103,14 @@ def run_survivor_bot():
             try:
                 clock = trading_client.get_clock()
                 if not clock.is_open:
-                    print(f"[{datetime.datetime.now().strftime('%H:%M')}] Market Closed.", end='\r')
+                    logger.info(f"Market Closed. Sleeping 15m...")
                     time.sleep(900) # Sleep 15 mins if closed
                     continue
             except: pass
 
             # 2. [FIX] CFO Check OUTSIDE the loop
             if not utils.check_budget("survivor_bot", trading_client):
-                print(f"[{datetime.datetime.now().strftime('%H:%M')}] Survivor Budget Paused.")
+                logger.info(f"Survivor Budget Paused.")
                 time.sleep(300)
                 continue
 
@@ -119,7 +127,7 @@ def run_survivor_bot():
             positions = trading_client.get_all_positions()
             pos_dict = {p.symbol: p for p in positions}
 
-            print(f"\n[{datetime.datetime.now(TIMEZONE).strftime('%H:%M')}] Scanning {len(clean_watchlist)} Targets (Ignored {len(blacklist)} Fleet Targets)")
+            logger.info(f"Scanning {len(clean_watchlist)} Targets (Ignored {len(blacklist)} Fleet Targets)")
 
             for symbol in clean_watchlist:
                 if symbol in ["BTC/USD", "ETH/USD"]: continue 
@@ -128,8 +136,8 @@ def run_survivor_bot():
                 if df is None: continue
 
                 # Indicators
-                df['rsi'] = ta.rsi(df['close'], length=14)
-                df['sma200'] = ta.sma(df['close'], length=200)
+                df['rsi'] = RSIIndicator(close=df['close'], window=14).rsi()
+                df['sma200'] = SMAIndicator(close=df['close'], window=200).sma_indicator()
                 
                 latest = df.iloc[-1]
                 price = float(latest['close'])
@@ -158,7 +166,7 @@ def run_survivor_bot():
                         reason = "Stop Loss (-3%)"
                         
                     if should_sell:
-                        print(f"    📉 SELLING {symbol}: {reason}")
+                        logger.info(f"    📉 SELLING {symbol}: {reason}")
                         trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC))
                         send_discord(f"💰 **SOLD {symbol}**\nReason: {reason}\nP&L: {pct_gain*100:.2f}%")
                         log_to_influx(symbol, "sell", price, qty)
@@ -170,24 +178,24 @@ def run_survivor_bot():
                         
                         # Only buy if uptrend OR it's a Core ETF (which we revert aggressively)
                         if is_uptrend or symbol in CORE_WATCHLIST:
-                            print(f"    💎 DIP DETECTED: {symbol} (RSI {rsi:.0f})")
+                            logger.info(f"    💎 DIP DETECTED: {symbol} (RSI {rsi:.0f})")
                             
                             risk_amt = equity * RISK_PER_TRADE
                             qty = int(risk_amt / price)
                             
                             if qty > 0:
-                                print(f"       -> Buying {qty} shares...")
+                                logger.info(f"       -> Buying {qty} shares...")
                                 try:
                                     trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
                                     send_discord(f"💎 **BOUGHT DIP {symbol}**\nRSI: {rsi:.0f}")
                                     log_to_influx(symbol, "buy", price, qty)
                                 except Exception as e:
-                                    print(f"       [!] Order Error: {e}")
+                                    logger.error(f"       [!] Order Error: {e}")
 
             time.sleep(60)
 
         except Exception as e:
-            print(f"Survivor Error: {e}")
+            logger.error(f"Survivor Error: {e}", exc_info=True)
             time.sleep(60)
 
 if __name__ == "__main__":

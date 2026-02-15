@@ -11,7 +11,12 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest, GetOptionContractsRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, ContractType, QueryOrderStatus
 import config
+import config
 import utils
+from logger import get_logger
+
+# --- LOGGING ---
+logger = get_logger("wheel_bot")
 
 # --- CONFIGURATION ---
 TARGET_FILE = "active_targets.json"
@@ -56,7 +61,9 @@ def get_current_price(symbol):
         res = data_client.get_stock_latest_trade(req)
         return float(res[symbol].price)
     except Exception as e:
-        print(f"  [!] Error price {symbol}: {e}")
+        return float(res[symbol].price)
+    except Exception as e:
+        logger.error(f"  [!] Error price {symbol}: {e}")
         return 0.0
 
 def get_option_data(symbol):
@@ -65,7 +72,9 @@ def get_option_data(symbol):
         res = option_data_client.get_option_latest_quote(req)
         return res[symbol]
     except Exception as e:
-        print(f"  [!] Error fetching option quote for {symbol}: {e}")
+        return res[symbol]
+    except Exception as e:
+        logger.error(f"  [!] Error fetching option quote for {symbol}: {e}")
         return None
 
 def calculate_smart_price(quote, side):
@@ -79,7 +88,7 @@ def calculate_smart_price(quote, side):
     midpoint = (bid + ask) / 2
     
     if spread_pct > MAX_SPREAD_PCT:
-        print(f"    [SKIP] Spread too wide ({spread_pct*100:.1f}%). Bid: {bid} Ask: {ask}")
+        logger.debug(f"    [SKIP] Spread too wide ({spread_pct*100:.1f}%). Bid: {bid} Ask: {ask}")
         return None
         
     return round(midpoint, 2)
@@ -102,7 +111,7 @@ def find_best_contract(symbol, side, current_price):
         contracts = trading_client.get_option_contracts(req)
         available = contracts.option_contracts
     except Exception as e:
-        print(f"  [!] API Error fetching contracts: {e}")
+        logger.error(f"  [!] API Error fetching contracts: {e}")
         return None
     
     if not available: return None
@@ -148,7 +157,7 @@ def get_open_order_tickers():
     return busy_tickers
 
 def run_wheel_bot():
-    print(f"--- 🚜 FLEET WHEEL BOT (Smart Pricing + Order Awareness) STARTED ---")
+    logger.info("--- 🚜 FLEET WHEEL BOT (Smart Pricing + Order Awareness) STARTED ---")
     send_discord(f"🚜 **Wheel Bot Online**\nSyncing with Sector Scout...")
     
     while True:
@@ -156,7 +165,7 @@ def run_wheel_bot():
             try:
                 clock = trading_client.get_clock()
                 if not clock.is_open:
-                    print(f"[{datetime.datetime.now().strftime('%H:%M')}] Market Closed. Sleeping 15m...", end='\r')
+                    logger.info(f"Market Closed. Sleeping 15m...")
                     time.sleep(900)
                     continue
             except: pass
@@ -166,14 +175,14 @@ def run_wheel_bot():
             # [FIX] Get list of tickers that already have pending orders
             busy_tickers = get_open_order_tickers()
             
-            print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] Scanning {len(targets)} Targets (Busy: {len(busy_tickers)})")
+            logger.info(f"Scanning {len(targets)} Targets (Busy: {len(busy_tickers)})")
 
             all_positions = trading_client.get_all_positions()
 
             for ticker in targets:
                 # [FIX] Skip if we already have an open order for this ticker
                 if ticker in busy_tickers:
-                    print(f"  {ticker:<4} | [SKIP] Open Order Exists.")
+                    logger.info(f"  {ticker:<4} | [SKIP] Open Order Exists.")
                     continue
 
                 stock_qty = 0
@@ -196,16 +205,16 @@ def run_wheel_bot():
                     
                     if entry_price > 0:
                         capture_pct = (entry_price - current_opt_price) / entry_price
-                        print(f"  {ticker:<4} | Option: {active_option.symbol} | Profit: {capture_pct*100:.1f}%")
+                        logger.info(f"  {ticker:<4} | Option: {active_option.symbol} | Profit: {capture_pct*100:.1f}%")
                         
                         if capture_pct >= TAKE_PROFIT_PCT:
-                            print(f"    💵 [HARVEST] Profit Target Hit! Closing {active_option.symbol}")
+                            logger.info(f"    💵 [HARVEST] Profit Target Hit! Closing {active_option.symbol}")
                             
                             quote = get_option_data(active_option.symbol)
                             close_price = calculate_smart_price(quote, "BUY")
                             
                             if close_price is None:
-                                print(f"    [WAIT] Spread too wide to close safely.")
+                                logger.warning(f"    [WAIT] Spread too wide to close safely.")
                                 continue
 
                             req = LimitOrderRequest(
@@ -222,7 +231,7 @@ def run_wheel_bot():
                     continue
 
                 # 3. OPEN NEW POSITIONS
-                print(f"  {ticker:<4} | ${current_stock_price:>7.2f} | No Active Option. Hunting...")
+                logger.info(f"  {ticker:<4} | ${current_stock_price:>7.2f} | No Active Option. Hunting...")
 
                 contract = None
                 side = None
@@ -241,7 +250,7 @@ def run_wheel_bot():
                         continue
 
                     if real_bp < (current_stock_price * 100):
-                        print(f"    [SKIP] Insufficient BP (Need ${current_stock_price*100:.0f})")
+                        logger.warning(f"    [SKIP] Insufficient BP (Need ${current_stock_price*100:.0f})")
                         continue
 
                     side = "PUT"
@@ -255,14 +264,14 @@ def run_wheel_bot():
                     if limit_price is None: continue 
 
                     if limit_price < MIN_PREMIUM:
-                        print(f"    [SKIP] Premium too low (${limit_price})")
+                        logger.info(f"    [SKIP] Premium too low (${limit_price})")
                         continue
                     
                     if side == "PUT" and real_bp < (float(contract.strike_price) * 100):
-                        print(f"    [SKIP] Strike too expensive.")
+                        logger.warning(f"    [SKIP] Strike too expensive.")
                         continue
 
-                    print(f"    [ENTRY] Selling {side} on {ticker} @ ${limit_price} (Midpoint)")
+                    logger.info(f"    [ENTRY] Selling {side} on {ticker} @ ${limit_price} (Midpoint)")
                     req = LimitOrderRequest(
                         symbol=contract.symbol,
                         qty=1,
@@ -278,7 +287,7 @@ def run_wheel_bot():
             time.sleep(900)
 
         except Exception as e:
-            print(f"\n[!] CRITICAL ERROR: {e}")
+            logger.error(f"CRITICAL ERROR: {e}", exc_info=True)
             time.sleep(60)
 
 if __name__ == "__main__":

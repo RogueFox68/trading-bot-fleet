@@ -1,6 +1,7 @@
 alpaca-py
 pandas
-pandas_ta
+pandas-ta-classic
+ta
 yfinance
 requests
 pytz
