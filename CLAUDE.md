@@ -1,5 +1,8 @@
 # CLAUDE.md - Trading Bot Fleet
 
+> **System Context:** See `../SYSTEM_ARCHITECTURE.md` for how this repo fits 
+> into the larger two-machine trading system.
+
 ## Project Overview
 
 Autonomous multi-strategy trading bot fleet for US equities, options, and cryptocurrency via Alpaca Markets. The fleet consists of 6 trading strategies and 3 infrastructure services, orchestrated through PM2 and controlled via Discord.
