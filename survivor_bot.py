@@ -1,7 +1,5 @@
 import utils
 import config
-import utils
-import config
 from logger import get_logger
 import time
 import json

@@ -11,7 +11,6 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest, GetOptionContractsRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, ContractType, QueryOrderStatus
 import config
-import config
 import utils
 from logger import get_logger
 
@@ -61,8 +60,6 @@ def get_current_price(symbol):
         res = data_client.get_stock_latest_trade(req)
         return float(res[symbol].price)
     except Exception as e:
-        return float(res[symbol].price)
-    except Exception as e:
         logger.error(f"  [!] Error price {symbol}: {e}")
         return 0.0
 
@@ -70,8 +67,6 @@ def get_option_data(symbol):
     try:
         req = OptionLatestQuoteRequest(symbol_or_symbols=symbol)
         res = option_data_client.get_option_latest_quote(req)
-        return res[symbol]
-    except Exception as e:
         return res[symbol]
     except Exception as e:
         logger.error(f"  [!] Error fetching option quote for {symbol}: {e}")
