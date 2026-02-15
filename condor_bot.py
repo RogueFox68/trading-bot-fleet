@@ -44,12 +44,7 @@ def log_to_influx(action, symbol, price, detail):
     except: pass
 
 def get_condor_targets():
-    if not os.path.exists(TARGET_FILE): return STATIC_TARGETS
-    try:
-        with open(TARGET_FILE, 'r') as f:
-            data = json.load(f)
-            return data.get("condor_targets", []) or STATIC_TARGETS
-    except: return STATIC_TARGETS
+    return utils.get_targets_with_freshness_check(TARGET_FILE, "condor_targets", STATIC_TARGETS)
 
 def get_current_price(symbol):
     try:

@@ -49,18 +49,23 @@ def get_segregated_targets():
     survivor_targets = []
     blacklist = []
     
-    if os.path.exists(TARGET_FILE):
-        try:
-            with open(TARGET_FILE, 'r') as f:
-                data = json.load(f)
-                # We can add a specific 'survivor_targets' key to the Scout later
-                survivor_targets = data.get("survivor_targets", [])
-                
-                # IMPORTANT: Build the Blacklist
-                blacklist += data.get("trend_targets", [])
-                blacklist += data.get("wheel_targets", [])
-                blacklist += data.get("condor_targets", [])
-        except: pass
+    # 1. Survivor Targets (Fallback: Empty)
+    survivor_targets = utils.get_targets_with_freshness_check(TARGET_FILE, "survivor_targets", [])
+
+    # 2. Blacklist (Trend + Wheel + Condor)
+    blacklist = []
+    
+    # Trend Fallback
+    trend_fallback = ["NVDA", "TSLA", "COIN"]
+    blacklist += utils.get_targets_with_freshness_check(TARGET_FILE, "trend_targets", trend_fallback)
+    
+    # Wheel Fallback
+    blacklist += utils.get_targets_with_freshness_check(TARGET_FILE, "wheel_targets", utils.BOT_MAPPING["wheel_bot"])
+    
+    # Condor Fallback
+    blacklist += utils.get_targets_with_freshness_check(TARGET_FILE, "condor_targets", utils.BOT_MAPPING["condor_bot"])
+        
+    return survivor_targets, set(blacklist)
         
     return survivor_targets, set(blacklist)
 

@@ -1,5 +1,6 @@
 import json
 from alpaca.trading.enums import AssetClass
+from logger import logger
 
 # --- CENTRALIZED ASSET MAP ---
 # This defines which bot is allowed to trade which ticker
@@ -66,12 +67,12 @@ def check_budget(bot_name, trading_client):
                 current_used += float(p.market_value)
 
         available = budget_dollars - current_used
-        print(f"  [CFO] {bot_name}: Used ${current_used:.0f} / ${budget_dollars:.0f} (Left: ${available:.0f})")
+        logger.info(f"  [CFO] {bot_name}: Used ${current_used:.0f} / ${budget_dollars:.0f} (Left: ${available:.0f})")
         
         return available > 0
 
     except Exception as e:
-        print(f"  [CFO] Budget Check Error: {e}")
+        logger.error(f"  [CFO] Budget Check Error: {e}")
         return True # Default to allow if file error
     
     # utils.py - Add this function at the bottom
@@ -87,7 +88,7 @@ def get_active_targets(strategy_key):
             # Return the specific list, or empty if not found
             return data.get(strategy_key, [])
     except Exception as e:
-        print(f"  [Utils] Error reading targets for {strategy_key}: {e}")
+        logger.error(f"  [Utils] Error reading targets for {strategy_key}: {e}")
         return []
 
 def get_targets_with_freshness_check(file_path, strategy_key, static_fallback):
@@ -100,13 +101,14 @@ def get_targets_with_freshness_check(file_path, strategy_key, static_fallback):
     
     # 1. Check Existence
     if not os.path.exists(file_path):
-        print(f"  [Warning] Target file {file_path} missing. Using Static Fallback.")
+        logger.warning(f"  [Warning] Target file {file_path} missing. Using Static Fallback.")
         return static_fallback
     
     # 2. Check Freshness (24h = 86400s)
     file_age = time.time() - os.path.getmtime(file_path)
+    file_age = time.time() - os.path.getmtime(file_path)
     if file_age > 86400:
-        print(f"  [Warning] Targets are stale ({file_age/3600:.1f} hours old). Using Static Fallback.")
+        logger.warning(f"  [Warning] Targets are stale ({file_age/3600:.1f} hours old). Using Static Fallback.")
         return static_fallback
         
     # 3. Load Data
@@ -115,9 +117,9 @@ def get_targets_with_freshness_check(file_path, strategy_key, static_fallback):
             data = json.load(f)
             targets = data.get(strategy_key, [])
             if not targets:
-                print(f"  [Warning] Strategy {strategy_key} empty in file. Using Static Fallback.")
+                logger.warning(f"  [Warning] Strategy {strategy_key} empty in file. Using Static Fallback.")
                 return static_fallback
             return targets
     except Exception as e:
-        print(f"  [Error] Failed to read target file: {e}. Using Static Fallback.")
+        logger.error(f"  [Error] Failed to read target file: {e}. Using Static Fallback.")
         return static_fallback

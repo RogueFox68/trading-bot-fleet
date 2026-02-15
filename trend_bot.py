@@ -54,20 +54,11 @@ def get_dynamic_targets(regime):
         return ["SQQQ", "SPXU", "UVXY", "SOXS"]
 
     # 2. BULL/CHOP MODE
-    if not os.path.exists(TARGET_FILE):
-        return ["NVDA", "TSLA", "COIN"] 
+    # Default fallback if file is missing/stale
+    static_fallback = ["NVDA", "TSLA", "COIN"]
     
-    try:
-        with open(TARGET_FILE, 'r') as f:
-            data = json.load(f)
-            # [FIX] Read the specific 'trend_targets' key
-            targets = data.get("trend_targets", [])
-            if not targets:
-                # Fallback to old 'targets' key or defaults
-                targets = data.get("targets", ["NVDA", "AMD", "MSFT"])
-            return targets
-    except:
-        return ["NVDA", "TSLA", "COIN"]
+    return utils.get_targets_with_freshness_check(TARGET_FILE, "trend_targets", static_fallback)
+
 
 def get_data_alpaca(symbol):
     try:
