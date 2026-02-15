@@ -111,6 +111,32 @@ async def watchdog_task():
     except Exception as e:
         print(f"[!] Watchdog Error: {e}")
 
+    # [NEW] Stale Target Check
+    try:
+        target_file = "active_targets.json"
+        # We need to know where this file lives essentially. 
+        # Commander is in fleet/ which should have it.
+        if os.path.exists(target_file):
+            file_age = time.time() - os.path.getmtime(target_file)
+            if file_age > 86400: # 24 Hours
+                try:
+                    channel = await bot.fetch_channel(int(CHANNEL_ID))
+                    await channel.send(
+                        f"⚠️ **STALE TARGETS DETECTED**\n"
+                        f"File age: {file_age/3600:.1f} hours\n"
+                        f"Bots are using fallback watchlists."
+                    )
+                except: pass
+        else:
+             # If missing entirely
+             try:
+                channel = await bot.fetch_channel(int(CHANNEL_ID))
+                await channel.send("🚨 **TARGETS FILE MISSING**\nCheck 5080 scanner!")
+             except: pass
+
+    except Exception as e:
+        print(f"[!] Stale Check Error: {e}")
+
 @watchdog_task.before_loop
 async def before_watchdog():
     await bot.wait_until_ready()

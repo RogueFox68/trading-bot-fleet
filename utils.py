@@ -106,7 +106,7 @@ def get_targets_with_freshness_check(file_path, strategy_key, static_fallback):
     
     # 2. Check Freshness (24h = 86400s)
     file_age = time.time() - os.path.getmtime(file_path)
-    file_age = time.time() - os.path.getmtime(file_path)
+
     if file_age > 86400:
         logger.warning(f"  [Warning] Targets are stale ({file_age/3600:.1f} hours old). Using Static Fallback.")
         return static_fallback

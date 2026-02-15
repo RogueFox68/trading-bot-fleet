@@ -11,6 +11,7 @@ BACKUP_COUNT = 3
 def get_logger(name):
     """
     Returns a configured logger instance.
+    Writes to logs/{name}.log
     """
     logger = logging.getLogger(name)
     
@@ -20,9 +21,15 @@ def get_logger(name):
         
     logger.setLevel(logging.INFO)
 
-    # 1. File Handler (Rotation)
+    # Ensure logs directory exists
+    log_dir = "logs"
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+
+    # 1. File Handler (Rotation) - Per Bot
+    log_file = os.path.join(log_dir, f"{name}.log")
     file_handler = RotatingFileHandler(
-        LOG_FILE, maxBytes=MAX_BYTES, backupCount=BACKUP_COUNT, encoding='utf-8'
+        log_file, maxBytes=MAX_BYTES, backupCount=BACKUP_COUNT, encoding='utf-8'
     )
     file_formatter = logging.Formatter(
         '[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s',

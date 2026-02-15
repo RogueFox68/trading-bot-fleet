@@ -65,7 +65,7 @@ def get_segregated_targets():
     # Condor Fallback
     blacklist += utils.get_targets_with_freshness_check(TARGET_FILE, "condor_targets", utils.BOT_MAPPING["condor_bot"])
         
-    return survivor_targets, set(blacklist)
+
         
     return survivor_targets, set(blacklist)
 
