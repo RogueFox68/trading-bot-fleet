@@ -44,16 +44,11 @@ def log_to_influx(action, price, symbol, detail):
     except: pass
 
 def get_wheel_targets():
-    if not os.path.exists(TARGET_FILE):
-        return STATIC_WATCHLIST
-    try:
-        with open(TARGET_FILE, 'r') as f:
-            data = json.load(f)
-            targets = data.get("wheel_targets", [])
-            if not targets: return STATIC_WATCHLIST
-            return targets
-    except:
-        return STATIC_WATCHLIST
+    return utils.get_targets_with_freshness_check(
+        TARGET_FILE, 
+        "wheel_targets", 
+        STATIC_WATCHLIST
+    )
 
 def get_current_price(symbol):
     try:

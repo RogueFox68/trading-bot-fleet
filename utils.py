@@ -89,3 +89,35 @@ def get_active_targets(strategy_key):
     except Exception as e:
         print(f"  [Utils] Error reading targets for {strategy_key}: {e}")
         return []
+
+def get_targets_with_freshness_check(file_path, strategy_key, static_fallback):
+    """
+    Loads targets with a freshness check (24 hour TTL).
+    Returns static_fallback if file is missing or stale.
+    """
+    import os
+    import time
+    
+    # 1. Check Existence
+    if not os.path.exists(file_path):
+        print(f"  [Warning] Target file {file_path} missing. Using Static Fallback.")
+        return static_fallback
+    
+    # 2. Check Freshness (24h = 86400s)
+    file_age = time.time() - os.path.getmtime(file_path)
+    if file_age > 86400:
+        print(f"  [Warning] Targets are stale ({file_age/3600:.1f} hours old). Using Static Fallback.")
+        return static_fallback
+        
+    # 3. Load Data
+    try:
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+            targets = data.get(strategy_key, [])
+            if not targets:
+                print(f"  [Warning] Strategy {strategy_key} empty in file. Using Static Fallback.")
+                return static_fallback
+            return targets
+    except Exception as e:
+        print(f"  [Error] Failed to read target file: {e}. Using Static Fallback.")
+        return static_fallback

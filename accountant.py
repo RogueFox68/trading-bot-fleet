@@ -5,6 +5,8 @@ import requests
 import pandas as pd
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass
+from logger import logger
+
 
 # --- CONFIGURATION ---
 # We verify these against the specific bot scripts to ensure correct attribution
@@ -64,7 +66,7 @@ def query_influx_trades(days=30):
         return pd.concat(valid_dfs, ignore_index=True, sort=False)
     
     except Exception as e:
-        print(f"[!] History Fetch Error: {e}")
+        logger.error(f"History Fetch Error: {e}")
         return pd.DataFrame()
 
 def calculate_realized_pl(df):
@@ -117,7 +119,7 @@ def log_metric(measurement, tags, fields):
         url = f"http://{INFLUX_HOST}:{INFLUX_PORT}/write?db={INFLUX_DB_NAME}"
         requests.post(url, data=data_str, timeout=5)
     except Exception as e:
-        print(f"[!] Influx Write Error: {e}")
+        logger.error(f"Influx Write Error: {e}")
 
 def get_bot_owner(symbol, asset_class):
     """
@@ -157,7 +159,7 @@ def get_bot_owner(symbol, asset_class):
     return "trend_bot"
 
 def run_accountant():
-    print("--- 🧾 SMART ACCOUNTANT (Condor Aware) STARTED ---")
+    logger.info("--- 🧾 SMART ACCOUNTANT (Condor Aware) STARTED ---")
 
     while True:
         try:
@@ -213,7 +215,7 @@ def run_accountant():
             time.sleep(300) # 5 minutes
 
         except Exception as e:
-            print(f"[!] Accountant Error: {e}")
+            logger.error(f"Accountant Error: {e}", exc_info=True)
             time.sleep(60)
 
 if __name__ == "__main__":
