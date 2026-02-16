@@ -103,19 +103,33 @@ def run_trend_bot():
                  continue
 
             global_regime = get_market_regime()
-            targets = get_dynamic_targets(global_regime)
+            raw_targets = get_dynamic_targets(global_regime)
+            
+            # --- PARSE TARGETS (Phase 2) ---
+            target_map = {} # symbol -> confidence
+            clean_targets = []
+            for item in raw_targets:
+                sym, conf = utils.parse_target(item)
+                if sym:
+                    clean_targets.append(sym)
+                    target_map[sym] = conf
             
             account = trading_client.get_account()
             equity = float(account.portfolio_value)
             positions = trading_client.get_all_positions()
             pos_dict = {p.symbol: p for p in positions}
 
-            logger.info(f"Regime: {global_regime} | Targets: {len(targets)}")
+            logger.info(f"Regime: {global_regime} | Targets: {len(clean_targets)}")
 
             # 3. Only scan OUR targets + OUR existing positions
             # We filter existing positions to only those relevant to Trend Bot strategies
-            my_holdings = [p.symbol for p in positions if p.asset_class == AssetClass.US_EQUITY and p.symbol in targets]
-            scan_list = list(set(targets + my_holdings))
+            
+            # NOTE: If we hold it, we manage it. Even if it dropped from targets list, 
+            # we should probably still scan it to see if we need to close?
+            # Existing logic only included holdings if they WERE in targets. 
+            # I will preserve existing logic for safety, but use clean_targets.
+            my_holdings = [p.symbol for p in positions if p.asset_class == AssetClass.US_EQUITY and p.symbol in clean_targets]
+            scan_list = list(set(clean_targets + my_holdings))
 
             for symbol in scan_list:
                 if symbol in ["BTC/USD", "ETH/USD"]: continue 
@@ -160,7 +174,7 @@ def run_trend_bot():
                         log_to_influx(symbol, "sell", price, qty)
 
                 # B) ENTRY LOGIC (Open new trades)
-                elif symbol in targets:
+                elif symbol in clean_targets:
                     # We only trade if ADX > 20 (Trend is strong)
                     if local_adx > 20:
                         should_buy = False
@@ -169,15 +183,24 @@ def run_trend_bot():
                             should_buy = True
 
                         if should_buy:
-                            risk_amt = equity * RISK_PER_TRADE
+                            # --- DYNAMIC SIZING (Phase 2) ---
+                            confidence = target_map.get(symbol, 0.5)
+                            # Risk Scaling: 
+                            # Conf 0.5 -> 1.0x Risk
+                            # Conf 1.0 -> 1.5x Risk
+                            # Conf 0.1 -> 0.6x Risk
+                            scaler = 0.5 + confidence
+                            scaled_risk = RISK_PER_TRADE * scaler
+                            
+                            risk_amt = equity * scaled_risk
                             # Stop loss approx 2% away
                             qty = int(risk_amt / (price * 0.02))
                             
                             if qty > 0:
-                                logger.info(f"    噫 BUY SIGNAL {symbol}")
+                                logger.info(f"    噫 BUY SIGNAL {symbol} (Conf: {confidence:.2f}, Size: {scaler:.1f}x)")
                                 try:
                                     trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                                    send_discord(f"噫 **BUY {symbol}**\nRegime: {global_regime}\nADX: {local_adx:.0f}")
+                                    send_discord(f"噫 **BUY {symbol}**\nRegime: {global_regime}\nADX: {local_adx:.0f}\nConfidence: {confidence:.2f}")
                                     log_to_influx(symbol, "buy", price, qty)
                                 except Exception as e:
                                     logger.error(f"    [!] Order Error: {e}")

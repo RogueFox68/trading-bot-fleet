@@ -113,11 +113,21 @@ def run_survivor_bot():
                 continue
 
             # 3. Build Watchlist & Blacklist
-            scout_targets, blacklist = get_segregated_targets()
+            raw_scout_targets, blacklist = get_segregated_targets()
+            
+            # --- PARSE & FILTER (Phase 2) ---
+            target_map = {} # symbol -> confidence
+            clean_scout_targets = []
+            
+            for item in raw_scout_targets:
+                sym, conf = utils.parse_target(item)
+                if sym and sym not in blacklist:
+                    clean_scout_targets.append(sym)
+                    target_map[sym] = conf
             
             # Combine Core + Scout
-            # FILTER: Remove anything that belongs to Trend/Wheel bots
-            raw_list = list(set(CORE_WATCHLIST + scout_targets))
+            # Core Watchlist items get default 0.5 confidence if not in Scout map
+            raw_list = list(set(CORE_WATCHLIST + clean_scout_targets))
             clean_watchlist = [t for t in raw_list if t not in blacklist]
             
             account = trading_client.get_account()
@@ -176,16 +186,21 @@ def run_survivor_bot():
                         
                         # Only buy if uptrend OR it's a Core ETF (which we revert aggressively)
                         if is_uptrend or symbol in CORE_WATCHLIST:
-                            logger.info(f"    💎 DIP DETECTED: {symbol} (RSI {rsi:.0f})")
+                            # --- DYNAMIC SIZING (Phase 2) ---
+                            confidence = target_map.get(symbol, 0.5)
+                            scaler = 0.5 + confidence
+                            scaled_risk = RISK_PER_TRADE * scaler
                             
-                            risk_amt = equity * RISK_PER_TRADE
+                            logger.info(f"    💎 DIP DETECTED: {symbol} (RSI {rsi:.0f}, Conf {confidence:.2f})")
+                            
+                            risk_amt = equity * scaled_risk
                             qty = int(risk_amt / price)
                             
                             if qty > 0:
-                                logger.info(f"       -> Buying {qty} shares...")
+                                logger.info(f"       -> Buying {qty} shares (Size: {scaler:.1f}x)...")
                                 try:
                                     trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                                    send_discord(f"💎 **BOUGHT DIP {symbol}**\nRSI: {rsi:.0f}")
+                                    send_discord(f"💎 **BOUGHT DIP {symbol}**\nRSI: {rsi:.0f}\nConfidence: {confidence:.2f}")
                                     log_to_influx(symbol, "buy", price, qty)
                                 except Exception as e:
                                     logger.error(f"       [!] Order Error: {e}")

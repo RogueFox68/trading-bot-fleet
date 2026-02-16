@@ -88,7 +88,7 @@ def calculate_smart_price(quote, side):
         
     return round(midpoint, 2)
 
-def find_best_contract(symbol, side, current_price):
+def find_best_contract(symbol, side, current_price, target_otm=TARGET_OTM_PCT):
     today = datetime.date.today()
     start_date = today + datetime.timedelta(days=MIN_DTE)
     end_date = today + datetime.timedelta(days=MAX_DTE)
@@ -120,7 +120,7 @@ def find_best_contract(symbol, side, current_price):
         if side == "CALL" and strike <= current_price: continue
         
         pct_otm = abs(current_price - strike) / current_price
-        score = abs(pct_otm - TARGET_OTM_PCT)
+        score = abs(pct_otm - target_otm)
         
         if score < best_score:
             best_score = score
@@ -165,16 +165,26 @@ def run_wheel_bot():
                     continue
             except: pass
 
-            targets = get_wheel_targets()
+            raw_targets = get_wheel_targets()
+            
+            # --- PARSE & CONFIGURE (Phase 2) ---
+            target_map = {} # symbol -> confidence
+            clean_targets = []
+            
+            for item in raw_targets:
+                s, c = utils.parse_target(item)
+                if s:
+                    clean_targets.append(s)
+                    target_map[s] = c
             
             # [FIX] Get list of tickers that already have pending orders
             busy_tickers = get_open_order_tickers()
             
-            logger.info(f"Scanning {len(targets)} Targets (Busy: {len(busy_tickers)})")
+            logger.info(f"Scanning {len(clean_targets)} Targets (Busy: {len(busy_tickers)})")
 
             all_positions = trading_client.get_all_positions()
 
-            for ticker in targets:
+            for ticker in clean_targets:
                 # [FIX] Skip if we already have an open order for this ticker
                 if ticker in busy_tickers:
                     logger.info(f"  {ticker:<4} | [SKIP] Open Order Exists.")
@@ -226,7 +236,15 @@ def run_wheel_bot():
                     continue
 
                 # 3. OPEN NEW POSITIONS
-                logger.info(f"  {ticker:<4} | ${current_stock_price:>7.2f} | No Active Option. Hunting...")
+                confidence = target_map.get(ticker, 0.5)
+                # Dynamic OTM: Higher Conf = Closer (Riskier), Lower Conf = Further (Safer)
+                # Formula: Base * (1.5 - Confidence)
+                # 0.5 -> Base * 1.0 (0.05)
+                # 0.9 -> Base * 0.6 (0.03)
+                # 0.1 -> Base * 1.4 (0.07)
+                dynamic_otm = TARGET_OTM_PCT * (1.5 - confidence)
+                
+                logger.info(f"  {ticker:<4} | ${current_stock_price:>7.2f} | Conf: {confidence:.2f} | Target OTM: {dynamic_otm*100:.1f}%")
 
                 contract = None
                 side = None
@@ -237,7 +255,7 @@ def run_wheel_bot():
                 # Covered Call?
                 if stock_qty >= 100:
                     side = "CALL"
-                    contract = find_best_contract(ticker, "CALL", current_stock_price)
+                    contract = find_best_contract(ticker, "CALL", current_stock_price, dynamic_otm)
                 
                 # Cash Secured Put?
                 else:
@@ -249,7 +267,7 @@ def run_wheel_bot():
                         continue
 
                     side = "PUT"
-                    contract = find_best_contract(ticker, "PUT", current_stock_price)
+                    contract = find_best_contract(ticker, "PUT", current_stock_price, dynamic_otm)
 
                 if contract:
                     quote = get_option_data(contract.symbol)
@@ -257,6 +275,9 @@ def run_wheel_bot():
                     
                     limit_price = calculate_smart_price(quote, side)
                     if limit_price is None: continue 
+                    
+                    # [OPTIONAL] Adjust Minimum Premium based on confidence? 
+                    # For now just use static MIN_PREMIUM
 
                     if limit_price < MIN_PREMIUM:
                         logger.info(f"    [SKIP] Premium too low (${limit_price})")
@@ -276,7 +297,7 @@ def run_wheel_bot():
                     )
                     trading_client.submit_order(order_data=req)
                     emoji = "🟢" if side == "CALL" else "🔴"
-                    send_discord(f"{emoji} **SOLD {side} {ticker}**\nStrike: ${contract.strike_price}\nLimit: ${limit_price} (Mid)")
+                    send_discord(f"{emoji} **SOLD {side} {ticker}**\nStrike: ${contract.strike_price}\nLimit: ${limit_price}\nConf: {confidence:.2f}")
                     log_to_influx(f"sell_{side.lower()}", limit_price, contract.symbol, "Opened Position")
 
             time.sleep(900)

@@ -123,3 +123,16 @@ def get_targets_with_freshness_check(file_path, strategy_key, static_fallback):
     except Exception as e:
         logger.error(f"  [Error] Failed to read target file: {e}. Using Static Fallback.")
         return static_fallback
+
+def parse_target(item):
+    """
+    Normalizes a target item (String or Dict) into a tuple.
+    Returns: (symbol, confidence_score)
+    Default Confidence for legacy strings = 0.5
+    """
+    if isinstance(item, dict):
+        return item.get("symbol"), item.get("confidence", 0.5)
+    elif isinstance(item, str):
+        return item, 0.5
+    else:
+        return None, 0.0
