@@ -189,6 +189,9 @@ def run_wheel_bot():
 
             all_positions = trading_client.get_all_positions()
 
+            # [FIX] Check budget ONCE per cycle (prevents log spam)
+            is_budget_ok = utils.check_budget("wheel_bot", trading_client)
+            
             for ticker in clean_targets:
                 # [FIX] Skip if we already have an open order for this ticker
                 if ticker in busy_tickers:
@@ -209,6 +212,7 @@ def run_wheel_bot():
                 
                 # 2. MANAGE EXISTING OPTION (TAKE PROFIT)
                 if active_option:
+                    # ... existing management logic ...
                     entry_price = float(active_option.avg_entry_price)
                     current_opt_price = float(active_option.current_price) 
                     qty = float(active_option.qty) 
@@ -242,11 +246,7 @@ def run_wheel_bot():
 
                 # 3. OPEN NEW POSITIONS
                 confidence = target_map.get(ticker, 0.5)
-                # Dynamic OTM: Higher Conf = Closer (Riskier), Lower Conf = Further (Safer)
-                # Formula: Base * (1.5 - Confidence)
-                # 0.5 -> Base * 1.0 (0.05)
-                # 0.9 -> Base * 0.6 (0.03)
-                # 0.1 -> Base * 1.4 (0.07)
+                # Dynamic OTM
                 dynamic_otm = TARGET_OTM_PCT * (1.5 - confidence)
                 
                 logger.info(f"  {ticker:<4} | ${current_stock_price:>7.2f} | Conf: {confidence:.2f} | Target OTM: {dynamic_otm*100:.1f}%")
@@ -264,7 +264,8 @@ def run_wheel_bot():
                 
                 # Cash Secured Put?
                 else:
-                    if not utils.check_budget("wheel_bot", trading_client):
+                    # [FIX] Use cached budget check
+                    if not is_budget_ok:
                         continue
 
                     if real_bp < (current_stock_price * 100):

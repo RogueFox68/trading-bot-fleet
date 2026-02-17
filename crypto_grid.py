@@ -155,7 +155,9 @@ def run_grid_bot():
                         
                         # Check Cash
                         acct = trading_client.get_account()
-                        if float(acct.buying_power) > BUDGET_PER_GRID:
+                        buying_power = float(acct.buying_power)
+                        
+                        if buying_power > BUDGET_PER_GRID:
                             qty = BUDGET_PER_GRID / price
                             req = MarketOrderRequest(symbol=SYMBOL, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC)
                             trading_client.submit_order(order_data=req)
@@ -163,7 +165,7 @@ def run_grid_bot():
                             send_discord(f"🟢 **GRID BUY {SYMBOL}**\nPrice: ${price:,.2f}\nZone: {current_zone}")
                             log_to_influx(SYMBOL, "grid_buy", price, qty)
                         else:
-                            logger.warn("    [!] Insufficient Buying Power.")
+                            logger.warning(f"    [SKIP] Low Balance: ${buying_power:.2f} (Need ${BUDGET_PER_GRID})")
 
                 # PRICE RISE -> SELL (Take Profit)
                 elif current_zone > previous_zone:
@@ -172,20 +174,40 @@ def run_grid_bot():
                     # Verify Inventory
                     qty_to_sell = BUDGET_PER_GRID / price
                     current_qty_held = 0.0
+                    
+                    # [FIX] Robust Position Fetching
                     try:
-                        pos_symbol = SYMBOL.replace("/", "")
-                        pos = trading_client.get_open_position(pos_symbol)
+                        pos = trading_client.get_open_position(SYMBOL)
                         current_qty_held = float(pos.qty)
-                    except: pass
+                    except:
+                        # Fallback for BTCUSD vs BTC/USD mismatch
+                        try:
+                             alt_sym = SYMBOL.replace("/", "")
+                             pos = trading_client.get_open_position(alt_sym)
+                             current_qty_held = float(pos.qty)
+                        except: 
+                             current_qty_held = 0.0
                     
                     if current_qty_held >= qty_to_sell:
+                        # Full Sell
                         req = MarketOrderRequest(symbol=SYMBOL, qty=qty_to_sell, side=OrderSide.SELL, time_in_force=TimeInForce.GTC)
                         trading_client.submit_order(order_data=req)
 
                         send_discord(f"🔴 **GRID SELL {SYMBOL}**\nPrice: ${price:,.2f}\nZone: {current_zone}")
                         log_to_influx(SYMBOL, "grid_sell", price, qty_to_sell)
+                        
+                    elif current_qty_held > (qty_to_sell * 0.1):
+                        # [FIX] Partial Sell (Sweep Dust)
+                        logger.info(f"    [SWEEP] Selling remaining {current_qty_held:.6f} (Target: {qty_to_sell:.6f})")
+                        req = MarketOrderRequest(symbol=SYMBOL, qty=current_qty_held, side=OrderSide.SELL, time_in_force=TimeInForce.GTC)
+                        trading_client.submit_order(order_data=req)
+                        
+                        send_discord(f"🧹 **GRID SWEEP {SYMBOL}**\nSold remaining {current_qty_held:.4f}\nPrice: ${price:,.2f}")
+                        log_to_influx(SYMBOL, "grid_sweep", price, current_qty_held)
+                        
                     else:
-                        logger.warn(f"    [!] Ghost Signal. No inventory to sell.")
+                        # [FIX] Clean Log (No Warn) using Info
+                        logger.info(f"    [SKIP] Sell Signal but Zero Inventory (Ghost Signal handled).")
 
             previous_zone = current_zone
             time.sleep(30)
