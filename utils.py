@@ -99,13 +99,29 @@ def get_targets_with_freshness_check(file_path, strategy_key, static_fallback):
     import os
     import time
     
-    # 1. Check Existence
-    if not os.path.exists(file_path):
-        logger.warning(f"  [Warning] Target file {file_path} missing. Using Static Fallback.")
+    # 1. Resolve Path (Robust Search)
+    search_paths = [
+        file_path,  # As provided (CWD)
+        os.path.join("..", "TradingAgent", file_path), # Sibling of Parent?
+        os.path.join("..", "..", "TradingAgent", file_path), # Grandparent sibling
+        r"C:\Trading System\TradingAgent\active_targets.json", # Absolute Win
+        r"C:\Users\rogue\Trading System\TradingAgent\active_targets.json" # Absolute User
+    ]
+    
+    final_path = None
+    for p in search_paths:
+        if os.path.exists(p):
+            final_path = p
+            break
+            
+    if not final_path:
+        logger.warning(f"  [Warning] Target file {file_path} NOT FOUND in search paths. Using Static Fallback.")
         return static_fallback
+        
+    logger.info(f"  [Utils] Found targets at: {final_path}")
     
     # 2. Check Freshness (24h = 86400s)
-    file_age = time.time() - os.path.getmtime(file_path)
+    file_age = time.time() - os.path.getmtime(final_path)
 
     if file_age > 86400:
         logger.warning(f"  [Warning] Targets are stale ({file_age/3600:.1f} hours old). Using Static Fallback.")
@@ -113,7 +129,7 @@ def get_targets_with_freshness_check(file_path, strategy_key, static_fallback):
         
     # 3. Load Data
     try:
-        with open(file_path, 'r') as f:
+        with open(final_path, 'r') as f:
             data = json.load(f)
             
             # [PHASE 2.5] Check for Success Status
