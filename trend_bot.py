@@ -121,6 +121,11 @@ def run_trend_bot():
 
             logger.info(f"Regime: {global_regime} | Targets: {len(clean_targets)}")
 
+            if not clean_targets and not my_holdings:
+                 logger.info("    💤 Standby Mode: No targets or holdings. Sleeping...")
+                 time.sleep(60)
+                 continue
+
             # 3. Only scan OUR targets + OUR existing positions
             # We filter existing positions to only those relevant to Trend Bot strategies
             

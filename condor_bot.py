@@ -144,6 +144,11 @@ def run_condor_bot():
             
             logger.info(f"Scanning {len(clean_targets)} Targets (Condors: {condor_positions}/{MAX_POSITIONS}, Busy Roots: {len(active_tickers)})...")
             
+            if not clean_targets:
+                logger.info("    💤 Standby Mode: No targets found. Sleeping...")
+                time.sleep(1800)
+                continue
+            
             # --- MANAGEMENT ---
             # (Existing management logic remains same, summarized here)
             for p in positions:

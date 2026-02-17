@@ -182,6 +182,11 @@ def run_wheel_bot():
             
             logger.info(f"Scanning {len(clean_targets)} Targets (Busy: {len(busy_tickers)})")
 
+            if not clean_targets:
+                logger.info("    💤 Standby Mode: No targets found. Sleeping...")
+                time.sleep(900)
+                continue
+
             all_positions = trading_client.get_all_positions()
 
             for ticker in clean_targets:
