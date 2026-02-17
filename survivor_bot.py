@@ -55,6 +55,14 @@ def get_segregated_targets():
     survivor_targets = []
     blacklist = []
     
+    # Helper to extract symbols
+    def extract_symbols(raw_list):
+        syms = []
+        for x in raw_list:
+             s, _ = utils.parse_target(x)
+             if s: syms.append(s)
+        return syms
+
     # 1. Survivor Targets (Fallback: Empty)
     survivor_targets = utils.get_targets_with_freshness_check(TARGET_FILE, "survivor_targets", [])
 
@@ -63,13 +71,16 @@ def get_segregated_targets():
     
     # Trend Fallback
     trend_fallback = ["NVDA", "TSLA", "COIN"]
-    blacklist += utils.get_targets_with_freshness_check(TARGET_FILE, "trend_targets", trend_fallback)
+    trend_raw = utils.get_targets_with_freshness_check(TARGET_FILE, "trend_targets", trend_fallback)
+    blacklist += extract_symbols(trend_raw)
     
     # Wheel Fallback
-    blacklist += utils.get_targets_with_freshness_check(TARGET_FILE, "wheel_targets", utils.BOT_MAPPING["wheel_bot"])
+    wheel_raw = utils.get_targets_with_freshness_check(TARGET_FILE, "wheel_targets", utils.BOT_MAPPING["wheel_bot"])
+    blacklist += extract_symbols(wheel_raw)
     
     # Condor Fallback
-    blacklist += utils.get_targets_with_freshness_check(TARGET_FILE, "condor_targets", utils.BOT_MAPPING["condor_bot"])
+    condor_raw = utils.get_targets_with_freshness_check(TARGET_FILE, "condor_targets", utils.BOT_MAPPING["condor_bot"])
+    blacklist += extract_symbols(condor_raw)
         
 
         
