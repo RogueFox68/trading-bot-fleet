@@ -117,7 +117,7 @@ def get_targets_with_freshness_check(file_path, strategy_key, static_fallback):
             data = json.load(f)
             
             # [PHASE 2.5] Check for Success Status
-            scan_status = data.get("scan_status", "unknown")
+            scan_status = data.get("status", "unknown")
             targets = data.get(strategy_key, [])
             
             if not targets:
