@@ -105,7 +105,11 @@ def run_condor_bot():
             except: pass
 
             positions = trading_client.get_all_positions()
-            condor_positions = 0
+            
+            # [FIX] Count Legs per Root
+            # Single legs (Wheel/Trend) should not count towards Condor Limit.
+            # Condor/Spread = >= 2 legs.
+            root_leg_counts = {}
             active_tickers = set()
             
             for p in positions:
@@ -119,8 +123,14 @@ def run_condor_bot():
                             match = True
                             break
                     if match:
-                        condor_positions += 1
                         active_tickers.add(root)
+                        root_leg_counts[root] = root_leg_counts.get(root, 0) + 1
+
+            # Only count roots with 2+ legs as "Condor Positions"
+            condor_positions = sum(1 for c in root_leg_counts.values() if c >= 2)
+            
+            # active_tickers set retains ALL roots to prevent collisions.
+            # condor_positions only counts complex positions against the limit.
 
             # --- PARSE TARGETS (Phase 2) ---
             raw_targets = get_condor_targets()
@@ -132,7 +142,7 @@ def run_condor_bot():
                     clean_targets.append(s)
                     target_map[s] = c
             
-            logger.info(f"Scanning {len(clean_targets)} Targets (Active: {len(active_tickers)}/{MAX_POSITIONS})...")
+            logger.info(f"Scanning {len(clean_targets)} Targets (Condors: {condor_positions}/{MAX_POSITIONS}, Busy Roots: {len(active_tickers)})...")
             
             # --- MANAGEMENT ---
             # (Existing management logic remains same, summarized here)
@@ -142,7 +152,7 @@ def run_condor_bot():
                      pass
 
             # --- ENTRY ---
-            if len(active_tickers) >= MAX_POSITIONS:
+            if condor_positions >= MAX_POSITIONS:
                 logger.info("    Max positions reached. Skipping entry.")
             else:
                 for ticker in clean_targets:
