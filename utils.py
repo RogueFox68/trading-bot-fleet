@@ -115,10 +115,21 @@ def get_targets_with_freshness_check(file_path, strategy_key, static_fallback):
     try:
         with open(file_path, 'r') as f:
             data = json.load(f)
+            
+            # [PHASE 2.5] Check for Success Status
+            scan_status = data.get("scan_status", "unknown")
             targets = data.get(strategy_key, [])
+            
             if not targets:
-                logger.warning(f"  [Warning] Strategy {strategy_key} empty in file. Using Static Fallback.")
+                # Case A: Scan ended successfully, but found nothing.
+                if scan_status == "success":
+                    logger.info(f"  [Info] {strategy_key} empty, but scan SUCCESS. Standby Mode (No Fallback).")
+                    return []
+                
+                # Case B: Old format or missing status -> Assume failure/stale -> Use Fallback
+                logger.warning(f"  [Warning] {strategy_key} empty (Status: {scan_status}). Using Static Fallback.")
                 return static_fallback
+                
             return targets
     except Exception as e:
         logger.error(f"  [Error] Failed to read target file: {e}. Using Static Fallback.")
