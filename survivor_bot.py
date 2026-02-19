@@ -194,15 +194,19 @@ def run_survivor_bot():
                 else:
                     if rsi < RSI_BUY:
                         is_uptrend = price > sma
+                        is_core = symbol in CORE_WATCHLIST
+                        is_scout_approved = symbol in target_map  # Scout already vetted this
                         
-                        # Only buy if uptrend OR it's a Core ETF (which we revert aggressively)
-                        if is_uptrend or symbol in CORE_WATCHLIST:
+                        # Only buy if uptrend OR it's a Core ETF (which we revert aggressively) OR Scout Approved
+                        if is_uptrend or is_core or is_scout_approved:
                             # --- DYNAMIC SIZING (Phase 2) ---
                             confidence = target_map.get(symbol, 0.5)
                             scaler = 0.5 + confidence
                             scaled_risk = RISK_PER_TRADE * scaler
                             
-                            logger.info(f"    💎 DIP DETECTED: {symbol} (RSI {rsi:.0f}, Conf {confidence:.2f})")
+                            # Log the gate that triggered
+                            gate = "Core" if is_core else ("Scout" if is_scout_approved else "Uptrend")
+                            logger.info(f"    💎 DIP DETECTED: {symbol} (RSI {rsi:.0f}, Conf {confidence:.2f}, Gate: {gate})")
                             
                             risk_amt = equity * scaled_risk
                             qty = int(risk_amt / price)
@@ -211,7 +215,7 @@ def run_survivor_bot():
                                 logger.info(f"       -> Buying {qty} shares (Size: {scaler:.1f}x)...")
                                 try:
                                     trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                                    send_discord(f"💎 **BOUGHT DIP {symbol}**\nRSI: {rsi:.0f}\nConfidence: {confidence:.2f}")
+                                    send_discord(f"💎 **BOUGHT DIP {symbol}**\nRSI: {rsi:.0f}\nConfidence: {confidence:.2f}\nGate: {gate}")
                                     log_to_influx(symbol, "buy", price, qty)
                                 except Exception as e:
                                     logger.error(f"       [!] Order Error: {e}")

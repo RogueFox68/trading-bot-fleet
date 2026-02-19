@@ -27,6 +27,12 @@ FAST_EMA = 9
 SLOW_EMA = 21
 RISK_PER_TRADE = 0.02
 
+# Momentum Confirmation Settings
+MOMENTUM_BARS = 5           # Fast EMA must be above Slow EMA for N consecutive bars
+MOMENTUM_ADX_MIN = 25       # Higher bar than crossover (20) - need confirmed trend
+MOMENTUM_PULLBACK_PCT = 0.01  # Price must be within 1% of fast EMA (buying the dip)
+MOMENTUM_SIZE_MULT = 0.8    # Slightly smaller than crossover (joining late)
+
 # --- CLIENTS ---
 trading_client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=config.PAPER)
 data_client = StockHistoricalDataClient(config.API_KEY, config.SECRET_KEY)
@@ -161,8 +167,24 @@ def run_trend_bot():
                 local_adx = float(latest['adx'])
                 
                 # Signals
+                # Signals — Crossover (existing)
                 bull_cross = (latest['ema_fast'] > latest['ema_slow']) and (prev['ema_fast'] <= prev['ema_slow'])
                 bear_cross = (latest['ema_fast'] < latest['ema_slow']) and (prev['ema_fast'] >= prev['ema_slow'])
+
+                # Signals — Momentum Confirmation (new)
+                momentum_ok = False
+                if len(df) >= MOMENTUM_BARS + 1:
+                    recent = df.iloc[-(MOMENTUM_BARS + 1):]
+                    ema_aligned = all(
+                        recent['ema_fast'].iloc[i] > recent['ema_slow'].iloc[i] 
+                        for i in range(len(recent))
+                    )
+                    # Price must be near the fast EMA (pullback to support)
+                    ema_fast_val = float(latest['ema_fast'])
+                    pullback = abs(price - ema_fast_val) / ema_fast_val
+                    near_ema = pullback <= MOMENTUM_PULLBACK_PCT
+                    
+                    momentum_ok = ema_aligned and near_ema and (local_adx > MOMENTUM_ADX_MIN)
 
                 # --- EXECUTION ---
                 
@@ -183,29 +205,37 @@ def run_trend_bot():
                     # We only trade if ADX > 20 (Trend is strong)
                     if local_adx > 20:
                         should_buy = False
+                        entry_type = ""
+                        size_mult = 1.0
                         
+                        # Entry Path 1: Fresh Crossover (original)
                         if bull_cross:
                             should_buy = True
+                            entry_type = "Crossover"
+                            size_mult = 1.0
+                        
+                        # Entry Path 2: Momentum Confirmation (new)
+                        # Only fires if crossover didn't — no double entries
+                        elif momentum_ok:
+                            should_buy = True
+                            entry_type = "Momentum"
+                            size_mult = MOMENTUM_SIZE_MULT
 
                         if should_buy:
                             # --- DYNAMIC SIZING (Phase 2) ---
                             confidence = target_map.get(symbol, 0.5)
-                            # Risk Scaling: 
-                            # Conf 0.5 -> 1.0x Risk
-                            # Conf 1.0 -> 1.5x Risk
-                            # Conf 0.1 -> 0.6x Risk
                             scaler = 0.5 + confidence
-                            scaled_risk = RISK_PER_TRADE * scaler
+                            scaled_risk = RISK_PER_TRADE * scaler * size_mult
                             
                             risk_amt = equity * scaled_risk
                             # Stop loss approx 2% away
                             qty = int(risk_amt / (price * 0.02))
                             
                             if qty > 0:
-                                logger.info(f"    噫 BUY SIGNAL {symbol} (Conf: {confidence:.2f}, Size: {scaler:.1f}x)")
+                                logger.info(f"    噫 BUY SIGNAL {symbol} ({entry_type} | Conf: {confidence:.2f}, Size: {scaler * size_mult:.1f}x)")
                                 try:
                                     trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                                    send_discord(f"噫 **BUY {symbol}**\nRegime: {global_regime}\nADX: {local_adx:.0f}\nConfidence: {confidence:.2f}")
+                                    send_discord(f"噫 **BUY {symbol}** ({entry_type})\nRegime: {global_regime}\nADX: {local_adx:.0f}\nConfidence: {confidence:.2f}")
                                     log_to_influx(symbol, "buy", price, qty)
                                 except Exception as e:
                                     logger.error(f"    [!] Order Error: {e}")
