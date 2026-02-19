@@ -23,7 +23,7 @@ CORE_WATCHLIST = ["TQQQ", "SQQQ", "SOXL", "SOXS", "FNGU", "UPRO"]
 TARGET_FILE = "active_targets.json" 
 
 # Indicators
-RSI_BUY = 30        
+RSI_BUY = 38        
 RSI_SELL = 70       
 RISK_PER_TRADE = 0.05 
 
