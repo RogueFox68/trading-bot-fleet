@@ -163,6 +163,20 @@ def run_survivor_bot():
                 rsi = float(latest['rsi'])
                 sma = float(latest['sma200']) if not pd.isna(latest['sma200']) else 0
 
+                # --- DIAGNOSTICS ---
+                if symbol not in pos_dict:
+                    is_core = symbol in CORE_WATCHLIST
+                    is_scout = symbol in target_map
+                    sma_status = "above" if price > sma else "BELOW"
+                    gate_available = "Core" if is_core else ("Scout" if is_scout else "Uptrend only")
+                    
+                    if rsi < RSI_BUY:
+                        logger.info(f"  📊 {symbol:<5} ${price:>8.2f} | RSI {rsi:>5.1f} | SMA200 {sma_status} | Gate: {gate_available} | 🎯 ENTRY ZONE")
+                    elif rsi < RSI_BUY + 5:
+                        logger.info(f"  📊 {symbol:<5} ${price:>8.2f} | RSI {rsi:>5.1f} | SMA200 {sma_status} | Gate: {gate_available} | ⏳ Near threshold")
+                    else:
+                        logger.debug(f"  📊 {symbol:<5} ${price:>8.2f} | RSI {rsi:>5.1f} | SMA200 {sma_status} | Gate: {gate_available}")
+
                 # --- EXIT LOGIC ---
                 # Only manage if we are ALLOWED to trade this symbol
                 if symbol in pos_dict:

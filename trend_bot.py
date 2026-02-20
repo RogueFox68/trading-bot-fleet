@@ -186,6 +186,20 @@ def run_trend_bot():
                     
                     momentum_ok = ema_aligned and near_ema and (local_adx > MOMENTUM_ADX_MIN)
 
+                # --- DIAGNOSTICS ---
+                ema_gap = ((latest['ema_fast'] - latest['ema_slow']) / latest['ema_slow']) * 100
+                if symbol not in pos_dict and len(df) >= MOMENTUM_BARS + 1:
+                    if bull_cross:
+                        logger.info(f"  📊 {symbol:<5} ${price:>8.2f} | ADX {local_adx:>5.1f} | EMA Gap {ema_gap:>+5.1f}% | ⚡ CROSSOVER")
+                    elif momentum_ok:
+                        logger.info(f"  📊 {symbol:<5} ${price:>8.2f} | ADX {local_adx:>5.1f} | EMA Gap {ema_gap:>+5.1f}% | Pullback {pullback*100:.1f}% | 🎯 MOMENTUM")
+                    elif ema_aligned and local_adx > MOMENTUM_ADX_MIN:
+                        logger.info(f"  📊 {symbol:<5} ${price:>8.2f} | ADX {local_adx:>5.1f} | EMA Gap {ema_gap:>+5.1f}% | Pullback {pullback*100:.1f}% | ⏳ Waiting (pullback > {MOMENTUM_PULLBACK_PCT*100}%)")
+                    elif ema_aligned:
+                        logger.debug(f"  📊 {symbol:<5} ${price:>8.2f} | ADX {local_adx:>5.1f} | EMA Gap {ema_gap:>+5.1f}% | Pullback {pullback*100:.1f}% | Weak ADX")
+                    else:
+                        logger.debug(f"  📊 {symbol:<5} ${price:>8.2f} | ADX {local_adx:>5.1f} | EMA Gap {ema_gap:>+5.1f}% | No alignment")
+
                 # --- EXECUTION ---
                 
                 # A) EXIT LOGIC (Manage existing trades)
