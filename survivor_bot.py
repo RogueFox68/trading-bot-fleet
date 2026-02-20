@@ -219,6 +219,10 @@ def run_survivor_bot():
                                     log_to_influx(symbol, "buy", price, qty)
                                 except Exception as e:
                                     logger.error(f"       [!] Order Error: {e}")
+                        else:
+                            logger.info(f"    [SKIP] {symbol} | RSI {rsi:.0f} < {RSI_BUY} but NOT (Uptrend | Core | Scout). SMA: {sma:.2f}")
+                    else:
+                        logger.info(f"    [SKIP] {symbol} | RSI {rsi:.0f} >= {RSI_BUY}")
 
             time.sleep(60)
 

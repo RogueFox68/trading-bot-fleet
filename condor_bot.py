@@ -198,7 +198,12 @@ def run_condor_bot():
                     call_long = find_strike(ticker, "CALL", start_date, end_date, call_long_price)
                     
                     if not (put_short and put_long and call_short and call_long):
-                        logger.info("    -> Failed to find all 4 legs.")
+                        missing = []
+                        if not put_short: missing.append(f"PS({put_short_price:.1f})")
+                        if not put_long: missing.append(f"PL({put_long_price:.1f})")
+                        if not call_short: missing.append(f"CS({call_short_price:.1f})")
+                        if not call_long: missing.append(f"CL({call_long_price:.1f})")
+                        logger.info(f"    [SKIP] {ticker} | Failed to find all 4 legs. Missing: {', '.join(missing)}")
                         continue
                         
                     print(f"    -> 🦅 FOUND CONDOR! Executing Atomic Sequence...")

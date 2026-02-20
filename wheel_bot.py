@@ -277,21 +277,28 @@ def run_wheel_bot():
 
                 if contract:
                     quote = get_option_data(contract.symbol)
-                    if not quote: continue
+                    if not quote: 
+                        logger.info(f"    [SKIP] Failed to fetch quote for {contract.symbol}")
+                        continue
                     
                     limit_price = calculate_smart_price(quote, side)
-                    if limit_price is None: continue 
+                    if limit_price is None: 
+                        # `calculate_smart_price` already logs the wide spread reason
+                        continue 
                     
                     # [OPTIONAL] Adjust Minimum Premium based on confidence? 
                     # For now just use static MIN_PREMIUM
 
                     if limit_price < MIN_PREMIUM:
-                        logger.info(f"    [SKIP] Premium too low (${limit_price})")
+                        logger.info(f"    [SKIP] Premium too low (${limit_price:.2f} < ${MIN_PREMIUM:.2f})")
                         continue
                     
                     if side == "PUT" and real_bp < (float(contract.strike_price) * 100):
-                        logger.warning(f"    [SKIP] Strike too expensive.")
+                        logger.warning(f"    [SKIP] Strike too expensive for available BP.")
                         continue
+                else:
+                    logger.info(f"    [SKIP] No suitable {side} contract found within {MIN_DTE}-{MAX_DTE} DTE for {ticker}.")
+                    continue
 
                     logger.info(f"    [ENTRY] Selling {side} on {ticker} @ ${limit_price} (Midpoint)")
                     req = LimitOrderRequest(

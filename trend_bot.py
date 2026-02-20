@@ -239,6 +239,10 @@ def run_trend_bot():
                                     log_to_influx(symbol, "buy", price, qty)
                                 except Exception as e:
                                     logger.error(f"    [!] Order Error: {e}")
+                        else:
+                            logger.info(f"    [SKIP] {symbol} | ADX {local_adx:.0f} > 20 but no Crossover or Momentum trigger.")
+                    else:
+                        logger.info(f"    [SKIP] {symbol} | ADX {local_adx:.0f} <= 20 (Trend too weak)")
 
             time.sleep(60)
 
