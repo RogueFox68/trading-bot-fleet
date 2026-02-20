@@ -19,7 +19,7 @@ def get_logger(name):
     if logger.hasHandlers():
         return logger
         
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
 
     # Ensure logs directory exists
     log_dir = "logs"
