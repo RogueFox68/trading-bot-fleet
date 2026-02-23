@@ -19,7 +19,6 @@ logger = get_logger("wheel_bot")
 
 # --- CONFIGURATION ---
 TARGET_FILE = "active_targets.json"
-STATIC_WATCHLIST = ["DIS", "PLTR", "F"] 
 
 MIN_DTE = 25             
 MAX_DTE = 45
@@ -51,7 +50,7 @@ def get_wheel_targets():
     return utils.get_targets_with_freshness_check(
         TARGET_FILE, 
         "wheel_targets", 
-        STATIC_WATCHLIST
+        []
     )
 
 def get_current_price(symbol):

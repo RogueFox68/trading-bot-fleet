@@ -18,7 +18,6 @@ logger = get_logger("condor_bot")
 
 # --- CONFIGURATION ---
 TARGET_FILE = "active_targets.json"
-STATIC_TARGETS = ["COIN", "MSTR", "TSLA", "NVDA", "NFLX"] 
 
 MIN_DTE = 25              
 MAX_DTE = 45              
@@ -48,7 +47,7 @@ def log_to_influx(action, symbol, price, detail):
     except: pass
 
 def get_condor_targets():
-    return utils.get_targets_with_freshness_check(TARGET_FILE, "condor_targets", STATIC_TARGETS)
+    return utils.get_targets_with_freshness_check(TARGET_FILE, "condor_targets", [])
 
 def get_current_price(symbol):
     try:

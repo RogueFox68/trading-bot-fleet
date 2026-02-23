@@ -12,8 +12,8 @@ from logger import logger
 # We verify these against the specific bot scripts to ensure correct attribution
 BOT_MAPPING = {
     "survivor": [],
-    "wheel": ["DIS", "F", "PLTR"], 
-    "condor": ["COIN", "MSTR", "TSLA", "NVDA", "NFLX"],
+    "wheel": [], 
+    "condor": [],
     "crypto": ["BTC/USD", "ETH/USD", "SOL/USD"]
 }
 

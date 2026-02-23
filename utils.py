@@ -6,8 +6,8 @@ from logger import logger
 # This defines which bot is allowed to trade which ticker
 BOT_MAPPING = {
     "survivor_bot": [],
-    "wheel_bot": ["DIS", "F", "PLTR"], 
-    "condor_bot": ["COIN", "MSTR", "TSLA", "NVDA", "NFLX"],
+    "wheel_bot": [], 
+    "condor_bot": [],
     "crypto_grid": ["BTC/USD", "ETH/USD", "SOL/USD"],
     "moon_bag": ["BTC/USD", "ETH/USD"]
 }
