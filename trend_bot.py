@@ -60,15 +60,13 @@ def get_market_regime():
 
 def get_dynamic_targets(regime):
     # 1. BEAR MODE: Short the market
-    if regime == "BEAR_TREND":
-        # No more hardcoded short ETFs like SOXS/SQQQ
-        return []
+    long_fallback = []
+    short_fallback = []
 
-    # 2. BULL/CHOP MODE
-    # Default fallback if file is missing/stale
-    static_fallback = ["NVDA", "TSLA", "COIN"]
+    longs = utils.get_targets_with_freshness_check(TARGET_FILE, "trend_targets", long_fallback)
+    shorts = utils.get_targets_with_freshness_check(TARGET_FILE, "short_targets", short_fallback)
     
-    return utils.get_targets_with_freshness_check(TARGET_FILE, "trend_targets", static_fallback)
+    return longs, shorts
 
 
 def get_data_alpaca(symbol):
@@ -112,16 +110,25 @@ def run_trend_bot():
                  continue
 
             global_regime = get_market_regime()
-            raw_targets = get_dynamic_targets(global_regime)
+            long_targets, short_targets = get_dynamic_targets(global_regime)
             
             # --- PARSE TARGETS (Phase 2) ---
-            target_map = {} # symbol -> confidence
-            clean_targets = []
-            for item in raw_targets:
+            target_map_long = {} # symbol -> confidence
+            target_map_short = {}
+            clean_targets_long = []
+            clean_targets_short = []
+            
+            for item in long_targets:
                 sym, conf = utils.parse_target(item)
                 if sym:
-                    clean_targets.append(sym)
-                    target_map[sym] = conf
+                    clean_targets_long.append(sym)
+                    target_map_long[sym] = conf
+            
+            for item in short_targets:
+                sym, conf = utils.parse_target(item)
+                if sym:
+                    clean_targets_short.append(sym)
+                    target_map_short[sym] = conf
             
             account = trading_client.get_account()
             equity = float(account.portfolio_value)
@@ -132,22 +139,25 @@ def run_trend_bot():
             open_orders = trading_client.get_orders(filter=GetOrdersRequest(status="open"))
             pending_symbols = {o.symbol for o in open_orders}
 
-            # NOTE: If we hold it, we manage it. Even if it dropped from targets list, 
-            # we should probably still scan it to see if we need to close?
-            # Existing logic only included holdings if they WERE in targets. 
-            # I will preserve existing logic for safety, but use clean_targets.
-            my_holdings = [p.symbol for p in positions if p.asset_class == AssetClass.US_EQUITY and p.symbol in clean_targets]
+            # Calculate short exposure for safety cap
+            short_exposure = sum(
+                abs(float(p.market_value))
+                for p in positions
+                if p.side == "short" and utils.get_bot_owner(p.symbol, p.asset_class) == "trend_bot"
+            )
 
-            logger.info(f"Regime: {global_regime} | Targets: {len(clean_targets)}")
+            my_holdings = [p.symbol for p in positions if p.asset_class == AssetClass.US_EQUITY and (p.symbol in clean_targets_long or p.symbol in clean_targets_short)]
 
-            if not clean_targets and not my_holdings:
+            logger.info(f"Regime: {global_regime} | Long Targets: {len(clean_targets_long)} | Short Targets: {len(clean_targets_short)}")
+
+            if not (clean_targets_long or clean_targets_short) and not my_holdings:
                  logger.info("    💤 Standby Mode: No targets or holdings. Sleeping...")
                  time.sleep(60)
                  continue
 
             # 3. Only scan OUR targets + OUR existing positions
             # We filter existing positions to only those relevant to Trend Bot strategies
-            scan_list = list(set(clean_targets + my_holdings))
+            scan_list = list(set(clean_targets_long + clean_targets_short + my_holdings))
 
             for symbol in scan_list:
                 # Phase 10: Skip failed symbols and cryptos
@@ -216,24 +226,43 @@ def run_trend_bot():
                     pos = pos_dict[symbol]
                     qty = float(pos.qty)
                     sell_qty = int(abs(qty))
+                    side = pos.side
+                    entry_price = float(pos.avg_entry_price)
                     
-                    # Exit Longs on Bear Cross
-                    if bull_cross == False and bear_cross == True:
-                        if sell_qty <= 0:
-                            logger.info(f"    [SKIP] {symbol} fractional position ({qty} shares), cannot sell")
-                        else:
+                    if sell_qty <= 0:
+                        logger.info(f"    [SKIP] {symbol} fractional position ({qty} shares), cannot close")
+                        continue
+
+                    # Exit logic depends on side
+                    if side == "long":
+                        if bull_cross == False and bear_cross == True:
                             try:
                                 logger.info(f"    📉 CLOSE LONG {symbol}")
                                 trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC))
-                                send_discord(f"📉 **SELL {symbol}** (Cross)\nPrice: ${price:.2f}")
+                                pnl_pct = (price - entry_price) / entry_price
+                                send_discord(f"📉 **SELL/CLOSE {symbol}** (Cross)\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
                                 log_to_influx(symbol, "sell", price, sell_qty)
                             except Exception as e:
-                                logger.error(f"    [!] Sell Error {symbol}: {e}")
+                                logger.error(f"    [!] Close Long Error {symbol}: {e}")
+                                _failed_symbols.add(symbol)
+                                
+                    elif side == "short":
+                        # Exit short if we get a bull cross (trend reversal back up)
+                        if bear_cross == False and bull_cross == True:
+                            try:
+                                logger.info(f"    📉 CLOSE SHORT {symbol}")
+                                # Buy to cover
+                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC))
+                                pnl_pct = (entry_price - price) / entry_price # Inverted PnL
+                                send_discord(f"📉 **BUY TO COVER {symbol}** (Bull Cross)\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
+                                log_to_influx(symbol, "buy", price, sell_qty)
+                            except Exception as e:
+                                logger.error(f"    [!] Close Short Error {symbol}: {e}")
                                 _failed_symbols.add(symbol)
 
-                # B) ENTRY LOGIC (Open new trades)
+                # B) LONG ENTRY LOGIC
                 # Phase 10: Also check pending orders to avoid churn loops
-                elif symbol in clean_targets and symbol not in pending_symbols:
+                elif symbol in clean_targets_long and symbol not in pending_symbols:
                     
                     # Phase 10: Minimum price filter
                     MIN_PRICE = 5.00
@@ -247,24 +276,27 @@ def run_trend_bot():
                         entry_type = ""
                         size_mult = 1.0
                         
+                        # Regime-based sizing for longs
+                        if global_regime == "BEAR_TREND":
+                            size_mult = 0.5
+                            
                         # Entry Path 1: Fresh Crossover (original)
                         if bull_cross:
                             should_buy = True
                             entry_type = "Crossover"
-                            size_mult = 1.0
                         
                         # Entry Path 2: Momentum Confirmation (new)
                         # Only fires if crossover didn't — no double entries
                         elif momentum_ok:
                             should_buy = True
                             entry_type = "Momentum"
-                            size_mult = MOMENTUM_SIZE_MULT
+                            size_mult = float(size_mult) * MOMENTUM_SIZE_MULT
 
                         if should_buy:
                             # --- DYNAMIC SIZING (Phase 2) ---
-                            confidence = target_map.get(symbol, 0.5)
+                            confidence = target_map_long.get(symbol, 0.5)
                             scaler = 0.5 + confidence
-                            scaled_risk = RISK_PER_TRADE * scaler * size_mult
+                            scaled_risk = RISK_PER_TRADE * scaler * float(size_mult)
                             
                             risk_amt = equity * scaled_risk
                             # Stop loss approx 2% away
@@ -276,17 +308,102 @@ def run_trend_bot():
                             qty = min(qty, max_qty)
                             
                             if qty > 0:
-                                logger.info(f"    噫 BUY SIGNAL {symbol} ({entry_type} | Conf: {confidence:.2f}, Size: {scaler * size_mult:.1f}x)")
+                                logger.info(f"    🔼 BUY SIGNAL (LONG) {symbol} ({entry_type} | Conf: {confidence:.2f}, Size: {scaler * float(size_mult):.1f}x)")
                                 try:
                                     trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                                    send_discord(f"噫 **BUY {symbol}** ({entry_type})\nRegime: {global_regime}\nADX: {local_adx:.0f}\nConfidence: {confidence:.2f}")
+                                    send_discord(f"🔼 **LONG {symbol}** ({entry_type})\nRegime: {global_regime}\nADX: {local_adx:.0f}\nConfidence: {confidence:.2f}")
                                     log_to_influx(symbol, "buy", price, qty)
                                 except Exception as e:
                                     logger.error(f"    [!] Order Error: {e}")
                         else:
-                            logger.info(f"    [SKIP] {symbol} | ADX {local_adx:.0f} > 20 but no Crossover or Momentum trigger.")
+                            logger.info(f"    [SKIP] {symbol} | ADX {local_adx:.0f} > 20 but no Bullish Crossover or Momentum trigger.")
                     else:
                         logger.info(f"    [SKIP] {symbol} | ADX {local_adx:.0f} <= 20 (Trend too weak)")
+
+                # C) SHORT ENTRY LOGIC
+                elif symbol in clean_targets_short and symbol not in pending_symbols:
+                    
+                    MIN_PRICE = 10.00 # Higher min price for shorts to avoid extreme volatility
+                    if price < MIN_PRICE:
+                        logger.info(f"    [SKIP] {symbol} | Price ${price:.2f} < ${MIN_PRICE:.2f} minimum for shorts")
+                        continue
+                        
+                    # Cap short exposure at 30% of portfolio
+                    MAX_SHORT_EXPOSURE = 0.30
+                    if short_exposure >= equity * MAX_SHORT_EXPOSURE:
+                        logger.info(f"    [PAUSE] Max Short Exposure reached (${short_exposure:.0f} >= 30% of equity). Skipping short entry.")
+                        continue
+                        
+                    # We only trade if ADX > 20 (Trend is strong)
+                    if local_adx > 20:
+                        should_short = False
+                        entry_type = ""
+                        size_mult = 1.0
+                        
+                        # Regime-based sizing for shorts
+                        if global_regime == "BULL_TREND":
+                            size_mult = 0.5
+                            
+                        # Convert to float to avoid pandas type issues
+                        ema_fast_latest = float(latest['ema_fast'])
+                        ema_slow_latest = float(latest['ema_slow'])
+                        
+                        # Short Signals — Momentum Confirmation (mirror of long)
+                        momentum_short_ok = False
+                        if len(df) >= MOMENTUM_BARS + 1:
+                            recent = df.iloc[-(MOMENTUM_BARS + 1):]
+                            ema_aligned_bearish = all(
+                                float(recent['ema_fast'].iloc[i]) < float(recent['ema_slow'].iloc[i]) 
+                                for i in range(len(recent))
+                            )
+                            # Price must be near the fast EMA (relief bounce / short the rip)
+                            ema_fast_val = ema_fast_latest
+                            pullback = abs(price - ema_fast_val) / ema_fast_val
+                            near_ema = pullback <= MOMENTUM_PULLBACK_PCT
+                            
+                            momentum_short_ok = ema_aligned_bearish and near_ema and (local_adx > MOMENTUM_ADX_MIN)
+                            
+                        # Entry Path 1: Fresh Bear Crossover
+                        if bear_cross:
+                            should_short = True
+                            entry_type = "Crossover"
+                        
+                        # Entry Path 2: Bearish Momentum Confirmation
+                        elif momentum_short_ok:
+                            should_short = True
+                            entry_type = "Momentum"
+                            size_mult = float(size_mult) * MOMENTUM_SIZE_MULT
+
+                        if should_short:
+                            # --- DYNAMIC SIZING ---
+                            confidence = target_map_short.get(symbol, 0.5)
+                            scaler = 0.5 + confidence
+                            scaled_risk = RISK_PER_TRADE * scaler * float(size_mult)
+                            
+                            risk_amt = equity * scaled_risk
+                            # Stop loss approx 2% away
+                            qty = int(risk_amt / (price * 0.02))
+                            
+                            # Max position cap
+                            max_position_value = equity * 0.15
+                            max_qty = int(max_position_value / price)
+                            qty = min(qty, max_qty)
+                            
+                            if qty > 0:
+                                logger.info(f"    🩸 BUY SIGNAL (SHORT) {symbol} ({entry_type} | Conf: {confidence:.2f}, Size: {scaler * float(size_mult):.1f}x)")
+                                try:
+                                    trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
+                                    send_discord(f"🩸 **SHORT {symbol}** ({entry_type})\nRegime: {global_regime}\nADX: {local_adx:.0f}\nConfidence: {confidence:.2f}")
+                                    log_to_influx(symbol, "sell", price, qty)
+                                    
+                                    # Add to local short_exposure total so we don't rapid-fire exceed the cap in one loop
+                                    short_exposure = float(short_exposure) + (float(qty) * float(price))
+                                except Exception as e:
+                                    logger.error(f"    [!] Order Error: {e}")
+                        else:
+                            logger.info(f"    [SKIP] {symbol} | ADX {local_adx:.0f} > 20 but no Bearish Crossover or Momentum trigger.")
+                    else:
+                         logger.info(f"    [SKIP] {symbol} | ADX {local_adx:.0f} <= 20 (Trend too weak)")
 
             time.sleep(60)
 
