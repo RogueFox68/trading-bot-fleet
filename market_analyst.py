@@ -98,6 +98,12 @@ def update_bot_config(regime, vix_val, climate):
             # Accountant always runs
             if bot_name == "accountant": continue
             
+            # Phase 7: Disable Condor Bot Revivals
+            # We completely skip condor_bot here so that any manual state 
+            # set by the user in bot_config.json is never overwritten by the analyst.
+            if bot_name == "condor_bot":
+                continue
+            
             if bots[bot_name]['status'] != target_status:
                 bots[bot_name]['status'] = target_status
                 changes_made.append(f"{bot_name} -> {target_status}")
