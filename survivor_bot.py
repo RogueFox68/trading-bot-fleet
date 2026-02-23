@@ -182,6 +182,8 @@ def run_survivor_bot():
                 if symbol in pos_dict:
                     pos = pos_dict[symbol]
                     qty = float(pos.qty)
+                    sell_qty = int(abs(qty))
+                    
                     entry_price = float(pos.avg_entry_price)
                     pct_gain = (price - entry_price) / entry_price
                     
@@ -199,10 +201,13 @@ def run_survivor_bot():
                         reason = "Stop Loss (-3%)"
                         
                     if should_sell:
-                        logger.info(f"    📉 SELLING {symbol}: {reason}")
-                        trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC))
-                        send_discord(f"💰 **SOLD {symbol}**\nReason: {reason}\nP&L: {pct_gain*100:.2f}%")
-                        log_to_influx(symbol, "sell", price, qty)
+                        if sell_qty <= 0:
+                            logger.info(f"    [SKIP] {symbol} fractional position ({qty} shares), cannot sell")
+                        else:
+                            logger.info(f"    📉 SELLING {symbol}: {reason}")
+                            trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC))
+                            send_discord(f"💰 **SOLD {symbol}**\nReason: {reason}\nP&L: {pct_gain*100:.2f}%")
+                            log_to_influx(symbol, "sell", price, sell_qty)
 
                 # --- ENTRY LOGIC ---
                 else:

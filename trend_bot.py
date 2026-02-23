@@ -206,13 +206,17 @@ def run_trend_bot():
                 if symbol in pos_dict:
                     pos = pos_dict[symbol]
                     qty = float(pos.qty)
+                    sell_qty = int(abs(qty))
                     
                     # Exit Longs on Bear Cross
                     if bull_cross == False and bear_cross == True:
-                        logger.info(f"    悼 CLOSE LONG {symbol}")
-                        trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC))
-                        send_discord(f"悼 **SELL {symbol}** (Cross)\nPrice: ${price:.2f}")
-                        log_to_influx(symbol, "sell", price, qty)
+                        if sell_qty <= 0:
+                            logger.info(f"    [SKIP] {symbol} fractional position ({qty} shares), cannot sell")
+                        else:
+                            logger.info(f"    📉 CLOSE LONG {symbol}")
+                            trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC))
+                            send_discord(f"📉 **SELL {symbol}** (Cross)\nPrice: ${price:.2f}")
+                            log_to_influx(symbol, "sell", price, sell_qty)
 
                 # B) ENTRY LOGIC (Open new trades)
                 elif symbol in clean_targets:
@@ -244,6 +248,11 @@ def run_trend_bot():
                             risk_amt = equity * scaled_risk
                             # Stop loss approx 2% away
                             qty = int(risk_amt / (price * 0.02))
+                            
+                            # Max position cap (Phase 8 Bugfix)
+                            max_position_value = equity * 0.15  # Never more than 15% of portfolio per trade
+                            max_qty = int(max_position_value / price)
+                            qty = min(qty, max_qty)
                             
                             if qty > 0:
                                 logger.info(f"    噫 BUY SIGNAL {symbol} ({entry_type} | Conf: {confidence:.2f}, Size: {scaler * size_mult:.1f}x)")
