@@ -5,7 +5,7 @@ from logger import logger
 # --- CENTRALIZED ASSET MAP ---
 # This defines which bot is allowed to trade which ticker
 BOT_MAPPING = {
-    "survivor_bot": ["TQQQ", "SQQQ", "SOXL", "SOXS", "FNGU", "UPRO", "SPXL", "SPXS"],
+    "survivor_bot": [],
     "wheel_bot": ["DIS", "F", "PLTR"], 
     "condor_bot": ["COIN", "MSTR", "TSLA", "NVDA", "NFLX"],
     "crypto_grid": ["BTC/USD", "ETH/USD", "SOL/USD"],

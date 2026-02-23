@@ -11,7 +11,7 @@ import pytz
 import utils
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -61,8 +61,8 @@ def get_market_regime():
 def get_dynamic_targets(regime):
     # 1. BEAR MODE: Short the market
     if regime == "BEAR_TREND":
-        # Check for specific short targets or default to ETFs
-        return ["SQQQ", "SPXU", "UVXY", "SOXS"]
+        # No more hardcoded short ETFs like SOXS/SQQQ
+        return []
 
     # 2. BULL/CHOP MODE
     # Default fallback if file is missing/stale
@@ -90,6 +90,9 @@ def get_data_alpaca(symbol):
 def run_trend_bot():
     logger.info(f"--- 昌 TREND SNIPER (Target Locked) STARTED ---")
     send_discord("**Trend Sniper V4.1** Online\nOwnership Logic Active.")
+    
+    # Phase 10: Failed order cooldown
+    _failed_symbols = set()
     
     while True:
         try:
@@ -125,6 +128,16 @@ def run_trend_bot():
             positions = trading_client.get_all_positions()
             pos_dict = {p.symbol: p for p in positions}
 
+            # Phase 10: Get Pending Orders to avoid buy churn loops
+            open_orders = trading_client.get_orders(filter=GetOrdersRequest(status="open"))
+            pending_symbols = {o.symbol for o in open_orders}
+
+            # NOTE: If we hold it, we manage it. Even if it dropped from targets list, 
+            # we should probably still scan it to see if we need to close?
+            # Existing logic only included holdings if they WERE in targets. 
+            # I will preserve existing logic for safety, but use clean_targets.
+            my_holdings = [p.symbol for p in positions if p.asset_class == AssetClass.US_EQUITY and p.symbol in clean_targets]
+
             logger.info(f"Regime: {global_regime} | Targets: {len(clean_targets)}")
 
             if not clean_targets and not my_holdings:
@@ -134,15 +147,11 @@ def run_trend_bot():
 
             # 3. Only scan OUR targets + OUR existing positions
             # We filter existing positions to only those relevant to Trend Bot strategies
-            
-            # NOTE: If we hold it, we manage it. Even if it dropped from targets list, 
-            # we should probably still scan it to see if we need to close?
-            # Existing logic only included holdings if they WERE in targets. 
-            # I will preserve existing logic for safety, but use clean_targets.
-            my_holdings = [p.symbol for p in positions if p.asset_class == AssetClass.US_EQUITY and p.symbol in clean_targets]
             scan_list = list(set(clean_targets + my_holdings))
 
             for symbol in scan_list:
+                # Phase 10: Skip failed symbols and cryptos
+                if symbol in _failed_symbols: continue
                 if symbol in ["BTC/USD", "ETH/USD"]: continue 
                 if "/" in symbol: continue 
                 
@@ -213,13 +222,25 @@ def run_trend_bot():
                         if sell_qty <= 0:
                             logger.info(f"    [SKIP] {symbol} fractional position ({qty} shares), cannot sell")
                         else:
-                            logger.info(f"    📉 CLOSE LONG {symbol}")
-                            trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC))
-                            send_discord(f"📉 **SELL {symbol}** (Cross)\nPrice: ${price:.2f}")
-                            log_to_influx(symbol, "sell", price, sell_qty)
+                            try:
+                                logger.info(f"    📉 CLOSE LONG {symbol}")
+                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC))
+                                send_discord(f"📉 **SELL {symbol}** (Cross)\nPrice: ${price:.2f}")
+                                log_to_influx(symbol, "sell", price, sell_qty)
+                            except Exception as e:
+                                logger.error(f"    [!] Sell Error {symbol}: {e}")
+                                _failed_symbols.add(symbol)
 
                 # B) ENTRY LOGIC (Open new trades)
-                elif symbol in clean_targets:
+                # Phase 10: Also check pending orders to avoid churn loops
+                elif symbol in clean_targets and symbol not in pending_symbols:
+                    
+                    # Phase 10: Minimum price filter
+                    MIN_PRICE = 5.00
+                    if price < MIN_PRICE:
+                        logger.info(f"    [SKIP] {symbol} | Price ${price:.2f} < ${MIN_PRICE:.2f} minimum")
+                        continue
+                        
                     # We only trade if ADX > 20 (Trend is strong)
                     if local_adx > 20:
                         should_buy = False
