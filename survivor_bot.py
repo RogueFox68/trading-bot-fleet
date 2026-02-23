@@ -15,7 +15,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 # --- CONFIGURATION ---
@@ -186,12 +186,24 @@ def run_survivor_bot():
                 # --- EXIT LOGIC ---
                 # Only manage if we are ALLOWED to trade this symbol
                 if symbol in pos_dict:
+                    # Prevent duplicate sell orders
+                    if symbol in pending_symbols:
+                        logger.debug(f"  [SKIP] {symbol} already has a pending order.")
+                        continue
+                        
                     pos = pos_dict[symbol]
                     qty = float(pos.qty)
                     sell_qty = int(abs(qty))
                     
+                    # FETCH LIVE PRICE FOR P&L
+                    try:
+                        trade_req = StockLatestTradeRequest(symbol_or_symbols=[symbol])
+                        live_price = float(data_client.get_stock_latest_trade(trade_req)[symbol].price)
+                    except:
+                        live_price = price # fallback to bar close if API fails
+                    
                     entry_price = float(pos.avg_entry_price)
-                    pct_gain = (price - entry_price) / entry_price
+                    pct_gain = (live_price - entry_price) / entry_price
                     
                     should_sell = False
                     reason = ""
@@ -207,17 +219,30 @@ def run_survivor_bot():
                         reason = "Stop Loss (-3%)"
                         
                     if should_sell:
-                        if sell_qty <= 0:
-                            logger.info(f"    [SKIP] {symbol} fractional position ({qty} shares), cannot sell")
-                        else:
-                            try:
-                                logger.info(f"    📉 SELLING {symbol}: {reason}")
-                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC))
-                                send_discord(f"💰 **SOLD {symbol}**\nReason: {reason}\nP&L: {pct_gain*100:.2f}%")
-                                log_to_influx(symbol, "sell", price, sell_qty)
-                            except Exception as e:
-                                logger.error(f"    [!] Sell Error {symbol}: {e}")
-                                _failed_symbols.add(symbol)
+                        try:
+                            logger.info(f"    📉 SELLING {symbol}: {reason}")
+                            
+                            # Fractional shares require DAY orders, whole shares can be GTC
+                            if qty != sell_qty: 
+                                order_tif = TimeInForce.DAY
+                                order_qty = qty # sell exact fractional amount
+                            else:
+                                order_tif = TimeInForce.GTC
+                                order_qty = sell_qty
+                                
+                            trading_client.submit_order(
+                                order_data=MarketOrderRequest(
+                                    symbol=symbol, 
+                                    qty=order_qty, 
+                                    side=OrderSide.SELL, 
+                                    time_in_force=order_tif
+                                )
+                            )
+                            send_discord(f"💰 **SOLD {symbol}**\nReason: {reason}\nP&L: {pct_gain*100:.2f}%")
+                            log_to_influx(symbol, "sell", live_price, order_qty)
+                        except Exception as e:
+                            logger.error(f"    [!] Sell Error {symbol}: {e}")
+                            _failed_symbols.add(symbol)
 
                 # --- ENTRY LOGIC ---
                 # Phase 10: Also check pending orders to avoid buy/buy/buy churn loops
