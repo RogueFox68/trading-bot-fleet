@@ -12,24 +12,99 @@ BOT_MAPPING = {
     "moon_bag": ["BTC/USD", "ETH/USD"]
 }
 
+# Cache to avoid reading the file on every position in the loop
+_ownership_cache = {}
+_ownership_cache_time = 0
+
+def _build_ownership_map():
+    """
+    Builds a symbol -> bot_name lookup from active_targets.json.
+    Cached for 60 seconds to avoid repeated file reads.
+    """
+    import time
+    import os
+    global _ownership_cache, _ownership_cache_time
+    
+    now = time.time()
+    if _ownership_cache and (now - _ownership_cache_time) < 60:
+        return _ownership_cache
+    
+    owner_map = {}
+    
+    # 1. Load static mapping as baseline
+    for bot_name, symbols in BOT_MAPPING.items():
+        for sym in symbols:
+            owner_map[sym] = bot_name
+    
+    # 2. Overlay scout targets (these take priority)
+    SCOUT_TO_BOT = {
+        "wheel_targets": "wheel_bot",
+        "condor_targets": "condor_bot",
+        "trend_targets": "trend_bot",
+        "survivor_targets": "survivor_bot",
+        "short_targets": "trend_bot",  # Short targets are trend bot's domain
+    }
+    
+    try:
+        # Same path resolution as get_targets_with_freshness_check
+        target_path = None
+        for p in ["active_targets.json",
+                   os.path.join(os.path.dirname(__file__), "active_targets.json"),
+                   os.path.join(os.path.expanduser("~"), "bots", "repo", "active_targets.json")]:
+            if os.path.exists(p):
+                target_path = p
+                break
+        
+        if target_path:
+            with open(target_path, 'r') as f:
+                data = json.load(f)
+            
+            for scout_key, bot_name in SCOUT_TO_BOT.items():
+                targets = data.get(scout_key, [])
+                for item in targets:
+                    sym, _ = parse_target(item)
+                    if sym:
+                        owner_map[sym] = bot_name
+    except Exception as e:
+        logger.error(f"  [CFO] Error building ownership map: {e}")
+        # Fall through to static mapping only
+    
+    _ownership_cache = owner_map
+    _ownership_cache_time = now
+    return owner_map
+
 def get_bot_owner(symbol, asset_class):
     """Determines which bot owns a specific position."""
-    # 1. Crypto Rules
+    # 1. Crypto Rules (unchanged)
     if asset_class == AssetClass.CRYPTO:
-        return "crypto_grid" # Default owner, Moon Bag shares this space
+        return "crypto_grid"
     
-    # 2. Options Rules
+    # 2. Build dynamic map
+    owner_map = _build_ownership_map()
+    
+    # 3. Options Rules — extract root symbol
     if asset_class == AssetClass.US_OPTION:
-        # Check if the root symbol belongs to Wheel
-        for ticker in BOT_MAPPING["wheel_bot"]:
-            if symbol.startswith(ticker): return "wheel_bot"
-        return "condor_bot" # All other options go to Condor
-
-    # 3. Stock Rules
-    if symbol in BOT_MAPPING["survivor_bot"]: return "survivor_bot"
-    if symbol in BOT_MAPPING["wheel_bot"]: return "wheel_bot"
+        root = symbol
+        for i, char in enumerate(symbol):
+            if char.isdigit():
+                root = symbol[:i]
+                break
+        
+        # Check dynamic map for the root
+        owner = owner_map.get(root)
+        if owner in ("wheel_bot", "condor_bot"):
+            return owner
+        
+        # Fallback: if root is in any bot's targets, use that
+        # Otherwise default to condor (it's the options-focused bot)
+        return owner if owner else "condor_bot"
     
-    # 4. Default Aggressive
+    # 4. Stock/ETF Rules — check dynamic map
+    owner = owner_map.get(symbol)
+    if owner:
+        return owner
+    
+    # 5. Default fallback
     return "trend_bot"
 
 def check_budget(bot_name, trading_client):
@@ -64,7 +139,11 @@ def check_budget(bot_name, trading_client):
             if bot_name in ["crypto_grid", "moon_bag"] and owner == "crypto_grid":
                 current_used += float(p.market_value)
             elif owner == bot_name:
-                current_used += float(p.market_value)
+                if p.asset_class == AssetClass.US_OPTION:
+                    # Options: use cost basis or absolute market value as "capital at risk"
+                    current_used += abs(float(p.market_value))
+                else:
+                    current_used += float(p.market_value)
 
         available = budget_dollars - current_used
         logger.info(f"  [CFO] {bot_name}: Used ${current_used:.0f} / ${budget_dollars:.0f} (Left: ${available:.0f})")
