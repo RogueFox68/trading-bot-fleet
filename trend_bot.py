@@ -138,7 +138,7 @@ def run_trend_bot():
             short_exposure = sum(
                 abs(float(p.market_value))
                 for p in positions
-                if p.side == "short" and utils.get_bot_owner(p.symbol, p.asset_class) == "trend_bot"
+                if p.side == "short" and utils.get_bot_owner(p.symbol, p.asset_class, trading_client) == "trend_bot"
             )
 
             my_holdings = [p.symbol for p in positions if p.asset_class == AssetClass.US_EQUITY and (p.symbol in clean_targets_long or p.symbol in clean_targets_short)]

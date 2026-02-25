@@ -264,9 +264,7 @@ def run_wheel_bot():
                 
                 # Cash Secured Put?
                 else:
-                    # [FIX] Use cached budget check
-                    if not is_budget_ok:
-                        continue
+                    # Budget check handled at top of entry logic
 
                     if real_bp < (current_stock_price * 100):
                         logger.warning(f"    [SKIP] Insufficient BP (Need ${current_stock_price*100:.0f})")
