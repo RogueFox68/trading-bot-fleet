@@ -119,13 +119,7 @@ def run_survivor_bot():
                     continue
             except: pass
 
-            # 2. [FIX] CFO Check OUTSIDE the loop
-            if not utils.check_budget("survivor_bot", trading_client):
-                logger.info(f"Survivor Budget Paused.")
-                time.sleep(300)
-                continue
-
-            # 3. Build Watchlist & Blacklist
+            # 2. Build Watchlist & Blacklist
             raw_scout_targets, blacklist = get_segregated_targets()
             
             # --- PARSE & FILTER (Phase 2) ---
@@ -248,6 +242,11 @@ def run_survivor_bot():
                 # Phase 10: Also check pending orders to avoid buy/buy/buy churn loops
                 elif symbol not in pos_dict and symbol not in pending_symbols:
                     
+                    # [FIX] CFO Check specifically for new entries
+                    if not utils.check_budget("survivor_bot", trading_client):
+                        logger.info(f"    [PAUSE] CFO Budget Paused for new entries. Skipping {symbol}.")
+                        continue
+                        
                     # Phase 10: Minimum price filter — avoid penny stock sizing bombs
                     MIN_PRICE = 5.00
                     if price < MIN_PRICE:

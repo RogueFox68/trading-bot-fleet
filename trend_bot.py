@@ -103,12 +103,7 @@ def run_trend_bot():
                     continue
             except: pass
 
-            # 2. [FIX] CFO Check OUTSIDE loop
-            if not utils.check_budget("trend_bot", trading_client):
-                 logger.info(f"Trend Budget Paused.")
-                 time.sleep(300)
-                 continue
-
+            # 2. Market Regime Check
             global_regime = get_market_regime()
             long_targets, short_targets = get_dynamic_targets(global_regime)
             
@@ -264,6 +259,11 @@ def run_trend_bot():
                 # Phase 10: Also check pending orders to avoid churn loops
                 elif symbol in clean_targets_long and symbol not in pending_symbols:
                     
+                    # [FIX] CFO Check specifically for new entries
+                    if not utils.check_budget("trend_bot", trading_client):
+                        logger.info(f"    [PAUSE] CFO Budget Paused for new longs. Skipping {symbol}.")
+                        continue
+                    
                     # Phase 10: Minimum price filter
                     MIN_PRICE = 5.00
                     if price < MIN_PRICE:
@@ -322,6 +322,11 @@ def run_trend_bot():
 
                 # C) SHORT ENTRY LOGIC
                 elif symbol in clean_targets_short and symbol not in pending_symbols:
+                    
+                    # [FIX] CFO Check specifically for new entries
+                    if not utils.check_budget("trend_bot", trading_client):
+                        logger.info(f"    [PAUSE] CFO Budget Paused for new shorts. Skipping {symbol}.")
+                        continue
                     
                     MIN_PRICE = 10.00 # Higher min price for shorts to avoid extreme volatility
                     if price < MIN_PRICE:

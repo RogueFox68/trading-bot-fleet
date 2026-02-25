@@ -188,9 +188,6 @@ def run_wheel_bot():
 
             all_positions = trading_client.get_all_positions()
 
-            # [FIX] Check budget ONCE per cycle (prevents log spam)
-            is_budget_ok = utils.check_budget("wheel_bot", trading_client)
-            
             for ticker in clean_targets:
                 # [FIX] Skip if we already have an open order for this ticker
                 if ticker in busy_tickers:
@@ -244,6 +241,9 @@ def run_wheel_bot():
                     continue
 
                 # 3. OPEN NEW POSITIONS
+                if not utils.check_budget("wheel_bot", trading_client):
+                     continue # Skip new entries if budget paused, but finish loop
+                     
                 confidence = target_map.get(ticker, 0.5)
                 # Dynamic OTM
                 dynamic_otm = TARGET_OTM_PCT * (1.5 - confidence)

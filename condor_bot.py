@@ -158,6 +158,8 @@ def run_condor_bot():
             # --- ENTRY ---
             if condor_positions >= MAX_POSITIONS:
                 logger.info("    Max positions reached. Skipping entry.")
+            elif not utils.check_budget("condor_bot", trading_client):
+                logger.info("    [PAUSE] CFO Budget Paused for new condors.")
             else:
                 for ticker in clean_targets:
                     if ticker in active_tickers: continue
