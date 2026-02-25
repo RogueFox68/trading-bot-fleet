@@ -233,7 +233,7 @@ def run_trend_bot():
                         if bull_cross == False and bear_cross == True:
                             try:
                                 logger.info(f"    📉 CLOSE LONG {symbol}")
-                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC))
+                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
                                 pnl_pct = (price - entry_price) / entry_price
                                 send_discord(f"📉 **SELL/CLOSE {symbol}** (Cross)\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
                                 log_to_influx(symbol, "sell", price, sell_qty)
@@ -247,7 +247,7 @@ def run_trend_bot():
                             try:
                                 logger.info(f"    📉 CLOSE SHORT {symbol}")
                                 # Buy to cover
-                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC))
+                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
                                 pnl_pct = (entry_price - price) / entry_price # Inverted PnL
                                 send_discord(f"📉 **BUY TO COVER {symbol}** (Bull Cross)\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
                                 log_to_influx(symbol, "buy", price, sell_qty)
@@ -310,7 +310,7 @@ def run_trend_bot():
                             if qty > 0:
                                 logger.info(f"    🔼 BUY SIGNAL (LONG) {symbol} ({entry_type} | Conf: {confidence:.2f}, Size: {scaler * float(size_mult):.1f}x)")
                                 try:
-                                    trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
+                                    trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
                                     send_discord(f"🔼 **LONG {symbol}** ({entry_type})\nRegime: {global_regime}\nADX: {local_adx:.0f}\nConfidence: {confidence:.2f}")
                                     log_to_influx(symbol, "buy", price, qty)
                                 except Exception as e:
@@ -397,7 +397,7 @@ def run_trend_bot():
                             if qty > 0:
                                 logger.info(f"    🩸 BUY SIGNAL (SHORT) {symbol} ({entry_type} | Conf: {confidence:.2f}, Size: {scaler * float(size_mult):.1f}x)")
                                 try:
-                                    trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
+                                    trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
                                     send_discord(f"🩸 **SHORT {symbol}** ({entry_type})\nRegime: {global_regime}\nADX: {local_adx:.0f}\nConfidence: {confidence:.2f}")
                                     log_to_influx(symbol, "sell", price, qty)
                                     

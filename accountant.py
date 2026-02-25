@@ -121,43 +121,7 @@ def log_metric(measurement, tags, fields):
     except Exception as e:
         logger.error(f"Influx Write Error: {e}")
 
-def get_bot_owner(symbol, asset_class):
-    """
-    Decides which bot owns a specific live position.
-    """
-    # 1. Crypto is easy
-    if asset_class == AssetClass.CRYPTO: return "crypto_grid"
-    
-    # 2. Options: Distinguish between Wheel and Condor
-    if asset_class == AssetClass.US_OPTION:
-        # Check the underlying symbol (e.g. "TSLA230120..." -> "TSLA")
-        # Alpaca symbols for options are standard, but the 'symbol' arg passed here is usually the contract name
-        # We need to extract the root. However, for simple mapping:
-        
-        root = symbol
-        # Basic attempt to find root if it's a contract string (Alpaca sometimes gives the root in a separate field, 
-        # but here we rely on the input). If 'symbol' is "TSLA", it works. 
-        # If 'symbol' is "TSLA240119P00200000", we check if it starts with the ticker.
-        
-        for ticker in BOT_MAPPING["wheel"]:
-            if symbol.startswith(ticker): return "wheel_bot"
-            
-        for ticker in BOT_MAPPING["condor"]:
-            if symbol.startswith(ticker): return "condor_bot"
-            
-        return "condor_bot" # Default aggressive options to Condor if unknown
-    
-    # 3. Stocks (Equity)
-    if symbol in BOT_MAPPING["survivor"]: return "survivor_bot"
-    
-    # Wheel bot sometimes holds stock (assignment), but usually sells covered calls.
-    # If we hold stock in DIS/F/PLTR, it's likely Wheel Bot (unless Trend Bot went rogue).
-    # Since Trend Bot doesn't trade DIS/F, this is safe.
-    if symbol in BOT_MAPPING["wheel"]: return "wheel_bot"
-    
-    # Trend Bot takes the rest (NVDA, TSLA shares, etc.)
-    return "trend_bot"
-
+# Removed duplicated get_bot_owner. Accountant now uses utils.get_bot_owner directly.
 def run_accountant():
     logger.info("--- 🧾 SMART ACCOUNTANT (Condor Aware) STARTED ---")
 
@@ -179,7 +143,8 @@ def run_accountant():
             allocation_stats = unrealized_stats.copy()
 
             for p in positions:
-                owner = get_bot_owner(p.symbol, p.asset_class)
+                from utils import get_bot_owner
+                owner = get_bot_owner(p.symbol, p.asset_class, trading_client)
                 if owner in unrealized_stats:
                     unrealized_stats[owner] += float(p.unrealized_pl)
                     allocation_stats[owner] += float(p.market_value)

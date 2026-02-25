@@ -227,7 +227,7 @@ def run_condor_bot():
                         
                         try:
                             logger.info(f"       Buying Wing {contract.symbol} @ {limit_price}...")
-                            req = LimitOrderRequest(symbol=contract.symbol, qty=1, side=OrderSide.BUY, time_in_force=TimeInForce.DAY, limit_price=limit_price)
+                            req = LimitOrderRequest(symbol=contract.symbol, qty=1, side=OrderSide.BUY, time_in_force=TimeInForce.DAY, limit_price=limit_price, client_order_id=f"condor_bot-{contract.symbol}-{int(time.time())}")
                             order = trading_client.submit_order(order_data=req)
                             
                             # Wait for Fill (5 seconds max)
@@ -265,7 +265,7 @@ def run_condor_bot():
 
                             try:
                                 logger.info(f"       Selling Body {contract.symbol} @ {limit_price}...")
-                                req = LimitOrderRequest(symbol=contract.symbol, qty=1, side=OrderSide.SELL, time_in_force=TimeInForce.DAY, limit_price=limit_price)
+                                req = LimitOrderRequest(symbol=contract.symbol, qty=1, side=OrderSide.SELL, time_in_force=TimeInForce.DAY, limit_price=limit_price, client_order_id=f"condor_bot-{contract.symbol}-{int(time.time())}")
                                 trading_client.submit_order(order_data=req)
                                 # We assume Body fills or sits as limit. 
                                 # Ideally we check this too, but for now we just needed to ensure we HAVE the wings first.
@@ -278,7 +278,7 @@ def run_condor_bot():
                             # EMERGENCY CLOSE WINGS
                             for sym in wings_filled_ids:
                                 try:
-                                    trading_client.submit_order(order_data=MarketOrderRequest(symbol=sym, qty=1, side=OrderSide.SELL, time_in_force=TimeInForce.GTC))
+                                    trading_client.submit_order(order_data=MarketOrderRequest(symbol=sym, qty=1, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"condor_bot-{sym}-{int(time.time())}"))
                                     logger.warning(f"       ⚠️ Rolled back (Sold) {sym}")
                                 except: logger.error(f"       💀 CRITICAL: Failed to rollback {sym}. Manually Close!")
                             send_discord(f"⚠️ **CONDOR FAILED & ROLLED BACK**\nTicker: {ticker}\nCheck Account!")
@@ -293,7 +293,7 @@ def run_condor_bot():
                         if len(wings_filled_ids) > 0:
                              logger.warning("       ⚠️ Cleaning up partial wings...")
                              for sym in wings_filled_ids:
-                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=sym, qty=1, side=OrderSide.SELL, time_in_force=TimeInForce.GTC))
+                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=sym, qty=1, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"condor_bot-{sym}-{int(time.time())}"))
 
                     break # Move to sleep after attempt
 

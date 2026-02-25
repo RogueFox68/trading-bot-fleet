@@ -229,7 +229,8 @@ def run_survivor_bot():
                                     symbol=symbol, 
                                     qty=order_qty, 
                                     side=OrderSide.SELL, 
-                                    time_in_force=order_tif
+                                    time_in_force=order_tif,
+                                    client_order_id=f"survivor_bot-{symbol}-{int(time.time())}"
                                 )
                             )
                             send_discord(f"💰 **SOLD {symbol}**\nReason: {reason}\nP&L: {pct_gain*100:.2f}%")

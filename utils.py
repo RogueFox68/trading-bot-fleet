@@ -16,13 +16,13 @@ BOT_MAPPING = {
 _ownership_cache = {}
 _ownership_cache_time = 0
 
-def _build_ownership_map():
+def _build_order_based_map(trading_client):
     """
-    Builds a symbol -> bot_name lookup from active_targets.json.
-    Cached for 60 seconds to avoid repeated file reads.
+    Builds a symbol -> bot_name lookup from recent Alpaca orders.
+    Parses the custom client_order_id (e.g., 'survivor_bot-AAPL-170...').
+    Cached for 60 seconds to avoid API spam.
     """
     import time
-    import os
     global _ownership_cache, _ownership_cache_time
     
     now = time.time()
@@ -31,58 +31,44 @@ def _build_ownership_map():
     
     owner_map = {}
     
-    # 1. Load static mapping as baseline
+    # 1. Load static mapping as absolute baseline
     for bot_name, symbols in BOT_MAPPING.items():
         for sym in symbols:
             owner_map[sym] = bot_name
-    
-    # 2. Overlay scout targets (these take priority)
-    SCOUT_TO_BOT = {
-        "wheel_targets": "wheel_bot",
-        "condor_targets": "condor_bot",
-        "trend_targets": "trend_bot",
-        "survivor_targets": "survivor_bot",
-        "short_targets": "trend_bot",  # Short targets are trend bot's domain
-    }
-    
-    try:
-        # Same path resolution as get_targets_with_freshness_check
-        target_path = None
-        for p in ["active_targets.json",
-                   os.path.join(os.path.dirname(__file__), "active_targets.json"),
-                   os.path.join(os.path.expanduser("~"), "bots", "repo", "active_targets.json")]:
-            if os.path.exists(p):
-                target_path = p
-                break
-        
-        if target_path:
-            with open(target_path, 'r') as f:
-                data = json.load(f)
             
-            for scout_key, bot_name in SCOUT_TO_BOT.items():
-                targets = data.get(scout_key, [])
-                for item in targets:
-                    sym, _ = parse_target(item)
-                    if sym:
-                        owner_map[sym] = bot_name
+    # 2. Query recent orders for definitive tags
+    try:
+        from alpaca.trading.requests import GetOrdersRequest
+        req = GetOrdersRequest(status="all", limit=500)
+        orders = trading_client.get_orders(filter=req)
+        
+        for o in orders:
+            # client_order_id format: "{bot_name}-{symbol}-{timestamp}"
+            c_id = o.client_order_id
+            if not c_id: continue
+            
+            for bot in ["survivor_bot", "trend_bot", "wheel_bot", "condor_bot", "crypto_grid", "moon_bag"]:
+                if c_id.startswith(f"{bot}-"):
+                    owner_map[o.symbol] = bot
+                    break
+                    
     except Exception as e:
-        logger.error(f"  [CFO] Error building ownership map: {e}")
-        # Fall through to static mapping only
+        logger.error(f"  [CFO] Error building order-based ownership map: {e}")
     
     _ownership_cache = owner_map
     _ownership_cache_time = now
     return owner_map
 
-def get_bot_owner(symbol, asset_class):
-    """Determines which bot owns a specific position."""
-    # 1. Crypto Rules (unchanged)
+def get_bot_owner(symbol, asset_class, trading_client):
+    """Determines which bot owns a specific position based on order history."""
+    # 1. Crypto Rules
     if asset_class == AssetClass.CRYPTO:
         return "crypto_grid"
     
-    # 2. Build dynamic map
-    owner_map = _build_ownership_map()
+    # 2. Build dynamic map from order history
+    owner_map = _build_order_based_map(trading_client)
     
-    # 3. Options Rules — extract root symbol
+    # 3. Options Rules — extract root symbol if contract string
     if asset_class == AssetClass.US_OPTION:
         root = symbol
         for i, char in enumerate(symbol):
@@ -90,21 +76,19 @@ def get_bot_owner(symbol, asset_class):
                 root = symbol[:i]
                 break
         
-        # Check dynamic map for the root
-        owner = owner_map.get(root)
+        # Check dynamic map for the specific contract OR the root
+        owner = owner_map.get(symbol) or owner_map.get(root)
         if owner in ("wheel_bot", "condor_bot"):
             return owner
-        
-        # Fallback: if root is in any bot's targets, use that
-        # Otherwise default to condor (it's the options-focused bot)
+            
         return owner if owner else "condor_bot"
     
-    # 4. Stock/ETF Rules — check dynamic map
+    # 4. Stock/ETF Rules — check dynamic map for exact symbol
     owner = owner_map.get(symbol)
     if owner:
         return owner
     
-    # 5. Default fallback
+    # 5. Default fallback (e.g., manually placed order without tag)
     return "trend_bot"
 
 def check_budget(bot_name, trading_client):
@@ -133,7 +117,7 @@ def check_budget(bot_name, trading_client):
         current_used = 0.0
         
         for p in positions:
-            owner = get_bot_owner(p.symbol, p.asset_class)
+            owner = get_bot_owner(p.symbol, p.asset_class, trading_client)
             
             # Special Case: Crypto Grid and Moon Bag share assets
             if bot_name in ["crypto_grid", "moon_bag"] and owner == "crypto_grid":

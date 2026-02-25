@@ -232,7 +232,8 @@ def run_wheel_bot():
                                 qty=abs(int(qty)),
                                 side=OrderSide.BUY,
                                 time_in_force=TimeInForce.DAY,
-                                limit_price=close_price
+                                limit_price=close_price,
+                                client_order_id=f"wheel_bot-{active_option.symbol}-{int(time.time())}"
                             )
                             trading_client.submit_order(order_data=req)
                             send_discord(f"💵 **TOOK PROFIT {ticker}**\nClosed @ ${close_price} ({capture_pct*100:.0f}% Cap)")
@@ -305,7 +306,8 @@ def run_wheel_bot():
                         qty=1,
                         side=OrderSide.SELL,
                         time_in_force=TimeInForce.DAY,
-                        limit_price=limit_price
+                        limit_price=limit_price,
+                        client_order_id=f"wheel_bot-{contract.symbol}-{int(time.time())}"
                     )
                     trading_client.submit_order(order_data=req)
                     emoji = "🟢" if side == "CALL" else "🔴"
