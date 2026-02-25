@@ -147,7 +147,7 @@ def run_accountant():
                 owner = get_bot_owner(p.symbol, p.asset_class, trading_client)
                 if owner in unrealized_stats:
                     unrealized_stats[owner] += float(p.unrealized_pl)
-                    allocation_stats[owner] += float(p.market_value)
+                    allocation_stats[owner] += abs(float(p.market_value))
 
             # 3. COMBINE & REPORT
             # print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] TRUE P&L UPDATE:")

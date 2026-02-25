@@ -121,13 +121,13 @@ def check_budget(bot_name, trading_client):
             
             # Special Case: Crypto Grid and Moon Bag share assets
             if bot_name in ["crypto_grid", "moon_bag"] and owner == "crypto_grid":
-                current_used += float(p.market_value)
+                current_used += abs(float(p.market_value))
             elif owner == bot_name:
                 if p.asset_class == AssetClass.US_OPTION:
                     # Options: use cost basis or absolute market value as "capital at risk"
                     current_used += abs(float(p.market_value))
                 else:
-                    current_used += float(p.market_value)
+                    current_used += abs(float(p.market_value))
 
         available = budget_dollars - current_used
         logger.info(f"  [CFO] {bot_name}: Used ${current_used:.0f} / ${budget_dollars:.0f} (Left: ${available:.0f})")
