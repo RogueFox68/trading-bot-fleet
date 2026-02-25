@@ -147,6 +147,9 @@ def run_survivor_bot():
 
             logger.info(f"Scanning {len(clean_watchlist)} Targets (Ignored {len(blacklist)} Fleet Targets)")
 
+            # Batch budget check outside the symbol loop to prevent log spam
+            is_budget_ok = utils.check_budget("survivor_bot", trading_client)
+
             for symbol in clean_watchlist:
                 # Phase 10: Skip failed symbols and cryptos
                 if symbol in _failed_symbols: continue
@@ -244,8 +247,7 @@ def run_survivor_bot():
                 elif symbol not in pos_dict and symbol not in pending_symbols:
                     
                     # [FIX] CFO Check specifically for new entries
-                    if not utils.check_budget("survivor_bot", trading_client):
-                        logger.info(f"    [PAUSE] CFO Budget Paused for new entries. Skipping {symbol}.")
+                    if not is_budget_ok:
                         continue
                         
                     # Phase 10: Minimum price filter — avoid penny stock sizing bombs
@@ -280,7 +282,7 @@ def run_survivor_bot():
                             if qty > 0:
                                 logger.info(f"       -> Buying {qty} shares (Size: {scaler:.1f}x)...")
                                 try:
-                                    trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
+                                    trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY, client_order_id=f"survivor_bot-{symbol}-{int(time.time())}"))
                                     send_discord(f"💎 **BOUGHT DIP {symbol}**\nRSI: {rsi:.0f}\nConfidence: {confidence:.2f}\nGate: {gate}")
                                     log_to_influx(symbol, "buy", price, qty)
                                 except Exception as e:

@@ -158,58 +158,60 @@ def run_condor_bot():
             # --- ENTRY ---
             if condor_positions >= MAX_POSITIONS:
                 logger.info("    Max positions reached. Skipping entry.")
-            elif not utils.check_budget("condor_bot", trading_client):
-                logger.info("    [PAUSE] CFO Budget Paused for new condors.")
             else:
-                for ticker in clean_targets:
-                    if ticker in active_tickers: continue
-                    
-                    price = get_current_price(ticker)
-                    if price == 0: continue
-                    
-                    confidence = target_map.get(ticker, 0.5)
-                    
-                    # 1. Dynamic OTM (Closer if confident)
-                    # 0.5 -> 1.0x (0.08)
-                    # 0.9 -> 0.6x (0.048 - Aggressive)
-                    # 0.1 -> 1.4x (0.112 - Conservative)
-                    dynamic_otm = SHORT_OTM_PCT * (1.5 - confidence)
-                    
-                    # 2. Dynamic Width (Wider if confident)
-                    # 0.5 -> 1.0x (0.05)
-                    # 0.9 -> 1.4x (0.07 - Higher Profit/Risk)
-                    # 0.1 -> 0.6x (0.03 - Lower Profit/Risk)
-                    dynamic_width = WING_WIDTH_PCT * (0.5 + confidence)
-                    
-                    logger.info(f"  Analysing {ticker} (${price:.2f}) | Conf: {confidence:.2f} | OTM: {dynamic_otm*100:.1f}% | Width: {dynamic_width*100:.1f}%")
-                    
-                    # Calculate Strikes
-                    put_short_price = price * (1 - dynamic_otm)
-                    put_long_price = price * (1 - (dynamic_otm + dynamic_width))
-                    call_short_price = price * (1 + dynamic_otm)
-                    call_long_price = price * (1 + (dynamic_otm + dynamic_width))
-                    
-                    start_date = datetime.date.today() + datetime.timedelta(days=MIN_DTE)
-                    end_date = datetime.date.today() + datetime.timedelta(days=MAX_DTE)
-                    
-                    # Find Contracts
-                    put_short = find_strike(ticker, "PUT", start_date, end_date, put_short_price)
-                    put_long = find_strike(ticker, "PUT", start_date, end_date, put_long_price)
-                    call_short = find_strike(ticker, "CALL", start_date, end_date, call_short_price)
-                    call_long = find_strike(ticker, "CALL", start_date, end_date, call_long_price)
-                    
-                    if not (put_short and put_long and call_short and call_long):
-                        missing = []
-                        if not put_short: missing.append(f"PS({put_short_price:.1f})")
-                        if not put_long: missing.append(f"PL({put_long_price:.1f})")
-                        if not call_short: missing.append(f"CS({call_short_price:.1f})")
-                        if not call_long: missing.append(f"CL({call_long_price:.1f})")
-                        logger.info(f"    [SKIP] {ticker} | Failed to find all 4 legs. Missing: {', '.join(missing)}")
-                        continue
+                is_budget_ok = utils.check_budget("condor_bot", trading_client)
+                if not is_budget_ok:
+                    logger.info("    [PAUSE] CFO Budget Paused for new condors.")
+                else:
+                    for ticker in clean_targets:
+                        if ticker in active_tickers: continue
                         
-                    print(f"    -> 🦅 FOUND CONDOR! Executing Atomic Sequence...")
+                        price = get_current_price(ticker)
+                        if price == 0: continue
+                        
+                        confidence = target_map.get(ticker, 0.5)
+                        
+                        # 1. Dynamic OTM (Closer if confident)
+                        # 0.5 -> 1.0x (0.08)
+                        # 0.9 -> 0.6x (0.048 - Aggressive)
+                        # 0.1 -> 1.4x (0.112 - Conservative)
+                        dynamic_otm = SHORT_OTM_PCT * (1.5 - confidence)
+                        
+                        # 2. Dynamic Width (Wider if confident)
+                        # 0.5 -> 1.0x (0.05)
+                        # 0.9 -> 1.4x (0.07 - Higher Profit/Risk)
+                        # 0.1 -> 0.6x (0.03 - Lower Profit/Risk)
+                        dynamic_width = WING_WIDTH_PCT * (0.5 + confidence)
+                        
+                        logger.info(f"  Analysing {ticker} (${price:.2f}) | Conf: {confidence:.2f} | OTM: {dynamic_otm*100:.1f}% | Width: {dynamic_width*100:.1f}%")
+                        
+                        # Calculate Strikes
+                        put_short_price = price * (1 - dynamic_otm)
+                        put_long_price = price * (1 - (dynamic_otm + dynamic_width))
+                        call_short_price = price * (1 + dynamic_otm)
+                        call_long_price = price * (1 + (dynamic_otm + dynamic_width))
+                        
+                        start_date = datetime.date.today() + datetime.timedelta(days=MIN_DTE)
+                        end_date = datetime.date.today() + datetime.timedelta(days=MAX_DTE)
+                        
+                        # Find Contracts
+                        put_short = find_strike(ticker, "PUT", start_date, end_date, put_short_price)
+                        put_long = find_strike(ticker, "PUT", start_date, end_date, put_long_price)
+                        call_short = find_strike(ticker, "CALL", start_date, end_date, call_short_price)
+                        call_long = find_strike(ticker, "CALL", start_date, end_date, call_long_price)
+                        
+                        if not (put_short and put_long and call_short and call_long):
+                            missing = []
+                            if not put_short: missing.append(f"PS({put_short_price:.1f})")
+                            if not put_long: missing.append(f"PL({put_long_price:.1f})")
+                            if not call_short: missing.append(f"CS({call_short_price:.1f})")
+                            if not call_long: missing.append(f"CL({call_long_price:.1f})")
+                            logger.info(f"    [SKIP] {ticker} | Failed to find all 4 legs. Missing: {', '.join(missing)}")
+                            continue
+                            
+                        print(f"    -> 🦅 FOUND CONDOR! Executing Atomic Sequence...")
 
-                    if not utils.check_budget("condor_bot", trading_client):
+                    if not is_budget_ok:
                         break 
                     
                     wings = [put_long, call_long]

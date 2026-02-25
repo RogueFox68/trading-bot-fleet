@@ -186,6 +186,9 @@ def run_wheel_bot():
                 time.sleep(900)
                 continue
 
+            # Batch budget check outside the symbol loop to prevent log spam
+            is_budget_ok = utils.check_budget("wheel_bot", trading_client)
+
             all_positions = trading_client.get_all_positions()
 
             for ticker in clean_targets:
@@ -242,7 +245,7 @@ def run_wheel_bot():
                     continue
 
                 # 3. OPEN NEW POSITIONS
-                if not utils.check_budget("wheel_bot", trading_client):
+                if not is_budget_ok:
                      continue # Skip new entries if budget paused, but finish loop
                      
                 confidence = target_map.get(ticker, 0.5)
@@ -294,10 +297,7 @@ def run_wheel_bot():
                     if side == "PUT" and real_bp < (float(contract.strike_price) * 100):
                         logger.warning(f"    [SKIP] Strike too expensive for available BP.")
                         continue
-                else:
-                    logger.info(f"    [SKIP] No suitable {side} contract found within {MIN_DTE}-{MAX_DTE} DTE for {ticker}.")
-                    continue
-
+                        
                     logger.info(f"    [ENTRY] Selling {side} on {ticker} @ ${limit_price} (Midpoint)")
                     req = LimitOrderRequest(
                         symbol=contract.symbol,
@@ -311,6 +311,9 @@ def run_wheel_bot():
                     emoji = "🟢" if side == "CALL" else "🔴"
                     send_discord(f"{emoji} **SOLD {side} {ticker}**\nStrike: ${contract.strike_price}\nLimit: ${limit_price}\nConf: {confidence:.2f}")
                     log_to_influx(f"sell_{side.lower()}", limit_price, contract.symbol, "Opened Position")
+                else:
+                    logger.info(f"    [SKIP] No suitable {side} contract found within {MIN_DTE}-{MAX_DTE} DTE for {ticker}.")
+                    continue
 
             time.sleep(900)
 

@@ -154,6 +154,9 @@ def run_trend_bot():
             # We filter existing positions to only those relevant to Trend Bot strategies
             scan_list = list(set(clean_targets_long + clean_targets_short + my_holdings))
 
+            # Batch budget check outside the symbol loop to prevent log spam
+            is_budget_ok = utils.check_budget("trend_bot", trading_client)
+
             for symbol in scan_list:
                 # Phase 10: Skip failed symbols and cryptos
                 if symbol in _failed_symbols: continue
@@ -230,11 +233,31 @@ def run_trend_bot():
 
                     # Exit logic depends on side
                     if side == "long":
-                        if bull_cross == False and bear_cross == True:
+                        pnl_pct = (price - entry_price) / entry_price
+                        
+                        # Stop Loss / Take profit overrides
+                        if pnl_pct <= -0.05:
                             try:
-                                logger.info(f"    📉 CLOSE LONG {symbol}")
+                                logger.info(f"    🛑 STOP LOSS LONG {symbol} ({pnl_pct:.1%})")
                                 trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
-                                pnl_pct = (price - entry_price) / entry_price
+                                send_discord(f"🛑 **STOP LOSS {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
+                                log_to_influx(symbol, "sell", price, sell_qty)
+                            except Exception as e:
+                                logger.error(f"    [!] Stop Loss Error {symbol}: {e}")
+                                _failed_symbols.add(symbol)
+                        elif pnl_pct >= 0.08:
+                            try:
+                                logger.info(f"    💰 TAKE PROFIT LONG {symbol} ({pnl_pct:.1%})")
+                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
+                                send_discord(f"💰 **TAKE PROFIT {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
+                                log_to_influx(symbol, "sell", price, sell_qty)
+                            except Exception as e:
+                                logger.error(f"    [!] Take Profit Error {symbol}: {e}")
+                                _failed_symbols.add(symbol)
+                        elif bull_cross == False and bear_cross == True:
+                            try:
+                                logger.info(f"    📉 CLOSE LONG {symbol} (Crossover)")
+                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
                                 send_discord(f"📉 **SELL/CLOSE {symbol}** (Cross)\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
                                 log_to_influx(symbol, "sell", price, sell_qty)
                             except Exception as e:
@@ -242,13 +265,34 @@ def run_trend_bot():
                                 _failed_symbols.add(symbol)
                                 
                     elif side == "short":
-                        # Exit short if we get a bull cross (trend reversal back up)
-                        if bear_cross == False and bull_cross == True:
+                        pnl_pct = (entry_price - price) / entry_price # Inverted PnL
+                        
+                        # Stop Loss / Take profit overrides
+                        if pnl_pct <= -0.05:
                             try:
-                                logger.info(f"    📉 CLOSE SHORT {symbol}")
+                                logger.info(f"    🛑 STOP LOSS SHORT {symbol} ({pnl_pct:.1%})")
+                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
+                                send_discord(f"🛑 **STOP LOSS SHORT {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
+                                log_to_influx(symbol, "buy", price, sell_qty)
+                            except Exception as e:
+                                logger.error(f"    [!] Stop Loss Short Error {symbol}: {e}")
+                                _failed_symbols.add(symbol)
+                        elif pnl_pct >= 0.08:
+                            try:
+                                logger.info(f"    💰 TAKE PROFIT SHORT {symbol} ({pnl_pct:.1%})")
                                 # Buy to cover
                                 trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
-                                pnl_pct = (entry_price - price) / entry_price # Inverted PnL
+                                send_discord(f"💰 **TAKE PROFIT SHORT {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
+                                log_to_influx(symbol, "buy", price, sell_qty)
+                            except Exception as e:
+                                logger.error(f"    [!] Take Profit Short Error {symbol}: {e}")
+                                _failed_symbols.add(symbol)
+                        # Exit short if we get a bull cross (trend reversal back up)
+                        elif bear_cross == False and bull_cross == True:
+                            try:
+                                logger.info(f"    📉 CLOSE SHORT {symbol} (Crossover)")
+                                # Buy to cover
+                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
                                 send_discord(f"📉 **BUY TO COVER {symbol}** (Bull Cross)\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
                                 log_to_influx(symbol, "buy", price, sell_qty)
                             except Exception as e:
@@ -260,8 +304,7 @@ def run_trend_bot():
                 elif symbol in clean_targets_long and symbol not in pending_symbols:
                     
                     # [FIX] CFO Check specifically for new entries
-                    if not utils.check_budget("trend_bot", trading_client):
-                        logger.info(f"    [PAUSE] CFO Budget Paused for new longs. Skipping {symbol}.")
+                    if not is_budget_ok:
                         continue
                     
                     # Phase 10: Minimum price filter
@@ -324,8 +367,7 @@ def run_trend_bot():
                 elif symbol in clean_targets_short and symbol not in pending_symbols:
                     
                     # [FIX] CFO Check specifically for new entries
-                    if not utils.check_budget("trend_bot", trading_client):
-                        logger.info(f"    [PAUSE] CFO Budget Paused for new shorts. Skipping {symbol}.")
+                    if not is_budget_ok:
                         continue
                     
                     MIN_PRICE = 10.00 # Higher min price for shorts to avoid extreme volatility
