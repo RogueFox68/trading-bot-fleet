@@ -38,7 +38,6 @@ def _build_order_based_map(trading_client):
             
     # 2. Query recent orders for definitive tags
     try:
-        from alpaca.trading.requests import GetOrdersRequest
         req = GetOrdersRequest(status="all", limit=500)
         orders = trading_client.get_orders(filter=req)
         
@@ -129,8 +128,46 @@ def check_budget(bot_name, trading_client):
                 else:
                     current_used += abs(float(p.market_value))
 
-        available = budget_dollars - current_used
-        logger.info(f"  [CFO] {bot_name}: Used ${current_used:.0f} / ${budget_dollars:.0f} (Left: ${available:.0f})")
+        # 5. Calculate Pending Order Usage
+        open_orders = trading_client.get_orders(filter=GetOrdersRequest(status="open"))
+        pending_used = 0.0
+        
+        for o in open_orders:
+            # Check if this order originated from this specific bot
+            is_my_order = False
+            if o.client_order_id and o.client_order_id.startswith(f"{bot_name}-"):
+                is_my_order = True
+            
+            # If the bot placed the order, we need to account for the capital lock
+            if is_my_order:
+                unfilled_qty = float(o.qty) - float(o.filled_qty)
+                if unfilled_qty <= 0: continue
+                
+                # Equities (Buy Orders)
+                if o.asset_class == AssetClass.US_EQUITY and o.side == OrderSide.BUY:
+                    if o.limit_price:
+                        pending_used += unfilled_qty * float(o.limit_price)
+                        
+                # Options (Sell to Open / CSPs / CCs)
+                elif o.asset_class == AssetClass.US_OPTION and o.side == OrderSide.SELL:
+                    # Parse strike price from standard OCC symbol (e.g., AAPL240119P00150000)
+                    # The last 8 characters represent the strike price multiplied by 1000
+                    try:
+                        strike_str = o.symbol[-8:] 
+                        strike_price = float(strike_str) / 1000.0
+                        
+                        # Options are 100 shares per contract
+                        pending_used += unfilled_qty * strike_price * 100.0
+                    except Exception as e:
+                        logger.error(f"  [CFO] Error parsing strike from {o.symbol}: {e}")
+
+        total_used = current_used + pending_used
+        available = budget_dollars - total_used
+        
+        if pending_used > 0:
+            logger.info(f"  [CFO] {bot_name}: Used ${total_used:.0f} [Pos: ${current_used:.0f} | Pend: ${pending_used:.0f}] / Limit: ${budget_dollars:.0f} (Left: ${available:.0f})")
+        else:
+            logger.info(f"  [CFO] {bot_name}: Used ${total_used:.0f} / ${budget_dollars:.0f} (Left: ${available:.0f})")
         
         return available > 0
 
