@@ -136,33 +136,38 @@ async def watchdog_task():
     except Exception as e:
         print(f"[!] Watchdog Error: {e}")
 
-    # [NEW] Stale Target Check with Cooldown
+# [NEW] Stale Target Check with Cooldown (Skipped on Weekends)
     try:
-        target_file = "active_targets.json"
+        # 0 = Monday, ..., 4 = Friday, 5 = Saturday, 6 = Sunday
+        current_day = datetime.datetime.today().weekday()
         
-        if os.path.exists(target_file):
-            file_age = time.time() - os.path.getmtime(target_file)
-            if file_age > 86400: # 24 Hours
-                # Check Cooldown
-                if (time.time() - LAST_STALE_ALERT) > STALE_ALERT_COOLDOWN:
-                    try:
+        # Only run the stale target check on weekdays
+        if current_day < 5:  
+            target_file = "active_targets.json"
+            
+            if os.path.exists(target_file):
+                file_age = time.time() - os.path.getmtime(target_file)
+                if file_age > 86400: # 24 Hours
+                    # Check Cooldown
+                    if (time.time() - LAST_STALE_ALERT) > STALE_ALERT_COOLDOWN:
+                        try:
+                            channel = await bot.fetch_channel(int(CHANNEL_ID))
+                            await channel.send(
+                                f"⚠️ **STALE TARGETS DETECTED**\n"
+                                f"File age: {file_age/3600:.1f} hours\n"
+                                f"Bots are using fallback watchlists."
+                            )
+                            LAST_STALE_ALERT = time.time()
+                        except: pass
+            else:
+                 # If missing entirely
+                 # We might want cooldown here too, but missing file is more critical
+                 if (time.time() - LAST_STALE_ALERT) > STALE_ALERT_COOLDOWN:
+                     try:
                         channel = await bot.fetch_channel(int(CHANNEL_ID))
-                        await channel.send(
-                            f"⚠️ **STALE TARGETS DETECTED**\n"
-                            f"File age: {file_age/3600:.1f} hours\n"
-                            f"Bots are using fallback watchlists."
-                        )
+                        await channel.send("🚨 **TARGETS FILE MISSING**\nCheck 5080 scanner!")
                         LAST_STALE_ALERT = time.time()
-                    except: pass
-        else:
-             # If missing entirely
-             # We might want cooldown here too, but missing file is more critical
-             if (time.time() - LAST_STALE_ALERT) > STALE_ALERT_COOLDOWN:
-                 try:
-                    channel = await bot.fetch_channel(int(CHANNEL_ID))
-                    await channel.send("🚨 **TARGETS FILE MISSING**\nCheck 5080 scanner!")
-                    LAST_STALE_ALERT = time.time()
-                 except: pass
+                     except: pass
 
     except Exception as e:
         print(f"[!] Stale Check Error: {e}")
