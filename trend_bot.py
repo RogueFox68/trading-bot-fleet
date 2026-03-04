@@ -141,7 +141,7 @@ def run_trend_bot():
                 if p.side == "short" and utils.get_bot_owner(p.symbol, p.asset_class, trading_client) == "trend_bot"
             )
 
-            my_holdings = [p.symbol for p in positions if p.asset_class == AssetClass.US_EQUITY and (p.symbol in clean_targets_long or p.symbol in clean_targets_short)]
+            my_holdings = [p.symbol for p in positions if p.asset_class == AssetClass.US_EQUITY and utils.get_bot_owner(p.symbol, p.asset_class, trading_client) == "trend_bot"]
 
             logger.info(f"Regime: {global_regime} | Long Targets: {len(clean_targets_long)} | Short Targets: {len(clean_targets_short)}")
 
@@ -149,6 +149,12 @@ def run_trend_bot():
                  logger.info("    💤 Standby Mode: No targets or holdings. Sleeping...")
                  time.sleep(60)
                  continue
+
+            # EOD Policy Time Check
+            now_et = datetime.datetime.now(pytz.timezone('US/Eastern'))
+            time_str = now_et.strftime('%H:%M')
+            is_eod_close = time_str >= "15:45"
+            is_eod_skip_entry = time_str >= "14:00"
 
             # 3. Only scan OUR targets + OUR existing positions
             # We filter existing positions to only those relevant to Trend Bot strategies
@@ -235,8 +241,17 @@ def run_trend_bot():
                     if side == "long":
                         pnl_pct = (price - entry_price) / entry_price
                         
-                        # Stop Loss / Take profit overrides
-                        if pnl_pct <= -0.05:
+                        # Stop Loss / Take profit / EOD overrides
+                        if is_eod_close:
+                            try:
+                                logger.info(f"    📉 EOD LIQUIDATION LONG {symbol} (15:45+ ET)")
+                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
+                                send_discord(f"📉 **EOD CLOSE LONG {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
+                                log_to_influx(symbol, "sell", price, sell_qty)
+                            except Exception as e:
+                                logger.error(f"    [!] EOD Close Error {symbol}: {e}")
+                                _failed_symbols.add(symbol)
+                        elif pnl_pct <= -0.05:
                             try:
                                 logger.info(f"    🛑 STOP LOSS LONG {symbol} ({pnl_pct:.1%})")
                                 trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
@@ -267,8 +282,17 @@ def run_trend_bot():
                     elif side == "short":
                         pnl_pct = (entry_price - price) / entry_price # Inverted PnL
                         
-                        # Stop Loss / Take profit overrides
-                        if pnl_pct <= -0.05:
+                        # Stop Loss / Take profit / EOD overrides
+                        if is_eod_close:
+                            try:
+                                logger.info(f"    📉 EOD LIQUIDATION SHORT {symbol} (15:45+ ET)")
+                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
+                                send_discord(f"📉 **EOD CLOSE SHORT {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
+                                log_to_influx(symbol, "buy", price, sell_qty)
+                            except Exception as e:
+                                logger.error(f"    [!] EOD Close Short Error {symbol}: {e}")
+                                _failed_symbols.add(symbol)
+                        elif pnl_pct <= -0.05:
                             try:
                                 logger.info(f"    🛑 STOP LOSS SHORT {symbol} ({pnl_pct:.1%})")
                                 trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
@@ -302,6 +326,9 @@ def run_trend_bot():
                 # B) LONG ENTRY LOGIC
                 # Phase 10: Also check pending orders to avoid churn loops
                 elif symbol in clean_targets_long and symbol not in pending_symbols:
+                    
+                    if is_eod_skip_entry:
+                        continue
                     
                     # [FIX] CFO Check specifically for new entries
                     if not is_budget_ok:
@@ -365,6 +392,9 @@ def run_trend_bot():
 
                 # C) SHORT ENTRY LOGIC
                 elif symbol in clean_targets_short and symbol not in pending_symbols:
+                    
+                    if is_eod_skip_entry:
+                        continue
                     
                     # [FIX] CFO Check specifically for new entries
                     if not is_budget_ok:

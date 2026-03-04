@@ -145,12 +145,23 @@ def run_survivor_bot():
             open_orders = trading_client.get_orders(filter=GetOrdersRequest(status="open"))
             pending_symbols = {o.symbol for o in open_orders}
 
-            logger.info(f"Scanning {len(clean_watchlist)} Targets (Ignored {len(blacklist)} Fleet Targets)")
+            # EOD Policy Time Check
+            now_et = datetime.datetime.now(pytz.timezone('US/Eastern'))
+            time_str = now_et.strftime('%H:%M')
+            is_eod_close = time_str >= "15:45"
+            is_eod_skip_entry = time_str >= "14:00"
+
+            # Add all survivor-owned positions to the scan list
+            owned_symbols = [p.symbol for p in positions
+                if utils.get_bot_owner(p.symbol, p.asset_class, trading_client) == "survivor_bot"]
+            full_scan_list = list(set(clean_watchlist + owned_symbols))
+
+            logger.info(f"Scanning {len(full_scan_list)} Targets (Watchlist + Owned, Ignored {len(blacklist)} Blacklist) | ET: {time_str}")
 
             # Batch budget check outside the symbol loop to prevent log spam
             is_budget_ok = utils.check_budget("survivor_bot", trading_client)
 
-            for symbol in clean_watchlist:
+            for symbol in full_scan_list:
                 # Phase 10: Skip failed symbols and cryptos
                 if symbol in _failed_symbols: continue
                 if symbol in ["BTC/USD", "ETH/USD"]: continue 
@@ -205,7 +216,10 @@ def run_survivor_bot():
                     should_sell = False
                     reason = ""
                     
-                    if rsi > RSI_SELL:
+                    if is_eod_close:
+                        should_sell = True
+                        reason = "EOD Liquidation (15:45+ ET)"
+                    elif rsi > RSI_SELL:
                         should_sell = True
                         reason = f"RSI Overbought ({rsi:.0f})"
                     elif pct_gain > 0.05:
@@ -245,6 +259,10 @@ def run_survivor_bot():
                 # --- ENTRY LOGIC ---
                 # Phase 10: Also check pending orders to avoid buy/buy/buy churn loops
                 elif symbol not in pos_dict and symbol not in pending_symbols:
+                    
+                    # EOD Policy: Skip new entries after 14:00 ET
+                    if is_eod_skip_entry:
+                        continue
                     
                     # [FIX] CFO Check specifically for new entries
                     if not is_budget_ok:
