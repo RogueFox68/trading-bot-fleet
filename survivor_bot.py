@@ -297,6 +297,13 @@ def run_survivor_bot():
                             max_qty = int(max_position_value / price)
                             qty = min(qty, max_qty)
                             
+                            # Check buying power before ordering
+                            order_cost = float(qty) * float(price)
+                            buying_power = float(account.non_marginable_buying_power)
+                            if order_cost > buying_power:
+                                logger.info(f"       [SKIP] {symbol} | Cost ${order_cost:.0f} > Buying Power ${buying_power:.0f}")
+                                continue
+                            
                             if qty > 0:
                                 logger.info(f"       -> Buying {qty} shares (Size: {scaler:.1f}x)...")
                                 try:

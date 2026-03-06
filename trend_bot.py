@@ -377,6 +377,13 @@ def run_trend_bot():
                             max_qty = int(max_position_value / price)
                             qty = min(qty, max_qty)
                             
+                            # Check buying power before ordering
+                            order_cost = float(qty) * float(price)
+                            buying_power = float(account.non_marginable_buying_power)
+                            if order_cost > buying_power:
+                                logger.info(f"    [SKIP] {symbol} | Cost ${order_cost:.0f} > Buying Power ${buying_power:.0f}")
+                                continue
+                                
                             if qty > 0:
                                 logger.info(f"    🔼 BUY SIGNAL (LONG) {symbol} ({entry_type} | Conf: {confidence:.2f}, Size: {scaler * float(size_mult):.1f}x)")
                                 try:
@@ -385,6 +392,7 @@ def run_trend_bot():
                                     log_to_influx(symbol, "buy", price, qty)
                                 except Exception as e:
                                     logger.error(f"    [!] Order Error: {e}")
+                                    _failed_symbols.add(symbol)
                         else:
                             logger.info(f"    [SKIP] {symbol} | ADX {local_adx:.0f} > 20 but no Bullish Crossover or Momentum trigger.")
                     else:
@@ -466,6 +474,13 @@ def run_trend_bot():
                             max_qty = int(max_position_value / price)
                             qty = min(qty, max_qty)
                             
+                            # Check buying power before ordering
+                            order_cost = float(qty) * float(price)
+                            buying_power = float(account.non_marginable_buying_power)
+                            if order_cost > buying_power:
+                                logger.info(f"    [SKIP] {symbol} | Cost ${order_cost:.0f} > Buying Power ${buying_power:.0f}")
+                                continue
+                                
                             if qty > 0:
                                 logger.info(f"    🩸 BUY SIGNAL (SHORT) {symbol} ({entry_type} | Conf: {confidence:.2f}, Size: {scaler * float(size_mult):.1f}x)")
                                 try:
@@ -477,6 +492,7 @@ def run_trend_bot():
                                     short_exposure = float(short_exposure) + (float(qty) * float(price))
                                 except Exception as e:
                                     logger.error(f"    [!] Order Error: {e}")
+                                    _failed_symbols.add(symbol)
                         else:
                             logger.info(f"    [SKIP] {symbol} | ADX {local_adx:.0f} > 20 but no Bearish Crossover or Momentum trigger.")
                     else:
