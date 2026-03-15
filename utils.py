@@ -1,6 +1,7 @@
 import json
 from alpaca.trading.enums import AssetClass
 from logger import logger
+from alpaca.trading.requests import GetOrdersRequest
 
 # --- CENTRALIZED ASSET MAP ---
 # This defines which bot is allowed to trade which ticker
