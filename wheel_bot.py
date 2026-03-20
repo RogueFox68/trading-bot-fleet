@@ -164,6 +164,16 @@ def run_wheel_bot():
                     continue
             except: pass
 
+            try:
+                import json
+                with open("bot_config.json", 'r') as f:
+                    bot_cfg = json.load(f)
+                current_vix = bot_cfg.get('global_settings', {}).get('vix', 0)
+                current_regime = bot_cfg.get('global_settings', {}).get('market_condition', 'UNKNOWN')
+            except:
+                current_vix = 0
+                current_regime = 'UNKNOWN'
+
             raw_targets = get_wheel_targets()
             
             # --- PARSE & CONFIGURE (Phase 2) ---
@@ -247,6 +257,11 @@ def run_wheel_bot():
                 # 3. OPEN NEW POSITIONS
                 if not is_budget_ok:
                      continue # Skip new entries if budget paused, but finish loop
+                     
+                # Gate new entries by Macro Environment
+                if current_vix > 22 or current_regime in ('BEAR_TREND', 'CRITICAL_VOLATILITY'):
+                    logger.info(f"    [GATE] {ticker:<4} | No new puts — VIX {current_vix:.1f} / Regime: {current_regime}")
+                    continue
                      
                 confidence = target_map.get(ticker, 0.5)
                 # Dynamic OTM
