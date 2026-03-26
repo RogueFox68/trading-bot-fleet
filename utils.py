@@ -1,5 +1,5 @@
 import json
-from alpaca.trading.enums import AssetClass
+from alpaca.trading.enums import AssetClass, OrderSide
 from logger import logger
 from alpaca.trading.requests import GetOrdersRequest
 
