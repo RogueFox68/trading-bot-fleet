@@ -10,6 +10,7 @@ import requests
 import pandas as pd
 import config
 from logger import get_logger
+import utils
 
 # --- LOGGING ---
 logger = get_logger("moon_bot")
@@ -100,6 +101,11 @@ def run_breakout_bot():
                         if current_price > entry_high:
                             logger.info(f"    [SIGNAL] BREAKOUT! Price ${current_price} > ${entry_high}")
                             
+                            is_budget_ok = utils.check_budget("moon_bag", trading_client)
+                            if not is_budget_ok:
+                                logger.warning(f"    [SKIP] Breakout buy blocked — CFO Budget limit reached.")
+                                continue
+                                
                             # Calculate Size
                             target_val = equity * RISK_PCT
                             qty_to_buy = target_val / current_price
@@ -108,11 +114,13 @@ def run_breakout_bot():
                                 logger.info("    [!] Insufficient Buying Power")
                                 continue
 
+                            c_id = f"moon_bag-{symbol.replace('/', '')}-{int(time.time())}"
                             req = MarketOrderRequest(
                                 symbol=symbol,
                                 qty=round(qty_to_buy, 4),
                                 side=OrderSide.BUY,
-                                time_in_force=TimeInForce.GTC
+                                time_in_force=TimeInForce.GTC,
+                                client_order_id=c_id
                             )
                             trading_client.submit_order(order_data=req)
                             
@@ -124,11 +132,13 @@ def run_breakout_bot():
                         if current_price < exit_low:
                             logger.info(f"    [SIGNAL] TRAILING STOP! Price ${current_price} < ${exit_low}")
                             
+                            c_id = f"moon_bag-{symbol.replace('/', '')}-{int(time.time())}"
                             req = MarketOrderRequest(
                                 symbol=symbol,
                                 qty=qty_held,
                                 side=OrderSide.SELL,
-                                time_in_force=TimeInForce.GTC
+                                time_in_force=TimeInForce.GTC,
+                                client_order_id=c_id
                             )
                             trading_client.submit_order(order_data=req)
                             

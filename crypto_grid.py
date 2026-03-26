@@ -9,6 +9,7 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.data.historical import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoLatestTradeRequest
 from logger import get_logger
+import utils
 
 # --- LOGGING ---
 logger = get_logger("crypto_grid")
@@ -106,6 +107,9 @@ def run_grid_bot():
             if price is None:
                 time.sleep(30)
                 continue
+                
+            # CFO Sync: Ping the accountant to track our position value globally.
+            is_budget_ok = utils.check_budget("crypto_grid", trading_client)
 
             # 3. Determine Zone
             if price < grid_bottom:
@@ -153,13 +157,17 @@ def run_grid_bot():
                     else:
                         logger.info(f"    [BUY] Dropped to Zone {current_zone}")
                         
-                        # Check Cash
+                        # Check Cash & Global Budget limits
                         acct = trading_client.get_account()
                         buying_power = float(acct.buying_power)
                         
-                        if buying_power > BUDGET_PER_GRID:
+                        if not is_budget_ok:
+                            logger.warning(f"    [SKIP] Grid buy $50 > Available (budget limit)")
+                            
+                        elif buying_power > BUDGET_PER_GRID:
                             qty = BUDGET_PER_GRID / price
-                            req = MarketOrderRequest(symbol=SYMBOL, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC)
+                            c_id = f"crypto_grid-{SYMBOL.replace('/', '')}-{int(time.time())}"
+                            req = MarketOrderRequest(symbol=SYMBOL, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=c_id)
                             trading_client.submit_order(order_data=req)
                             
                             send_discord(f"🟢 **GRID BUY {SYMBOL}**\nPrice: ${price:,.2f}\nZone: {current_zone}")
@@ -190,7 +198,8 @@ def run_grid_bot():
                     
                     if current_qty_held >= qty_to_sell:
                         # Full Sell
-                        req = MarketOrderRequest(symbol=SYMBOL, qty=qty_to_sell, side=OrderSide.SELL, time_in_force=TimeInForce.GTC)
+                        c_id = f"crypto_grid-{SYMBOL.replace('/', '')}-{int(time.time())}"
+                        req = MarketOrderRequest(symbol=SYMBOL, qty=qty_to_sell, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=c_id)
                         trading_client.submit_order(order_data=req)
 
                         send_discord(f"🔴 **GRID SELL {SYMBOL}**\nPrice: ${price:,.2f}\nZone: {current_zone}")
@@ -199,7 +208,8 @@ def run_grid_bot():
                     elif current_qty_held > (qty_to_sell * 0.1):
                         # [FIX] Partial Sell (Sweep Dust)
                         logger.info(f"    [SWEEP] Selling remaining {current_qty_held:.6f} (Target: {qty_to_sell:.6f})")
-                        req = MarketOrderRequest(symbol=SYMBOL, qty=current_qty_held, side=OrderSide.SELL, time_in_force=TimeInForce.GTC)
+                        c_id = f"crypto_grid-{SYMBOL.replace('/', '')}-{int(time.time())}"
+                        req = MarketOrderRequest(symbol=SYMBOL, qty=current_qty_held, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=c_id)
                         trading_client.submit_order(order_data=req)
                         
                         send_discord(f"🧹 **GRID SWEEP {SYMBOL}**\nSold remaining {current_qty_held:.4f}\nPrice: ${price:,.2f}")
