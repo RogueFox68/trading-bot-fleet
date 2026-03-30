@@ -150,9 +150,22 @@ def run_trend_bot():
                  time.sleep(60)
                  continue
 
+            # Global Risk Map
+            try:
+                with open('bot_config.json', 'r') as f:
+                    config_data = json.load(f)
+                    market_weather = config_data.get('global_settings', {})
+                    current_regime = market_weather.get('market_condition', 'SIDEWAYS')
+                    current_vix = market_weather.get('vix', 15.0)
+            except Exception as e:
+                logger.error(f"[!] Config load error: {e}")
+                current_regime = "SIDEWAYS"
+                current_vix = 15.0
+
             # EOD Policy Time Check
             now_et = datetime.datetime.now(pytz.timezone('US/Eastern'))
             time_str = now_et.strftime('%H:%M')
+            is_eod_eval = time_str >= "15:30" and time_str < "15:45"
             is_eod_close = time_str >= "15:45"
             is_eod_skip_entry = time_str >= "14:00"
 
@@ -242,6 +255,16 @@ def run_trend_bot():
                         pnl_pct = (price - entry_price) / entry_price
                         
                         # Stop Loss / Take profit / EOD overrides
+                        if is_eod_eval:
+                            import datetime
+                            indicators = {"adx": float(local_adx), "ema_trend_intact": bool(latest['ema_fast'] > latest['ema_slow'])}
+                            score = tiered_hold.calculate_hold_score("trend_bot", price, entry_price, indicators, current_regime, current_vix, hours_held=24.0)
+                            tier = tiered_hold.get_hold_tier(score, "trend_bot")
+                            
+                            if tier != "CLOSE_EOD":
+                                logger.info(f"    [HOLD] 🌙 Overriding EOD sweep for {symbol} LONG. Tier: {tier} (Score: {score})")
+                                continue
+                                
                         if is_eod_close:
                             try:
                                 logger.info(f"    📉 EOD LIQUIDATION LONG {symbol} (15:45+ ET)")
@@ -283,6 +306,16 @@ def run_trend_bot():
                         pnl_pct = (entry_price - price) / entry_price # Inverted PnL
                         
                         # Stop Loss / Take profit / EOD overrides
+                        if is_eod_eval:
+                            import datetime
+                            indicators = {"adx": float(local_adx), "ema_trend_intact": bool(latest['ema_fast'] < latest['ema_slow'])}
+                            score = tiered_hold.calculate_hold_score("trend_short", price, entry_price, indicators, current_regime, current_vix, hours_held=24.0)
+                            tier = tiered_hold.get_hold_tier(score, "trend_short")
+                            
+                            if tier != "CLOSE_EOD":
+                                logger.info(f"    [HOLD] 🌙 Overriding EOD sweep for {symbol} SHORT. Tier: {tier} (Score: {score})")
+                                continue
+                                
                         if is_eod_close:
                             try:
                                 logger.info(f"    📉 EOD LIQUIDATION SHORT {symbol} (15:45+ ET)")

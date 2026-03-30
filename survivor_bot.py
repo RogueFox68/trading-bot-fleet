@@ -3,6 +3,7 @@ import config
 from logger import get_logger
 import time
 import json
+import tiered_hold
 import os
 import datetime
 import requests
@@ -145,9 +146,22 @@ def run_survivor_bot():
             open_orders = trading_client.get_orders(filter=GetOrdersRequest(status="open"))
             pending_symbols = {o.symbol for o in open_orders}
 
+            # Global Risk Map
+            try:
+                with open('bot_config.json', 'r') as f:
+                    config_data = json.load(f)
+                    market_weather = config_data.get('global_settings', {})
+                    current_regime = market_weather.get('market_condition', 'SIDEWAYS')
+                    current_vix = market_weather.get('vix', 15.0)
+            except Exception as e:
+                logger.error(f"[!] Config load error: {e}")
+                current_regime = "SIDEWAYS"
+                current_vix = 15.0
+
             # EOD Policy Time Check
             now_et = datetime.datetime.now(pytz.timezone('US/Eastern'))
             time_str = now_et.strftime('%H:%M')
+            is_eod_eval = time_str >= "15:30" and time_str < "15:45"
             is_eod_close = time_str >= "15:45"
             is_eod_skip_entry = time_str >= "14:00"
 
@@ -216,6 +230,16 @@ def run_survivor_bot():
                     should_sell = False
                     reason = ""
                     
+                    if is_eod_eval:
+                        import datetime
+                        indicators = {"rsi": float(rsi)}
+                        score = tiered_hold.calculate_hold_score("survivor_bot", live_price, entry_price, indicators, current_regime, current_vix, hours_held=24.0)
+                        tier = tiered_hold.get_hold_tier(score, "survivor_bot")
+                        
+                        if tier != "CLOSE_EOD":
+                            logger.info(f"    [HOLD] 🌙 Overriding EOD sweep for {symbol}. Tier: {tier} (Score: {score})")
+                            continue
+                            
                     if is_eod_close:
                         should_sell = True
                         reason = "EOD Liquidation (15:45+ ET)"
