@@ -47,5 +47,32 @@
         "market_condition": "SIDEWAYS",
         "emergency_stop": false,
         "macro_climate": "MACRO_BULL"
+    },
+    "cfo_settings": {
+        "reallocation_enabled": true,
+        "base_allocations": {
+            "trend_bot": 0.28,
+            "survivor_bot": 0.20,
+            "wheel_bot": 0.38,
+            "crypto_grid": 0.05,
+            "moon_bot": 0.04
+        },
+        "minimum_reserves": {
+            "trend_bot": 0.10,
+            "survivor_bot": 0.10,
+            "wheel_bot": 0.05,
+            "crypto_grid": 0.02,
+            "moon_bot": 0.02
+        },
+        "reallocation_priority": [
+            "survivor_bot",
+            "trend_bot",
+            "crypto_grid",
+            "wheel_bot",
+            "moon_bot"
+        ],
+        "gate_idle_threshold_cycles": 10,
+        "reallocation_cap_per_cycle": 0.02,
+        "unallocated_reserve": 0.05
     }
 }

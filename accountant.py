@@ -121,8 +121,106 @@ def log_metric(measurement, tags, fields):
     except Exception as e:
         logger.error(f"Influx Write Error: {e}")
 
+bot_idle_cycles = {
+    "trend_bot": 0, "survivor_bot": 0, "wheel_bot": 0, 
+    "crypto_grid": 0, "moon_bot": 0, "condor_bot": 0
+}
+
+def is_bot_gated(bot, regime, vix):
+    """Determine if a bot is currently prohibited from entering new positions."""
+    if bot == "wheel_bot":
+        return regime in ["BEAR_TREND", "CRITICAL_VOLATILITY"] or vix > 22
+    elif bot == "crypto_grid":
+        return regime in ["BEAR_TREND", "CRITICAL_VOLATILITY"]
+    return False
+
+def calculate_dynamic_allocations(equity, allocation_stats, regime, vix, config_data):
+    """
+    Executes the dynamic capital reallocation algorithm based on bot gating status
+    and minimum reserve floors. Reallocates surplus capital to free bots.
+    """
+    import json
+    
+    cfo_settings = config_data.get("cfo_settings")
+    if not cfo_settings or not cfo_settings.get("reallocation_enabled"):
+        return None # Graceful fallback to static bot_config
+        
+    base = cfo_settings["base_allocations"]
+    mins = cfo_settings["minimum_reserves"]
+    priority = cfo_settings["reallocation_priority"]
+    reserve = cfo_settings["unallocated_reserve"] * equity  
+    allocatable_equity = equity - reserve
+    
+    bot_status = {}
+    for bot in base.keys():
+        gated = is_bot_gated(bot, regime, vix)
+        if gated:
+            bot_idle_cycles[bot] += 1
+        else:
+            bot_idle_cycles[bot] = 0
+            
+        bot_status[bot] = {
+            "gated": gated,
+            "idle_cycles": bot_idle_cycles[bot],
+            "positions_held": allocation_stats.get(bot, 0.0), # Current locked capital
+            "can_accept_capital": not gated
+        }
+    
+    surplus = 0.0
+    effective_alloc = {}
+    
+    # 1. Harvest Surplus from Gated Bots
+    for bot in base.keys():
+        threshold = cfo_settings.get("gate_idle_threshold_cycles", 10)
+        
+        if bot_status[bot]["gated"] and bot_status[bot]["idle_cycles"] >= threshold:
+            locked_capital = bot_status[bot]["positions_held"]
+            # Floor is strictly the higher of its absolute minimum percentage, or its actual existing positions
+            floor = max(mins.get(bot, 0) * allocatable_equity, locked_capital)
+            released = (base.get(bot, 0) * allocatable_equity) - floor
+            surplus += max(0, released)
+            effective_alloc[bot] = floor
+        else:
+            effective_alloc[bot] = base.get(bot, 0) * allocatable_equity
+            
+    # 2. Distribute Surplus to Active Bots capped by velocity
+    max_move = cfo_settings.get("reallocation_cap_per_cycle", 0.02) * equity
+    distributable = min(surplus, max_move)
+    remaining = distributable
+    
+    active_priority = [b for b in priority if bot_status.get(b, {}).get("can_accept_capital")]
+    
+    if active_priority and remaining > 0:
+        for i, bot in enumerate(active_priority):
+            if remaining <= 0: break
+            
+            if i == 0:
+                share = remaining * 0.50
+            elif i == 1:
+                share = remaining * 0.30
+            else:
+                share = remaining * 0.20 / max(1, len(active_priority) - 2)
+                
+            effective_alloc[bot] = effective_alloc.get(bot, 0) + share
+            remaining -= share
+
+    # 3. Export Data for Fleet Consumption
+    try:
+        with open("effective_budgets.json", "w") as f:
+            json.dump(effective_alloc, f, indent=4)
+            
+        budgets_log = " | ".join(f"{b}=${int(v)}" for b, v in effective_alloc.items())
+        logger.info(f"[CFO] Effective budgets: {budgets_log}")
+        logger.info(f"[CFO] Reserve: ${int(reserve)} | Surplus pool: ${int(surplus)} (Distributing: ${int(distributable)})")
+    except Exception as e:
+        logger.error(f"[CFO] Could not write effective_budgets.json: {e}")
+        
+    return effective_alloc
+
+
 # Removed duplicated get_bot_owner. Accountant now uses utils.get_bot_owner directly.
 def run_accountant():
+    import json
     logger.info("--- 🧾 SMART ACCOUNTANT (Condor Aware) STARTED ---")
 
     while True:
@@ -169,6 +267,17 @@ def run_accountant():
                         "total_pl": total_pl
                     }
                 )
+            
+            # --- PHASE 23C: CFO DYNAMIC REALLOCATION ---
+            try:
+                with open("bot_config.json", "r") as f:
+                    config_data = json.load(f)
+                    regime = config_data.get("global_settings", {}).get("market_condition", "SIDEWAYS")
+                    vix = config_data.get("global_settings", {}).get("vix", 15.0)
+                
+                calculate_dynamic_allocations(float(account.equity), allocation_stats, regime, vix, config_data)
+            except Exception as e:
+                logger.error(f"[CFO] Reallocation process failed: {e}")
             
             # Log Global Stats
             log_metric("account_stats", {"type": "global"}, {

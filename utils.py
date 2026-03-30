@@ -93,24 +93,34 @@ def get_bot_owner(symbol, asset_class, trading_client):
 
 def check_budget(bot_name, trading_client):
     """
-    Returns True if the bot is under its allocated budget.
+    Returns True if the bot is under its dynamically allocated or static budget.
     """
+    import os
     try:
-        # 1. Load Config
-        with open("bot_config.json", "r") as f:
-            config = json.load(f)
-        
-        # 2. Get Limits
-        bot_settings = config["bots"].get(bot_name, {})
-        allocation_pct = bot_settings.get("allocation", 0.0)
-        
-        if allocation_pct == 0.0:
-            return True # No limit set, allow trade (or False to be strict)
-
-        # 3. Calculate Equity Share
         account = trading_client.get_account()
         equity = float(account.equity)
-        budget_dollars = equity * allocation_pct
+        budget_dollars = 0.0
+        
+        # 1. Try fetching Dynamic Effective Budget
+        if os.path.exists("effective_budgets.json"):
+            try:
+                with open("effective_budgets.json", "r") as f:
+                    effective = json.load(f)
+                    if bot_name in effective:
+                        budget_dollars = float(effective[bot_name])
+            except Exception as e:
+                logger.error(f"  [CFO] Dynamic budget parse error: {e}")
+                
+        # 2. Fallback to Static Base Budget
+        if budget_dollars == 0.0:
+            with open("bot_config.json", "r") as f:
+                config = json.load(f)
+            bot_settings = config["bots"].get(bot_name, {})
+            allocation_pct = bot_settings.get("allocation", 0.0)
+            
+            if allocation_pct == 0.0:
+                return True # No limit set
+            budget_dollars = equity * allocation_pct
         
         # 4. Calculate Current Usage
         positions = trading_client.get_all_positions()
