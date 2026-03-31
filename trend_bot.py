@@ -256,7 +256,6 @@ def run_trend_bot():
                         
                         # Stop Loss / Take profit / EOD overrides
                         if is_eod_eval:
-                            import datetime
                             indicators = {"adx": float(local_adx), "ema_trend_intact": bool(latest['ema_fast'] > latest['ema_slow'])}
                             score = tiered_hold.calculate_hold_score("trend_bot", price, entry_price, indicators, current_regime, current_vix, hours_held=24.0)
                             tier = tiered_hold.get_hold_tier(score, "trend_bot")
@@ -307,7 +306,6 @@ def run_trend_bot():
                         
                         # Stop Loss / Take profit / EOD overrides
                         if is_eod_eval:
-                            import datetime
                             indicators = {"adx": float(local_adx), "ema_trend_intact": bool(latest['ema_fast'] < latest['ema_slow'])}
                             score = tiered_hold.calculate_hold_score("trend_short", price, entry_price, indicators, current_regime, current_vix, hours_held=24.0)
                             tier = tiered_hold.get_hold_tier(score, "trend_short")

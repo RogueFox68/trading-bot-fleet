@@ -231,7 +231,6 @@ def run_survivor_bot():
                     reason = ""
                     
                     if is_eod_eval:
-                        import datetime
                         indicators = {"rsi": float(rsi)}
                         score = tiered_hold.calculate_hold_score("survivor_bot", live_price, entry_price, indicators, current_regime, current_vix, hours_held=24.0)
                         tier = tiered_hold.get_hold_tier(score, "survivor_bot")
