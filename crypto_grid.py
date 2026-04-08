@@ -48,8 +48,11 @@ def log_to_influx(symbol, action, price, qty):
     try:
         data_str = f'crypto_trades,symbol={symbol} price={price},action="{action}",qty={qty}'
         url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
-        requests.post(url, data=data_str)
-    except: pass
+        r = requests.post(url, data=data_str, timeout=2)
+        if r.status_code != 204:
+            logger.warning(f"InfluxDB write failed: {r.status_code} {r.text}")
+    except Exception as e:
+        logger.warning(f"InfluxDB write error: {e}")
 
 def get_market_regime():
     """Reads the 'Weather' from the Market Analyst."""

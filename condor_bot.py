@@ -43,8 +43,11 @@ def log_to_influx(action, symbol, price, detail):
     try:
         data_str = f'condor_trades,symbol={symbol} price={price},action="{action}",detail="{detail}"'
         url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
-        requests.post(url, data=data_str, timeout=2)
-    except: pass
+        r = requests.post(url, data=data_str, timeout=2)
+        if r.status_code != 204:
+            logger.warning(f"InfluxDB write failed: {r.status_code} {r.text}")
+    except Exception as e:
+        logger.warning(f"InfluxDB write error: {e}")
 
 def get_condor_targets():
     return utils.get_targets_with_freshness_check(TARGET_FILE, "condor_targets", [])
