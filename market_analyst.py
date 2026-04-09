@@ -14,7 +14,8 @@ CONFIG_FILE = "bot_config.json"
 MARKET_SYMBOL = "SPY"
 
 # --- INFLUXDB ---
-INFLUX_HOST = config.INFLUX_HOST
+# Market Analyst is co-located with DB, use localhost to bypass firewalls
+INFLUX_HOST = "localhost"
 INFLUX_PORT = config.INFLUX_PORT
 INFLUX_DB_NAME = config.INFLUX_DB_NAME
 INFLUX_URL = f"http://{INFLUX_HOST}:{INFLUX_PORT}/write?db={INFLUX_DB_NAME}"
