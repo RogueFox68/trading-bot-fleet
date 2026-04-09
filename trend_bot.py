@@ -9,6 +9,7 @@ import ta
 from ta.trend import EMAIndicator, ADXIndicator
 import pytz
 import utils
+import tiered_hold
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
