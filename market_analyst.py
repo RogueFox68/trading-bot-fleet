@@ -59,9 +59,9 @@ def log_to_influx(price, vix, adx, regime, sma, ema):
                     f'regime_score={regime_score},regime="{regime}"')
         r = requests.post(INFLUX_URL, data=data_str, timeout=2)
         if r.status_code != 204:
-            logger.warning(f"InfluxDB write failed: {r.status_code} {r.text}")
+            print(f"   [!] InfluxDB write failed: {r.status_code} {r.text}")
     except Exception as e:
-        logger.warning(f"InfluxDB write error: {e}")
+        print(f"   [!] InfluxDB write error: {e}")
 
 def get_market_data():
     try:
