@@ -113,11 +113,12 @@ def update_bot_config(regime, vix_val, climate):
                 changes_made.append(f"{bot_name} -> {target_status}")
 
         # Update Global Weather Report
+        prev_regime = current_config['global_settings'].get('market_condition')
         current_config['global_settings']['market_condition'] = forced_regime
         current_config['global_settings']['macro_climate'] = climate
         current_config['global_settings']['vix'] = round(vix_val, 2)
 
-        if changes_made or current_config['global_settings'].get('market_condition') != forced_regime:
+        if changes_made or prev_regime != forced_regime:
             with open(CONFIG_FILE, 'w') as f:
                 json.dump(current_config, f, indent=4)
             
