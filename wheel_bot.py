@@ -41,7 +41,7 @@ def send_discord(msg):
 
 def log_to_influx(action, price, symbol, detail):
     try:
-        data_str = f'wheel_trades,symbol={symbol} price={price},action="{action}",detail="{detail}",contract="{symbol}"'
+        data_str = f'wheel_trades,symbol={symbol} price={price},action="{action}",detail="{detail}",contract="{symbol}" {time.time_ns()}'
         url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
         r = requests.post(url, data=data_str, timeout=2)
         if r.status_code != 204:

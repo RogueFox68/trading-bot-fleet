@@ -57,7 +57,7 @@ def log_to_influx(price, vix, adx, regime, sma, ema):
         regime_score = 1 if "BULL" in regime else (-1 if "BEAR" in regime else 0)
         data_str = (f'market_regime,symbol=SPY '
                     f'price={price},vix={vix},adx={adx},sma200={sma},ema20={ema},'
-                    f'regime_score={regime_score},regime="{regime}"')
+                    f'regime_score={regime_score},regime="{regime}" {time.time_ns()}')
         r = requests.post(INFLUX_URL, data=data_str, timeout=2)
         if r.status_code != 204:
             print(f"   [!] InfluxDB write failed: {r.status_code} {r.text}")
