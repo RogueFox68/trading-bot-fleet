@@ -6,3 +6,5 @@ yfinance
 requests
 pytz
 discord.py
+influxdb
+python-dotenv
