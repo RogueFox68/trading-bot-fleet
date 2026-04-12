@@ -1,6 +1,6 @@
 import json
 from alpaca.trading.enums import AssetClass, OrderSide
-from logger import logger
+from logger import logger, registry
 from alpaca.trading.requests import GetOrdersRequest
 
 # --- CENTRALIZED ASSET MAP ---
@@ -53,6 +53,7 @@ def _build_order_based_map(trading_client):
                     break
                     
     except Exception as e:
+        registry.log_error("utils", "build_order_map", e)
         logger.error(f"  [CFO] Error building order-based ownership map: {e}")
     
     _ownership_cache = owner_map
@@ -109,6 +110,7 @@ def check_budget(bot_name, trading_client):
                     if bot_name in effective:
                         budget_dollars = float(effective[bot_name])
             except Exception as e:
+                registry.log_error("utils", "parse_budget", e)
                 logger.error(f"  [CFO] Dynamic budget parse error: {e}")
                 
         # 2. Fallback to Static Base Budget
@@ -170,6 +172,7 @@ def check_budget(bot_name, trading_client):
                         # Options are 100 shares per contract
                         pending_used += unfilled_qty * strike_price * 100.0
                     except Exception as e:
+                        registry.log_error("utils", "parse_strike", e, context=o.symbol)
                         logger.error(f"  [CFO] Error parsing strike from {o.symbol}: {e}")
 
         total_used = current_used + pending_used
@@ -183,6 +186,7 @@ def check_budget(bot_name, trading_client):
         return available > 0
 
     except Exception as e:
+        registry.log_error("utils", "check_budget", e)
         logger.error(f"  [CFO] Budget Check Error: {e}")
         return True # Default to allow if file error
     
@@ -199,6 +203,7 @@ def get_active_targets(strategy_key):
             # Return the specific list, or empty if not found
             return data.get(strategy_key, [])
     except Exception as e:
+        registry.log_error("utils", "get_active_targets", e, context=strategy_key)
         logger.error(f"  [Utils] Error reading targets for {strategy_key}: {e}")
         return []
 
@@ -253,6 +258,7 @@ def get_targets_with_freshness_check(file_path, strategy_key, static_fallback):
                 
             return targets
     except Exception as e:
+        registry.log_error("utils", "check_freshness", e, context=file_path)
         logger.error(f"  [Error] Failed to read target file: {e}. Using Static Fallback.")
         return static_fallback
 

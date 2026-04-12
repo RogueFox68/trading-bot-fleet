@@ -7,6 +7,7 @@ import pandas_ta as ta
 import requests
 import datetime
 import random
+from logger import registry, logger
 
 # --- CONFIGURATION ---
 TARGET_FILE = "active_targets.json"
@@ -30,7 +31,8 @@ def get_sp500_tickers():
         # Clean up symbols (e.g., BRK.B -> BRK-B for yfinance)
         return [t.replace('.', '-') for t in tickers]
     except Exception as e:
-        print(f"  [!] S&P 500 Scrape Failed: {e}")
+        registry.log_error("sector_scout_legacy", "get_sp500_tickers", e)
+        logger.error(f"  [!] S&P 500 Scrape Failed: {e}")
         return []
 
 def get_technical_metrics(tickers):
@@ -82,11 +84,13 @@ def get_technical_metrics(tickers):
                     "above_sma200": current_price > sma200,
                     "volatility": vol_pct
                 }
-            except:
+            except Exception as e:
+                registry.log_error("sector_scout_legacy", "technical_metrics_loop", e, context=ticker)
                 continue
                 
     except Exception as e:
-        print(f"  [!] Batch Data Error: {e}")
+        registry.log_error("sector_scout_legacy", "batch_data_fetch", e)
+        logger.error(f"  [!] Batch Data Error: {e}")
         
     return metrics
 
@@ -172,7 +176,8 @@ def run_scout():
             time.sleep(SCAN_INTERVAL)
 
         except Exception as e:
-            print(f"[!] Scout Loop Error: {e}")
+            registry.log_error("sector_scout_legacy", "main_loop", e)
+            logger.error(f"[!] Scout Loop Error: {e}", exc_info=True)
             time.sleep(60)
 
 if __name__ == "__main__":

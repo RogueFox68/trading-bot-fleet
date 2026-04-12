@@ -12,7 +12,7 @@ from alpaca.trading.requests import LimitOrderRequest, GetOptionContractsRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, ContractType, QueryOrderStatus
 import config
 import utils
-from logger import get_logger
+from logger import get_logger, registry
 
 # --- LOGGING ---
 logger = get_logger("wheel_bot")
@@ -37,7 +37,9 @@ def send_discord(msg):
     try:
         payload = {"content": msg, "username": "WheelBot 🚜"}
         requests.post(config.WEBHOOK_WHEEL, json=payload)
-    except: pass
+    except Exception as e:
+        registry.log_error("wheel_bot", "send_discord", e, context=msg[:50])
+        logger.error(f"Discord webhook failed: {e}")
 
 def log_to_influx(action, price, symbol, detail):
     try:
@@ -165,7 +167,9 @@ def run_wheel_bot():
                     logger.info(f"Market Closed. Sleeping 15m...")
                     time.sleep(900)
                     continue
-            except: pass
+            except Exception as e:
+                registry.log_error("wheel_bot", "get_clock", e)
+                logger.error(f"Failed to check market clock: {e}")
 
             try:
                 import json
@@ -173,7 +177,9 @@ def run_wheel_bot():
                     bot_cfg = json.load(f)
                 current_vix = bot_cfg.get('global_settings', {}).get('vix', 0)
                 current_regime = bot_cfg.get('global_settings', {}).get('market_condition', 'UNKNOWN')
-            except:
+            except Exception as e:
+                registry.log_error("wheel_bot", "read_config", e)
+                logger.error(f"Failed to read bot_config.json: {e}")
                 current_vix = 0
                 current_regime = 'UNKNOWN'
 
@@ -336,6 +342,7 @@ def run_wheel_bot():
             time.sleep(900)
 
         except Exception as e:
+            registry.log_error("wheel_bot", "main_loop", e)
             logger.error(f"CRITICAL ERROR: {e}", exc_info=True)
             time.sleep(60)
 

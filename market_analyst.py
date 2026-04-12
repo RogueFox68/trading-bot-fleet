@@ -7,6 +7,7 @@ import numpy as np
 import datetime
 import os
 import yfinance as yf
+from logger import registry, logger
 
 # --- CONFIGURATION ---
 CHECK_INTERVAL = 900   # 15 Minutes
@@ -50,7 +51,9 @@ def send_discord(msg):
         requests.post(config.WEBHOOK_OVERSEER, json={
             "content": msg, "username": "Market Analyst 🧠"
         })
-    except: pass
+    except Exception as e:
+        registry.log_error("market_analyst", "send_discord", e, context=msg[:50])
+        logger.error(f"Discord webhook failed: {e}")
 
 def log_to_influx(price, vix, adx, regime, sma, ema):
     try:
@@ -68,7 +71,10 @@ def get_market_data():
     try:
         data = yf.download(["SPY", "^VIX"], period="1y", interval="1d", group_by='ticker', progress=False)
         return data["SPY"], data["^VIX"]
-    except: return None, None
+    except Exception as e:
+        registry.log_error("market_analyst", "get_market_data", e)
+        logger.error(f"Failed to fetch market data: {e}")
+        return None, None
 
 def update_bot_config(regime, vix_val, climate):
     """
@@ -170,7 +176,8 @@ def run_analyst():
             time.sleep(CHECK_INTERVAL)
 
         except Exception as e:
-            print(f"[!] Analyst Error: {e}")
+            registry.log_error("market_analyst", "run_analyst", e)
+            logger.error(f"[!] Analyst Error: {e}", exc_info=True)
             time.sleep(60)
 
 if __name__ == "__main__":

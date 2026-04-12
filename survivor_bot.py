@@ -1,6 +1,6 @@
 import utils
 import config
-from logger import get_logger
+from logger import get_logger, registry
 import time
 import json
 import tiered_hold
@@ -38,7 +38,9 @@ TIMEZONE = pytz.timezone('US/Eastern')
 def send_discord(msg):
     if "YOUR" in config.WEBHOOK_SURVIVOR: return 
     try: requests.post(config.WEBHOOK_SURVIVOR, json={"content": msg})
-    except: pass
+    except Exception as e:
+        registry.log_error("survivor_bot", "send_discord", e, context=msg[:50])
+        logger.error(f"Discord webhook failed: {e}")
 
 def log_to_influx(symbol, action, price, qty):
     try:
@@ -103,7 +105,9 @@ def get_data_alpaca(symbol):
         df = bars.df.xs(symbol)
         df.index = df.index.tz_convert('US/Eastern')
         return df
-    except: return None
+    except Exception as e:
+        registry.log_error("survivor_bot", "get_data_alpaca", e, context=symbol)
+        return None
 
 def run_survivor_bot():
     logger.info(f"--- 🛡️ SURVIVOR BOT (Segregated) STARTED ---")
@@ -121,7 +125,8 @@ def run_survivor_bot():
                     logger.info(f"Market Closed. Sleeping 15m...")
                     time.sleep(900) # Sleep 15 mins if closed
                     continue
-            except: pass
+            except Exception as e:
+                registry.log_error("survivor_bot", "get_clock", e)
 
             # 2. Build Watchlist & Blacklist
             raw_scout_targets, blacklist = get_segregated_targets()
@@ -157,6 +162,7 @@ def run_survivor_bot():
                     current_regime = market_weather.get('market_condition', 'SIDEWAYS')
                     current_vix = market_weather.get('vix', 15.0)
             except Exception as e:
+                registry.log_error("survivor_bot", "read_config", e)
                 logger.error(f"[!] Config load error: {e}")
                 current_regime = "SIDEWAYS"
                 current_vix = 15.0
@@ -224,7 +230,8 @@ def run_survivor_bot():
                     try:
                         trade_req = StockLatestTradeRequest(symbol_or_symbols=[symbol])
                         live_price = float(data_client.get_stock_latest_trade(trade_req)[symbol].price)
-                    except:
+                    except Exception as e:
+                        registry.log_error("survivor_bot", "fetch_live_price", e, context=symbol)
                         live_price = price # fallback to bar close if API fails
                     
                     entry_price = float(pos.avg_entry_price)
@@ -347,6 +354,7 @@ def run_survivor_bot():
             time.sleep(60)
 
         except Exception as e:
+            registry.log_error("survivor_bot", "main_loop", e)
             logger.error(f"Survivor Error: {e}", exc_info=True)
             time.sleep(60)
 

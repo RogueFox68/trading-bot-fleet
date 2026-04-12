@@ -22,7 +22,7 @@ TARGET_FILE = "active_targets.json"
 CONFIG_FILE = "bot_config.json"
 
 # --- LOGGING ---
-from logger import get_logger
+from logger import get_logger, registry
 logger = get_logger("trend_bot")
 FAST_EMA = 9
 SLOW_EMA = 21
@@ -42,7 +42,9 @@ TIMEZONE = pytz.timezone('US/Eastern')
 def send_discord(msg):
     if "YOUR" in config.WEBHOOK_TREND: return
     try: requests.post(config.WEBHOOK_TREND, json={"content": msg})
-    except: pass
+    except Exception as e:
+        registry.log_error("trend_bot", "send_discord", e, context=msg[:50])
+        logger.error(f"Discord webhook failed: {e}")
 
 def log_to_influx(symbol, action, price, qty):
     try:
@@ -60,7 +62,9 @@ def get_market_regime():
         with open(CONFIG_FILE, 'r') as f:
             data = json.load(f)
             return data.get("global_settings", {}).get("market_condition", "UNKNOWN")
-    except: return "UNKNOWN"
+    except Exception as e:
+        registry.log_error("trend_bot", "get_market_regime", e)
+        return "UNKNOWN"
 
 def get_dynamic_targets(regime):
     # 1. BEAR MODE: Short the market
@@ -87,7 +91,9 @@ def get_data_alpaca(symbol):
         df = bars.df.xs(symbol)
         df.index = df.index.tz_convert('US/Eastern')
         return df
-    except: return None
+    except Exception as e:
+        registry.log_error("trend_bot", "get_data_alpaca", e, context=symbol)
+        return None
 
 def run_trend_bot():
     logger.info(f"--- 昌 TREND SNIPER (Target Locked) STARTED ---")
@@ -105,7 +111,8 @@ def run_trend_bot():
                     logger.info(f"Market Closed. Sleeping...")
                     time.sleep(900)
                     continue
-            except: pass
+            except Exception as e:
+                registry.log_error("trend_bot", "get_clock", e)
 
             # 2. Market Regime Check
             global_regime = get_market_regime()
@@ -162,6 +169,7 @@ def run_trend_bot():
                     current_regime = market_weather.get('market_condition', 'SIDEWAYS')
                     current_vix = market_weather.get('vix', 15.0)
             except Exception as e:
+                registry.log_error("trend_bot", "read_config", e)
                 logger.error(f"[!] Config load error: {e}")
                 current_regime = "SIDEWAYS"
                 current_vix = 15.0
@@ -536,6 +544,7 @@ def run_trend_bot():
             time.sleep(60)
 
         except Exception as e:
+            registry.log_error("trend_bot", "main_loop", e)
             logger.error(f"Trend Bot Error: {e}", exc_info=True)
             time.sleep(60)
 

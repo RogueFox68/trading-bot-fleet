@@ -11,7 +11,7 @@ from alpaca.trading.requests import LimitOrderRequest, GetOptionContractsRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, ContractType
 from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest, OptionLatestQuoteRequest
-from logger import get_logger
+from logger import get_logger, registry
 
 # --- LOGGING ---
 logger = get_logger("condor_bot")
@@ -37,7 +37,9 @@ def send_discord(msg):
     if "YOUR" in WEBHOOK_URL: return
     try:
         requests.post(WEBHOOK_URL, json={"content": msg, "username": "Condor Bot 🦅"})
-    except: pass
+    except Exception as e:
+        registry.log_error("condor_bot", "send_discord", e, context=msg[:50])
+        logger.error(f"Discord webhook failed: {e}")
 
 def log_to_influx(action, symbol, price, detail):
     try:
@@ -66,7 +68,9 @@ def get_option_price(symbol, side="bid"):
         req = OptionLatestQuoteRequest(symbol_or_symbols=symbol)
         res = option_data_client.get_option_latest_quote(req)
         return float(res[symbol].bid_price) if side == "bid" else float(res[symbol].ask_price)
-    except: return 0.0
+    except Exception as e:
+        registry.log_error("condor_bot", "get_option_price", e, context=symbol)
+        return 0.0
 
 def find_strike(symbol, type, expiry_start, expiry_end, target_price):
     req = GetOptionContractsRequest(
@@ -79,7 +83,9 @@ def find_strike(symbol, type, expiry_start, expiry_end, target_price):
     )
     try:
         contracts = trading_client.get_option_contracts(req).option_contracts
-    except: return None
+    except Exception as e:
+        registry.log_error("condor_bot", "find_strike", e, context=symbol)
+        return None
 
     best_contract = None
     best_diff = float('inf')
@@ -104,7 +110,8 @@ def run_condor_bot():
                     logger.info("Market Closed. Sleeping 15m...")
                     time.sleep(900)
                     continue
-            except: pass
+            except Exception as e:
+                registry.log_error("condor_bot", "get_clock", e)
 
             positions = trading_client.get_all_positions()
             
@@ -285,7 +292,9 @@ def run_condor_bot():
                                 try:
                                     trading_client.submit_order(order_data=MarketOrderRequest(symbol=sym, qty=1, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"condor_bot-{sym}-{int(time.time())}"))
                                     logger.warning(f"       ⚠️ Rolled back (Sold) {sym}")
-                                except: logger.error(f"       💀 CRITICAL: Failed to rollback {sym}. Manually Close!")
+                                except Exception as e:
+                                    registry.log_error("condor_bot", "rollback", e, context=sym)
+                                    logger.error(f"       💀 CRITICAL: Failed to rollback {sym}. Manually Close! {e}")
                             send_discord(f"⚠️ **CONDOR FAILED & ROLLED BACK**\nTicker: {ticker}\nCheck Account!")
 
                         else:
@@ -305,6 +314,7 @@ def run_condor_bot():
             time.sleep(1800)
 
         except Exception as e:
+            registry.log_error("condor_bot", "main_loop", e)
             logger.error(f"Critical Error: {e}", exc_info=True)
             time.sleep(60)
 

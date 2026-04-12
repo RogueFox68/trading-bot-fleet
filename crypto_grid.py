@@ -8,7 +8,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.data.historical import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoLatestTradeRequest
-from logger import get_logger
+from logger import get_logger, registry
 import utils
 
 # --- LOGGING ---
@@ -42,7 +42,9 @@ def send_discord(msg):
     if "YOUR" in DISCORD_URL: return
     try:
         requests.post(DISCORD_URL, json={"content": msg})
-    except: pass
+    except Exception as e:
+        registry.log_error("crypto_grid", "send_discord", e, context=msg[:50])
+        logger.error(f"Discord webhook failed: {e}")
 
 def log_to_influx(symbol, action, price, qty):
     try:
@@ -60,7 +62,9 @@ def get_market_regime():
         with open(CONFIG_FILE, 'r') as f:
             data = json.load(f)
             return data.get('global_settings', {}).get('market_condition', 'SIDEWAYS')
-    except:
+    except Exception as e:
+        registry.log_error("crypto_grid", "get_market_regime", e)
+        logger.error(f"Failed to read market regime: {e}")
         return "SIDEWAYS" # Default to trading if analyst is offline
 
 def get_crypto_price(symbol):
@@ -190,13 +194,14 @@ def run_grid_bot():
                     try:
                         pos = trading_client.get_open_position(SYMBOL)
                         current_qty_held = float(pos.qty)
-                    except:
+                    except Exception as e1:
                         # Fallback for BTCUSD vs BTC/USD mismatch
                         try:
                              alt_sym = SYMBOL.replace("/", "")
                              pos = trading_client.get_open_position(alt_sym)
                              current_qty_held = float(pos.qty)
-                        except: 
+                        except Exception as e2: 
+                             registry.log_error("crypto_grid", "check_inventory", e2, context=f"{SYMBOL} + {alt_sym}")
                              current_qty_held = 0.0
                     
                     if current_qty_held >= qty_to_sell:
@@ -226,6 +231,7 @@ def run_grid_bot():
             time.sleep(30)
 
         except Exception as e:
+            registry.log_error("crypto_grid", "main_loop", e)
             logger.error(f"Grid Error: {e}", exc_info=True)
             time.sleep(60)
 
