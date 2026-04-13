@@ -33,7 +33,7 @@ logger = get_logger("survivor_bot")
 # --- CREDENTIALS ---
 trading_client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=config.PAPER)
 data_client = StockHistoricalDataClient(config.API_KEY, config.SECRET_KEY)
-TIMEZONE = pytz.timezone('US/Eastern')
+TIMEZONE = pytz.timezone('America/New_York')
 
 def send_discord(msg):
     if "YOUR" in config.WEBHOOK_SURVIVOR: return 
@@ -103,7 +103,7 @@ def get_data_alpaca(symbol):
         bars = data_client.get_stock_bars(req)
         if not bars.data: return None
         df = bars.df.xs(symbol)
-        df.index = df.index.tz_convert('US/Eastern')
+        df.index = df.index.tz_convert('America/New_York')
         return df
     except Exception as e:
         registry.log_error("survivor_bot", "get_data_alpaca", e, context=symbol)
@@ -168,7 +168,7 @@ def run_survivor_bot():
                 current_vix = 15.0
 
             # EOD Policy Time Check
-            now_et = datetime.datetime.now(pytz.timezone('US/Eastern'))
+            now_et = datetime.datetime.now(pytz.timezone('America/New_York'))
             time_str = now_et.strftime('%H:%M')
             is_eod_eval = time_str >= "15:30" and time_str < "15:45"
             is_eod_close = time_str >= "15:45"

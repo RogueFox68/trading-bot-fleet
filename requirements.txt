@@ -8,3 +8,4 @@ pytz
 discord.py
 influxdb
 python-dotenv
+tzdata
