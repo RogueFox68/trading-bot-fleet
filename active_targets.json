@@ -1,0 +1,25 @@
+{
+    "condor_targets": [
+        "SCHB",
+        "SO",
+        "RUN",
+        "SSO",
+        "PSTG"
+    ],
+    "wheel_targets": [
+        "SHOO",
+        "SCHG",
+        "MAGS",
+        "KRMN",
+        "CGGR"
+    ],
+    "trend_targets": [
+        "LUV",
+        "HON",
+        "HSBC",
+        "PNC",
+        "RIO",
+        "VALE"
+    ],
+    "updated": "2026-02-11 09:42:12.649248"
+}
