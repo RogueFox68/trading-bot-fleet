@@ -15,7 +15,7 @@ import utils
 logger = get_logger("crypto_grid")
 
 # --- CONFIGURATION ---
-SYMBOL = "BTC/USD"
+SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD"]
 GRID_WIDTH_PCT = 0.15    # Grid covers +/- 15% of current price
 GRID_LEVELS = 8          # More levels = Finer scalping
 BUDGET_PER_GRID = 50     # $50 per slice
@@ -34,9 +34,7 @@ data_client = CryptoHistoricalDataClient()
 
 # --- STATE VARIABLES (Dynamic) ---
 # We no longer hardcode these. They are calculated at runtime.
-grid_top = 0
-grid_bottom = 0
-zone_size = 0
+grids = {sym: {"top": 0, "bottom": 0, "size": 0, "prev_zone": GRID_LEVELS // 2, "oob": 0} for sym in SYMBOLS}
 
 def send_discord(msg):
     if "YOUR" in DISCORD_URL: return
@@ -76,19 +74,23 @@ def get_crypto_price(symbol):
         logger.error(f"  [!] Price Error {symbol}: {e}")
         return None
 
-def recalibrate_grid(current_price):
+def recalibrate_grid(symbol, current_price):
     """Centers the grid around the NEW price."""
-    global grid_top, grid_bottom, zone_size
-    
     # Grid spans +/- WIDTH_PCT
     grid_top = current_price * (1 + GRID_WIDTH_PCT)
     grid_bottom = current_price * (1 - GRID_WIDTH_PCT)
     zone_size = (grid_top - grid_bottom) / GRID_LEVELS
     
-    msg = (f"♻️ **Grid Recalibrated**\n"
+    grids[symbol]["top"] = grid_top
+    grids[symbol]["bottom"] = grid_bottom
+    grids[symbol]["size"] = zone_size
+    grids[symbol]["prev_zone"] = GRID_LEVELS // 2
+    grids[symbol]["oob"] = 0
+    
+    msg = (f"♻️ **Grid Recalibrated ({symbol})**\n"
            f"Center: ${current_price:,.0f}\n"
            f"Range: ${grid_bottom:,.0f} - ${grid_top:,.0f}")
-    logger.info(f"    [RECALIBRATE] Center: {current_price:.0f} | Range: {grid_bottom:.0f}-{grid_top:.0f}")
+    logger.info(f"    [RECALIBRATE] {symbol} Center: {current_price:.0f} | Range: {grid_bottom:.0f}-{grid_top:.0f}")
     send_discord(msg)
 
 def get_my_budget():
@@ -105,151 +107,148 @@ def run_grid_bot():
     logger.info(f"--- 🕸️ CRYPTO GRID BOT V2 (Auto-Tuning) ---")
     
     # 1. Initial Setup
-    price = get_crypto_price(SYMBOL)
-    while price is None:
-        time.sleep(10)
-        price = get_crypto_price(SYMBOL)
-        
-    recalibrate_grid(price)
-    
-    previous_zone = GRID_LEVELS // 2 # Assume we start in the middle
-    out_of_bounds_counter = 0
+    for symbol in SYMBOLS:
+        price = get_crypto_price(symbol)
+        while price is None:
+            time.sleep(10)
+            price = get_crypto_price(symbol)
+            
+        recalibrate_grid(symbol, price)
 
     while True:
         try:
-            # 2. Get Data
-            price = get_crypto_price(SYMBOL)
             regime = get_market_regime()
             
-            if price is None:
-                time.sleep(30)
-                continue
-                
             # CFO Sync: Ping the accountant to track our position value globally.
             is_budget_ok = utils.check_budget("crypto_grid", trading_client)
 
-            # 3. Determine Zone
-            if price < grid_bottom:
-                current_zone = -1
-                out_of_bounds_counter += 1
-            elif price > grid_top:
-                current_zone = GRID_LEVELS + 1
-                out_of_bounds_counter += 1
-            else:
-                current_zone = int((price - grid_bottom) / zone_size)
-                out_of_bounds_counter = 0 # Reset if we are back in range
-
-            # 4. Status Display
-            status_msg = f"{SYMBOL} ${price:,.0f} | Zone: {current_zone} | Regime: {regime}"
-            if out_of_bounds_counter > 0:
-                status_msg += f" | OOB: {out_of_bounds_counter}/{RECALIBRATE_DELAY}"
-            
-            # Use carriage return logger or just INFO periodically? 
-            # Logger doesn't support \r well. We'll use INFO every ~10 loops or just silence it to avoid log spam.
-            # For now, let's log only on zone change or just keep it minimal.
-            # logger.info(status_msg) --> Too spammy.
-            # We will print to stdout safely if needed, but logger is preferred.
-            # Let's just log if zone CHANGES.
-
-            # 5. AUTO-RECALIBRATE LOGIC
-            # If we are lost in the woods for too long, move the base.
-            if out_of_bounds_counter >= RECALIBRATE_DELAY:
-                recalibrate_grid(price)
-                # Reset logic so we don't trigger a fake trade immediately
-                previous_zone = GRID_LEVELS // 2 
-                out_of_bounds_counter = 0
-                time.sleep(5)
-                continue
-
-            # 6. TRADING LOGIC
-            if current_zone != previous_zone and 0 <= current_zone <= GRID_LEVELS:
+            for symbol in SYMBOLS:
+                # 2. Get Data
+                price = get_crypto_price(symbol)
                 
-                logger.info(f"Zone Change: {previous_zone} -> {current_zone} | Price: ${price:.0f}")
+                if price is None:
+                    continue
+                    
+                grid = grids[symbol]
 
-                # PRICE DROP -> BUY (Accumulate)
-                if current_zone < previous_zone:
-                    # TREND FILTER: Don't buy if the Analyst says BEAR_TREND
-                    if "BEAR" in regime:
-                        logger.info(f"    [SKIP] Bear Trend Detected. Buying Paused in Zone {current_zone}.")
+                # 3. Determine Zone
+                if price < grid["bottom"]:
+                    current_zone = -1
+                    grid["oob"] += 1
+                elif price > grid["top"]:
+                    current_zone = GRID_LEVELS + 1
+                    grid["oob"] += 1
+                else:
+                    if grid["size"] > 0:
+                        current_zone = int((price - grid["bottom"]) / grid["size"])
                     else:
-                        # NEW: Check Global Budget Enforcement
-                        my_budget = get_my_budget()
-                        try:
-                            pos = trading_client.get_open_position(SYMBOL)
-                            current_val = float(pos.market_value)
-                        except:
-                            current_val = 0.0
+                        current_zone = GRID_LEVELS // 2
+                    grid["oob"] = 0 # Reset if we are back in range
 
-                        if current_val >= my_budget:
-                            logger.warning(f"    [BUDGET STOP] Current value ${current_val:.2f} >= Budget ${my_budget:.2f}. Skipping buy.")
-                            # We still allow the loop to continue so we can SELL if price rises
+                # 4. Status Display
+                status_msg = f"{symbol} ${price:,.0f} | Zone: {current_zone} | Regime: {regime}"
+                if grid["oob"] > 0:
+                    status_msg += f" | OOB: {grid['oob']}/{RECALIBRATE_DELAY}"
+
+                # 5. AUTO-RECALIBRATE LOGIC
+                # If we are lost in the woods for too long, move the base.
+                if grid["oob"] >= RECALIBRATE_DELAY:
+                    recalibrate_grid(symbol, price)
+                    time.sleep(5)
+                    continue
+
+                # 6. TRADING LOGIC
+                previous_zone = grid["prev_zone"]
+                if current_zone != previous_zone and 0 <= current_zone <= GRID_LEVELS:
+                    
+                    logger.info(f"[{symbol}] Zone Change: {previous_zone} -> {current_zone} | Price: ${price:.0f}")
+
+                    # PRICE DROP -> BUY (Accumulate)
+                    if current_zone < previous_zone:
+                        # TREND FILTER: Don't buy if the Analyst says BEAR_TREND
+                        if "BEAR" in regime:
+                            logger.info(f"    [SKIP] Bear Trend Detected. Buying Paused in Zone {current_zone} for {symbol}.")
                         else:
-                            logger.info(f"    [BUY] Dropped to Zone {current_zone}")
-                            
-                            # Check Cash & Global Budget limits
-                        acct = trading_client.get_account()
-                        buying_power = float(acct.buying_power)
+                            # NEW: Check Global Budget Enforcement
+                            my_budget = get_my_budget()
+                            try:
+                                pos = trading_client.get_open_position(symbol)
+                                current_val = float(pos.market_value)
+                            except:
+                                current_val = 0.0
+
+                            if current_val >= my_budget:
+                                logger.warning(f"    [BUDGET STOP] {symbol} Current value ${current_val:.2f} >= Budget ${my_budget:.2f}. Skipping buy.")
+                                # We still allow the loop to continue so we can SELL if price rises
+                            else:
+                                logger.info(f"    [BUY] {symbol} Dropped to Zone {current_zone}")
+                                
+                                # Check Cash & Global Budget limits
+                                acct = trading_client.get_account()
+                                buying_power = float(acct.buying_power)
+                                
+                                if not is_budget_ok:
+                                    logger.warning(f"    [SKIP] {symbol} Grid buy $50 > Available (budget limit)")
+                                    
+                                elif buying_power > BUDGET_PER_GRID:
+                                    qty = BUDGET_PER_GRID / price
+                                    c_id = f"crypto_grid-{symbol.replace('/', '')}-{int(time.time())}"
+                                    req = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=c_id)
+                                    trading_client.submit_order(order_data=req)
+                                    
+                                    send_discord(f"🟢 **GRID BUY {symbol}**\nPrice: ${price:,.2f}\nZone: {current_zone}")
+                                    log_to_influx(symbol, "grid_buy", price, qty)
+                                else:
+                                    logger.warning(f"    [SKIP] {symbol} Low Balance: ${buying_power:.2f} (Need ${BUDGET_PER_GRID})")
+
+                    # PRICE RISE -> SELL (Take Profit)
+                    elif current_zone > previous_zone:
+                        logger.info(f"    [SELL] {symbol} Rose to Zone {current_zone}")
                         
-                        if not is_budget_ok:
-                            logger.warning(f"    [SKIP] Grid buy $50 > Available (budget limit)")
+                        # Verify Inventory
+                        qty_to_sell = BUDGET_PER_GRID / price
+                        current_qty_held = 0.0
+                        
+                        # [FIX] Robust Position Fetching
+                        try:
+                            pos = trading_client.get_open_position(symbol)
+                            current_qty_held = float(pos.qty)
+                        except Exception as e1:
+                            # Fallback for BTCUSD vs BTC/USD mismatch
+                            try:
+                                 alt_sym = symbol.replace("/", "")
+                                 pos = trading_client.get_open_position(alt_sym)
+                                 current_qty_held = float(pos.qty)
+                            except Exception as e2: 
+                                 registry.log_error("crypto_grid", "check_inventory", e2, context=f"{symbol} + {alt_sym}")
+                                 current_qty_held = 0.0
+                        
+                        if current_qty_held >= qty_to_sell:
+                            # Full Sell
+                            c_id = f"crypto_grid-{symbol.replace('/', '')}-{int(time.time())}"
+                            req = MarketOrderRequest(symbol=symbol, qty=qty_to_sell, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=c_id)
+                            trading_client.submit_order(order_data=req)
+
+                            send_discord(f"🔴 **GRID SELL {symbol}**\nPrice: ${price:,.2f}\nZone: {current_zone}")
+                            log_to_influx(symbol, "grid_sell", price, qty_to_sell)
                             
-                        elif buying_power > BUDGET_PER_GRID:
-                            qty = BUDGET_PER_GRID / price
-                            c_id = f"crypto_grid-{SYMBOL.replace('/', '')}-{int(time.time())}"
-                            req = MarketOrderRequest(symbol=SYMBOL, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=c_id)
+                        elif current_qty_held > (qty_to_sell * 0.1):
+                            # [FIX] Partial Sell (Sweep Dust)
+                            logger.info(f"    [SWEEP] {symbol} Selling remaining {current_qty_held:.6f} (Target: {qty_to_sell:.6f})")
+                            c_id = f"crypto_grid-{symbol.replace('/', '')}-{int(time.time())}"
+                            req = MarketOrderRequest(symbol=symbol, qty=current_qty_held, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=c_id)
                             trading_client.submit_order(order_data=req)
                             
-                            send_discord(f"🟢 **GRID BUY {SYMBOL}**\nPrice: ${price:,.2f}\nZone: {current_zone}")
-                            log_to_influx(SYMBOL, "grid_buy", price, qty)
+                            send_discord(f"🧹 **GRID SWEEP {symbol}**\nSold remaining {current_qty_held:.4f}\nPrice: ${price:,.2f}")
+                            log_to_influx(symbol, "grid_sweep", price, current_qty_held)
+                            
                         else:
-                            logger.warning(f"    [SKIP] Low Balance: ${buying_power:.2f} (Need ${BUDGET_PER_GRID})")
+                            # [FIX] Clean Log (No Warn) using Info
+                            logger.info(f"    [SKIP] {symbol} Sell Signal but Zero Inventory (Ghost Signal handled).")
 
-                # PRICE RISE -> SELL (Take Profit)
-                elif current_zone > previous_zone:
-                    logger.info(f"    [SELL] Rose to Zone {current_zone}")
-                    
-                    # Verify Inventory
-                    qty_to_sell = BUDGET_PER_GRID / price
-                    current_qty_held = 0.0
-                    
-                    # [FIX] Robust Position Fetching
-                    try:
-                        pos = trading_client.get_open_position(SYMBOL)
-                        current_qty_held = float(pos.qty)
-                    except Exception as e1:
-                        # Fallback for BTCUSD vs BTC/USD mismatch
-                        try:
-                             alt_sym = SYMBOL.replace("/", "")
-                             pos = trading_client.get_open_position(alt_sym)
-                             current_qty_held = float(pos.qty)
-                        except Exception as e2: 
-                             registry.log_error("crypto_grid", "check_inventory", e2, context=f"{SYMBOL} + {alt_sym}")
-                             current_qty_held = 0.0
-                    
-                    if current_qty_held >= qty_to_sell:
-                        # Full Sell
-                        c_id = f"crypto_grid-{SYMBOL.replace('/', '')}-{int(time.time())}"
-                        req = MarketOrderRequest(symbol=SYMBOL, qty=qty_to_sell, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=c_id)
-                        trading_client.submit_order(order_data=req)
-
-                        send_discord(f"🔴 **GRID SELL {SYMBOL}**\nPrice: ${price:,.2f}\nZone: {current_zone}")
-                        log_to_influx(SYMBOL, "grid_sell", price, qty_to_sell)
-                        
-                    elif current_qty_held > (qty_to_sell * 0.1):
-                        # [FIX] Partial Sell (Sweep Dust)
-                        logger.info(f"    [SWEEP] Selling remaining {current_qty_held:.6f} (Target: {qty_to_sell:.6f})")
-                        c_id = f"crypto_grid-{SYMBOL.replace('/', '')}-{int(time.time())}"
-                        req = MarketOrderRequest(symbol=SYMBOL, qty=current_qty_held, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=c_id)
-                        trading_client.submit_order(order_data=req)
-                        
-                        send_discord(f"🧹 **GRID SWEEP {SYMBOL}**\nSold remaining {current_qty_held:.4f}\nPrice: ${price:,.2f}")
-                        log_to_influx(SYMBOL, "grid_sweep", price, current_qty_held)
-                        
-                    else:
-                        # [FIX] Clean Log (No Warn) using Info
-                        logger.info(f"    [SKIP] Sell Signal but Zero Inventory (Ghost Signal handled).")
-
-            previous_zone = current_zone
+                grid["prev_zone"] = current_zone
+            
+            # Sleep at the end of the full multi-symbol loop
             time.sleep(30)
 
         except Exception as e:
