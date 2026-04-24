@@ -155,6 +155,15 @@ def get_open_order_tickers():
             
     return busy_tickers
 
+def get_my_budget():
+    """Reads the CFO's effective budget for this bot."""
+    try:
+        with open("effective_budgets.json", "r") as f:
+            budgets = json.load(f)
+            return budgets.get("wheel_bot", 20000)
+    except Exception as e:
+        return 20000
+
 def run_wheel_bot():
     logger.info("--- 🚜 FLEET WHEEL BOT (Smart Pricing + Order Awareness) STARTED ---")
     send_discord(f"🚜 **Wheel Bot Online**\nSyncing with Sector Scout...")
@@ -267,6 +276,14 @@ def run_wheel_bot():
                 if not is_budget_ok:
                      continue # Skip new entries if budget paused, but finish loop
                      
+                # NEW: Budget Enforcement
+                my_budget = get_my_budget()
+                current_wheel_exposure = sum(abs(float(p.market_value)) for p in all_positions if p.asset_class == AssetClass.US_OPTION and (p.symbol.startswith(ticker) or "WHEEL" in p.symbol))
+                
+                if current_wheel_exposure >= my_budget:
+                    logger.info(f"  {ticker:<4} | [BUDGET] Wheel bot at capacity (${my_budget:.0f}). Skipping.")
+                    continue
+
                 # Gate new entries by Macro Environment
                 if current_vix > 22 or current_regime in ('BEAR_TREND', 'CRITICAL_VOLATILITY'):
                     logger.info(f"    [GATE] {ticker:<4} | No new puts — VIX {current_vix:.1f} / Regime: {current_regime}")

@@ -171,7 +171,7 @@ def calculate_dynamic_allocations(equity, allocation_stats, regime, vix, config_
     
     # 1. Harvest Surplus from Gated Bots
     for bot in base.keys():
-        threshold = cfo_settings.get("gate_idle_threshold_cycles", 10)
+        threshold = 3 # Release capital much faster (from 50 mins down to 15 mins)
         
         if bot_status[bot]["gated"] and bot_status[bot]["idle_cycles"] >= threshold:
             locked_capital = bot_status[bot]["positions_held"]

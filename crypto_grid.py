@@ -91,6 +91,16 @@ def recalibrate_grid(current_price):
     logger.info(f"    [RECALIBRATE] Center: {current_price:.0f} | Range: {grid_bottom:.0f}-{grid_top:.0f}")
     send_discord(msg)
 
+def get_my_budget():
+    """Reads the CFO's effective budget for this bot."""
+    try:
+        with open("effective_budgets.json", "r") as f:
+            budgets = json.load(f)
+            return budgets.get("crypto_grid", 5000) # Default to $5k if file missing
+    except Exception as e:
+        logger.warning(f"Could not read budget file: {e}. Using safe default.")
+        return 5000
+
 def run_grid_bot():
     logger.info(f"--- 🕸️ CRYPTO GRID BOT V2 (Auto-Tuning) ---")
     
@@ -162,9 +172,21 @@ def run_grid_bot():
                     if "BEAR" in regime:
                         logger.info(f"    [SKIP] Bear Trend Detected. Buying Paused in Zone {current_zone}.")
                     else:
-                        logger.info(f"    [BUY] Dropped to Zone {current_zone}")
-                        
-                        # Check Cash & Global Budget limits
+                        # NEW: Check Global Budget Enforcement
+                        my_budget = get_my_budget()
+                        try:
+                            pos = trading_client.get_open_position(SYMBOL)
+                            current_val = float(pos.market_value)
+                        except:
+                            current_val = 0.0
+
+                        if current_val >= my_budget:
+                            logger.warning(f"    [BUDGET STOP] Current value ${current_val:.2f} >= Budget ${my_budget:.2f}. Skipping buy.")
+                            # We still allow the loop to continue so we can SELL if price rises
+                        else:
+                            logger.info(f"    [BUY] Dropped to Zone {current_zone}")
+                            
+                            # Check Cash & Global Budget limits
                         acct = trading_client.get_account()
                         buying_power = float(acct.buying_power)
                         
