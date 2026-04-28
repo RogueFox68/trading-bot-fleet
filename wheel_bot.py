@@ -186,11 +186,13 @@ def run_wheel_bot():
                     bot_cfg = json.load(f)
                 current_vix = bot_cfg.get('global_settings', {}).get('vix', 0)
                 current_regime = bot_cfg.get('global_settings', {}).get('market_condition', 'UNKNOWN')
+                capital_crunch = bot_cfg.get('global_settings', {}).get('CAPITAL_CRUNCH', False)
             except Exception as e:
                 registry.log_error("wheel_bot", "read_config", e)
                 logger.error(f"Failed to read bot_config.json: {e}")
                 current_vix = 0
                 current_regime = 'UNKNOWN'
+                capital_crunch = False
 
             raw_targets = get_wheel_targets()
             
@@ -278,10 +280,23 @@ def run_wheel_bot():
                      
                 # NEW: Budget Enforcement
                 my_budget = get_my_budget()
-                current_wheel_exposure = sum(abs(float(p.market_value)) for p in all_positions if p.asset_class == AssetClass.US_OPTION and (p.symbol.startswith(ticker) or "WHEEL" in p.symbol))
                 
-                if current_wheel_exposure >= my_budget:
-                    logger.info(f"  {ticker:<4} | [BUDGET] Wheel bot at capacity (${my_budget:.0f}). Skipping.")
+                total_commitment = 0.0
+                for p in all_positions:
+                    owner = utils.get_bot_owner(p.symbol, p.asset_class, trading_client)
+                    if owner == "wheel_bot":
+                        if p.asset_class == AssetClass.US_OPTION and float(p.qty) < 0:
+                            match = re.match(r"^[A-Z]{1,6}\d{6}(P|C)(\d{8})$", p.symbol)
+                            if match and match.group(1) == 'P':
+                                strike = float(match.group(2)) / 1000
+                                total_commitment += strike * abs(float(p.qty)) * 100
+                            else:
+                                total_commitment += abs(float(p.market_value))
+                        else:
+                            total_commitment += abs(float(p.market_value))
+
+                if capital_crunch:
+                    logger.info(f"    [GATE] {ticker:<4} | No new positions — CAPITAL_CRUNCH is active.")
                     continue
 
                 # Gate new entries by Macro Environment
@@ -337,6 +352,11 @@ def run_wheel_bot():
                     
                     if side == "PUT" and real_bp < (float(contract.strike_price) * 100):
                         logger.warning(f"    [SKIP] Strike too expensive for available BP.")
+                        continue
+                        
+                    new_trade_collateral = float(contract.strike_price) * 100 if side == "PUT" else 0
+                    if total_commitment + new_trade_collateral > my_budget:
+                        logger.warning(f"    [SKIP] Total commitment (${total_commitment:.0f} + ${new_trade_collateral:.0f}) > Budget (${my_budget:.0f}).")
                         continue
                         
                     logger.info(f"    [ENTRY] Selling {side} on {ticker} @ ${limit_price} (Midpoint)")

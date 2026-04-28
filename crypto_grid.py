@@ -54,16 +54,18 @@ def log_to_influx(symbol, action, price, qty):
     except Exception as e:
         logger.warning(f"InfluxDB write error: {e}")
 
-def get_market_regime():
-    """Reads the 'Weather' from the Market Analyst."""
+def get_market_config():
+    """Reads the 'Weather' and CAPITAL_CRUNCH from the config."""
     try:
         with open(CONFIG_FILE, 'r') as f:
             data = json.load(f)
-            return data.get('global_settings', {}).get('market_condition', 'SIDEWAYS')
+            regime = data.get('global_settings', {}).get('market_condition', 'SIDEWAYS')
+            crunch = data.get('global_settings', {}).get('CAPITAL_CRUNCH', False)
+            return regime, crunch
     except Exception as e:
-        registry.log_error("crypto_grid", "get_market_regime", e)
-        logger.error(f"Failed to read market regime: {e}")
-        return "SIDEWAYS" # Default to trading if analyst is offline
+        registry.log_error("crypto_grid", "get_market_config", e)
+        logger.error(f"Failed to read market config: {e}")
+        return "SIDEWAYS", False
 
 def get_crypto_price(symbol):
     try:
@@ -117,7 +119,7 @@ def run_grid_bot():
 
     while True:
         try:
-            regime = get_market_regime()
+            regime, capital_crunch = get_market_config()
             
             # CFO Sync: Ping the accountant to track our position value globally.
             is_budget_ok = utils.check_budget("crypto_grid", trading_client)
@@ -168,6 +170,8 @@ def run_grid_bot():
                         # TREND FILTER: Don't buy if the Analyst says BEAR_TREND
                         if "BEAR" in regime:
                             logger.info(f"    [SKIP] Bear Trend Detected. Buying Paused in Zone {current_zone} for {symbol}.")
+                        elif capital_crunch:
+                            logger.warning(f"    [SKIP] CAPITAL_CRUNCH active. Buy paused for {symbol}.")
                         else:
                             # NEW: Check Global Budget Enforcement
                             my_budget = get_my_budget()

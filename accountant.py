@@ -245,7 +245,17 @@ def run_accountant():
                 owner = get_bot_owner(p.symbol, p.asset_class, trading_client)
                 if owner in unrealized_stats:
                     unrealized_stats[owner] += float(p.unrealized_pl)
-                    allocation_stats[owner] += abs(float(p.market_value))
+                    
+                    if p.asset_class == AssetClass.US_OPTION and float(p.qty) < 0:
+                        import re
+                        match = re.match(r"^[A-Z]{1,6}\d{6}(P|C)(\d{8})$", p.symbol)
+                        if match and match.group(1) == 'P':
+                            strike = float(match.group(2)) / 1000
+                            allocation_stats[owner] += strike * abs(float(p.qty)) * 100
+                        else:
+                            allocation_stats[owner] += abs(float(p.market_value))
+                    else:
+                        allocation_stats[owner] += abs(float(p.market_value))
 
             # 3. COMBINE & REPORT
             # print(f"\n[{datetime.datetime.now().strftime('%H:%M')}] TRUE P&L UPDATE:")
@@ -272,12 +282,34 @@ def run_accountant():
             try:
                 with open("bot_config.json", "r") as f:
                     config_data = json.load(f)
-                    regime = config_data.get("global_settings", {}).get("market_condition", "SIDEWAYS")
-                    vix = config_data.get("global_settings", {}).get("vix", 15.0)
+                    
+                if "global_settings" not in config_data:
+                    config_data["global_settings"] = {}
+                    
+                regime = config_data["global_settings"].get("market_condition", "SIDEWAYS")
+                vix = config_data["global_settings"].get("vix", 15.0)
+                current_crunch = config_data["global_settings"].get("CAPITAL_CRUNCH", False)
                 
-                calculate_dynamic_allocations(float(account.equity), allocation_stats, regime, vix, config_data)
+                total_equity = float(account.equity)
+                total_committed = sum(allocation_stats.values())
+                utilization = total_committed / total_equity if total_equity > 0 else 0
+                
+                if utilization > 0.90:
+                    if not current_crunch:
+                        logger.warning(f"[CFO] CAPITAL_CRUNCH ACTIVATED! Utilization: {utilization*100:.1f}% > 90%")
+                        config_data["global_settings"]["CAPITAL_CRUNCH"] = True
+                        with open("bot_config.json", "w") as f:
+                            json.dump(config_data, f, indent=4)
+                elif utilization < 0.80:
+                    if current_crunch:
+                        logger.info(f"[CFO] CAPITAL_CRUNCH LIFTED! Utilization: {utilization*100:.1f}% < 80%")
+                        config_data["global_settings"]["CAPITAL_CRUNCH"] = False
+                        with open("bot_config.json", "w") as f:
+                            json.dump(config_data, f, indent=4)
+                
+                calculate_dynamic_allocations(total_equity, allocation_stats, regime, vix, config_data)
             except Exception as e:
-                logger.error(f"[CFO] Reallocation process failed: {e}")
+                logger.error(f"[CFO] Reallocation and Utilization process failed: {e}")
             
             # Log Global Stats
             log_metric("account_stats", {"type": "global"}, {
