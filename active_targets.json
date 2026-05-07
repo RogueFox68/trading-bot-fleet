@@ -1,179 +1,184 @@
 {
     "condor_targets": [
         {
-            "symbol": "ORLY",
+            "symbol": "ETHU",
+            "confidence": 0.7,
+            "reason": "Tech Score: 11.13 -> 0.74. Social: 0.35. "
+        },
+        {
+            "symbol": "MOS",
             "confidence": 0.69,
-            "reason": "Tech Score: 10.82 -> 0.72. Social: 0.25. "
+            "reason": "Tech Score: 10.93 -> 0.73. Social: 0.65. "
+        },
+        {
+            "symbol": "ACAD",
+            "confidence": 0.71,
+            "reason": "Tech Score: 10.68 -> 0.71. Social: 0.95. "
+        },
+        {
+            "symbol": "VST",
+            "confidence": 0.63,
+            "reason": "Tech Score: 10.68 -> 0.71. Social: 0.45. "
         },
         {
             "symbol": "PDD",
-            "confidence": 0.63,
-            "reason": "Tech Score: 10.53 -> 0.70. Social: 0.35. "
+            "confidence": 0.65,
+            "reason": "Tech Score: 10.62 -> 0.71. Social: 0.35. "
         },
         {
-            "symbol": "MDLZ",
-            "confidence": 0.69,
-            "reason": "Tech Score: 9.69 -> 0.65. Social: 0.88. "
+            "symbol": "UEC",
+            "confidence": 0.65,
+            "reason": "Tech Score: 10.27 -> 0.68. Social: 0.35. "
         },
         {
-            "symbol": "AMT",
-            "confidence": 0.66,
-            "reason": "Tech Score: 9.04 -> 0.60. Social: 0.95. "
-        },
-        {
-            "symbol": "FIGR",
-            "confidence": 0.59,
-            "reason": "Tech Score: 8.95 -> 0.60. Social: 0.35. "
+            "symbol": "WFC",
+            "confidence": 0.72,
+            "reason": "Tech Score: 10.08 -> 0.67. Social: 0.92. "
         },
         {
             "symbol": "DOCU",
-            "confidence": 0.59,
-            "reason": "Tech Score: 8.82 -> 0.59. Social: 0.78. "
+            "confidence": 0.69,
+            "reason": "Tech Score: 9.93 -> 0.66. Social: 0.78. "
         },
         {
-            "symbol": "WRB",
-            "confidence": 0.65,
-            "reason": "Tech Score: 8.75 -> 0.58. Social: 0.95. "
+            "symbol": "IOT",
+            "confidence": 0.63,
+            "reason": "Tech Score: 9.49 -> 0.63. Social: 0.35. "
         },
         {
-            "symbol": "VVV",
+            "symbol": "TOST",
             "confidence": 0.61,
-            "reason": "Tech Score: 8.37 -> 0.56. Social: 0.72. "
-        },
-        {
-            "symbol": "NI",
-            "confidence": 0.56,
-            "reason": "Tech Score: 8.25 -> 0.55. Social: 0.35. "
+            "reason": "Tech Score: 9.35 -> 0.62. Social: 0.35. "
         }
     ],
     "wheel_targets": [
         {
-            "symbol": "EPRT",
+            "symbol": "AM",
             "confidence": 0.89,
-            "reason": "Tech Score: 9.82 -> 0.98. Social: 0.15. "
+            "reason": "Tech Score: 9.82 -> 0.98. Social: 0.25. "
         },
         {
-            "symbol": "JBS",
-            "confidence": 0.96,
-            "reason": "Tech Score: 9.76 -> 0.98. Social: 0.85. "
+            "symbol": "TJX",
+            "confidence": 0.94,
+            "reason": "Tech Score: 9.77 -> 0.98. Social: 0.72. "
         },
         {
-            "symbol": "GSK",
-            "confidence": 0.96,
-            "reason": "Tech Score: 9.67 -> 0.97. Social: 0.95. "
+            "symbol": "BP",
+            "confidence": 0.88,
+            "reason": "Tech Score: 9.48 -> 0.95. Social: 0.48. "
         },
         {
-            "symbol": "SHEL",
-            "confidence": 0.84,
-            "reason": "Tech Score: 9.47 -> 0.95. Social: 0.72. "
-        },
-        {
-            "symbol": "XOM",
-            "confidence": 0.87,
-            "reason": "Tech Score: 9.31 -> 0.93. Social: 0.35. "
-        },
-        {
-            "symbol": "CVX",
-            "confidence": 0.92,
-            "reason": "Tech Score: 9.25 -> 0.93. Social: 0.88. "
-        },
-        {
-            "symbol": "AEM",
+            "symbol": "FLS",
             "confidence": 0.86,
-            "reason": "Tech Score: 9.13 -> 0.91. Social: 0.82. "
+            "reason": "Tech Score: 9.31 -> 0.93. Social: 0.42. "
         },
         {
-            "symbol": "SON",
+            "symbol": "PFE",
+            "confidence": 0.85,
+            "reason": "Tech Score: 9.11 -> 0.91. Social: 0.35. "
+        },
+        {
+            "symbol": "KMI",
+            "confidence": 0.8,
+            "reason": "Tech Score: 8.69 -> 0.87. Social: 0.25. "
+        },
+        {
+            "symbol": "XLE",
+            "confidence": 0.74,
+            "reason": "Tech Score: 8.4 -> 0.84. Social: 0.35. "
+        },
+        {
+            "symbol": "SEDG",
+            "confidence": 0.7,
+            "reason": "Tech Score: 8.31 -> 0.83. Social: 0.15. "
+        },
+        {
+            "symbol": "XLU",
+            "confidence": 0.83,
+            "reason": "Tech Score: 8.28 -> 0.83. Social: 0.82. "
+        },
+        {
+            "symbol": "MRK",
             "confidence": 0.84,
-            "reason": "Tech Score: 9.07 -> 0.91. Social: 0.35. "
-        },
-        {
-            "symbol": "EXC",
-            "confidence": 0.89,
-            "reason": "Tech Score: 8.92 -> 0.89. Social: 0.88. "
-        },
-        {
-            "symbol": "MRNA",
-            "confidence": 0.65,
-            "reason": "Tech Score: 8.9 -> 0.89. Social: 0.15. "
+            "reason": "Tech Score: 8.22 -> 0.82. Social: 0.92. "
         }
     ],
     "trend_targets": [
         {
-            "symbol": "TNGX",
-            "confidence": 0.56,
-            "reason": "Tech Score: 55.65 -> 0.56. "
+            "symbol": "TXN",
+            "confidence": 0.63,
+            "reason": "Tech Score: 48.07 -> 0.48. Social: 0.60. "
         },
         {
-            "symbol": "AEHR",
-            "confidence": 0.52,
-            "reason": "Tech Score: 46.29 -> 0.46. Social: 0.72. "
+            "symbol": "PBI",
+            "confidence": 0.54,
+            "reason": "Tech Score: 46.86 -> 0.47. Social: 0.82. "
         },
         {
-            "symbol": "DELL",
+            "symbol": "MRAM",
             "confidence": 0.53,
-            "reason": "Tech Score: 39.74 -> 0.40. Social: 0.58. "
+            "reason": "Tech Score: 45.09 -> 0.45. Social: 0.82. "
         },
         {
-            "symbol": "AVGO",
-            "confidence": 0.56,
-            "reason": "Tech Score: 35.31 -> 0.35. Social: 0.95. "
+            "symbol": "CPRX",
+            "confidence": 0.53,
+            "reason": "Tech Score: 44.83 -> 0.45. Social: 0.75. "
         }
     ],
     "survivor_targets": [
         {
-            "symbol": "GILD",
-            "confidence": 0.78,
-            "reason": "Tech Score: 22.8 -> 0.76. Social: 0.82. "
-        },
-        {
-            "symbol": "PCG",
-            "confidence": 0.63,
-            "reason": "Tech Score: 19.44 -> 0.65. Social: 0.25. "
-        },
-        {
-            "symbol": "HON",
-            "confidence": 0.67,
-            "reason": "Tech Score: 19.15 -> 0.64. Social: 0.75. "
-        },
-        {
-            "symbol": "KMI",
+            "symbol": "PCVX",
             "confidence": 0.66,
-            "reason": "Tech Score: 18.97 -> 0.63. Social: 0.75. "
+            "reason": "Tech Score: 19.47 -> 0.65. Social: 0.78. "
+        },
+        {
+            "symbol": "GSK",
+            "confidence": 0.58,
+            "reason": "Tech Score: 18.55 -> 0.62. Social: 0.00. "
         },
         {
             "symbol": "JNJ",
-            "confidence": 0.7,
-            "reason": "Tech Score: 16.99 -> 0.57. Social: 0.82. "
+            "confidence": 0.6,
+            "reason": "Tech Score: 16.78 -> 0.56. Social: 0.82. "
         },
         {
-            "symbol": "CME",
-            "confidence": 0.7,
-            "reason": "Tech Score: 16.51 -> 0.55. Social: 0.85. "
+            "symbol": "EQT",
+            "confidence": 0.53,
+            "reason": "Tech Score: 13.7 -> 0.46. Social: 0.82. "
         },
         {
-            "symbol": "MRK",
-            "confidence": 0.64,
-            "reason": "Tech Score: 14.5 -> 0.48. Social: 0.75. "
+            "symbol": "SHEL",
+            "confidence": 0.68,
+            "reason": "Tech Score: 13.19 -> 0.44. Social: 0.78. "
         },
         {
-            "symbol": "MPLX",
-            "confidence": 0.54,
-            "reason": "Tech Score: 14.3 -> 0.48. Social: 0.75. "
+            "symbol": "AMGN",
+            "confidence": 0.53,
+            "reason": "Tech Score: 12.49 -> 0.42. Social: 0.70. "
         }
     ],
     "short_targets": [
         {
-            "symbol": "ABT",
-            "confidence": 0.51,
-            "reason": "Tech Score: 44.7 -> 0.45. Social: 0.85. "
+            "symbol": "TSCO",
+            "confidence": 0.59,
+            "reason": "Tech Score: 54.04 -> 0.54. Social: 0.78. "
         },
         {
-            "symbol": "NKE",
-            "confidence": 0.62,
-            "reason": "Tech Score: 36.72 -> 0.37. Social: 0.75. "
+            "symbol": "PODD",
+            "confidence": 0.55,
+            "reason": "Tech Score: 52.51 -> 0.53. Social: 0.00. "
+        },
+        {
+            "symbol": "COO",
+            "confidence": 0.56,
+            "reason": "Tech Score: 49.51 -> 0.50. Social: 0.92. "
+        },
+        {
+            "symbol": "COR",
+            "confidence": 0.51,
+            "reason": "Tech Score: 44.97 -> 0.45. Social: 0.85. "
         }
     ],
-    "updated": "2026-04-27 15:02:17.288889",
+    "updated": "2026-05-07 12:02:19.486638",
     "status": "success"
 }

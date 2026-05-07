@@ -97,11 +97,16 @@ def calculate_realized_pl(df):
             realized = sell_val - cost_of_sold
             
         # --- MAPPING: Measurement Name -> Bot Name ---
-        bot_name = "trend_bot" # default
-        if bot == "crypto_trades": bot_name = "crypto_grid"
-        elif bot == "survivor_trades": bot_name = "survivor_bot"
-        elif bot == "wheel_trades": bot_name = "wheel_bot"
-        elif bot == "condor_trades": bot_name = "condor_bot" # <--- NEW
+        mapping = {
+            "trades": "trend_bot", 
+            "crypto_trades": "crypto_grid",
+            "survivor_trades": "survivor_bot",
+            "wheel_trades": "wheel_bot",
+            "condor_trades": "condor_bot"
+        }
+        bot_name = mapping.get(bot)
+        if not bot_name:
+            continue # Skip any measurements we don't recognize
             
         scores[bot_name] = realized
 
