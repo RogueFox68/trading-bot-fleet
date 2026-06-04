@@ -164,6 +164,100 @@ def get_my_budget():
     except Exception as e:
         return 20000
 
+def roll_option_position(ticker, active_option, current_stock_price, side, confidence):
+    logger.info(f"🌀 [ROLL] Pre-checking next contract for {ticker} {side}...")
+    
+    # Step 1: Pre-Check (Find next contract and calculate price before executing any trades)
+    dynamic_otm = TARGET_OTM_PCT * (1.5 - confidence)
+    new_contract = find_best_contract(ticker, side, current_stock_price, dynamic_otm)
+    
+    if not new_contract:
+        logger.error(f"  [ROLL ABORTED] No suitable next contract found for {ticker} {side}.")
+        return False
+        
+    new_quote = get_option_data(new_contract.symbol)
+    if not new_quote:
+        logger.error(f"  [ROLL ABORTED] Failed to get quote for next contract {new_contract.symbol}.")
+        return False
+        
+    new_limit_price = calculate_smart_price(new_quote, side)
+    if new_limit_price is None:
+        logger.error(f"  [ROLL ABORTED] Next contract spread too wide for midpoint pricing.")
+        return False
+        
+    if new_limit_price < MIN_PREMIUM:
+        logger.error(f"  [ROLL ABORTED] Next contract premium too low (${new_limit_price:.2f} < ${MIN_PREMIUM:.2f}).")
+        return False
+        
+    # Smart pricing on closing contract
+    quote = get_option_data(active_option.symbol)
+    close_price = calculate_smart_price(quote, "BUY")
+    if close_price is None:
+        logger.error(f"  [ROLL ABORTED] Current contract {active_option.symbol} spread too wide to close safely.")
+        return False
+
+    logger.info(f"🌀 [ROLL EXECUTION] Leg 1: Closing {active_option.symbol} @ limit ${close_price}...")
+    qty = float(active_option.qty)
+    
+    # Step 2: Close Leg
+    close_req = LimitOrderRequest(
+        symbol=active_option.symbol,
+        qty=abs(int(qty)),
+        side=OrderSide.BUY,
+        time_in_force=TimeInForce.DAY,
+        limit_price=close_price,
+        client_order_id=f"wheel_bot-{active_option.symbol}-rollcls-{int(time.time())}"
+    )
+    
+    try:
+        # Submit the order
+        close_order = utils.submit_and_log_order(trading_client, close_req, logger)
+        
+        # Poll for up to 10 seconds to make sure it fills
+        filled = False
+        for _ in range(20):
+            time.sleep(0.5)
+            o = trading_client.get_order_by_id(close_order.id)
+            if o.status.value in ["filled", "partially_filled"]:
+                filled = True
+                break
+            elif o.status.value in ["canceled", "expired", "rejected"]:
+                break
+                
+        if not filled:
+            logger.warning(f"  [ROLL ABORTED] Timeout waiting for close order {close_order.id} to fill. Canceling order.")
+            try:
+                trading_client.cancel_order_by_id(close_order.id)
+            except: pass
+            return False
+            
+    except Exception as e:
+        logger.error(f"  [ROLL ABORTED] Close order execution failed: {e}")
+        return False
+
+    # Step 3: Open Leg
+    logger.info(f"🌀 [ROLL EXECUTION] Leg 2: Opening {new_contract.symbol} @ limit ${new_limit_price}...")
+    open_req = LimitOrderRequest(
+        symbol=new_contract.symbol,
+        qty=1,
+        side=OrderSide.SELL,
+        time_in_force=TimeInForce.DAY,
+        limit_price=new_limit_price,
+        client_order_id=f"wheel_bot-{new_contract.symbol}-{int(time.time())}"
+    )
+    
+    try:
+        utils.submit_and_log_order(trading_client, open_req, logger)
+        emoji = "🟢" if side == "CALL" else "🔴"
+        send_discord(f"🌀 **ROLLED {ticker} {side}**\nClosed: {active_option.symbol} @ ${close_price}\nOpened: {new_contract.symbol} @ ${new_limit_price}")
+        log_to_influx(f"roll_{side.lower()}", new_limit_price, new_contract.symbol, f"Rolled from {active_option.symbol}")
+        return True
+    except Exception as e:
+        logger.error(f"  [CRITICAL ROLL ERROR] Closed {active_option.symbol} but failed to open new contract {new_contract.symbol}! Position is now flat. Error: {e}")
+        send_discord(f"🚨 **CRITICAL ROLL FAILURE: {ticker}**\nClosed position but failed to re-open next leg! Position is flat. Check Alpaca manual execution immediately.")
+        registry.log_error("wheel_bot", "roll_critical", e, context=f"flat_on_roll_{ticker}")
+        return False
+
 def run_wheel_bot():
     logger.info("--- 🚜 FLEET WHEEL BOT (Smart Pricing + Order Awareness) STARTED ---")
     send_discord(f"🚜 **Wheel Bot Online**\nSyncing with Sector Scout...")
@@ -211,72 +305,149 @@ def run_wheel_bot():
             
             logger.info(f"Scanning {len(clean_targets)} Targets (Busy: {len(busy_tickers)})")
 
-            if not clean_targets:
-                logger.info("    💤 Standby Mode: No targets found. Sleeping...")
-                time.sleep(900)
-                continue
-
             # Batch budget check outside the symbol loop to prevent log spam
             is_budget_ok = utils.check_budget("wheel_bot", trading_client)
 
             all_positions = trading_client.get_all_positions()
 
+            # --- 2. MANAGE EXISTING OPTIONS (Wheel Bot Portfolio Ownership) ---
+            # Filter option positions belonging to wheel_bot
+            wheel_option_positions = []
+            for p in all_positions:
+                if p.asset_class == AssetClass.US_OPTION:
+                    owner = utils.get_bot_owner(p.symbol, p.asset_class, trading_client)
+                    if owner == "wheel_bot":
+                        wheel_option_positions.append(p)
+
+            # Keep track of tickers that currently have active options we managed
+            managed_option_tickers = set()
+
+            wheel_settings = bot_cfg.get("bots", {}).get("wheel_bot", {})
+            force_close_list = wheel_settings.get("force_close_symbols", [])
+            force_roll_list = wheel_settings.get("force_roll_symbols", [])
+
+            for active_option in wheel_option_positions:
+                # Extract ticker root from OCC symbol (e.g. AAPL260626P00140000 -> AAPL)
+                ticker = active_option.symbol
+                for i, char in enumerate(active_option.symbol):
+                    if char.isdigit():
+                        ticker = active_option.symbol[:i]
+                        break
+                
+                managed_option_tickers.add(ticker)
+                
+                # Check if busy (has pending orders)
+                if ticker in busy_tickers:
+                    logger.info(f"  {ticker:<4} | [SKIP] Open Order Exists on managed option.")
+                    continue
+
+                # Parse details
+                occ_part = active_option.symbol[len(ticker):]
+                exp_yymmdd = occ_part[:6]
+                opt_type = occ_part[6]
+                strike_raw = occ_part[7:]
+                strike = float(strike_raw) / 1000.0
+                side = "PUT" if opt_type == 'P' else "CALL"
+                
+                # Calculate DTE
+                try:
+                    exp_date = datetime.datetime.strptime(exp_yymmdd, "%y%m%d").date()
+                    today = datetime.date.today()
+                    dte = (exp_date - today).days
+                except Exception as e:
+                    logger.error(f"Failed parsing exp date for {active_option.symbol}: {e}")
+                    dte = 99
+                
+                current_stock_price = get_current_price(ticker)
+                entry_price = float(active_option.avg_entry_price)
+                current_opt_price = float(active_option.current_price) 
+                qty = float(active_option.qty) 
+                
+                capture_pct = 0.0
+                if entry_price > 0:
+                    capture_pct = (entry_price - current_opt_price) / entry_price
+                
+                logger.info(f"  {ticker:<4} | Option: {active_option.symbol} | Profit: {capture_pct*100:.1f}% | DTE: {dte}")
+                
+                # A) TAKE PROFIT
+                if capture_pct >= TAKE_PROFIT_PCT:
+                    logger.info(f"    💵 [HARVEST] Profit Target Hit! Closing {active_option.symbol}")
+                    quote = get_option_data(active_option.symbol)
+                    close_price = calculate_smart_price(quote, "BUY")
+                    
+                    if close_price is None:
+                        logger.warning(f"    [WAIT] Spread too wide to close safely.")
+                        continue
+
+                    req = LimitOrderRequest(
+                        symbol=active_option.symbol,
+                        qty=abs(int(qty)),
+                        side=OrderSide.BUY,
+                        time_in_force=TimeInForce.DAY,
+                        limit_price=close_price,
+                        client_order_id=f"wheel_bot-{active_option.symbol}-{int(time.time())}"
+                    )
+                    utils.submit_and_log_order(trading_client, req, logger)
+                    send_discord(f"💵 **TOOK PROFIT {ticker}**\nClosed @ ${close_price} ({capture_pct*100:.0f}% Cap)")
+                    log_to_influx("buy_close", close_price, active_option.symbol, "Take Profit")
+                    continue
+
+                # B) FORCE CLOSE FROM CONFIG
+                if ticker in force_close_list:
+                    logger.info(f"    🚨 [FORCE CLOSE] Config triggered close for {active_option.symbol}")
+                    quote = get_option_data(active_option.symbol)
+                    close_price = calculate_smart_price(quote, "BUY")
+                    
+                    if close_price is None:
+                        logger.warning(f"    [WAIT] Spread too wide to close safely.")
+                        continue
+
+                    req = LimitOrderRequest(
+                        symbol=active_option.symbol,
+                        qty=abs(int(qty)),
+                        side=OrderSide.BUY,
+                        time_in_force=TimeInForce.DAY,
+                        limit_price=close_price,
+                        client_order_id=f"wheel_bot-{active_option.symbol}-forcecls-{int(time.time())}"
+                    )
+                    utils.submit_and_log_order(trading_client, req, logger)
+                    send_discord(f"🚨 **FORCE CLOSED {active_option.symbol}**")
+                    log_to_influx("buy_close", close_price, active_option.symbol, "Force Close")
+                    continue
+
+                # C) STALE ROLL (DTE <= 22 days) OR FORCE ROLL
+                is_stale = dte <= 22
+                if ticker in force_roll_list or is_stale:
+                    reason = f"DTE stale ({dte} days)" if is_stale else "Force roll config"
+                    logger.info(f"    🌀 [ROLL] Rolling {active_option.symbol} due to: {reason}")
+                    
+                    confidence = target_map.get(ticker, 0.5)
+                    roll_option_position(ticker, active_option, current_stock_price, side, confidence)
+                    continue
+
+            # --- 3. OPEN NEW POSITIONS ---
             for ticker in clean_targets:
                 # [FIX] Skip if we already have an open order for this ticker
                 if ticker in busy_tickers:
                     logger.info(f"  {ticker:<4} | [SKIP] Open Order Exists.")
                     continue
 
+                # Skip if we already have an active option position for this ticker
+                if ticker in managed_option_tickers:
+                    continue
+
                 stock_qty = 0
-                active_option = None
-                
-                # Check positions
+                # Check stock position
                 for p in all_positions:
                     if p.symbol == ticker and p.asset_class == AssetClass.US_EQUITY:
                         stock_qty = float(p.qty)
-                    elif p.symbol.startswith(ticker) and p.asset_class == AssetClass.US_OPTION:
-                        active_option = p
-                
-                current_stock_price = get_current_price(ticker)
-                
-                # 2. MANAGE EXISTING OPTION (TAKE PROFIT)
-                if active_option:
-                    # ... existing management logic ...
-                    entry_price = float(active_option.avg_entry_price)
-                    current_opt_price = float(active_option.current_price) 
-                    qty = float(active_option.qty) 
-                    
-                    if entry_price > 0:
-                        capture_pct = (entry_price - current_opt_price) / entry_price
-                        logger.info(f"  {ticker:<4} | Option: {active_option.symbol} | Profit: {capture_pct*100:.1f}%")
-                        
-                        if capture_pct >= TAKE_PROFIT_PCT:
-                            logger.info(f"    💵 [HARVEST] Profit Target Hit! Closing {active_option.symbol}")
-                            
-                            quote = get_option_data(active_option.symbol)
-                            close_price = calculate_smart_price(quote, "BUY")
-                            
-                            if close_price is None:
-                                logger.warning(f"    [WAIT] Spread too wide to close safely.")
-                                continue
 
-                            req = LimitOrderRequest(
-                                symbol=active_option.symbol,
-                                qty=abs(int(qty)),
-                                side=OrderSide.BUY,
-                                time_in_force=TimeInForce.DAY,
-                                limit_price=close_price,
-                                client_order_id=f"wheel_bot-{active_option.symbol}-{int(time.time())}"
-                            )
-                            trading_client.submit_order(order_data=req)
-                            send_discord(f"💵 **TOOK PROFIT {ticker}**\nClosed @ ${close_price} ({capture_pct*100:.0f}% Cap)")
-                            log_to_influx("buy_close", close_price, active_option.symbol, "Take Profit")
-                            continue 
+                current_stock_price = get_current_price(ticker)
+                if current_stock_price == 0.0:
                     continue
 
-                # 3. OPEN NEW POSITIONS
                 if not is_budget_ok:
-                     continue # Skip new entries if budget paused, but finish loop
+                    continue # Skip new entries if budget paused, but finish loop
                      
                 # NEW: Budget Enforcement
                 my_budget = get_my_budget()
@@ -323,8 +494,6 @@ def run_wheel_bot():
                 
                 # Cash Secured Put?
                 else:
-                    # Budget check handled at top of entry logic
-
                     if real_bp < (current_stock_price * 100):
                         logger.warning(f"    [SKIP] Insufficient BP (Need ${current_stock_price*100:.0f})")
                         continue
@@ -340,12 +509,8 @@ def run_wheel_bot():
                     
                     limit_price = calculate_smart_price(quote, side)
                     if limit_price is None: 
-                        # `calculate_smart_price` already logs the wide spread reason
                         continue 
                     
-                    # [OPTIONAL] Adjust Minimum Premium based on confidence? 
-                    # For now just use static MIN_PREMIUM
-
                     if limit_price < MIN_PREMIUM:
                         logger.info(f"    [SKIP] Premium too low (${limit_price:.2f} < ${MIN_PREMIUM:.2f})")
                         continue
@@ -368,7 +533,7 @@ def run_wheel_bot():
                         limit_price=limit_price,
                         client_order_id=f"wheel_bot-{contract.symbol}-{int(time.time())}"
                     )
-                    trading_client.submit_order(order_data=req)
+                    utils.submit_and_log_order(trading_client, req, logger)
                     emoji = "🟢" if side == "CALL" else "🔴"
                     send_discord(f"{emoji} **SOLD {side} {ticker}**\nStrike: ${contract.strike_price}\nLimit: ${limit_price}\nConf: {confidence:.2f}")
                     log_to_influx(f"sell_{side.lower()}", limit_price, contract.symbol, "Opened Position")

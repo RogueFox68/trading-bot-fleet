@@ -4,8 +4,8 @@ import requests
 import json
 import math
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.data.historical import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoLatestTradeRequest
 from logger import get_logger, registry
@@ -105,6 +105,18 @@ def get_my_budget():
         logger.warning(f"Could not read budget file: {e}. Using safe default.")
         return 5000
 
+def cancel_open_orders_for_symbol(symbol, opposite_side_only=None):
+    """Cancels any open orders for a specific symbol, optionally filtering by side."""
+    try:
+        req_filter = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+        open_orders = trading_client.get_orders(filter=req_filter)
+        for o in open_orders:
+            if opposite_side_only is None or o.side == opposite_side_only:
+                logger.info(f"    [CANCEL] Canceling open order {o.id} on {symbol} (Side: {o.side}) before placing new order.")
+                trading_client.cancel_order_by_id(o.id)
+    except Exception as e:
+        logger.error(f"Error canceling open orders for {symbol}: {e}")
+
 def run_grid_bot():
     logger.info(f"--- 🕸️ CRYPTO GRID BOT V2 (Auto-Tuning) ---")
     
@@ -193,18 +205,18 @@ def run_grid_bot():
                                 
                                 if not is_budget_ok:
                                     logger.warning(f"    [SKIP] {symbol} Grid buy $50 > Available (budget limit)")
-                                    
                                 elif buying_power > BUDGET_PER_GRID:
+                                    cancel_open_orders_for_symbol(symbol, opposite_side_only=OrderSide.SELL)
                                     qty = BUDGET_PER_GRID / price
                                     c_id = f"crypto_grid-{symbol.replace('/', '')}-{int(time.time())}"
                                     req = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=c_id)
-                                    trading_client.submit_order(order_data=req)
+                                    utils.submit_and_log_order(trading_client, req, logger)
                                     
                                     send_discord(f"🟢 **GRID BUY {symbol}**\nPrice: ${price:,.2f}\nZone: {current_zone}")
                                     log_to_influx(symbol, "grid_buy", price, qty)
                                 else:
                                     logger.warning(f"    [SKIP] {symbol} Low Balance: ${buying_power:.2f} (Need ${BUDGET_PER_GRID})")
-
+ 
                     # PRICE RISE -> SELL (Take Profit)
                     elif current_zone > previous_zone:
                         logger.info(f"    [SELL] {symbol} Rose to Zone {current_zone}")
@@ -229,19 +241,21 @@ def run_grid_bot():
                         
                         if current_qty_held >= qty_to_sell:
                             # Full Sell
+                            cancel_open_orders_for_symbol(symbol, opposite_side_only=OrderSide.BUY)
                             c_id = f"crypto_grid-{symbol.replace('/', '')}-{int(time.time())}"
                             req = MarketOrderRequest(symbol=symbol, qty=qty_to_sell, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=c_id)
-                            trading_client.submit_order(order_data=req)
-
+                            utils.submit_and_log_order(trading_client, req, logger)
+ 
                             send_discord(f"🔴 **GRID SELL {symbol}**\nPrice: ${price:,.2f}\nZone: {current_zone}")
                             log_to_influx(symbol, "grid_sell", price, qty_to_sell)
                             
                         elif current_qty_held > (qty_to_sell * 0.1):
                             # [FIX] Partial Sell (Sweep Dust)
                             logger.info(f"    [SWEEP] {symbol} Selling remaining {current_qty_held:.6f} (Target: {qty_to_sell:.6f})")
+                            cancel_open_orders_for_symbol(symbol, opposite_side_only=OrderSide.BUY)
                             c_id = f"crypto_grid-{symbol.replace('/', '')}-{int(time.time())}"
                             req = MarketOrderRequest(symbol=symbol, qty=current_qty_held, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=c_id)
-                            trading_client.submit_order(order_data=req)
+                            utils.submit_and_log_order(trading_client, req, logger)
                             
                             send_discord(f"🧹 **GRID SWEEP {symbol}**\nSold remaining {current_qty_held:.4f}\nPrice: ${price:,.2f}")
                             log_to_influx(symbol, "grid_sweep", price, current_qty_held)

@@ -267,28 +267,37 @@ def run_trend_bot():
                         pnl_pct = (price - entry_price) / entry_price
                         
                         # Stop Loss / Take profit / EOD overrides
-                        if is_eod_eval:
+                        is_held_overnight = False
+                        is_eod_window = time_str >= "15:30"
+                        if is_eod_window:
                             indicators = {"adx": float(local_adx), "ema_trend_intact": bool(latest['ema_fast'] > latest['ema_slow'])}
                             score = tiered_hold.calculate_hold_score("trend_bot", price, entry_price, indicators, current_regime, current_vix, hours_held=24.0)
                             tier = tiered_hold.get_hold_tier(score, "trend_bot")
                             
                             if tier != "CLOSE_EOD":
-                                logger.info(f"    [HOLD] 🌙 Overriding EOD sweep for {symbol} LONG. Tier: {tier} (Score: {score})")
-                                continue
-                                
+                                is_held_overnight = True
+                                if is_eod_eval:
+                                    logger.info(f"    [HOLD] 🌙 Overriding EOD sweep for {symbol} LONG. Tier: {tier} (Score: {score})")
+                                    continue
+                                    
                         if is_eod_close:
-                            try:
-                                logger.info(f"    📉 EOD LIQUIDATION LONG {symbol} (15:45+ ET)")
-                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
-                                send_discord(f"📉 **EOD CLOSE LONG {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
-                                log_to_influx(symbol, "sell", price, sell_qty)
-                            except Exception as e:
-                                logger.error(f"    [!] EOD Close Error {symbol}: {e}")
-                                _failed_symbols.add(symbol)
+                            if is_held_overnight:
+                                logger.info(f"    [HOLD] 🌙 Overriding EOD sweep for {symbol} LONG (15:45+ ET).")
+                            else:
+                                try:
+                                    logger.info(f"    📉 EOD LIQUIDATION LONG {symbol} (15:45+ ET)")
+                                    req = MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
+                                    utils.submit_and_log_order(trading_client, req, logger)
+                                    send_discord(f"📉 **EOD CLOSE LONG {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
+                                    log_to_influx(symbol, "sell", price, sell_qty)
+                                except Exception as e:
+                                    logger.error(f"    [!] EOD Close Error {symbol}: {e}")
+                                    _failed_symbols.add(symbol)
                         elif pnl_pct <= -0.05:
                             try:
                                 logger.info(f"    🛑 STOP LOSS LONG {symbol} ({pnl_pct:.1%})")
-                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
+                                req = MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
+                                utils.submit_and_log_order(trading_client, req, logger)
                                 send_discord(f"🛑 **STOP LOSS {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
                                 log_to_influx(symbol, "sell", price, sell_qty)
                             except Exception as e:
@@ -297,7 +306,8 @@ def run_trend_bot():
                         elif pnl_pct >= 0.08:
                             try:
                                 logger.info(f"    💰 TAKE PROFIT LONG {symbol} ({pnl_pct:.1%})")
-                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
+                                req = MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
+                                utils.submit_and_log_order(trading_client, req, logger)
                                 send_discord(f"💰 **TAKE PROFIT {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
                                 log_to_influx(symbol, "sell", price, sell_qty)
                             except Exception as e:
@@ -306,7 +316,8 @@ def run_trend_bot():
                         elif bull_cross == False and bear_cross == True:
                             try:
                                 logger.info(f"    📉 CLOSE LONG {symbol} (Crossover)")
-                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
+                                req = MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
+                                utils.submit_and_log_order(trading_client, req, logger)
                                 send_discord(f"📉 **SELL/CLOSE {symbol}** (Cross)\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
                                 log_to_influx(symbol, "sell", price, sell_qty)
                             except Exception as e:
@@ -317,28 +328,37 @@ def run_trend_bot():
                         pnl_pct = (entry_price - price) / entry_price # Inverted PnL
                         
                         # Stop Loss / Take profit / EOD overrides
-                        if is_eod_eval:
+                        is_held_overnight = False
+                        is_eod_window = time_str >= "15:30"
+                        if is_eod_window:
                             indicators = {"adx": float(local_adx), "ema_trend_intact": bool(latest['ema_fast'] < latest['ema_slow'])}
                             score = tiered_hold.calculate_hold_score("trend_short", price, entry_price, indicators, current_regime, current_vix, hours_held=24.0)
                             tier = tiered_hold.get_hold_tier(score, "trend_short")
                             
                             if tier != "CLOSE_EOD":
-                                logger.info(f"    [HOLD] 🌙 Overriding EOD sweep for {symbol} SHORT. Tier: {tier} (Score: {score})")
-                                continue
-                                
+                                is_held_overnight = True
+                                if is_eod_eval:
+                                    logger.info(f"    [HOLD] 🌙 Overriding EOD sweep for {symbol} SHORT. Tier: {tier} (Score: {score})")
+                                    continue
+                                    
                         if is_eod_close:
-                            try:
-                                logger.info(f"    📉 EOD LIQUIDATION SHORT {symbol} (15:45+ ET)")
-                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
-                                send_discord(f"📉 **EOD CLOSE SHORT {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
-                                log_to_influx(symbol, "buy", price, sell_qty)
-                            except Exception as e:
-                                logger.error(f"    [!] EOD Close Short Error {symbol}: {e}")
-                                _failed_symbols.add(symbol)
+                            if is_held_overnight:
+                                logger.info(f"    [HOLD] 🌙 Overriding EOD sweep for {symbol} SHORT (15:45+ ET).")
+                            else:
+                                try:
+                                    logger.info(f"    📉 EOD LIQUIDATION SHORT {symbol} (15:45+ ET)")
+                                    req = MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
+                                    utils.submit_and_log_order(trading_client, req, logger)
+                                    send_discord(f"📉 **EOD CLOSE SHORT {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
+                                    log_to_influx(symbol, "buy", price, sell_qty)
+                                except Exception as e:
+                                    logger.error(f"    [!] EOD Close Short Error {symbol}: {e}")
+                                    _failed_symbols.add(symbol)
                         elif pnl_pct <= -0.05:
                             try:
                                 logger.info(f"    🛑 STOP LOSS SHORT {symbol} ({pnl_pct:.1%})")
-                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
+                                req = MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
+                                utils.submit_and_log_order(trading_client, req, logger)
                                 send_discord(f"🛑 **STOP LOSS SHORT {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
                                 log_to_influx(symbol, "buy", price, sell_qty)
                             except Exception as e:
@@ -347,8 +367,8 @@ def run_trend_bot():
                         elif pnl_pct >= 0.08:
                             try:
                                 logger.info(f"    💰 TAKE PROFIT SHORT {symbol} ({pnl_pct:.1%})")
-                                # Buy to cover
-                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
+                                req = MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
+                                utils.submit_and_log_order(trading_client, req, logger)
                                 send_discord(f"💰 **TAKE PROFIT SHORT {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
                                 log_to_influx(symbol, "buy", price, sell_qty)
                             except Exception as e:
@@ -358,8 +378,8 @@ def run_trend_bot():
                         elif bear_cross == False and bull_cross == True:
                             try:
                                 logger.info(f"    📉 CLOSE SHORT {symbol} (Crossover)")
-                                # Buy to cover
-                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
+                                req = MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
+                                utils.submit_and_log_order(trading_client, req, logger)
                                 send_discord(f"📉 **BUY TO COVER {symbol}** (Bull Cross)\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
                                 log_to_influx(symbol, "buy", price, sell_qty)
                             except Exception as e:
@@ -412,6 +432,11 @@ def run_trend_bot():
                             scaled_risk = RISK_PER_TRADE * scaler * float(size_mult)
                             
                             risk_amt = equity * scaled_risk
+                            
+                            # Cap by available CFO budget
+                            available_budget = utils.get_available_budget("trend_bot", trading_client)
+                            risk_amt = min(risk_amt, available_budget)
+                            
                             # Stop loss approx 2% away
                             qty = int(risk_amt / (price * 0.02))
                             
@@ -422,15 +447,16 @@ def run_trend_bot():
                             
                             # Check buying power before ordering
                             order_cost = float(qty) * float(price)
-                            buying_power = float(account.non_marginable_buying_power)
+                            buying_power = float(account.regt_buying_power)
                             if order_cost > buying_power:
-                                logger.info(f"    [SKIP] {symbol} | Cost ${order_cost:.0f} > Buying Power ${buying_power:.0f}")
+                                logger.info(f"    [SKIP] {symbol} | Cost ${order_cost:.0f} > RegT Buying Power ${buying_power:.0f}")
                                 continue
                                 
                             if qty > 0:
-                                logger.info(f"    🔼 BUY SIGNAL (LONG) {symbol} ({entry_type} | Conf: {confidence:.2f}, Size: {scaler * float(size_mult):.1f}x)")
+                                logger.info(f"    🔼 BUY SIGNAL (LONG) {symbol} ({entry_type} | Conf: {confidence:.2f}, Size: {scaler * float(size_mult):.1f}x, Cost: ${order_cost:.0f})")
                                 try:
-                                    trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
+                                    req = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
+                                    utils.submit_and_log_order(trading_client, req, logger)
                                     send_discord(f"🔼 **LONG {symbol}** ({entry_type})\nRegime: {global_regime}\nADX: {local_adx:.0f}\nConfidence: {confidence:.2f}")
                                     log_to_influx(symbol, "buy", price, qty)
                                 except Exception as e:
@@ -509,6 +535,11 @@ def run_trend_bot():
                             scaled_risk = RISK_PER_TRADE * scaler * float(size_mult)
                             
                             risk_amt = equity * scaled_risk
+                            
+                            # Cap by available CFO budget
+                            available_budget = utils.get_available_budget("trend_bot", trading_client)
+                            risk_amt = min(risk_amt, available_budget)
+                            
                             # Stop loss approx 2% away
                             qty = int(risk_amt / (price * 0.02))
                             
@@ -519,15 +550,16 @@ def run_trend_bot():
                             
                             # Check buying power before ordering
                             order_cost = float(qty) * float(price)
-                            buying_power = float(account.non_marginable_buying_power)
+                            buying_power = float(account.regt_buying_power)
                             if order_cost > buying_power:
-                                logger.info(f"    [SKIP] {symbol} | Cost ${order_cost:.0f} > Buying Power ${buying_power:.0f}")
+                                logger.info(f"    [SKIP] {symbol} | Cost ${order_cost:.0f} > RegT Buying Power ${buying_power:.0f}")
                                 continue
                                 
                             if qty > 0:
-                                logger.info(f"    🩸 BUY SIGNAL (SHORT) {symbol} ({entry_type} | Conf: {confidence:.2f}, Size: {scaler * float(size_mult):.1f}x)")
+                                logger.info(f"    🩸 BUY SIGNAL (SHORT) {symbol} ({entry_type} | Conf: {confidence:.2f}, Size: {scaler * float(size_mult):.1f}x, Cost: ${order_cost:.0f})")
                                 try:
-                                    trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY, client_order_id=f"trend_bot-{symbol}-{int(time.time())}"))
+                                    req = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
+                                    utils.submit_and_log_order(trading_client, req, logger)
                                     send_discord(f"🩸 **SHORT {symbol}** ({entry_type})\nRegime: {global_regime}\nADX: {local_adx:.0f}\nConfidence: {confidence:.2f}")
                                     log_to_influx(symbol, "sell", price, qty)
                                     

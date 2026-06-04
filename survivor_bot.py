@@ -236,22 +236,29 @@ def run_survivor_bot():
                     
                     entry_price = float(pos.avg_entry_price)
                     pct_gain = (live_price - entry_price) / entry_price
-                    
                     should_sell = False
                     reason = ""
                     
-                    if is_eod_eval:
+                    is_held_overnight = False
+                    is_eod_window = time_str >= "15:30"
+                    
+                    if is_eod_window:
                         indicators = {"rsi": float(rsi)}
                         score = tiered_hold.calculate_hold_score("survivor_bot", live_price, entry_price, indicators, current_regime, current_vix, hours_held=24.0)
                         tier = tiered_hold.get_hold_tier(score, "survivor_bot")
                         
                         if tier != "CLOSE_EOD":
-                            logger.info(f"    [HOLD] 🌙 Overriding EOD sweep for {symbol}. Tier: {tier} (Score: {score})")
-                            continue
-                            
+                            is_held_overnight = True
+                            if is_eod_eval:
+                                logger.info(f"    [HOLD] 🌙 Overriding EOD sweep for {symbol}. Tier: {tier} (Score: {score})")
+                                continue
+                                
                     if is_eod_close:
-                        should_sell = True
-                        reason = "EOD Liquidation (15:45+ ET)"
+                        if is_held_overnight:
+                            logger.info(f"    [HOLD] 🌙 Overriding EOD sweep for {symbol} (15:45+ ET).")
+                        else:
+                            should_sell = True
+                            reason = "EOD Liquidation (15:45+ ET)"
                     elif rsi > RSI_SELL:
                         should_sell = True
                         reason = f"RSI Overbought ({rsi:.0f})"
@@ -274,21 +281,23 @@ def run_survivor_bot():
                                 order_tif = TimeInForce.GTC
                                 order_qty = sell_qty
                                 
-                            trading_client.submit_order(
+                            utils.submit_and_log_order(
+                                trading_client,
                                 order_data=MarketOrderRequest(
                                     symbol=symbol, 
                                     qty=order_qty, 
                                     side=OrderSide.SELL, 
                                     time_in_force=order_tif,
                                     client_order_id=f"survivor_bot-{symbol}-{int(time.time())}"
-                                )
+                                ),
+                                logger=logger
                             )
                             send_discord(f"💰 **SOLD {symbol}**\nReason: {reason}\nP&L: {pct_gain*100:.2f}%")
                             log_to_influx(symbol, "sell", live_price, order_qty)
                         except Exception as e:
                             logger.error(f"    [!] Sell Error {symbol}: {e}")
                             _failed_symbols.add(symbol)
-
+ 
                 # --- ENTRY LOGIC ---
                 # Phase 10: Also check pending orders to avoid buy/buy/buy churn loops
                 elif symbol not in pos_dict and symbol not in pending_symbols:
@@ -323,6 +332,11 @@ def run_survivor_bot():
                             logger.info(f"    💎 DIP DETECTED: {symbol} (RSI {rsi:.0f}, Conf {confidence:.2f}, Gate: {gate})")
                             
                             risk_amt = equity * scaled_risk
+                            
+                            # Cap by available CFO budget
+                            available_budget = utils.get_available_budget("survivor_bot", trading_client)
+                            risk_amt = min(risk_amt, available_budget)
+                            
                             qty = int(risk_amt / price)
                             
                             # Phase 10: Max position value cap (10% of equity max)
@@ -332,15 +346,19 @@ def run_survivor_bot():
                             
                             # Check buying power before ordering
                             order_cost = float(qty) * float(price)
-                            buying_power = float(account.non_marginable_buying_power)
+                            buying_power = float(account.regt_buying_power)
                             if order_cost > buying_power:
-                                logger.info(f"       [SKIP] {symbol} | Cost ${order_cost:.0f} > Buying Power ${buying_power:.0f}")
+                                logger.info(f"       [SKIP] {symbol} | Cost ${order_cost:.0f} > RegT Buying Power ${buying_power:.0f}")
                                 continue
                             
                             if qty > 0:
-                                logger.info(f"       -> Buying {qty} shares (Size: {scaler:.1f}x)...")
+                                logger.info(f"       -> Buying {qty} shares (Size: {scaler:.1f}x, Cost: ${order_cost:.0f})...")
                                 try:
-                                    trading_client.submit_order(order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY, client_order_id=f"survivor_bot-{symbol}-{int(time.time())}"))
+                                    utils.submit_and_log_order(
+                                        trading_client,
+                                        order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY, client_order_id=f"survivor_bot-{symbol}-{int(time.time())}"),
+                                        logger=logger
+                                    )
                                     send_discord(f"💎 **BOUGHT DIP {symbol}**\nRSI: {rsi:.0f}\nConfidence: {confidence:.2f}\nGate: {gate}")
                                     log_to_influx(symbol, "buy", price, qty)
                                 except Exception as e:

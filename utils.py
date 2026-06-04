@@ -1,7 +1,7 @@
 import json
-from alpaca.trading.enums import AssetClass, OrderSide
+from alpaca.trading.enums import AssetClass, OrderSide, OrderStatus
 from logger import logger, registry
-from alpaca.trading.requests import GetOrdersRequest
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 
 # --- CENTRALIZED ASSET MAP ---
 # This defines which bot is allowed to trade which ticker
@@ -92,9 +92,9 @@ def get_bot_owner(symbol, asset_class, trading_client):
     # 5. Default fallback (e.g., manually placed order without tag)
     return "trend_bot"
 
-def check_budget(bot_name, trading_client):
+def check_budget_details(bot_name, trading_client):
     """
-    Returns True if the bot is under its dynamically allocated or static budget.
+    Returns (is_ok, budget_dollars, total_used)
     """
     import os
     try:
@@ -121,7 +121,7 @@ def check_budget(bot_name, trading_client):
             allocation_pct = bot_settings.get("allocation", 0.0)
             
             if allocation_pct == 0.0:
-                return True # No limit set
+                return True, equity, 0.0 # No limit set
             budget_dollars = equity * allocation_pct
         
         # 4. Calculate Current Usage
@@ -183,12 +183,63 @@ def check_budget(bot_name, trading_client):
         else:
             logger.info(f"  [CFO] {bot_name}: Used ${total_used:.0f} / ${budget_dollars:.0f} (Left: ${available:.0f})")
         
-        return available > 0
+        return available > 0, budget_dollars, total_used
 
     except Exception as e:
         registry.log_error("utils", "check_budget", e)
         logger.error(f"  [CFO] Budget Check Error: {e}")
-        return True # Default to allow if file error
+        return True, 0.0, 0.0
+
+def check_budget(bot_name, trading_client):
+    """
+    Returns True if the bot is under its dynamically allocated or static budget.
+    """
+    is_ok, _, _ = check_budget_details(bot_name, trading_client)
+    return is_ok
+
+def get_available_budget(bot_name, trading_client):
+    """
+    Returns the remaining budget in dollars for the bot.
+    """
+    is_ok, budget_dollars, total_used = check_budget_details(bot_name, trading_client)
+    return max(0.0, budget_dollars - total_used)
+
+def submit_and_log_order(trading_client, order_data, logger):
+    """
+    Submits an order and polls for a few seconds to log fill-confirmation.
+    For limit orders, logs pending status without polling.
+    """
+    import time
+    try:
+        order = trading_client.submit_order(order_data)
+        logger.info(f"  [ORDER SUBMITTED] ID: {order.id} | Symbol: {order.symbol} | Side: {order.side} | Qty: {order.qty} | Status: {order.status.value} | Type: {order.type.value}")
+        
+        # Check if market order, poll for fill
+        is_market = isinstance(order_data, MarketOrderRequest)
+        
+        if is_market:
+            # Poll for up to 5 seconds (10 attempts * 0.5s)
+            max_attempts = 10
+            for attempt in range(max_attempts):
+                time.sleep(0.5)
+                updated_order = trading_client.get_order_by_id(order.id)
+                if updated_order.status.value in ["filled", "partially_filled"]:
+                    logger.info(f"  [FILL CONFIRMED] ID: {updated_order.id} | Status: {updated_order.status.value} | Fill Price: ${updated_order.filled_avg_price}")
+                    return updated_order
+                elif updated_order.status.value in ["canceled", "expired", "rejected"]:
+                    logger.warning(f"  [ORDER FAILED] ID: {updated_order.id} | Status: {updated_order.status.value}")
+                    return updated_order
+            
+            # If it hasn't filled in 5s
+            logger.info(f"  [ORDER PENDING] ID: {updated_order.id} | Status: {updated_order.status.value}")
+            return updated_order
+        else:
+            limit_price_str = f" @ ${order.limit_price}" if hasattr(order, 'limit_price') and order.limit_price else ""
+            logger.info(f"  [LIMIT ORDER PENDING] ID: {order.id}{limit_price_str}")
+            return order
+    except Exception as e:
+        logger.error(f"  [ORDER SUBMIT ERROR] Failed to submit order: {e}")
+        raise e
     
     # utils.py - Add this function at the bottom
 

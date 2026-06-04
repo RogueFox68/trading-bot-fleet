@@ -236,18 +236,17 @@ def run_condor_bot():
                         ask_price = get_option_price(contract.symbol, "ask")
                         limit_price = round(ask_price * 1.05, 2)
                         if limit_price <= 0: limit_price = 0.05 # Safety floor
-                        
                         try:
                             logger.info(f"       Buying Wing {contract.symbol} @ {limit_price}...")
                             req = LimitOrderRequest(symbol=contract.symbol, qty=1, side=OrderSide.BUY, time_in_force=TimeInForce.DAY, limit_price=limit_price, client_order_id=f"condor_bot-{contract.symbol}-{int(time.time())}")
-                            order = trading_client.submit_order(order_data=req)
+                            order = utils.submit_and_log_order(trading_client, req, logger)
                             
                             # Wait for Fill (5 seconds max)
                             filled = False
                             for _ in range(5):
                                 time.sleep(1)
                                 o = trading_client.get_order_by_id(order.id)
-                                if o.status == 'filled':
+                                if o.status.value == 'filled':
                                     filled = True
                                     wings_filled_ids.append(contract.symbol)
                                     print("       ✅ Filled.")
@@ -274,11 +273,11 @@ def run_condor_bot():
                             bid_price = get_option_price(contract.symbol, "bid")
                             limit_price = round(bid_price * 0.95, 2)
                             if limit_price <= 0: limit_price = 0.05 # Safety floor
-
+ 
                             try:
                                 logger.info(f"       Selling Body {contract.symbol} @ {limit_price}...")
                                 req = LimitOrderRequest(symbol=contract.symbol, qty=1, side=OrderSide.SELL, time_in_force=TimeInForce.DAY, limit_price=limit_price, client_order_id=f"condor_bot-{contract.symbol}-{int(time.time())}")
-                                trading_client.submit_order(order_data=req)
+                                utils.submit_and_log_order(trading_client, req, logger)
                                 # We assume Body fills or sits as limit. 
                                 # Ideally we check this too, but for now we just needed to ensure we HAVE the wings first.
                             except Exception as e:
@@ -290,25 +289,28 @@ def run_condor_bot():
                             # EMERGENCY CLOSE WINGS
                             for sym in wings_filled_ids:
                                 try:
-                                    trading_client.submit_order(order_data=MarketOrderRequest(symbol=sym, qty=1, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"condor_bot-{sym}-{int(time.time())}"))
+                                    req = MarketOrderRequest(symbol=sym, qty=1, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"condor_bot-{sym}-{int(time.time())}")
+                                    utils.submit_and_log_order(trading_client, req, logger)
                                     logger.warning(f"       ⚠️ Rolled back (Sold) {sym}")
+                                # In case rollback submit fails, log critical
                                 except Exception as e:
                                     registry.log_error("condor_bot", "rollback", e, context=sym)
                                     logger.error(f"       💀 CRITICAL: Failed to rollback {sym}. Manually Close! {e}")
                             send_discord(f"⚠️ **CONDOR FAILED & ROLLED BACK**\nTicker: {ticker}\nCheck Account!")
-
+ 
                         else:
                             send_discord(f"🦅 **CONDOR DEPLOYED: {ticker}**\nRange: ${put_short.strike_price} - ${call_short.strike_price}")
                             log_to_influx("open_condor", ticker, price, "Strategy Executed")
-
+ 
                     else:
                         logger.warning("    [ABORT] Wings failed. Cancelling sequence.")
                         # If one wing filled and second failed, we should probably close the first one too.
                         if len(wings_filled_ids) > 0:
                              logger.warning("       ⚠️ Cleaning up partial wings...")
                              for sym in wings_filled_ids:
-                                trading_client.submit_order(order_data=MarketOrderRequest(symbol=sym, qty=1, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"condor_bot-{sym}-{int(time.time())}"))
-
+                                req = MarketOrderRequest(symbol=sym, qty=1, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"condor_bot-{sym}-{int(time.time())}")
+                                utils.submit_and_log_order(trading_client, req, logger)
+ 
                     break # Move to sleep after attempt
 
             time.sleep(1800)
