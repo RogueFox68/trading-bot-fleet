@@ -52,10 +52,10 @@ def log_to_influx(action, price, symbol, detail):
         logger.warning(f"InfluxDB write error: {e}")
 
 def get_wheel_targets():
-    return utils.get_targets_with_freshness_check(
+    return utils.load_and_validate_targets(
         TARGET_FILE, 
         "wheel_targets", 
-        []
+        {}
     )
 
 def get_current_price(symbol):
@@ -294,11 +294,10 @@ def run_wheel_bot():
             target_map = {} # symbol -> confidence
             clean_targets = []
             
-            for item in raw_targets:
-                s, c = utils.parse_target(item)
-                if s:
-                    clean_targets.append(s)
-                    target_map[s] = c
+            for symbol, data in raw_targets.items():
+                confidence = data.get("confidence", 0.5)
+                clean_targets.append(symbol)
+                target_map[symbol] = confidence
             
             # [FIX] Get list of tickers that already have pending orders
             busy_tickers = get_open_order_tickers()

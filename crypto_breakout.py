@@ -27,10 +27,10 @@ data_client = CryptoHistoricalDataClient()
 
 def send_discord(msg):
     try:
-        # FIXED: Using the specific Moon Bag webhook
-        payload = {"content": msg, "username": "MoonBag Bot 🚀"}
+        # FIXED: Using the specific Moon Bot webhook
+        payload = {"content": msg, "username": "Moon Bot 🚀"}
         # Checks if the specific key exists, falls back to default if not
-        webhook = getattr(config, 'WEBHOOK_MOONBAG')
+        webhook = getattr(config, 'WEBHOOK_MOONBOT')
         requests.post(webhook, json=payload)
     except Exception as e:
         logger.error(f"[!] Discord Error: {e}")
@@ -75,8 +75,8 @@ def get_donchian_levels(symbol):
         return None, None, None
 
 def run_breakout_bot():
-    logger.info("--- 🚀 MOON BAG BREAKOUT BOT STARTED ---")
-    send_discord("🚀 **Moon Bag Bot Online**\nStrategy: Donchian Breakout (20/10)")
+    logger.info("--- 🚀 MOON BOT BREAKOUT BOT STARTED ---")
+    send_discord("🚀 **Moon Bot Online**\nStrategy: Donchian Breakout (20/10)")
     
     while True:
         try:
@@ -104,7 +104,7 @@ def run_breakout_bot():
                         if current_price > entry_high:
                             logger.info(f"    [SIGNAL] BREAKOUT! Price ${current_price} > ${entry_high}")
                             
-                            is_budget_ok = utils.check_budget("moon_bag", trading_client)
+                            is_budget_ok = utils.check_budget("moon_bot", trading_client)
                             if not is_budget_ok:
                                 logger.warning(f"    [SKIP] Breakout buy blocked — CFO Budget limit reached.")
                                 continue
@@ -117,7 +117,7 @@ def run_breakout_bot():
                                 logger.info("    [!] Insufficient Buying Power")
                                 continue
 
-                            c_id = f"moon_bag-{symbol.replace('/', '')}-{int(time.time())}"
+                            c_id = f"moon_bot-{symbol.replace('/', '')}-{int(time.time())}"
                             req = MarketOrderRequest(
                                 symbol=symbol,
                                 qty=round(qty_to_buy, 4),
@@ -135,7 +135,7 @@ def run_breakout_bot():
                         if current_price < exit_low:
                             logger.info(f"    [SIGNAL] TRAILING STOP! Price ${current_price} < ${exit_low}")
                             
-                            c_id = f"moon_bag-{symbol.replace('/', '')}-{int(time.time())}"
+                            c_id = f"moon_bot-{symbol.replace('/', '')}-{int(time.time())}"
                             req = MarketOrderRequest(
                                 symbol=symbol,
                                 qty=qty_held,

@@ -30,7 +30,7 @@
             "strategy": "neutral",
             "allocation": 0.10
         },
-        "moon_bag": {
+        "moon_bot": {
             "script": "crypto_breakout.py",
             "status": "active",
             "strategy": "breakout",

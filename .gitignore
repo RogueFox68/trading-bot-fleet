@@ -31,5 +31,7 @@ logs/
 # Assuming you don't want to upload your heavy grafana/influx data if it's local
 influx_data/
 *.json
+!*.template.json
+!*.example.json
 *.txt
 !requirements.txt

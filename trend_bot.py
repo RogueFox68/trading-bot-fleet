@@ -68,11 +68,11 @@ def get_market_regime():
 
 def get_dynamic_targets(regime):
     # 1. BEAR MODE: Short the market
-    long_fallback = []
-    short_fallback = []
+    long_fallback = {}
+    short_fallback = {}
 
-    longs = utils.get_targets_with_freshness_check(TARGET_FILE, "trend_targets", long_fallback)
-    shorts = utils.get_targets_with_freshness_check(TARGET_FILE, "short_targets", short_fallback)
+    longs = utils.load_and_validate_targets(TARGET_FILE, "trend_targets", long_fallback)
+    shorts = utils.load_and_validate_targets(TARGET_FILE, "short_targets", short_fallback)
     
     return longs, shorts
 
@@ -124,17 +124,15 @@ def run_trend_bot():
             clean_targets_long = []
             clean_targets_short = []
             
-            for item in long_targets:
-                sym, conf = utils.parse_target(item)
-                if sym:
-                    clean_targets_long.append(sym)
-                    target_map_long[sym] = conf
+            for sym, data in long_targets.items():
+                conf = data.get("confidence", 0.5)
+                clean_targets_long.append(sym)
+                target_map_long[sym] = conf
             
-            for item in short_targets:
-                sym, conf = utils.parse_target(item)
-                if sym:
-                    clean_targets_short.append(sym)
-                    target_map_short[sym] = conf
+            for sym, data in short_targets.items():
+                conf = data.get("confidence", 0.5)
+                clean_targets_short.append(sym)
+                target_map_short[sym] = conf
             
             account = trading_client.get_account()
             equity = float(account.portfolio_value)

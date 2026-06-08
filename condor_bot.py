@@ -52,7 +52,7 @@ def log_to_influx(action, symbol, price, detail):
         logger.warning(f"InfluxDB write error: {e}")
 
 def get_condor_targets():
-    return utils.get_targets_with_freshness_check(TARGET_FILE, "condor_targets", [])
+    return utils.load_and_validate_targets(TARGET_FILE, "condor_targets", {})
 
 def get_current_price(symbol):
     try:
@@ -145,11 +145,10 @@ def run_condor_bot():
             raw_targets = get_condor_targets()
             target_map = {} # symbol -> confidence
             clean_targets = []
-            for item in raw_targets:
-                s, c = utils.parse_target(item)
-                if s:
-                    clean_targets.append(s)
-                    target_map[s] = c
+            for sym, data in raw_targets.items():
+                conf = data.get("confidence", 0.5)
+                clean_targets.append(sym)
+                target_map[sym] = conf
             
             logger.info(f"Scanning {len(clean_targets)} Targets (Condors: {condor_positions}/{MAX_POSITIONS}, Busy Roots: {len(active_tickers)})...")
             

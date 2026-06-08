@@ -57,38 +57,31 @@ def get_segregated_targets():
     Returns specific survivor targets and a BLACKLIST of other bots' targets.
     This prevents Survivor from selling Trend Bot's positions.
     """
-    survivor_targets = []
+    survivor_targets = {}
     blacklist = []
     
     # Helper to extract symbols
-    def extract_symbols(raw_list):
-        syms = []
-        for x in raw_list:
-             s, _ = utils.parse_target(x)
-             if s: syms.append(s)
-        return syms
+    def extract_symbols(raw_dict):
+        return list(raw_dict.keys()) if isinstance(raw_dict, dict) else []
 
     # 1. Survivor Targets (Fallback: Empty)
-    survivor_targets = utils.get_targets_with_freshness_check(TARGET_FILE, "survivor_targets", [])
+    survivor_targets = utils.load_and_validate_targets(TARGET_FILE, "survivor_targets", {})
 
     # 2. Blacklist (Trend + Wheel + Condor)
     blacklist = []
     
     # Trend Fallback
-    trend_fallback = ["NVDA", "TSLA", "COIN"]
-    trend_raw = utils.get_targets_with_freshness_check(TARGET_FILE, "trend_targets", trend_fallback)
+    trend_fallback = {sym: {"confidence": 0.5} for sym in ["NVDA", "TSLA", "COIN"]}
+    trend_raw = utils.load_and_validate_targets(TARGET_FILE, "trend_targets", trend_fallback)
     blacklist += extract_symbols(trend_raw)
     
     # Wheel Fallback
-    wheel_raw = utils.get_targets_with_freshness_check(TARGET_FILE, "wheel_targets", utils.BOT_MAPPING["wheel_bot"])
+    wheel_fallback = {sym: {"confidence": 0.5} for sym in utils.BOT_MAPPING.get("wheel_bot", [])}
+    wheel_raw = utils.load_and_validate_targets(TARGET_FILE, "wheel_targets", wheel_fallback)
     blacklist += extract_symbols(wheel_raw)
     
-    # Condor Fallback
-    condor_raw = utils.get_targets_with_freshness_check(TARGET_FILE, "condor_targets", utils.BOT_MAPPING["condor_bot"])
-    blacklist += extract_symbols(condor_raw)
-        
-
-        
+    # Condor Fallback (static only, removed from active_targets)
+    blacklist += utils.BOT_MAPPING.get("condor_bot", [])
     return survivor_targets, set(blacklist)
 
 def get_data_alpaca(symbol):
@@ -135,8 +128,8 @@ def run_survivor_bot():
             target_map = {} # symbol -> confidence
             clean_scout_targets = []
             
-            for item in raw_scout_targets:
-                sym, conf = utils.parse_target(item)
+            for sym, data in raw_scout_targets.items():
+                conf = data.get("confidence", 0.5)
                 if sym and sym not in blacklist:
                     clean_scout_targets.append(sym)
                     target_map[sym] = conf
