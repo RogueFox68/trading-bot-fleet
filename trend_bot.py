@@ -46,9 +46,10 @@ def send_discord(msg):
         registry.log_error("trend_bot", "send_discord", e, context=msg[:50])
         logger.error(f"Discord webhook failed: {e}")
 
-def log_to_influx(symbol, action, price, qty):
+def log_to_influx(symbol, action, price, qty, reason=""):
     try:
-        data_str = f'trades,symbol={symbol} price={price},action="{action}",qty={qty} {time.time_ns()}'
+        reason_field = f',reason="{reason}"' if reason else ""
+        data_str = f'trades,symbol={symbol} price={price},action="{action}",qty={qty}{reason_field} {time.time_ns()}'
         url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
         r = requests.post(url, data=data_str, timeout=2)
         if r.status_code != 204:
@@ -287,7 +288,7 @@ def run_trend_bot():
                                     req = MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
                                     utils.submit_and_log_order(trading_client, req, logger)
                                     send_discord(f"📉 **EOD CLOSE LONG {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
-                                    log_to_influx(symbol, "sell", price, sell_qty)
+                                    log_to_influx(symbol, "sell", price, sell_qty, reason="EOD Liquidation")
                                 except Exception as e:
                                     logger.error(f"    [!] EOD Close Error {symbol}: {e}")
                                     _failed_symbols.add(symbol)
@@ -297,7 +298,7 @@ def run_trend_bot():
                                 req = MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
                                 utils.submit_and_log_order(trading_client, req, logger)
                                 send_discord(f"🛑 **STOP LOSS {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
-                                log_to_influx(symbol, "sell", price, sell_qty)
+                                log_to_influx(symbol, "sell", price, sell_qty, reason="Stop Loss")
                             except Exception as e:
                                 logger.error(f"    [!] Stop Loss Error {symbol}: {e}")
                                 _failed_symbols.add(symbol)
@@ -307,7 +308,7 @@ def run_trend_bot():
                                 req = MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
                                 utils.submit_and_log_order(trading_client, req, logger)
                                 send_discord(f"💰 **TAKE PROFIT {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
-                                log_to_influx(symbol, "sell", price, sell_qty)
+                                log_to_influx(symbol, "sell", price, sell_qty, reason="Take Profit")
                             except Exception as e:
                                 logger.error(f"    [!] Take Profit Error {symbol}: {e}")
                                 _failed_symbols.add(symbol)
@@ -317,7 +318,7 @@ def run_trend_bot():
                                 req = MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
                                 utils.submit_and_log_order(trading_client, req, logger)
                                 send_discord(f"📉 **SELL/CLOSE {symbol}** (Cross)\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
-                                log_to_influx(symbol, "sell", price, sell_qty)
+                                log_to_influx(symbol, "sell", price, sell_qty, reason="Bearish Crossover")
                             except Exception as e:
                                 logger.error(f"    [!] Close Long Error {symbol}: {e}")
                                 _failed_symbols.add(symbol)
@@ -348,7 +349,7 @@ def run_trend_bot():
                                     req = MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
                                     utils.submit_and_log_order(trading_client, req, logger)
                                     send_discord(f"📉 **EOD CLOSE SHORT {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
-                                    log_to_influx(symbol, "buy", price, sell_qty)
+                                    log_to_influx(symbol, "buy", price, sell_qty, reason="EOD Liquidation")
                                 except Exception as e:
                                     logger.error(f"    [!] EOD Close Short Error {symbol}: {e}")
                                     _failed_symbols.add(symbol)
@@ -358,7 +359,7 @@ def run_trend_bot():
                                 req = MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
                                 utils.submit_and_log_order(trading_client, req, logger)
                                 send_discord(f"🛑 **STOP LOSS SHORT {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
-                                log_to_influx(symbol, "buy", price, sell_qty)
+                                log_to_influx(symbol, "buy", price, sell_qty, reason="Stop Loss")
                             except Exception as e:
                                 logger.error(f"    [!] Stop Loss Short Error {symbol}: {e}")
                                 _failed_symbols.add(symbol)
@@ -368,7 +369,7 @@ def run_trend_bot():
                                 req = MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
                                 utils.submit_and_log_order(trading_client, req, logger)
                                 send_discord(f"💰 **TAKE PROFIT SHORT {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
-                                log_to_influx(symbol, "buy", price, sell_qty)
+                                log_to_influx(symbol, "buy", price, sell_qty, reason="Take Profit")
                             except Exception as e:
                                 logger.error(f"    [!] Take Profit Short Error {symbol}: {e}")
                                 _failed_symbols.add(symbol)
@@ -379,7 +380,7 @@ def run_trend_bot():
                                 req = MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
                                 utils.submit_and_log_order(trading_client, req, logger)
                                 send_discord(f"📉 **BUY TO COVER {symbol}** (Bull Cross)\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
-                                log_to_influx(symbol, "buy", price, sell_qty)
+                                log_to_influx(symbol, "buy", price, sell_qty, reason="Bullish Crossover")
                             except Exception as e:
                                 logger.error(f"    [!] Close Short Error {symbol}: {e}")
                                 _failed_symbols.add(symbol)
@@ -456,7 +457,7 @@ def run_trend_bot():
                                     req = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
                                     utils.submit_and_log_order(trading_client, req, logger)
                                     send_discord(f"🔼 **LONG {symbol}** ({entry_type})\nRegime: {global_regime}\nADX: {local_adx:.0f}\nConfidence: {confidence:.2f}")
-                                    log_to_influx(symbol, "buy", price, qty)
+                                    log_to_influx(symbol, "buy", price, qty, reason=f"Entry ({entry_type})")
                                 except Exception as e:
                                     logger.error(f"    [!] Order Error: {e}")
                                     _failed_symbols.add(symbol)
@@ -559,7 +560,7 @@ def run_trend_bot():
                                     req = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
                                     utils.submit_and_log_order(trading_client, req, logger)
                                     send_discord(f"🩸 **SHORT {symbol}** ({entry_type})\nRegime: {global_regime}\nADX: {local_adx:.0f}\nConfidence: {confidence:.2f}")
-                                    log_to_influx(symbol, "sell", price, qty)
+                                    log_to_influx(symbol, "sell", price, qty, reason=f"Entry ({entry_type})")
                                     
                                     # Add to local short_exposure total so we don't rapid-fire exceed the cap in one loop
                                     short_exposure = float(short_exposure) + (float(qty) * float(price))

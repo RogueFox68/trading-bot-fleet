@@ -42,9 +42,10 @@ def send_discord(msg):
         registry.log_error("survivor_bot", "send_discord", e, context=msg[:50])
         logger.error(f"Discord webhook failed: {e}")
 
-def log_to_influx(symbol, action, price, qty):
+def log_to_influx(symbol, action, price, qty, reason=""):
     try:
-        data_str = f'survivor_trades,symbol={symbol} price={price},action="{action}",qty={qty} {time.time_ns()}'
+        reason_field = f',reason="{reason}"' if reason else ""
+        data_str = f'survivor_trades,symbol={symbol} price={price},action="{action}",qty={qty}{reason_field} {time.time_ns()}'
         url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
         r = requests.post(url, data=data_str, timeout=2)
         if r.status_code != 204:
@@ -286,7 +287,7 @@ def run_survivor_bot():
                                 logger=logger
                             )
                             send_discord(f"💰 **SOLD {symbol}**\nReason: {reason}\nP&L: {pct_gain*100:.2f}%")
-                            log_to_influx(symbol, "sell", live_price, order_qty)
+                            log_to_influx(symbol, "sell", live_price, order_qty, reason=reason)
                         except Exception as e:
                             logger.error(f"    [!] Sell Error {symbol}: {e}")
                             _failed_symbols.add(symbol)
@@ -353,7 +354,7 @@ def run_survivor_bot():
                                         logger=logger
                                     )
                                     send_discord(f"💎 **BOUGHT DIP {symbol}**\nRSI: {rsi:.0f}\nConfidence: {confidence:.2f}\nGate: {gate}")
-                                    log_to_influx(symbol, "buy", price, qty)
+                                    log_to_influx(symbol, "buy", price, qty, reason="Bought Dip")
                                 except Exception as e:
                                     logger.error(f"       [!] Order Error: {e}")
                                     _failed_symbols.add(symbol)
