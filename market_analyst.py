@@ -37,7 +37,12 @@ class TechnicalMath:
         minus_dm = low.diff()
         plus_dm[plus_dm < 0] = 0
         minus_dm[minus_dm > 0] = 0
-        tr = (high - low).abs() # Simplified TR for speed
+        # Full True Range (matches market_scanner.TechnicalMath.get_adx)
+        tr = pd.concat([
+            (high - low),
+            (high - close.shift(1)).abs(),
+            (low - close.shift(1)).abs()
+        ], axis=1).max(axis=1)
         tr = tr.replace(0, np.nan)
         plus_di = 100 * (plus_dm.ewm(alpha=1/window, adjust=False).mean() / tr)
         minus_di = 100 * (minus_dm.abs().ewm(alpha=1/window, adjust=False).mean() / tr)

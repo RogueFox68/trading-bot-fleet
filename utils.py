@@ -108,6 +108,29 @@ def get_bot_owner(symbol, asset_class, trading_client):
     # 5. Default fallback (e.g., manually placed order without tag)
     return "trend_bot"
 
+def get_position_entry_times(trading_client):
+    """
+    Best-effort {symbol: entry_datetime_utc} for held positions, taken from the
+    most recent FILLED order per symbol in the last 500 orders. For bots that do
+    full entries/exits (trend, survivor), the latest fill on a symbol you still
+    hold is its entry, so this is a good proxy for hold duration.
+    Returns {} on error; callers treat a missing symbol as 'unknown duration'.
+    """
+    entry_times = {}
+    try:
+        req = GetOrdersRequest(status="all", limit=500)
+        orders = trading_client.get_orders(filter=req)
+        for o in orders:
+            filled_at = getattr(o, "filled_at", None)
+            if filled_at is None:
+                continue
+            prev = entry_times.get(o.symbol)
+            if prev is None or filled_at > prev:
+                entry_times[o.symbol] = filled_at
+    except Exception as e:
+        registry.log_error("utils", "get_position_entry_times", e)
+    return entry_times
+
 def check_budget_details(bot_name, trading_client):
     """
     Returns (is_ok, budget_dollars, total_used)

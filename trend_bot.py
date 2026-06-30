@@ -27,6 +27,7 @@ logger = get_logger("trend_bot")
 FAST_EMA = 9
 SLOW_EMA = 21
 RISK_PER_TRADE = 0.02
+FAILED_SYMBOL_COOLDOWN = 3600  # seconds to skip a symbol after an order error (1h)
 
 # Momentum Confirmation Settings
 MOMENTUM_BARS = 5           # Fast EMA must be above Slow EMA for N consecutive bars
@@ -100,8 +101,8 @@ def run_trend_bot():
     logger.info(f"--- 昌 TREND SNIPER (Target Locked) STARTED ---")
     send_discord("**Trend Sniper V4.1** Online\nOwnership Logic Active.")
     
-    # Phase 10: Failed order cooldown
-    _failed_symbols = set()
+    # Phase 10: Failed order cooldown (symbol -> last-failure epoch)
+    _failed_symbols = {}
     
     while True:
         try:
@@ -139,6 +140,7 @@ def run_trend_bot():
             equity = float(account.portfolio_value)
             positions = trading_client.get_all_positions()
             pos_dict = {p.symbol: p for p in positions}
+            entry_times = utils.get_position_entry_times(trading_client)
 
             # Phase 10: Get Pending Orders to avoid buy churn loops
             open_orders = trading_client.get_orders(filter=GetOrdersRequest(status="open"))
@@ -188,10 +190,13 @@ def run_trend_bot():
             is_budget_ok = utils.check_budget("trend_bot", trading_client)
 
             for symbol in scan_list:
-                # Phase 10: Skip failed symbols and cryptos
-                if symbol in _failed_symbols: continue
-                if symbol in ["BTC/USD", "ETH/USD"]: continue 
-                if "/" in symbol: continue 
+                # Phase 10: Skip recently-failed symbols (cooldown) and cryptos
+                if symbol in _failed_symbols:
+                    if (time.time() - _failed_symbols[symbol]) < FAILED_SYMBOL_COOLDOWN:
+                        continue
+                    del _failed_symbols[symbol]  # cooldown elapsed, allow a retry
+                if symbol in ["BTC/USD", "ETH/USD"]: continue
+                if "/" in symbol: continue
                 
                 # Retrieve Data
                 df = get_data_alpaca(symbol)
@@ -256,7 +261,9 @@ def run_trend_bot():
                     sell_qty = int(abs(qty))
                     side = pos.side
                     entry_price = float(pos.avg_entry_price)
-                    
+                    entry_dt = entry_times.get(symbol)
+                    hours_held = ((datetime.datetime.now(datetime.timezone.utc) - entry_dt).total_seconds() / 3600.0) if entry_dt else None
+
                     if sell_qty <= 0:
                         logger.info(f"    [SKIP] {symbol} fractional position ({qty} shares), cannot close")
                         continue
@@ -270,7 +277,7 @@ def run_trend_bot():
                         is_eod_window = time_str >= "15:30"
                         if is_eod_window:
                             indicators = {"adx": float(local_adx), "ema_trend_intact": bool(latest['ema_fast'] > latest['ema_slow'])}
-                            score = tiered_hold.calculate_hold_score("trend_bot", price, entry_price, indicators, current_regime, current_vix, hours_held=24.0)
+                            score = tiered_hold.calculate_hold_score("trend_bot", price, entry_price, indicators, current_regime, current_vix, hours_held=hours_held)
                             tier = tiered_hold.get_hold_tier(score, "trend_bot")
                             
                             if tier != "CLOSE_EOD":
@@ -291,7 +298,7 @@ def run_trend_bot():
                                     log_to_influx(symbol, "sell", price, sell_qty, reason="EOD Liquidation")
                                 except Exception as e:
                                     logger.error(f"    [!] EOD Close Error {symbol}: {e}")
-                                    _failed_symbols.add(symbol)
+                                    _failed_symbols[symbol] = time.time()
                         elif pnl_pct <= -0.05:
                             try:
                                 logger.info(f"    🛑 STOP LOSS LONG {symbol} ({pnl_pct:.1%})")
@@ -301,7 +308,7 @@ def run_trend_bot():
                                 log_to_influx(symbol, "sell", price, sell_qty, reason="Stop Loss")
                             except Exception as e:
                                 logger.error(f"    [!] Stop Loss Error {symbol}: {e}")
-                                _failed_symbols.add(symbol)
+                                _failed_symbols[symbol] = time.time()
                         elif pnl_pct >= 0.08:
                             try:
                                 logger.info(f"    💰 TAKE PROFIT LONG {symbol} ({pnl_pct:.1%})")
@@ -311,7 +318,7 @@ def run_trend_bot():
                                 log_to_influx(symbol, "sell", price, sell_qty, reason="Take Profit")
                             except Exception as e:
                                 logger.error(f"    [!] Take Profit Error {symbol}: {e}")
-                                _failed_symbols.add(symbol)
+                                _failed_symbols[symbol] = time.time()
                         elif bull_cross == False and bear_cross == True:
                             try:
                                 logger.info(f"    📉 CLOSE LONG {symbol} (Crossover)")
@@ -321,7 +328,7 @@ def run_trend_bot():
                                 log_to_influx(symbol, "sell", price, sell_qty, reason="Bearish Crossover")
                             except Exception as e:
                                 logger.error(f"    [!] Close Long Error {symbol}: {e}")
-                                _failed_symbols.add(symbol)
+                                _failed_symbols[symbol] = time.time()
                                 
                     elif side == "short":
                         pnl_pct = (entry_price - price) / entry_price # Inverted PnL
@@ -331,7 +338,7 @@ def run_trend_bot():
                         is_eod_window = time_str >= "15:30"
                         if is_eod_window:
                             indicators = {"adx": float(local_adx), "ema_trend_intact": bool(latest['ema_fast'] < latest['ema_slow'])}
-                            score = tiered_hold.calculate_hold_score("trend_short", price, entry_price, indicators, current_regime, current_vix, hours_held=24.0)
+                            score = tiered_hold.calculate_hold_score("trend_short", price, entry_price, indicators, current_regime, current_vix, hours_held=hours_held)
                             tier = tiered_hold.get_hold_tier(score, "trend_short")
                             
                             if tier != "CLOSE_EOD":
@@ -352,7 +359,7 @@ def run_trend_bot():
                                     log_to_influx(symbol, "buy", price, sell_qty, reason="EOD Liquidation")
                                 except Exception as e:
                                     logger.error(f"    [!] EOD Close Short Error {symbol}: {e}")
-                                    _failed_symbols.add(symbol)
+                                    _failed_symbols[symbol] = time.time()
                         elif pnl_pct <= -0.05:
                             try:
                                 logger.info(f"    🛑 STOP LOSS SHORT {symbol} ({pnl_pct:.1%})")
@@ -362,7 +369,7 @@ def run_trend_bot():
                                 log_to_influx(symbol, "buy", price, sell_qty, reason="Stop Loss")
                             except Exception as e:
                                 logger.error(f"    [!] Stop Loss Short Error {symbol}: {e}")
-                                _failed_symbols.add(symbol)
+                                _failed_symbols[symbol] = time.time()
                         elif pnl_pct >= 0.08:
                             try:
                                 logger.info(f"    💰 TAKE PROFIT SHORT {symbol} ({pnl_pct:.1%})")
@@ -372,7 +379,7 @@ def run_trend_bot():
                                 log_to_influx(symbol, "buy", price, sell_qty, reason="Take Profit")
                             except Exception as e:
                                 logger.error(f"    [!] Take Profit Short Error {symbol}: {e}")
-                                _failed_symbols.add(symbol)
+                                _failed_symbols[symbol] = time.time()
                         # Exit short if we get a bull cross (trend reversal back up)
                         elif bear_cross == False and bull_cross == True:
                             try:
@@ -383,7 +390,7 @@ def run_trend_bot():
                                 log_to_influx(symbol, "buy", price, sell_qty, reason="Bullish Crossover")
                             except Exception as e:
                                 logger.error(f"    [!] Close Short Error {symbol}: {e}")
-                                _failed_symbols.add(symbol)
+                                _failed_symbols[symbol] = time.time()
 
                 # B) LONG ENTRY LOGIC
                 # Phase 10: Also check pending orders to avoid churn loops
@@ -436,8 +443,8 @@ def run_trend_bot():
                             available_budget = utils.get_available_budget("trend_bot", trading_client)
                             risk_amt = min(risk_amt, available_budget)
                             
-                            # Stop loss approx 2% away
-                            qty = int(risk_amt / (price * 0.02))
+                            # Notional sizing (matches survivor_bot): risk_amt is the dollar position size
+                            qty = int(risk_amt / price)
                             
                             # Max position cap (Phase 8 Bugfix)
                             max_position_value = equity * 0.15  # Never more than 15% of portfolio per trade
@@ -460,7 +467,7 @@ def run_trend_bot():
                                     log_to_influx(symbol, "buy", price, qty, reason=f"Entry ({entry_type})")
                                 except Exception as e:
                                     logger.error(f"    [!] Order Error: {e}")
-                                    _failed_symbols.add(symbol)
+                                    _failed_symbols[symbol] = time.time()
                         else:
                             logger.info(f"    [SKIP] {symbol} | ADX {local_adx:.0f} > 20 but no Bullish Crossover or Momentum trigger.")
                     else:
@@ -539,8 +546,8 @@ def run_trend_bot():
                             available_budget = utils.get_available_budget("trend_bot", trading_client)
                             risk_amt = min(risk_amt, available_budget)
                             
-                            # Stop loss approx 2% away
-                            qty = int(risk_amt / (price * 0.02))
+                            # Notional sizing (matches survivor_bot): risk_amt is the dollar position size
+                            qty = int(risk_amt / price)
                             
                             # Max position cap
                             max_position_value = equity * 0.15
@@ -566,7 +573,7 @@ def run_trend_bot():
                                     short_exposure = float(short_exposure) + (float(qty) * float(price))
                                 except Exception as e:
                                     logger.error(f"    [!] Order Error: {e}")
-                                    _failed_symbols.add(symbol)
+                                    _failed_symbols[symbol] = time.time()
                         else:
                             logger.info(f"    [SKIP] {symbol} | ADX {local_adx:.0f} > 20 but no Bearish Crossover or Momentum trigger.")
                     else:

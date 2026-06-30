@@ -10,7 +10,6 @@ import requests
 import pandas as pd
 import ta
 from ta.momentum import RSIIndicator
-from ta.trend import SMAIndicator
 import pytz
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass
@@ -23,9 +22,10 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 TARGET_FILE = "active_targets.json" 
 
 # Indicators
-RSI_BUY = 38        
-RSI_SELL = 70       
-RISK_PER_TRADE = 0.05 
+RSI_BUY = 38
+RSI_SELL = 70
+RISK_PER_TRADE = 0.05
+FAILED_SYMBOL_COOLDOWN = 3600  # seconds to skip a symbol after an order error (1h)
 
 # --- LOGGING ---
 logger = get_logger("survivor_bot")
@@ -103,12 +103,44 @@ def get_data_alpaca(symbol):
         registry.log_error("survivor_bot", "get_data_alpaca", e, context=symbol)
         return None
 
+# Daily SMA200 (long-term trend filter) is computed on DAILY bars and cached
+# per symbol — it barely moves intraday, so we refresh every few hours.
+_daily_sma_cache = {}  # symbol -> (epoch, sma_value)
+_DAILY_SMA_TTL = 6 * 3600
+
+def get_trend_sma(symbol, window=200):
+    """Latest `window`-period SMA on DAILY closes (long-term trend), cached."""
+    now = time.time()
+    cached = _daily_sma_cache.get(symbol)
+    if cached and (now - cached[0]) < _DAILY_SMA_TTL:
+        return cached[1]
+    try:
+        start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=window * 2 + 60)
+        req = StockBarsRequest(
+            symbol_or_symbols=[symbol],
+            timeframe=TimeFrame.Day,
+            start=start_time,
+            limit=window + 50
+        )
+        bars = data_client.get_stock_bars(req)
+        if not bars.data or symbol not in bars.data:
+            return None
+        df = bars.df.xs(symbol)
+        if len(df) < window:
+            return None
+        sma = float(df['close'].tail(window).mean())
+        _daily_sma_cache[symbol] = (now, sma)
+        return sma
+    except Exception as e:
+        registry.log_error("survivor_bot", "get_trend_sma", e, context=symbol)
+        return None
+
 def run_survivor_bot():
     logger.info(f"--- 🛡️ SURVIVOR BOT (Segregated) STARTED ---")
     send_discord("**Survivor Bot V3.1** Online\nSegregation Protocol Active.")
     
-    # Phase 10: Failed order cooldown
-    _failed_symbols = set()
+    # Phase 10: Failed order cooldown (symbol -> last-failure epoch)
+    _failed_symbols = {}
     
     while True:
         try:
@@ -143,7 +175,8 @@ def run_survivor_bot():
             equity = float(account.portfolio_value)
             positions = trading_client.get_all_positions()
             pos_dict = {p.symbol: p for p in positions}
-            
+            entry_times = utils.get_position_entry_times(trading_client)
+
             # Phase 10: Get Pending Orders to avoid buy churn loops
             open_orders = trading_client.get_orders(filter=GetOrdersRequest(status="open"))
             pending_symbols = {o.symbol for o in open_orders}
@@ -179,21 +212,23 @@ def run_survivor_bot():
             is_budget_ok = utils.check_budget("survivor_bot", trading_client)
 
             for symbol in full_scan_list:
-                # Phase 10: Skip failed symbols and cryptos
-                if symbol in _failed_symbols: continue
-                if symbol in ["BTC/USD", "ETH/USD"]: continue 
+                # Phase 10: Skip recently-failed symbols (cooldown) and cryptos
+                if symbol in _failed_symbols:
+                    if (time.time() - _failed_symbols[symbol]) < FAILED_SYMBOL_COOLDOWN:
+                        continue
+                    del _failed_symbols[symbol]  # cooldown elapsed, allow a retry
+                if symbol in ["BTC/USD", "ETH/USD"]: continue
 
                 df = get_data_alpaca(symbol)
                 if df is None: continue
 
-                # Indicators
+                # Indicators (RSI on 15m bars; SMA200 trend filter on DAILY bars)
                 df['rsi'] = RSIIndicator(close=df['close'], window=14).rsi()
-                df['sma200'] = SMAIndicator(close=df['close'], window=200).sma_indicator()
-                
+
                 latest = df.iloc[-1]
                 price = float(latest['close'])
                 rsi = float(latest['rsi'])
-                sma = float(latest['sma200']) if not pd.isna(latest['sma200']) else 0
+                sma = get_trend_sma(symbol, 200) or 0
 
                 # --- DIAGNOSTICS ---
                 if symbol not in pos_dict:
@@ -229,6 +264,8 @@ def run_survivor_bot():
                         live_price = price # fallback to bar close if API fails
                     
                     entry_price = float(pos.avg_entry_price)
+                    entry_dt = entry_times.get(symbol)
+                    hours_held = ((datetime.datetime.now(datetime.timezone.utc) - entry_dt).total_seconds() / 3600.0) if entry_dt else None
                     pct_gain = (live_price - entry_price) / entry_price
                     should_sell = False
                     reason = ""
@@ -238,7 +275,7 @@ def run_survivor_bot():
                     
                     if is_eod_window:
                         indicators = {"rsi": float(rsi)}
-                        score = tiered_hold.calculate_hold_score("survivor_bot", live_price, entry_price, indicators, current_regime, current_vix, hours_held=24.0)
+                        score = tiered_hold.calculate_hold_score("survivor_bot", live_price, entry_price, indicators, current_regime, current_vix, hours_held=hours_held)
                         tier = tiered_hold.get_hold_tier(score, "survivor_bot")
                         
                         if tier != "CLOSE_EOD":
@@ -264,6 +301,8 @@ def run_survivor_bot():
                         reason = "Stop Loss (-3%)"
                         
                     if should_sell:
+                        if hours_held is not None:
+                            reason = f"{reason} [held {hours_held:.1f}h]"
                         try:
                             logger.info(f"    📉 SELLING {symbol}: {reason}")
                             
@@ -290,7 +329,7 @@ def run_survivor_bot():
                             log_to_influx(symbol, "sell", live_price, order_qty, reason=reason)
                         except Exception as e:
                             logger.error(f"    [!] Sell Error {symbol}: {e}")
-                            _failed_symbols.add(symbol)
+                            _failed_symbols[symbol] = time.time()
  
                 # --- ENTRY LOGIC ---
                 # Phase 10: Also check pending orders to avoid buy/buy/buy churn loops
@@ -357,7 +396,7 @@ def run_survivor_bot():
                                     log_to_influx(symbol, "buy", price, qty, reason="Bought Dip")
                                 except Exception as e:
                                     logger.error(f"       [!] Order Error: {e}")
-                                    _failed_symbols.add(symbol)
+                                    _failed_symbols[symbol] = time.time()
                         else:
                             logger.info(f"    [SKIP] {symbol} | RSI {rsi:.0f} < {RSI_BUY} but NOT (Uptrend | Core | Scout). SMA: {sma:.2f}")
                     else:
