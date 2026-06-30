@@ -35,3 +35,6 @@ influx_data/
 !*.example.json
 *.txt
 !requirements.txt
+
+# --- Exported trade/performance data ---
+*.csv
