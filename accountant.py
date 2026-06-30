@@ -6,6 +6,7 @@ import pandas as pd
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass
 from logger import logger
+import utils
 
 
 # --- CONFIGURATION ---
@@ -226,6 +227,14 @@ def run_accountant():
 
     while True:
         try:
+            # 0. RECONCILE WHEEL FILLS — wheel submits LIMIT options that fill
+            #    asynchronously (or expire); pull the real fills from Alpaca so
+            #    wheel_trades reflects actual price/qty/time, not submit phantoms.
+            try:
+                utils.reconcile_wheel_fills(trading_client, logger)
+            except Exception as e:
+                logger.error(f"[Reconcile] wheel reconciliation failed: {e}")
+
             # 1. FETCH REALIZED P&L (HISTORY)
             history_df = query_influx_trades()
             realized_scores = calculate_realized_pl(history_df)
