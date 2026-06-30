@@ -41,7 +41,7 @@ trading-bot-fleet/
 ├── Infrastructure
 │   ├── commander.py             # Discord bot for fleet management + watchdog
 │   ├── accountant.py            # CFO: P&L attribution, budget enforcement, InfluxDB metrics
-│   └── market_analyst.py        # Market regime detection (SPY-based: BULL/SIDEWAYS/BEAR_TREND/
+│   └── market_analyst.py        # Market regime detection (SPY-based: BULL_TREND/SIDEWAYS/BEAR_TREND/
 │                                # CRITICAL_VOLATILITY) + VIX monitoring
 │
 └── Utilities
@@ -61,24 +61,23 @@ trading-bot-fleet/
 │   ("The Brain")                 │ ─────────────────────────► │   ("Execution Node")             │
 │                                 │    3x daily (08:30,        │                                  │
 │   AMD Strix Halo (96GB)        │    12:00, 15:00 CT)        │   Intel N100 (16GB)              │
-│   Ollama → Llama 3.3 70B      │                            │   Ubuntu Linux                   │
-│   Docker: ollama_backend +     │                            │                                  │
-│           sector_scout_bot     │                            │   Native: Trading bot fleet      │
-│   systemd timers for scheduling│                            │   Docker: InfluxDB 1.8 + Grafana │
+│   LM Studio → Gemma 4 21B MoE  │                            │   Ubuntu Linux                   │
+│   Native Windows               │                            │                                  │
+│   (RTX 5080 for CUDA tasks)    │                            │   Native: Trading bot fleet      │
+│   Task Scheduler (3x daily)    │                            │   Docker: InfluxDB 1.8 + Grafana │
 │                                 │                            │           + WireGuard/wg-easy    │
 │   Repo: TradingAgent           │                            │   Repo: trading-bot-fleet        │
 └─────────────────────────────────┘                            └──────────────────────────────────┘
 ```
 
-**Data flow:** Corsair scans ~4,800 Alpaca assets → filters to ~1,100 liquid candidates → runs
-Llama 3.3 70B sentiment analysis on top 50 → writes `active_targets.json` → SCP transfers to
-Beelink → bots read targets and trade against them.
+**Data flow:** Corsair scans the Alpaca universe → filters to liquid candidates → runs
+Gemma 4 21B MoE sentiment analysis on the top candidates → writes `active_targets.json` → SCP
+transfers to Beelink → bots read targets and trade against them.
 
-**Key change (April 2026):** Sector scout functions have been **fully migrated from the Windows
-desktop (MSI Aegis / RTX 5080) to the Corsair AI workstation**. The scout previously ran on
-Windows via Task Scheduler with Llama 3.1 8B; it now runs on Corsair via systemd timers with
-Llama 3.3 70B, giving dramatically better analysis quality. The Windows machine is freed for
-ComfyUI/creative AI work without GPU contention.
+**Platform note:** The sector scout runs on the **Corsair AI workstation under native Windows**,
+using **LM Studio + Gemma 4 21B MoE** scheduled via **Windows Task Scheduler** (3x daily). An
+earlier Ubuntu/Docker/Ollama/Llama 3.3 70B setup was abandoned for Windows stability — see
+`CORSAIR_ARCHITECTURE.md` in the `TradingAgent` repo for the authoritative hardware/model history.
 
 ## Architecture
 
@@ -170,7 +169,7 @@ All three services share a Docker network on the Beelink (`docker-compose.yml` i
 ### Data Flow
 
 ```
-Corsair (Llama 70B analysis) ──SCP──► active_targets.json on Beelink
+Corsair (Gemma 4 21B analysis) ──SCP──► active_targets.json on Beelink
                                               │
 Market Data (Alpaca/yfinance) ──► Bot Analysis ──► Trade Execution (Alpaca)
                                                           │
@@ -203,13 +202,13 @@ Market Data (Alpaca/yfinance) ──► Bot Analysis ──► Trade Execution (
 
 ### Known Issues / Tech Debt
 
-- **Silent InfluxDB failures:** `log_to_influx()` functions across the fleet use bare
-  `except: pass`, causing write failures to fail silently. This was the root cause of the
-  initial empty-dashboard issue after the Grafana migration. Needs replacement with proper
-  error logging.
-- **accountant.py BOT_MAPPING divergence:** The accountant historically had its own copy of
-  `BOT_MAPPING` with slightly different keys (`"survivor"` vs `"survivor_bot"`). It now
-  imports `get_bot_owner` from utils directly, but watch for regressions.
+- **Silent InfluxDB failures (resolved):** `log_to_influx()` functions previously used bare
+  `except: pass`, causing write failures to fail silently (root cause of the initial
+  empty-dashboard issue after the Grafana migration). They now check the HTTP status code and
+  log a warning on failure. Remaining bare `except: pass` are limited to best-effort Discord
+  sends in `commander.py`.
+- **accountant.py BOT_MAPPING divergence (resolved):** The accountant's duplicate `BOT_MAPPING`
+  copy has been removed; ownership is now resolved solely via `utils.get_bot_owner`.
 - **Iron condor bot:** Sidelined and excluded from allocations. Do not reactivate without
   solving Alpaca's multi-leg position tracking limitations.
 
@@ -234,7 +233,7 @@ No conventional commit prefixes (feat:, fix:, etc.) are used. Keep messages shor
 ```
 alpaca-py          # Alpaca Markets API client (trading + data)
 pandas             # DataFrames for trade analysis
-pandas_ta          # Technical analysis indicators (RSI, EMA, ADX)
+ta                 # Technical analysis indicators (RSI, EMA, ADX) — used by trend_bot/survivor_bot
 yfinance           # Yahoo Finance market data
 requests           # HTTP for webhooks and InfluxDB writes
 pytz               # Timezone handling (US/Eastern)

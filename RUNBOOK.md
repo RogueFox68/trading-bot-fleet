@@ -10,8 +10,8 @@ This runbook covers the Beelink/PM2/Alpaca automated trading fleet ("The Executo
 
 ## Deployment & Startup
 1.  **Clone / Pull Repo:** `git pull origin main`
-2.  **Setup Environment:** Ensure `.env` is configured with `API_KEY` and `SECRET_KEY`.
-3.  **Setup Config:** Copy `config.example.py` to `config.py` and populate the discord webhooks.
+2.  **Setup Secrets:** Copy `config.example.py` to `config.py` and fill in `API_KEY` / `SECRET_KEY`.
+3.  **Setup Config:** Populate the Discord webhooks and `DISCORD_TOKEN` / `DISCORD_CHANNEL_ID` in `config.py`.
 4.  **Setup Targets:** Create/Sync `active_targets.json` (or use `active_targets.example.json` to test).
 5.  **Start Fleet:** Use PM2 to start bots:
     ```bash
@@ -27,8 +27,8 @@ This runbook covers the Beelink/PM2/Alpaca automated trading fleet ("The Executo
 Safety is centralized in `utils.py`.
 *   **Fail-Closed Budget Checks:** Bots will pause if `bot_config.json` is missing or has no budget allocation.
 *   **Target Freshness:** `active_targets.json` older than 24 hours will be rejected, forcing bots into a static-fallback/standby mode.
-*   **Daily Loss Cap:** Trading stops for the day if PnL drops below the `MAX_DAILY_LOSS` (e.g. -$500).
-*   **Exposure Caps:** Max order notional ($2000) and max symbol exposure ($500) limit excessive concentration.
+*   **Daily Loss Cap:** Trading stops for the day if PnL drops below `MAX_DAILY_LOSS` (currently -$5,000 in `utils.py`).
+*   **Exposure Caps:** Max order notional ($20,000) and max symbol exposure ($5,000) limit excessive concentration (`utils.py`).
 
 ## Incident Response
 *   **Log Check:** `pm2 logs` or check `logs/fleet_error_registry.jsonl`.
