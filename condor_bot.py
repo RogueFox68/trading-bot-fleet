@@ -31,10 +31,10 @@ trading_client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=config.P
 data_client = StockHistoricalDataClient(config.API_KEY, config.SECRET_KEY)
 option_data_client = OptionHistoricalDataClient(config.API_KEY, config.SECRET_KEY)
 
-WEBHOOK_URL = getattr(config, 'WEBHOOK_CONDOR') 
+WEBHOOK_URL = getattr(config, 'WEBHOOK_CONDOR', '')
 
 def send_discord(msg):
-    if "YOUR" in WEBHOOK_URL: return
+    if not WEBHOOK_URL or "YOUR" in WEBHOOK_URL: return
     try:
         requests.post(WEBHOOK_URL, json={"content": msg, "username": "Condor Bot 🦅"})
     except Exception as e:
