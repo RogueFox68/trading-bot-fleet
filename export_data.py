@@ -32,7 +32,7 @@ print(f"--- 📊 EXPORTING DATA FROM {config.INFLUX_HOST} ---")
 
 # 1. Get Trade History (All Bots)
 print("1. Fetching Trade History...")
-measurements = ["trades", "crypto_trades", "survivor_trades", "breakout_trades", "wheel_trades"]
+measurements = ["trades", "crypto_trades", "survivor_trades", "breakout_trades", "wheel_trades", "condor_trades"]
 all_trades = []
 
 for m in measurements:

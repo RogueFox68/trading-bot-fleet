@@ -19,7 +19,10 @@ HOSTNAME = socket.gethostname()
 # --- DISCORD SETUP ---
 # You must put your BOT TOKEN here or in config.py
 TOKEN = config.DISCORD_TOKEN
-CHANNEL_ID = config.DISCORD_CHANNEL_ID 
+# Tolerate the historical 'DISCORD_CHANNNEL_ID' (triple-N) typo that exists in some config.py copies.
+CHANNEL_ID = getattr(config, "DISCORD_CHANNEL_ID", None) or getattr(config, "DISCORD_CHANNNEL_ID", None)
+if CHANNEL_ID is None:
+    print("[!] config.DISCORD_CHANNEL_ID is not set — commander cannot reach Discord.")
 
 # --- GLOBALS ---
 LAST_STALE_ALERT = 0

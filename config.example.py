@@ -17,9 +17,11 @@ INFLUX_PORT    = 8086
 INFLUX_DB_NAME = "trading_bots"
 
 # ---- Discord Webhooks ----
+# Key names must match exactly what the bots read (and config_docker.py).
 WEBHOOK_WHEEL     = "https://discord.com/api/webhooks/..."
 WEBHOOK_TREND     = "https://discord.com/api/webhooks/..."
 WEBHOOK_SURVIVOR  = "https://discord.com/api/webhooks/..."
+WEBHOOK_CONDOR    = "https://discord.com/api/webhooks/..."
 WEBHOOK_CRYPTO    = "https://discord.com/api/webhooks/..."
-WEBHOOK_MOONBOT   = "https://discord.com/api/webhooks/..."
+WEBHOOK_MOONBAG   = "https://discord.com/api/webhooks/..."
 WEBHOOK_OVERSEER  = "https://discord.com/api/webhooks/..."

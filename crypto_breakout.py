@@ -26,11 +26,12 @@ trading_client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=config.P
 data_client = CryptoHistoricalDataClient()
 
 def send_discord(msg):
+    # Canonical key is WEBHOOK_MOONBAG; fall back to the legacy WEBHOOK_MOONBOT name.
+    webhook = getattr(config, 'WEBHOOK_MOONBAG', '') or getattr(config, 'WEBHOOK_MOONBOT', '')
+    if not webhook or "YOUR" in webhook:
+        return
     try:
-        # FIXED: Using the specific Moon Bot webhook
         payload = {"content": msg, "username": "Moon Bot 🚀"}
-        # Checks if the specific key exists, falls back to default if not
-        webhook = getattr(config, 'WEBHOOK_MOONBOT')
         requests.post(webhook, json=payload)
     except Exception as e:
         logger.error(f"[!] Discord Error: {e}")

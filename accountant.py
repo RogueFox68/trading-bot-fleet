@@ -9,13 +9,8 @@ from logger import logger
 
 
 # --- CONFIGURATION ---
-# We verify these against the specific bot scripts to ensure correct attribution
-BOT_MAPPING = {
-    "survivor": [],
-    "wheel": [], 
-    "condor": [],
-    "crypto": ["BTC/USD", "ETH/USD", "SOL/USD"]
-}
+# Ownership/attribution is resolved via utils.get_bot_owner (imported below).
+# The old local BOT_MAPPING copy was removed to prevent key-divergence regressions.
 
 # --- CREDENTIALS ---
 API_KEY = config.API_KEY
@@ -34,8 +29,8 @@ trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
 def query_influx_trades(days=30):
     """Fetches trade history from InfluxDB to calculate Realized P&L."""
     try:
-        # UPDATED: Added 'condor_trades' to the query list
-        query = f"SELECT * FROM trades, crypto_trades, survivor_trades, wheel_trades, condor_trades WHERE time > now() - {days}d"
+        # Includes breakout_trades (moon_bot) so its realized P&L is attributed.
+        query = f"SELECT * FROM trades, crypto_trades, survivor_trades, wheel_trades, condor_trades, breakout_trades WHERE time > now() - {days}d"
         params = {'db': INFLUX_DB_NAME, 'q': query, 'epoch': 's'}
         response = requests.get(DB_QUERY_URL, params=params, timeout=5)
         data = response.json()
@@ -98,11 +93,12 @@ def calculate_realized_pl(df):
             
         # --- MAPPING: Measurement Name -> Bot Name ---
         mapping = {
-            "trades": "trend_bot", 
+            "trades": "trend_bot",
             "crypto_trades": "crypto_grid",
             "survivor_trades": "survivor_bot",
             "wheel_trades": "wheel_bot",
-            "condor_trades": "condor_bot"
+            "condor_trades": "condor_bot",
+            "breakout_trades": "moon_bot"
         }
         bot_name = mapping.get(bot)
         if not bot_name:
@@ -239,9 +235,10 @@ def run_accountant():
             account = trading_client.get_account()
             
             unrealized_stats = {
-                "survivor_bot": 0.0, "trend_bot": 0.0, 
+                "survivor_bot": 0.0, "trend_bot": 0.0,
                 "wheel_bot": 0.0, "crypto_grid": 0.0,
-                "condor_bot": 0.0 # <--- NEW
+                "condor_bot": 0.0,
+                "moon_bot": 0.0  # realized breakout P&L reported here (crypto positions still owned by crypto_grid)
             }
             allocation_stats = unrealized_stats.copy()
 
