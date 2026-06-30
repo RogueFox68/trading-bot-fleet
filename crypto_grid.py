@@ -44,16 +44,6 @@ def send_discord(msg):
         registry.log_error("crypto_grid", "send_discord", e, context=msg[:50])
         logger.error(f"Discord webhook failed: {e}")
 
-def log_to_influx(symbol, action, price, qty):
-    try:
-        data_str = f'crypto_trades,symbol={symbol} price={price},action="{action}",qty={qty} {time.time_ns()}'
-        url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
-        r = requests.post(url, data=data_str, timeout=2)
-        if r.status_code != 204:
-            logger.warning(f"InfluxDB write failed: {r.status_code} {r.text}")
-    except Exception as e:
-        logger.warning(f"InfluxDB write error: {e}")
-
 def get_market_config():
     """Reads the 'Weather' and CAPITAL_CRUNCH from the config."""
     try:
@@ -210,10 +200,9 @@ def run_grid_bot():
                                     qty = BUDGET_PER_GRID / price
                                     c_id = f"crypto_grid-{symbol.replace('/', '')}-{int(time.time())}"
                                     req = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC, client_order_id=c_id)
-                                    utils.submit_and_log_order(trading_client, req, logger)
+                                    utils.submit_and_log_order(trading_client, req, logger, log_action="grid_buy")
                                     
                                     send_discord(f"🟢 **GRID BUY {symbol}**\nPrice: ${price:,.2f}\nZone: {current_zone}")
-                                    log_to_influx(symbol, "grid_buy", price, qty)
                                 else:
                                     logger.warning(f"    [SKIP] {symbol} Low Balance: ${buying_power:.2f} (Need ${BUDGET_PER_GRID})")
  
@@ -244,10 +233,9 @@ def run_grid_bot():
                             cancel_open_orders_for_symbol(symbol, opposite_side_only=OrderSide.BUY)
                             c_id = f"crypto_grid-{symbol.replace('/', '')}-{int(time.time())}"
                             req = MarketOrderRequest(symbol=symbol, qty=qty_to_sell, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=c_id)
-                            utils.submit_and_log_order(trading_client, req, logger)
+                            utils.submit_and_log_order(trading_client, req, logger, log_action="grid_sell")
  
                             send_discord(f"🔴 **GRID SELL {symbol}**\nPrice: ${price:,.2f}\nZone: {current_zone}")
-                            log_to_influx(symbol, "grid_sell", price, qty_to_sell)
                             
                         elif current_qty_held > (qty_to_sell * 0.1):
                             # [FIX] Partial Sell (Sweep Dust)
@@ -255,10 +243,9 @@ def run_grid_bot():
                             cancel_open_orders_for_symbol(symbol, opposite_side_only=OrderSide.BUY)
                             c_id = f"crypto_grid-{symbol.replace('/', '')}-{int(time.time())}"
                             req = MarketOrderRequest(symbol=symbol, qty=current_qty_held, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, client_order_id=c_id)
-                            utils.submit_and_log_order(trading_client, req, logger)
+                            utils.submit_and_log_order(trading_client, req, logger, log_action="grid_sweep")
                             
                             send_discord(f"🧹 **GRID SWEEP {symbol}**\nSold remaining {current_qty_held:.4f}\nPrice: ${price:,.2f}")
-                            log_to_influx(symbol, "grid_sweep", price, current_qty_held)
                             
                         else:
                             # [FIX] Clean Log (No Warn) using Info
