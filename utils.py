@@ -1,5 +1,6 @@
 import json
 import time
+import re
 import requests
 from alpaca.trading.enums import AssetClass, OrderSide, OrderStatus
 from logger import logger, registry
@@ -463,3 +464,46 @@ def load_and_validate_targets(file_path, strategy_key, static_fallback):
         registry.log_error("utils", "load_and_validate", e, context=file_path)
         logger.error(f"  [Error] Failed to read/validate target file: {e}. Using Static Fallback.")
         return static_fallback
+
+def reconcile_wheel_fills(trading_client, logger, lookback_days=30):
+    """Reconcile wheel_bot's InfluxDB trade log against Alpaca's real fills.
+
+    wheel_bot submits LIMIT options orders that fill hours later or expire, so
+    submit_and_log_order's synchronous poll cannot capture them (and must not
+    block on them). The accountant calls this each cycle: it reads recent CLOSED
+    wheel_bot orders from Alpaca and writes the authoritative fill (real
+    price/qty/time) to wheel_trades via _log_fill_to_influx. Rows are stamped at
+    the broker filled_at, so re-running overwrites the same series+timestamp
+    (idempotent), and unfilled/expired/canceled orders produce no row.
+
+    Returns the number of fill rows written/updated.
+    """
+    from datetime import datetime, timezone, timedelta
+    written = 0
+    try:
+        after = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+        req = GetOrdersRequest(status="closed", limit=500, after=after)
+        orders = trading_client.get_orders(filter=req)
+    except Exception as e:
+        registry.log_error("utils", "reconcile_wheel_fills", e)
+        logger.warning(f"  [Reconcile] Failed to fetch wheel orders: {e}")
+        return written
+
+    for o in orders:
+        c_id = getattr(o, "client_order_id", "") or ""
+        if not c_id.startswith("wheel_bot-"):
+            continue
+        if getattr(o, "filled_avg_price", None) is None:
+            continue  # expired / canceled / unfilled -> no phantom row
+        # Preserve wheel's action vocabulary: buys close, sells open puts/calls.
+        if o.side == OrderSide.BUY:
+            action = "buy_close"
+        else:
+            m = re.match(r"^[A-Z]{1,6}\d{6}([PC])\d{8}$", o.symbol or "")
+            action = ("sell_put" if m.group(1) == "P" else "sell_call") if m else "sell"
+        _log_fill_to_influx(o, logger, action=action)
+        written += 1
+
+    if written:
+        logger.info(f"  [Reconcile] wheel_bot: wrote/updated {written} fill row(s) from Alpaca.")
+    return written

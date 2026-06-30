@@ -41,16 +41,6 @@ def send_discord(msg):
         registry.log_error("wheel_bot", "send_discord", e, context=msg[:50])
         logger.error(f"Discord webhook failed: {e}")
 
-def log_to_influx(action, price, symbol, detail):
-    try:
-        data_str = f'wheel_trades,symbol={symbol} price={price},action="{action}",detail="{detail}",contract="{symbol}" {time.time_ns()}'
-        url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
-        r = requests.post(url, data=data_str, timeout=2)
-        if r.status_code != 204:
-            logger.warning(f"InfluxDB write failed: {r.status_code} {r.text}")
-    except Exception as e:
-        logger.warning(f"InfluxDB write error: {e}")
-
 def get_wheel_targets():
     return utils.load_and_validate_targets(
         TARGET_FILE, 
@@ -250,7 +240,6 @@ def roll_option_position(ticker, active_option, current_stock_price, side, confi
         utils.submit_and_log_order(trading_client, open_req, logger)
         emoji = "🟢" if side == "CALL" else "🔴"
         send_discord(f"🌀 **ROLLED {ticker} {side}**\nClosed: {active_option.symbol} @ ${close_price}\nOpened: {new_contract.symbol} @ ${new_limit_price}")
-        log_to_influx(f"roll_{side.lower()}", new_limit_price, new_contract.symbol, f"Rolled from {active_option.symbol}")
         return True
     except Exception as e:
         logger.error(f"  [CRITICAL ROLL ERROR] Closed {active_option.symbol} but failed to open new contract {new_contract.symbol}! Position is now flat. Error: {e}")
@@ -388,7 +377,6 @@ def run_wheel_bot():
                     )
                     utils.submit_and_log_order(trading_client, req, logger)
                     send_discord(f"💵 **TOOK PROFIT {ticker}**\nClosed @ ${close_price} ({capture_pct*100:.0f}% Cap)")
-                    log_to_influx("buy_close", close_price, active_option.symbol, "Take Profit")
                     continue
 
                 # B) FORCE CLOSE FROM CONFIG
@@ -411,7 +399,6 @@ def run_wheel_bot():
                     )
                     utils.submit_and_log_order(trading_client, req, logger)
                     send_discord(f"🚨 **FORCE CLOSED {active_option.symbol}**")
-                    log_to_influx("buy_close", close_price, active_option.symbol, "Force Close")
                     continue
 
                 # C) STALE ROLL (DTE <= 22 days) OR FORCE ROLL
@@ -535,7 +522,6 @@ def run_wheel_bot():
                     utils.submit_and_log_order(trading_client, req, logger)
                     emoji = "🟢" if side == "CALL" else "🔴"
                     send_discord(f"{emoji} **SOLD {side} {ticker}**\nStrike: ${contract.strike_price}\nLimit: ${limit_price}\nConf: {confidence:.2f}")
-                    log_to_influx(f"sell_{side.lower()}", limit_price, contract.symbol, "Opened Position")
                 else:
                     logger.info(f"    [SKIP] No suitable {side} contract found within {MIN_DTE}-{MAX_DTE} DTE for {ticker}.")
                     continue
