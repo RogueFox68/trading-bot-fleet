@@ -36,16 +36,6 @@ def send_discord(msg):
     except Exception as e:
         logger.error(f"[!] Discord Error: {e}")
 
-def log_to_influx(symbol, action, price, qty):
-    try:
-        data_str = f'breakout_trades,symbol={symbol} price={price},action="{action}",qty={qty} {time.time_ns()}'
-        url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
-        r = requests.post(url, data=data_str, timeout=2)
-        if r.status_code != 204:
-            logger.warning(f"InfluxDB write failed: {r.status_code} {r.text}")
-    except Exception as e:
-        logger.warning(f"InfluxDB write error: {e}")
-
 def get_donchian_levels(symbol):
     try:
         # 1. Fetch History for Levels
@@ -126,10 +116,9 @@ def run_breakout_bot():
                                 time_in_force=TimeInForce.GTC,
                                 client_order_id=c_id
                             )
-                            trading_client.submit_order(order_data=req)
+                            utils.submit_and_log_order(trading_client, req, logger, log_action="buy_breakout")
                             
                             send_discord(f"🚀 **MOONSHOT ENTRY: {symbol}**\nBreakout Price: ${current_price}\nTargeting trends.")
-                            log_to_influx(symbol, "buy_breakout", current_price, qty_to_buy)
 
                     # --- EXIT LOGIC ---
                     elif qty_held > 0:
@@ -144,10 +133,9 @@ def run_breakout_bot():
                                 time_in_force=TimeInForce.GTC,
                                 client_order_id=c_id
                             )
-                            trading_client.submit_order(order_data=req)
+                            utils.submit_and_log_order(trading_client, req, logger, log_action="sell_breakout")
                             
                             send_discord(f"🛑 **STOP LOSS: {symbol}**\nPrice: ${current_price}\nTrend broken.")
-                            log_to_influx(symbol, "sell_breakout", current_price, qty_held)
                         else:
                             logger.info(f"    [HOLD] Riding the trend.")
 

@@ -1,9 +1,52 @@
 import json
+import time
+import requests
 from alpaca.trading.enums import AssetClass, OrderSide, OrderStatus
 from logger import logger, registry
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 
 import config
+
+# --- CENTRALIZED TRADE LOGGING ---
+# Maps the bot tag embedded in client_order_id ('{bot}-{symbol}-{ts}') to its
+# InfluxDB measurement. condor_bot routes its rollback market-sells through
+# submit_and_log_order, so it is mapped here to keep those fills out of the
+# trend 'trades' measurement.
+MEASUREMENT_BY_BOT = {
+    "trend_bot":    "trades",
+    "survivor_bot": "survivor_trades",
+    "wheel_bot":    "wheel_trades",
+    "crypto_grid":  "crypto_trades",
+    "moon_bot":     "breakout_trades",
+    "condor_bot":   "condor_trades",
+}
+
+def _log_fill_to_influx(order, logger, reason="", action=None):
+    """Write a trade row to InfluxDB from a CONFIRMED Alpaca fill.
+
+    Measurement is derived from the bot tag in client_order_id
+    ('{bot}-{symbol}-{ts}'). Never writes for an unconfirmed order, so
+    expired/pending/rejected orders produce no row (kills phantom logs).
+    """
+    try:
+        if order is None or getattr(order, "filled_avg_price", None) is None:
+            return  # not filled -> do not log
+        c_id = order.client_order_id or ""
+        bot = next((b for b in MEASUREMENT_BY_BOT if c_id.startswith(f"{b}-")), None)
+        measurement = MEASUREMENT_BY_BOT.get(bot, "trades")
+        act = action or ("buy" if order.side == OrderSide.BUY else "sell")
+        # Use the broker fill time, not now() — also fixes time skew.
+        ns = int(order.filled_at.timestamp() * 1e9) if getattr(order, "filled_at", None) else time.time_ns()
+        reason_field = f',reason="{reason}"' if reason else ""
+        line = (f'{measurement},symbol={order.symbol} '
+                f'price={float(order.filled_avg_price)},action="{act}",'
+                f'qty={float(order.filled_qty)}{reason_field} {ns}')
+        url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
+        r = requests.post(url, data=line, timeout=2)
+        if r.status_code != 204:
+            logger.warning(f"InfluxDB trade write failed: {r.status_code} {r.text}")
+    except Exception as e:
+        logger.warning(f"InfluxDB trade write error: {e}")
 
 # --- SAFETY LIMITS ---
 MAX_DAILY_LOSS = -5000.0
@@ -248,10 +291,14 @@ def get_available_budget(bot_name, trading_client):
     is_ok, budget_dollars, total_used = check_budget_details(bot_name, trading_client)
     return max(0.0, budget_dollars - total_used)
 
-def submit_and_log_order(trading_client, order_data, logger):
+def submit_and_log_order(trading_client, order_data, logger, reason="", log_action=None):
     """
     Submits an order and polls for a few seconds to log fill-confirmation.
     Includes fail-closed safety checks before execution.
+
+    On a confirmed market-order fill, writes the authoritative trade row to
+    InfluxDB (real fill price/qty/time) via _log_fill_to_influx. Limit orders
+    return pending and are intentionally not logged here.
     """
     import time
     try:
@@ -323,6 +370,7 @@ def submit_and_log_order(trading_client, order_data, logger):
                 updated_order = trading_client.get_order_by_id(order.id)
                 if updated_order.status.value in ["filled", "partially_filled"]:
                     logger.info(f"  [FILL CONFIRMED] ID: {updated_order.id} | Status: {updated_order.status.value} | Fill Price: ${updated_order.filled_avg_price}")
+                    _log_fill_to_influx(updated_order, logger, reason=reason, action=log_action)
                     return updated_order
                 elif updated_order.status.value in ["canceled", "expired", "rejected"]:
                     logger.warning(f"  [ORDER FAILED] ID: {updated_order.id} | Status: {updated_order.status.value}")
