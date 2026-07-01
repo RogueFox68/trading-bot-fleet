@@ -236,13 +236,14 @@ def run_accountant():
 
     while True:
         try:
-            # 0. RECONCILE WHEEL FILLS — wheel submits LIMIT options that fill
-            #    asynchronously (or expire); pull the real fills from Alpaca so
-            #    wheel_trades reflects actual price/qty/time, not submit phantoms.
+            # 0. RECONCILE FILLS — wheel's LIMIT options fill asynchronously, and
+            #    equity MARKET orders can finish filling after submit_and_log_order's
+            #    poll window; pull the authoritative fills from Alpaca so the trade
+            #    measurements reflect real price/qty/time, not submit-time phantoms.
             try:
-                utils.reconcile_wheel_fills(trading_client, logger)
+                utils.reconcile_fills(trading_client, logger)
             except Exception as e:
-                logger.error(f"[Reconcile] wheel reconciliation failed: {e}")
+                logger.error(f"[Reconcile] fill reconciliation failed: {e}")
 
             # 1. FETCH REALIZED P&L (HISTORY)
             history_df = query_influx_trades()
