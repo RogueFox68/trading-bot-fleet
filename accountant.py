@@ -24,6 +24,11 @@ INFLUX_PORT = config.INFLUX_PORT
 INFLUX_DB_NAME = config.INFLUX_DB_NAME
 DB_QUERY_URL = f"http://{INFLUX_HOST}:{INFLUX_PORT}/query"
 
+# Options measurements log per-share premium and contract qty, so their realized
+# P&L must be scaled by the 100-share contract multiplier to express dollars.
+OPTION_MEASUREMENTS = {"wheel_trades", "condor_trades"}
+OPTION_CONTRACT_SIZE = 100
+
 # --- CLIENT ---
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
 
@@ -91,7 +96,11 @@ def calculate_realized_pl(df):
             avg_cost = buy_val / total_bought
             cost_of_sold = avg_cost * total_sold
             realized = sell_val - cost_of_sold
-            
+
+        # Options are 100 shares/contract; scale per-share premium P&L to dollars.
+        if bot in OPTION_MEASUREMENTS:
+            realized *= OPTION_CONTRACT_SIZE
+
         # --- MAPPING: Measurement Name -> Bot Name ---
         mapping = {
             "trades": "trend_bot",
