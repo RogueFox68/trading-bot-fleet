@@ -364,21 +364,31 @@ def submit_and_log_order(trading_client, order_data, logger, reason="", log_acti
         is_market = isinstance(order_data, MarketOrderRequest)
         
         if is_market:
-            # Poll for up to 5 seconds (10 attempts * 0.5s)
+            # Poll up to 5s (10 * 0.5s) for the FULL fill. A market order can fill
+            # across several prints (partial fills); we must wait for the cumulative
+            # fill and log filled_qty/filled_avg_price once. Logging on the first
+            # 'partially_filled' poll records only the first print and drops the rest.
             max_attempts = 10
             for attempt in range(max_attempts):
                 time.sleep(0.5)
                 updated_order = trading_client.get_order_by_id(order.id)
-                if updated_order.status.value in ["filled", "partially_filled"]:
-                    logger.info(f"  [FILL CONFIRMED] ID: {updated_order.id} | Status: {updated_order.status.value} | Fill Price: ${updated_order.filled_avg_price}")
+                status = updated_order.status.value
+                if status == "filled":
+                    logger.info(f"  [FILL CONFIRMED] ID: {updated_order.id} | Status: {status} | Fill Price: ${updated_order.filled_avg_price} | Qty: {updated_order.filled_qty}")
                     _log_fill_to_influx(updated_order, logger, reason=reason, action=log_action)
                     return updated_order
-                elif updated_order.status.value in ["canceled", "expired", "rejected"]:
-                    logger.warning(f"  [ORDER FAILED] ID: {updated_order.id} | Status: {updated_order.status.value}")
+                elif status in ["canceled", "expired", "rejected"]:
+                    logger.warning(f"  [ORDER FAILED] ID: {updated_order.id} | Status: {status} | Filled: {updated_order.filled_qty}")
+                    # Record any partial that filled before termination; the helper
+                    # no-ops when nothing filled, so a zero-fill cancel writes no row.
+                    _log_fill_to_influx(updated_order, logger, reason=reason, action=log_action)
                     return updated_order
-            
-            # If it hasn't filled in 5s
-            logger.info(f"  [ORDER PENDING] ID: {updated_order.id} | Status: {updated_order.status.value}")
+                # 'partially_filled' / 'new' / 'accepted' / 'pending_new' -> keep polling
+
+            # Poll window elapsed without a full fill. Log the cumulative partial so
+            # far (best-effort; no-op if still unfilled) rather than drop a real fill.
+            logger.info(f"  [ORDER PENDING] ID: {updated_order.id} | Status: {updated_order.status.value} | Filled: {updated_order.filled_qty}/{updated_order.qty}")
+            _log_fill_to_influx(updated_order, logger, reason=reason, action=log_action)
             return updated_order
         else:
             limit_price_str = f" @ ${order.limit_price}" if hasattr(order, 'limit_price') and order.limit_price else ""
