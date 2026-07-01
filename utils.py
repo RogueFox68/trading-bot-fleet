@@ -379,16 +379,19 @@ def submit_and_log_order(trading_client, order_data, logger, reason="", log_acti
                     return updated_order
                 elif status in ["canceled", "expired", "rejected"]:
                     logger.warning(f"  [ORDER FAILED] ID: {updated_order.id} | Status: {status} | Filled: {updated_order.filled_qty}")
-                    # Record any partial that filled before termination; the helper
-                    # no-ops when nothing filled, so a zero-fill cancel writes no row.
+                    # Terminal with a partial fill: log it here. These never reach a
+                    # 'filled' status, so reconcile_fills() skips them (no filled_at)
+                    # and this is the only capture. The helper no-ops when nothing
+                    # filled, so a zero-fill cancel writes no row.
                     _log_fill_to_influx(updated_order, logger, reason=reason, action=log_action)
                     return updated_order
                 # 'partially_filled' / 'new' / 'accepted' / 'pending_new' -> keep polling
 
-            # Poll window elapsed without a full fill. Log the cumulative partial so
-            # far (best-effort; no-op if still unfilled) rather than drop a real fill.
+            # Poll window elapsed without a full fill. Do NOT log a partial here: the
+            # order can still complete, and reconcile_fills() will capture the final
+            # cumulative fill from Alpaca. A now()-stamped partial would double-count
+            # against that reconciled row (which is keyed on the broker filled_at).
             logger.info(f"  [ORDER PENDING] ID: {updated_order.id} | Status: {updated_order.status.value} | Filled: {updated_order.filled_qty}/{updated_order.qty}")
-            _log_fill_to_influx(updated_order, logger, reason=reason, action=log_action)
             return updated_order
         else:
             limit_price_str = f" @ ${order.limit_price}" if hasattr(order, 'limit_price') and order.limit_price else ""
@@ -475,16 +478,41 @@ def load_and_validate_targets(file_path, strategy_key, static_fallback):
         logger.error(f"  [Error] Failed to read/validate target file: {e}. Using Static Fallback.")
         return static_fallback
 
-def reconcile_wheel_fills(trading_client, logger, lookback_days=30):
-    """Reconcile wheel_bot's InfluxDB trade log against Alpaca's real fills.
+# Bots whose fills are reconciled from Alpaca's order feed. Crypto bots are
+# intentionally excluded: their action vocabulary (grid_buy / grid_sweep /
+# buy_breakout ...) can't be reconstructed from an order, and a generic buy/sell
+# would clobber it on rewrite. Crypto market fills are near-atomic anyway.
+RECONCILED_BOTS = ("trend_bot", "survivor_bot", "wheel_bot")
 
-    wheel_bot submits LIMIT options orders that fill hours later or expire, so
-    submit_and_log_order's synchronous poll cannot capture them (and must not
-    block on them). The accountant calls this each cycle: it reads recent CLOSED
-    wheel_bot orders from Alpaca and writes the authoritative fill (real
-    price/qty/time) to wheel_trades via _log_fill_to_influx. Rows are stamped at
-    the broker filled_at, so re-running overwrites the same series+timestamp
-    (idempotent), and unfilled/expired/canceled orders produce no row.
+def _fill_action(order):
+    """Best-effort trade action for a reconciled fill, from the order side/symbol.
+
+    Options (OCC symbol) -> buy_close / sell_put / sell_call; equities -> buy/sell.
+    Equity buy/sell matches what submit_and_log_order already logs, so a
+    reconciled rewrite is idempotent rather than a relabel.
+    """
+    is_option = re.match(r"^[A-Z]{1,6}\d{6}([PC])\d{8}$", order.symbol or "")
+    if order.side == OrderSide.BUY:
+        return "buy_close" if is_option else "buy"
+    if is_option:
+        return "sell_put" if is_option.group(1) == "P" else "sell_call"
+    return "sell"
+
+def reconcile_fills(trading_client, logger, lookback_days=30):
+    """Reconcile bot trade logs against Alpaca's authoritative fills.
+
+    Some fills can't be captured by submit_and_log_order's short poll: wheel's
+    LIMIT options fill hours later or expire, and an equity MARKET order can keep
+    filling across prints after the poll window closes. The accountant calls this
+    each cycle: it reads recent CLOSED orders for RECONCILED_BOTS and writes the
+    real cumulative fill (price/qty/time) to the bot's measurement via
+    _log_fill_to_influx.
+
+    Only fully-filled orders are written (they carry a stable broker filled_at),
+    so the row is stamped at filled_at and re-runs overwrite the same
+    series+timestamp (idempotent) instead of duplicating. Unfilled/expired orders
+    and still-open partials produce no row. Crypto bots are excluded (see
+    RECONCILED_BOTS).
 
     Returns the number of fill rows written/updated.
     """
@@ -495,25 +523,22 @@ def reconcile_wheel_fills(trading_client, logger, lookback_days=30):
         req = GetOrdersRequest(status="closed", limit=500, after=after)
         orders = trading_client.get_orders(filter=req)
     except Exception as e:
-        registry.log_error("utils", "reconcile_wheel_fills", e)
-        logger.warning(f"  [Reconcile] Failed to fetch wheel orders: {e}")
+        registry.log_error("utils", "reconcile_fills", e)
+        logger.warning(f"  [Reconcile] Failed to fetch orders: {e}")
         return written
 
     for o in orders:
         c_id = getattr(o, "client_order_id", "") or ""
-        if not c_id.startswith("wheel_bot-"):
+        if not any(c_id.startswith(f"{b}-") for b in RECONCILED_BOTS):
             continue
-        if getattr(o, "filled_avg_price", None) is None:
-            continue  # expired / canceled / unfilled -> no phantom row
-        # Preserve wheel's action vocabulary: buys close, sells open puts/calls.
-        if o.side == OrderSide.BUY:
-            action = "buy_close"
-        else:
-            m = re.match(r"^[A-Z]{1,6}\d{6}([PC])\d{8}$", o.symbol or "")
-            action = ("sell_put" if m.group(1) == "P" else "sell_call") if m else "sell"
-        _log_fill_to_influx(o, logger, action=action)
+        # Require a broker fill timestamp: guarantees a fully-filled order and a
+        # stable idempotency key. Unfilled and partial-then-canceled orders (no
+        # filled_at) are skipped here.
+        if getattr(o, "filled_at", None) is None:
+            continue
+        _log_fill_to_influx(o, logger, action=_fill_action(o))
         written += 1
 
     if written:
-        logger.info(f"  [Reconcile] wheel_bot: wrote/updated {written} fill row(s) from Alpaca.")
+        logger.info(f"  [Reconcile] wrote/updated {written} fill row(s) from Alpaca.")
     return written
