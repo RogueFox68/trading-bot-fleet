@@ -209,6 +209,17 @@ Market Data (Alpaca/yfinance) ──► Bot Analysis ──► Trade Execution (
   sends in `commander.py`.
 - **accountant.py BOT_MAPPING divergence (resolved):** The accountant's duplicate `BOT_MAPPING`
   copy has been removed; ownership is now resolved solely via `utils.get_bot_owner`.
+- **Position orphaning from bounded order window (resolved):** `_build_order_based_map` and
+  `get_position_entry_times` derived ownership + entry time from a single `limit=500` order
+  lookup. High-frequency `crypto_grid` orders flooded that window, so an aged equity position's
+  opening order scrolled out — silently stripping its owner tag and hold duration and disabling
+  stop-loss / max-hold exits (GEN/APTV bled for ~3 weeks). Fixed by paging order history
+  (`utils._fetch_orders_covering`, stops early once held symbols are covered), priming the
+  ownership cache each cycle (`utils.prime_ownership`), a hard `max_hold_days` backstop exit in
+  `trend_bot`/`survivor_bot` (`tiered_hold.max_hold_days_for_tier`), a logged+metered ownership
+  fallback (`ownership_fallback` measurement), and an accountant orphan sweep
+  (`orphan_position` measurement + overseer alert). Regression coverage in
+  `test_orphan_resolution.py`.
 - **Iron condor bot:** Sidelined and excluded from allocations. Do not reactivate without
   solving Alpaca's multi-leg position tracking limitations.
 

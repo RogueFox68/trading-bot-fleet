@@ -77,48 +77,131 @@ BOT_MAPPING = {
 _ownership_cache = {}
 _ownership_cache_time = 0
 
-def _build_order_based_map(trading_client):
+# Bot tags that can appear in a client_order_id ('{bot}-{symbol}-{ts}').
+_KNOWN_BOT_TAGS = ["survivor_bot", "trend_bot", "wheel_bot", "condor_bot", "crypto_grid", "moon_bot"]
+
+def _fetch_orders_covering(trading_client, held_symbols=None, require_fill=False,
+                           page_size=500, max_orders=None):
+    """Fetch recent Alpaca orders newest-first, paging past the 500-order cap.
+
+    A single GetOrdersRequest is capped at limit=500. A high-velocity bot
+    (crypto_grid submits/cancels dozens–hundreds of orders a day) can flood that
+    window so an opening order for an aged equity position scrolls out of it.
+    When that happens both ownership resolution and entry-time lookup lose the
+    position: get_bot_owner falls through to its default and get_position_entry_times
+    returns nothing, so stop-loss / max-hold protection silently stops firing
+    (the GEN/APTV orphaning bug).
+
+    We page backwards via `until` (submitted_at) so coverage no longer depends on
+    order velocity. When `held_symbols` is given we stop as soon as every held
+    symbol is covered (a filled order too, if `require_fill`), keeping the common
+    case to a single page; only a genuinely aged position pages deep. Returns a
+    de-duplicated list, newest-first.
     """
-    Builds a symbol -> bot_name lookup from recent Alpaca orders.
+    if max_orders is None:
+        # With a coverage target we can stop early, so page deep enough to reach
+        # a weeks-old opening order behind a crypto flood. Without one, just take
+        # a modest recent window (callers that need guaranteed coverage pass
+        # held_symbols / prime the cache).
+        max_orders = 12000 if held_symbols else 1500
+
+    orders = []
+    seen_ids = set()
+    remaining = set(held_symbols) if held_symbols else None
+    until = None
+    while len(orders) < max_orders:
+        try:
+            kwargs = {"status": "all", "limit": page_size}
+            if until is not None:
+                kwargs["until"] = until
+            page = trading_client.get_orders(filter=GetOrdersRequest(**kwargs))
+        except Exception as e:
+            registry.log_error("utils", "fetch_orders_paginated", e)
+            logger.error(f"  [Orders] paginated order fetch failed: {e}")
+            break
+        if not page:
+            break
+
+        oldest = None
+        added = 0
+        for o in page:
+            oid = getattr(o, "id", None)
+            if oid is not None and oid in seen_ids:
+                continue
+            if oid is not None:
+                seen_ids.add(oid)
+            orders.append(o)
+            added += 1
+            sub = getattr(o, "submitted_at", None)
+            if sub is not None and (oldest is None or sub < oldest):
+                oldest = sub
+            if remaining is not None and o.symbol in remaining:
+                if not require_fill or getattr(o, "filled_at", None) is not None:
+                    remaining.discard(o.symbol)
+
+        # Every held symbol covered -> done (the common, cheap case).
+        if remaining is not None and not remaining:
+            break
+        # Short read (last page) or no forward progress -> stop.
+        if len(page) < page_size or oldest is None or oldest == until or added == 0:
+            break
+        until = oldest
+
+    return orders
+
+def _build_order_based_map(trading_client, held_symbols=None):
+    """
+    Builds a symbol -> bot_name lookup from Alpaca order history.
     Parses the custom client_order_id (e.g., 'survivor_bot-AAPL-170...').
-    Cached for 60 seconds to avoid API spam.
+    Cached for 60 seconds to avoid API spam. When `held_symbols` is provided the
+    cache is only reused if it already covers every one of those symbols, so an
+    aged position can't be served a stale, incomplete map.
     """
     import time
     global _ownership_cache, _ownership_cache_time
-    
+
     now = time.time()
     if _ownership_cache and (now - _ownership_cache_time) < 60:
-        return _ownership_cache
-    
+        if not held_symbols or all(s in _ownership_cache for s in held_symbols):
+            return _ownership_cache
+
     owner_map = {}
-    
+
     # 1. Load static mapping as absolute baseline
     for bot_name, symbols in BOT_MAPPING.items():
         for sym in symbols:
             owner_map[sym] = bot_name
-            
-    # 2. Query recent orders for definitive tags
-    try:
-        req = GetOrdersRequest(status="all", limit=500)
-        orders = trading_client.get_orders(filter=req)
-        
-        for o in orders:
-            # client_order_id format: "{bot_name}-{symbol}-{timestamp}"
-            c_id = o.client_order_id
-            if not c_id: continue
-            
-            for bot in ["survivor_bot", "trend_bot", "wheel_bot", "condor_bot", "crypto_grid", "moon_bot"]:
-                if c_id.startswith(f"{bot}-"):
-                    owner_map[o.symbol] = bot
-                    break
-                    
-    except Exception as e:
-        registry.log_error("utils", "build_order_map", e)
-        logger.error(f"  [CFO] Error building order-based ownership map: {e}")
-    
+
+    # 2. Walk order history (paged for full coverage) for definitive tags.
+    #    Newest-first: the first tagged order for a symbol wins and overrides the
+    #    static baseline, so the most recent owner sticks.
+    order_set = set()
+    orders = _fetch_orders_covering(trading_client, held_symbols=held_symbols)
+    for o in orders:
+        # client_order_id format: "{bot_name}-{symbol}-{timestamp}"
+        c_id = o.client_order_id
+        if not c_id:
+            continue
+        if o.symbol in order_set:
+            continue
+        for bot in _KNOWN_BOT_TAGS:
+            if c_id.startswith(f"{bot}-"):
+                owner_map[o.symbol] = bot
+                order_set.add(o.symbol)
+                break
+
     _ownership_cache = owner_map
     _ownership_cache_time = now
     return owner_map
+
+def prime_ownership(trading_client, held_symbols):
+    """Warm the 60s ownership cache with full coverage for `held_symbols`.
+
+    Bots call this once per cycle after fetching positions. Subsequent
+    get_bot_owner() lookups (which don't take held_symbols) then resolve even
+    weeks-old positions from the primed cache instead of a bounded window.
+    """
+    return _build_order_based_map(trading_client, held_symbols=held_symbols)
 
 def get_bot_owner(symbol, asset_class, trading_client):
     """Determines which bot owns a specific position based on order history."""
@@ -148,22 +231,55 @@ def get_bot_owner(symbol, asset_class, trading_client):
     owner = owner_map.get(symbol)
     if owner:
         return owner
-    
-    # 5. Default fallback (e.g., manually placed order without tag)
+
+    # 5. Default fallback (e.g., manually placed order without tag, or an opening
+    #    order that aged out of history entirely). This is a catch-all, not a
+    #    durable tag: surface it so orphaned positions don't stay invisible.
+    _note_ownership_fallback(symbol)
     return "trend_bot"
 
-def get_position_entry_times(trading_client):
+# Throttle so a persistently-untagged symbol doesn't spam the log/metric each cycle.
+_fallback_log_times = {}
+
+def _note_ownership_fallback(symbol):
+    """Surface an untagged equity that resolved only via the trend_bot default.
+
+    Logs a throttled warning (once / 10 min per symbol) and writes an
+    'ownership_fallback' InfluxDB metric, so a position whose real tag has aged
+    out of order history is visible instead of silently absorbed by the fallback.
+    """
+    now = time.time()
+    if now - _fallback_log_times.get(symbol, 0) < 600:
+        return
+    _fallback_log_times[symbol] = now
+    logger.warning(f"  [Ownership] {symbol}: no bot tag in order history — "
+                   f"defaulting to trend_bot (possible orphan).")
+    try:
+        line = f'ownership_fallback,symbol={symbol} count=1i {int(now * 1e9)}'
+        url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
+        r = requests.post(url, data=line, timeout=2)
+        if r.status_code != 204:
+            logger.warning(f"  [Ownership] fallback metric write failed: {r.status_code}")
+    except Exception as e:
+        logger.warning(f"  [Ownership] fallback metric write error: {e}")
+
+def get_position_entry_times(trading_client, held_symbols=None):
     """
     Best-effort {symbol: entry_datetime_utc} for held positions, taken from the
-    most recent FILLED order per symbol in the last 500 orders. For bots that do
-    full entries/exits (trend, survivor), the latest fill on a symbol you still
-    hold is its entry, so this is a good proxy for hold duration.
-    Returns {} on error; callers treat a missing symbol as 'unknown duration'.
+    most recent FILLED order per symbol. For bots that do full entries/exits
+    (trend, survivor), the latest fill on a symbol you still hold is its entry,
+    so this is a good proxy for hold duration.
+
+    Order history is paged (not a single limit=500 call) so a position whose
+    opening fill has scrolled far behind a crypto-order flood still resolves.
+    Pass `held_symbols` to guarantee coverage of exactly the positions you hold
+    while keeping the common case to one page. Returns {} on error; callers treat
+    a missing symbol as 'unknown duration'.
     """
     entry_times = {}
     try:
-        req = GetOrdersRequest(status="all", limit=500)
-        orders = trading_client.get_orders(filter=req)
+        orders = _fetch_orders_covering(trading_client, held_symbols=held_symbols,
+                                        require_fill=True)
         for o in orders:
             filled_at = getattr(o, "filled_at", None)
             if filled_at is None:
