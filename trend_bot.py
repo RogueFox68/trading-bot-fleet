@@ -129,7 +129,12 @@ def run_trend_bot():
             equity = float(account.portfolio_value)
             positions = trading_client.get_all_positions()
             pos_dict = {p.symbol: p for p in positions}
-            entry_times = utils.get_position_entry_times(trading_client)
+            # Prime the ownership cache with full order-history coverage for the
+            # equities we hold, so aged positions (opening order buried behind a
+            # crypto-order flood) still resolve owner + entry time this cycle.
+            equity_syms = [p.symbol for p in positions if p.asset_class == AssetClass.US_EQUITY]
+            utils.prime_ownership(trading_client, equity_syms)
+            entry_times = utils.get_position_entry_times(trading_client, held_symbols=equity_syms)
 
             # Phase 10: Get Pending Orders to avoid buy churn loops
             open_orders = trading_client.get_orders(filter=GetOrdersRequest(status="open"))
@@ -256,6 +261,34 @@ def run_trend_bot():
                     if sell_qty <= 0:
                         logger.info(f"    [SKIP] {symbol} fractional position ({qty} shares), cannot close")
                         continue
+
+                    # --- MAX-HOLD BACKSTOP (orphan protection) ---
+                    # Hard time-based exit so no position can bleed indefinitely.
+                    # Runs every cycle (not just the EOD window): score the position
+                    # to pick its hold tier, and if it has been held past that tier's
+                    # max_hold_days, close it now. Depends on a resolvable entry time,
+                    # which the paged order lookup now restores for aged positions.
+                    if hours_held is not None:
+                        bt = "trend_long" if side == "long" else "trend_short"
+                        ema_intact = bool(latest['ema_fast'] > latest['ema_slow']) if side == "long" \
+                                     else bool(latest['ema_fast'] < latest['ema_slow'])
+                        mh_indicators = {"adx": float(local_adx), "ema_trend_intact": ema_intact}
+                        mh_score = tiered_hold.calculate_hold_score(bt, price, entry_price, mh_indicators, current_regime, current_vix, hours_held=hours_held)
+                        mh_tier = tiered_hold.get_hold_tier(mh_score, bt)
+                        max_days = tiered_hold.max_hold_days_for_tier(mh_tier)
+                        if max_days is not None and (hours_held / 24.0) >= max_days:
+                            close_side = OrderSide.SELL if side == "long" else OrderSide.BUY
+                            pnl_pct = (price - entry_price) / entry_price if side == "long" \
+                                      else (entry_price - price) / entry_price
+                            try:
+                                logger.info(f"    ⏳ MAX HOLD EXIT {side.upper()} {symbol} — held {hours_held/24:.1f}d ≥ {max_days}d cap (tier {mh_tier})")
+                                req = MarketOrderRequest(symbol=symbol, qty=sell_qty, side=close_side, time_in_force=TimeInForce.GTC, client_order_id=f"trend_bot-{symbol}-{int(time.time())}")
+                                utils.submit_and_log_order(trading_client, req, logger, reason="Max Hold Exceeded")
+                                send_discord(f"⏳ **MAX HOLD CLOSE {side.upper()} {symbol}**\nHeld {hours_held/24:.1f}d (cap {max_days}d)\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
+                            except Exception as e:
+                                logger.error(f"    [!] Max Hold Exit Error {symbol}: {e}")
+                                _failed_symbols[symbol] = time.time()
+                            continue
 
                     # Exit logic depends on side
                     if side == "long":

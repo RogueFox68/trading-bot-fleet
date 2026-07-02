@@ -164,7 +164,12 @@ def run_survivor_bot():
             equity = float(account.portfolio_value)
             positions = trading_client.get_all_positions()
             pos_dict = {p.symbol: p for p in positions}
-            entry_times = utils.get_position_entry_times(trading_client)
+            # Prime full-coverage ownership + entry times for held equities so an
+            # aged position (opening order buried behind a crypto-order flood)
+            # still resolves its owner and hold duration this cycle.
+            equity_syms = [p.symbol for p in positions if p.asset_class == AssetClass.US_EQUITY]
+            utils.prime_ownership(trading_client, equity_syms)
+            entry_times = utils.get_position_entry_times(trading_client, held_symbols=equity_syms)
 
             # Phase 10: Get Pending Orders to avoid buy churn loops
             open_orders = trading_client.get_orders(filter=GetOrdersRequest(status="open"))
@@ -258,6 +263,35 @@ def run_survivor_bot():
                     pct_gain = (live_price - entry_price) / entry_price
                     should_sell = False
                     reason = ""
+
+                    # --- MAX-HOLD BACKSTOP (orphan protection) ---
+                    # Hard time-based exit so no position can bleed indefinitely.
+                    # Score the position to pick its hold tier and close it now if
+                    # it's past that tier's max_hold_days. Relies on a resolvable
+                    # entry time, which the paged order lookup restores for aged
+                    # positions.
+                    if hours_held is not None:
+                        mh_score = tiered_hold.calculate_hold_score("survivor_bot", live_price, entry_price, {"rsi": float(rsi)}, current_regime, current_vix, hours_held=hours_held)
+                        mh_tier = tiered_hold.get_hold_tier(mh_score, "survivor_bot")
+                        max_days = tiered_hold.max_hold_days_for_tier(mh_tier)
+                        if max_days is not None and (hours_held / 24.0) >= max_days:
+                            try:
+                                logger.info(f"    ⏳ MAX HOLD EXIT {symbol} — held {hours_held/24:.1f}d ≥ {max_days}d cap (tier {mh_tier})")
+                                if qty != sell_qty:
+                                    mh_tif, mh_qty = TimeInForce.DAY, qty
+                                else:
+                                    mh_tif, mh_qty = TimeInForce.GTC, sell_qty
+                                utils.submit_and_log_order(
+                                    trading_client,
+                                    order_data=MarketOrderRequest(symbol=symbol, qty=mh_qty, side=OrderSide.SELL, time_in_force=mh_tif, client_order_id=f"survivor_bot-{symbol}-{int(time.time())}"),
+                                    logger=logger,
+                                    reason=f"Max Hold Exceeded [held {hours_held/24:.1f}d]"
+                                )
+                                send_discord(f"⏳ **MAX HOLD CLOSE {symbol}**\nHeld {hours_held/24:.1f}d (cap {max_days}d)\nP&L: {pct_gain*100:.2f}%")
+                            except Exception as e:
+                                logger.error(f"    [!] Max Hold Exit Error {symbol}: {e}")
+                                _failed_symbols[symbol] = time.time()
+                            continue
                     
                     is_held_overnight = False
                     is_eod_window = time_str >= "15:30"

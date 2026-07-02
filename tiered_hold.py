@@ -95,6 +95,17 @@ def calculate_hold_score(bot_type, current_price, avg_entry, indicators, regime,
     
     return score
 
+def max_hold_days_for_tier(tier):
+    """Max days a position may be held for a given hold tier.
+
+    Returns the tier's `max_hold_days` from OVERNIGHT_STOPS, or None for tiers
+    with no overnight allowance (CLOSE_EOD is liquidated same day). Used as a
+    hard backstop so a position can't be held indefinitely once its entry time
+    is known again.
+    """
+    params = OVERNIGHT_STOPS.get(tier)
+    return params["max_hold_days"] if params else None
+
 def get_hold_tier(score, bot_type):
     # Normalize bot_type
     if bot_type.startswith("trend_"): bot_type = "trend_bot"

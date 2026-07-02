@@ -132,8 +132,82 @@ def log_metric(measurement, tags, fields):
     except Exception as e:
         logger.error(f"Influx Write Error: {e}")
 
+def send_overseer(msg):
+    """Fleet-level alert to the overseer Discord webhook (skipped if unconfigured)."""
+    hook = getattr(config, "WEBHOOK_OVERSEER", "")
+    if not hook or "YOUR" in hook:
+        return
+    try:
+        requests.post(hook, json={"content": msg}, timeout=5)
+    except Exception as e:
+        logger.error(f"Overseer webhook failed: {e}")
+
+# Throttle orphan alerts so a persistently-orphaned position pings once, not
+# every 5-minute accountant cycle.
+_orphan_alert_times = {}
+ORPHAN_ALERT_INTERVAL = 6 * 3600  # 6 hours
+
+def detect_orphans(positions, trading_client):
+    """Flag held positions that no bot is durably managing.
+
+    Cross-checks every equity/option position against durable ownership + entry
+    time (resolved from full, paged order history). A position that carries no
+    real bot tag, or whose entry time can't be resolved, is an orphan — the exact
+    signature that silently hid GEN/APTV once their opening orders aged out of the
+    order window. Alerts (throttled) to the overseer webhook and logs a metric so
+    these are visible instead of bleeding past stops unmanaged.
+    """
+    from alpaca.trading.enums import AssetClass
+    managed = [p for p in positions
+               if p.asset_class in (AssetClass.US_EQUITY, AssetClass.US_OPTION)]
+    if not managed:
+        return
+    syms = [p.symbol for p in managed]
+    try:
+        owner_map = utils._build_order_based_map(trading_client, held_symbols=syms)
+        entry_times = utils.get_position_entry_times(trading_client, held_symbols=syms)
+    except Exception as e:
+        logger.error(f"[Orphan] detection failed: {e}")
+        return
+
+    now = time.time()
+    for p in managed:
+        sym = p.symbol
+        # Options may be tagged by full contract or by root symbol.
+        root = sym
+        if p.asset_class == AssetClass.US_OPTION:
+            for i, ch in enumerate(sym):
+                if ch.isdigit():
+                    root = sym[:i]
+                    break
+        tagged = sym in owner_map or root in owner_map
+        has_entry = sym in entry_times
+        if tagged and has_entry:
+            continue
+
+        if now - _orphan_alert_times.get(sym, 0) < ORPHAN_ALERT_INTERVAL:
+            continue
+        _orphan_alert_times[sym] = now
+
+        reasons = []
+        if not tagged:
+            reasons.append("no bot tag in order history")
+        if not has_entry:
+            reasons.append("no resolvable entry time")
+        detail = "; ".join(reasons)
+        logger.warning(f"[Orphan] {sym} side={p.side} qty={p.qty} — {detail}")
+        log_metric("orphan_position", {"symbol": sym}, {"detected": 1, "reason": detail})
+        try:
+            upl = float(p.unrealized_pl)
+        except Exception:
+            upl = 0.0
+        send_overseer(f"⚠️ **ORPHANED POSITION: {sym}**\n"
+                      f"Side: {p.side} | Qty: {p.qty} | Unrealized: ${upl:.2f}\n"
+                      f"Issue: {detail}\n"
+                      f"No bot is durably managing this — review and close manually if needed.")
+
 bot_idle_cycles = {
-    "trend_bot": 0, "survivor_bot": 0, "wheel_bot": 0, 
+    "trend_bot": 0, "survivor_bot": 0, "wheel_bot": 0,
     "crypto_grid": 0, "moon_bot": 0, "condor_bot": 0
 }
 
@@ -252,7 +326,15 @@ def run_accountant():
             # 2. FETCH UNREALIZED P&L (LIVE)
             positions = trading_client.get_all_positions()
             account = trading_client.get_account()
-            
+
+            # 2b. ORPHAN SWEEP — alert on any held position no bot is durably
+            #     managing (untagged / no resolvable entry time). Best-effort:
+            #     never let a detection error stall the accountant cycle.
+            try:
+                detect_orphans(positions, trading_client)
+            except Exception as e:
+                logger.error(f"[Orphan] sweep error: {e}")
+
             unrealized_stats = {
                 "survivor_bot": 0.0, "trend_bot": 0.0,
                 "wheel_bot": 0.0, "crypto_grid": 0.0,
