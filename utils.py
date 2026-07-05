@@ -7,20 +7,16 @@ from logger import logger, registry
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 
 import config
+import fleet_registry
 
 # --- CENTRALIZED TRADE LOGGING ---
 # Maps the bot tag embedded in client_order_id ('{bot}-{symbol}-{ts}') to its
-# InfluxDB measurement. condor_bot is retired (2026-07) but its tag stays
-# mapped so any historical condor order that flows through fill logging or
-# ownership resolution never misattributes to another bot's measurement.
+# InfluxDB measurement. Derived from fleet_registry; retired tags (condor)
+# stay mapped so historical orders never misattribute to another measurement.
 MEASUREMENT_BY_BOT = {
-    "trend_bot":    "trades",
-    "survivor_bot": "survivor_trades",
-    "wheel_bot":    "wheel_trades",
-    "crypto_grid":  "crypto_trades",
-    "moon_bot":     "breakout_trades",
-    "condor_bot":   "condor_trades",  # retired; historical orders only
+    name: cfg["measurement"] for name, cfg in fleet_registry.BOTS.items()
 }
+MEASUREMENT_BY_BOT.update(fleet_registry.RETIRED_BOT_MEASUREMENTS)
 
 def _log_fill_to_influx(order, logger, reason="", action=None):
     """Write a trade row to InfluxDB from a CONFIRMED Alpaca fill.
@@ -64,12 +60,10 @@ else:
     logger.info("="*50)
 
 # --- CENTRALIZED ASSET MAP ---
-# This defines which bot is allowed to trade which ticker
+# Static baseline ownership claims, derived from fleet_registry
+# (crypto tickers only; equities/options resolve dynamically from order tags)
 BOT_MAPPING = {
-    "survivor_bot": [],
-    "wheel_bot": [],
-    "crypto_grid": ["BTC/USD", "ETH/USD", "SOL/USD"],
-    "moon_bot": ["BTC/USD", "ETH/USD", "SOL/USD"]
+    name: list(cfg["static_symbols"]) for name, cfg in fleet_registry.BOTS.items()
 }
 
 # Cache to avoid reading the file on every position in the loop
@@ -77,8 +71,8 @@ _ownership_cache = {}
 _ownership_cache_time = 0
 
 # Bot tags that can appear in a client_order_id ('{bot}-{symbol}-{ts}').
-# condor_bot is retired but kept: its tag still exists on historical orders.
-_KNOWN_BOT_TAGS = ["survivor_bot", "trend_bot", "wheel_bot", "condor_bot", "crypto_grid", "moon_bot"]
+# Includes retired tags (condor) that still exist on historical orders.
+_KNOWN_BOT_TAGS = list(fleet_registry.BOTS) + list(fleet_registry.RETIRED_BOT_MEASUREMENTS)
 
 def _fetch_orders_covering(trading_client, held_symbols=None, require_fill=False,
                            page_size=500, max_orders=None):
@@ -614,10 +608,12 @@ def load_and_validate_targets(file_path, strategy_key, static_fallback):
         return static_fallback
 
 # Bots whose fills are reconciled from Alpaca's order feed. Crypto bots are
-# intentionally excluded: their action vocabulary (grid_buy / grid_sweep /
-# buy_breakout ...) can't be reconstructed from an order, and a generic buy/sell
-# would clobber it on rewrite. Crypto market fills are near-atomic anyway.
-RECONCILED_BOTS = ("trend_bot", "survivor_bot", "wheel_bot")
+# intentionally excluded (registry reconciled=False): their action vocabulary
+# (grid_buy / grid_sweep / buy_breakout ...) can't be reconstructed from an
+# order, and a generic buy/sell would clobber it on rewrite.
+RECONCILED_BOTS = tuple(
+    name for name, cfg in fleet_registry.BOTS.items() if cfg["reconciled"]
+)
 
 def _fill_action(order):
     """Best-effort trade action for a reconciled fill, from the order side/symbol.
