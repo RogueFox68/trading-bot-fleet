@@ -264,7 +264,6 @@ def run_wheel_bot():
                 logger.error(f"Failed to check market clock: {e}")
 
             try:
-                import json
                 with open("bot_config.json", 'r') as f:
                     bot_cfg = json.load(f)
                 current_vix = bot_cfg.get('global_settings', {}).get('vix', 0)
@@ -273,6 +272,7 @@ def run_wheel_bot():
             except Exception as e:
                 registry.log_error("wheel_bot", "read_config", e)
                 logger.error(f"Failed to read bot_config.json: {e}")
+                bot_cfg = {}  # wheel_settings below reads from this; a missing file must not NameError the loop
                 current_vix = 0
                 current_regime = 'UNKNOWN'
                 capital_crunch = False

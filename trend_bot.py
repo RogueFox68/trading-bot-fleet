@@ -87,7 +87,7 @@ def get_data_alpaca(symbol):
         return None
 
 def run_trend_bot():
-    logger.info(f"--- 昌 TREND SNIPER (Target Locked) STARTED ---")
+    logger.info(f"--- 🎯 TREND SNIPER (Target Locked) STARTED ---")
     send_discord("**Trend Sniper V4.1** Online\nOwnership Logic Active.")
     
     # Phase 10: Failed order cooldown (symbol -> last-failure epoch)

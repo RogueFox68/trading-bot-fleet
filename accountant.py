@@ -256,9 +256,11 @@ def calculate_dynamic_allocations(equity, allocation_stats, regime, vix, config_
     effective_alloc = {}
     
     # 1. Harvest Surplus from Gated Bots
+    # Cycles a bot must sit gated before its capital is released (5-min
+    # accountant cycles: 3 = 15 minutes). Read from cfo_settings so tuning
+    # doesn't require a code change.
+    threshold = cfo_settings.get("gate_idle_threshold_cycles", 3)
     for bot in base.keys():
-        threshold = 3 # Release capital much faster (from 50 mins down to 15 mins)
-        
         if bot_status[bot]["gated"] and bot_status[bot]["idle_cycles"] >= threshold:
             locked_capital = bot_status[bot]["positions_held"]
             # Floor is strictly the higher of its absolute minimum percentage, or its actual existing positions

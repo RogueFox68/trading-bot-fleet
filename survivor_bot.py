@@ -215,12 +215,15 @@ def run_survivor_bot():
                 latest = df.iloc[-1]
                 price = float(latest['close'])
                 rsi = float(latest['rsi'])
-                sma = get_trend_sma(symbol, 200) or 0
+                # None when daily bars are unavailable — treated as "trend
+                # unknown", NOT as an uptrend (a failed fetch must not open
+                # the uptrend gate).
+                sma = get_trend_sma(symbol, 200)
 
                 # --- DIAGNOSTICS ---
                 if symbol not in pos_dict:
                     is_scout = symbol in target_map
-                    sma_status = "above" if price > sma else "BELOW"
+                    sma_status = "above" if (sma and price > sma) else ("BELOW" if sma else "N/A")
                     gate_available = "Scout" if is_scout else "Uptrend only"
                     
                     if rsi < RSI_BUY:
@@ -366,7 +369,7 @@ def run_survivor_bot():
                         continue
                         
                     if rsi < RSI_BUY:
-                        is_uptrend = price > sma
+                        is_uptrend = bool(sma) and price > sma
                         is_scout_approved = symbol in target_map  # Scout already vetted this
                         
                         # Only buy if uptrend OR Scout Approved
@@ -414,7 +417,8 @@ def run_survivor_bot():
                                     logger.error(f"       [!] Order Error: {e}")
                                     _failed_symbols[symbol] = time.time()
                         else:
-                            logger.info(f"    [SKIP] {symbol} | RSI {rsi:.0f} < {RSI_BUY} but NOT (Uptrend | Core | Scout). SMA: {sma:.2f}")
+                            sma_txt = f"{sma:.2f}" if sma else "N/A"
+                            logger.info(f"    [SKIP] {symbol} | RSI {rsi:.0f} < {RSI_BUY} but NOT (Uptrend | Core | Scout). SMA: {sma_txt}")
                     else:
                         logger.info(f"    [SKIP] {symbol} | RSI {rsi:.0f} >= {RSI_BUY}")
 

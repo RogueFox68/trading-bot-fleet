@@ -432,13 +432,24 @@ def submit_and_log_order(trading_client, order_data, logger, reason="", log_acti
                 if today_pnl < MAX_DAILY_LOSS:
                     raise Exception(f"Daily Loss Cap Exceeded! PnL: ${today_pnl:.2f} < Limit: ${MAX_DAILY_LOSS:.2f}")
 
-            # 2. Order Notional Check
-            if order_data.side == OrderSide.BUY and hasattr(order_data, 'qty') and order_data.qty:
-                qty = float(order_data.qty)
-                
+            # 2+3. Notional & Symbol Exposure Caps — applied to any EQUITY
+            # order that OPENS or INCREASES exposure: buys beyond a held short
+            # (long entries) and sells beyond a held long (short entries).
+            # Orders that only reduce an existing position are risk-reducing
+            # and exempt (a buy-to-cover must never be blocked by a cap).
+            # Crypto is exempt (grid trades $50 slices; the stock price lookup
+            # can't quote it anyway); options keep their own collateral/BP
+            # gates in the bots.
+            symbol = getattr(order_data, 'symbol', None)
+            qty_attr = getattr(order_data, 'qty', None)
+            is_option = bool(re.match(r"^[A-Z]{1,6}\d{6}[PC]\d{8}$", symbol or ""))
+            is_crypto = "/" in (symbol or "")
+            if symbol and qty_attr and not is_option and not is_crypto:
+                qty = float(qty_attr)
+
                 # Approximate value for safety checks
                 est_price = 0.0
-                if hasattr(order_data, 'limit_price') and order_data.limit_price:
+                if getattr(order_data, 'limit_price', None):
                     est_price = float(order_data.limit_price)
                 else:
                     # For market orders, fetch a rough current price from Alpaca
@@ -446,30 +457,35 @@ def submit_and_log_order(trading_client, order_data, logger, reason="", log_acti
                     from alpaca.data.historical import StockHistoricalDataClient
                     try:
                         dc = StockHistoricalDataClient(config.API_KEY, config.SECRET_KEY)
-                        req = StockLatestTradeRequest(symbol_or_symbols=order_data.symbol)
+                        req = StockLatestTradeRequest(symbol_or_symbols=symbol)
                         res = dc.get_stock_latest_trade(req)
-                        est_price = float(res[order_data.symbol].price)
-                    except:
-                        pass
-                
-                if est_price > 0:
-                    notional = qty * est_price
-                    if notional > MAX_ORDER_NOTIONAL:
-                        raise Exception(f"Order Notional Cap Exceeded! $notional: ${notional:.2f} > Limit: ${MAX_ORDER_NOTIONAL:.2f}")
+                        est_price = float(res[symbol].price)
+                    except Exception as e:
+                        logger.warning(f"  [SAFETY] price lookup failed for {symbol}: {e}")
 
-            # 3. Symbol Exposure Check
-            if order_data.side == OrderSide.BUY:
                 positions = trading_client.get_all_positions()
-                symbol_exposure = sum(
-                    abs(float(p.market_value)) 
-                    for p in positions 
-                    if p.symbol == order_data.symbol
-                )
-                
-                if hasattr(order_data, 'qty') and order_data.qty and est_price > 0:
-                    projected_exposure = symbol_exposure + (float(order_data.qty) * est_price)
+                held_qty = sum(float(p.qty) for p in positions if p.symbol == symbol)  # signed: long > 0, short < 0
+
+                if order_data.side == OrderSide.BUY:
+                    # Buying while short covers up to |held_qty| before opening long
+                    opening_qty = qty if held_qty >= 0 else max(0.0, qty + held_qty)
+                else:
+                    # Selling while long closes up to held_qty before opening short
+                    opening_qty = qty if held_qty <= 0 else max(0.0, qty - held_qty)
+
+                if opening_qty > 0 and est_price > 0:
+                    notional = opening_qty * est_price
+                    if notional > MAX_ORDER_NOTIONAL:
+                        raise Exception(f"Order Notional Cap Exceeded! Notional: ${notional:.2f} > Limit: ${MAX_ORDER_NOTIONAL:.2f}")
+
+                    symbol_exposure = sum(
+                        abs(float(p.market_value))
+                        for p in positions
+                        if p.symbol == symbol
+                    )
+                    projected_exposure = symbol_exposure + notional
                     if projected_exposure > MAX_SYMBOL_EXPOSURE:
-                        raise Exception(f"Symbol Exposure Cap Exceeded for {order_data.symbol}! Projected: ${projected_exposure:.2f} > Limit: ${MAX_SYMBOL_EXPOSURE:.2f}")
+                        raise Exception(f"Symbol Exposure Cap Exceeded for {symbol}! Projected: ${projected_exposure:.2f} > Limit: ${MAX_SYMBOL_EXPOSURE:.2f}")
                         
         except Exception as gate_err:
             logger.error(f"  [SAFETY GATE TRIGGERED] Order Blocked: {gate_err}")

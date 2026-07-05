@@ -65,7 +65,7 @@
             "wheel_bot",
             "moon_bot"
         ],
-        "gate_idle_threshold_cycles": 10,
+        "gate_idle_threshold_cycles": 3,
         "reallocation_cap_per_cycle": 0.02,
         "unallocated_reserve": 0.05
     }
