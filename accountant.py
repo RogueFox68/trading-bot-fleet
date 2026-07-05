@@ -7,11 +7,12 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass
 from logger import logger
 import utils
+import fleet_registry
 
 
 # --- CONFIGURATION ---
-# Ownership/attribution is resolved via utils.get_bot_owner (imported below).
-# The old local BOT_MAPPING copy was removed to prevent key-divergence regressions.
+# Ownership/attribution is resolved via utils.get_bot_owner; the bot roster,
+# measurements, and gating rules all come from fleet_registry.
 
 # --- CREDENTIALS ---
 API_KEY = config.API_KEY
@@ -26,8 +27,15 @@ DB_QUERY_URL = f"http://{INFLUX_HOST}:{INFLUX_PORT}/query"
 
 # Options measurements log per-share premium and contract qty, so their realized
 # P&L must be scaled by the 100-share contract multiplier to express dollars.
-OPTION_MEASUREMENTS = {"wheel_trades", "condor_trades"}
+# (Retired measurements like condor_trades stay in InfluxDB but are no longer
+# queried or reported.)
+OPTION_MEASUREMENTS = fleet_registry.OPTION_MEASUREMENTS
 OPTION_CONTRACT_SIZE = 100
+
+# measurement -> bot, for attributing realized P&L rows
+MEASUREMENT_TO_BOT = {
+    cfg["measurement"]: name for name, cfg in fleet_registry.BOTS.items()
+}
 
 # --- CLIENT ---
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
@@ -35,8 +43,9 @@ trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
 def query_influx_trades(days=30):
     """Fetches trade history from InfluxDB to calculate Realized P&L."""
     try:
-        # Includes breakout_trades (moon_bot) so its realized P&L is attributed.
-        query = f"SELECT * FROM trades, crypto_trades, survivor_trades, wheel_trades, condor_trades, breakout_trades WHERE time > now() - {days}d"
+        # Every active bot's measurement, straight from the registry.
+        measurements = ", ".join(sorted(MEASUREMENT_TO_BOT))
+        query = f"SELECT * FROM {measurements} WHERE time > now() - {days}d"
         params = {'db': INFLUX_DB_NAME, 'q': query, 'epoch': 's'}
         response = requests.get(DB_QUERY_URL, params=params, timeout=5)
         data = response.json()
@@ -101,16 +110,8 @@ def calculate_realized_pl(df):
         if bot in OPTION_MEASUREMENTS:
             realized *= OPTION_CONTRACT_SIZE
 
-        # --- MAPPING: Measurement Name -> Bot Name ---
-        mapping = {
-            "trades": "trend_bot",
-            "crypto_trades": "crypto_grid",
-            "survivor_trades": "survivor_bot",
-            "wheel_trades": "wheel_bot",
-            "condor_trades": "condor_bot",
-            "breakout_trades": "moon_bot"
-        }
-        bot_name = mapping.get(bot)
+        # --- MAPPING: Measurement Name -> Bot Name (from fleet_registry) ---
+        bot_name = MEASUREMENT_TO_BOT.get(bot)
         if not bot_name:
             continue # Skip any measurements we don't recognize
             
@@ -206,18 +207,11 @@ def detect_orphans(positions, trading_client):
                       f"Issue: {detail}\n"
                       f"No bot is durably managing this — review and close manually if needed.")
 
-bot_idle_cycles = {
-    "trend_bot": 0, "survivor_bot": 0, "wheel_bot": 0,
-    "crypto_grid": 0, "moon_bot": 0, "condor_bot": 0
-}
+bot_idle_cycles = {name: 0 for name in fleet_registry.BOTS}
 
 def is_bot_gated(bot, regime, vix):
     """Determine if a bot is currently prohibited from entering new positions."""
-    if bot == "wheel_bot":
-        return regime in ["BEAR_TREND", "CRITICAL_VOLATILITY"] or vix > 22
-    elif bot == "crypto_grid":
-        return regime in ["BEAR_TREND", "CRITICAL_VOLATILITY"]
-    return False
+    return fleet_registry.is_gated(bot, regime, vix)
 
 def calculate_dynamic_allocations(equity, allocation_stats, regime, vix, config_data):
     """
@@ -255,9 +249,11 @@ def calculate_dynamic_allocations(equity, allocation_stats, regime, vix, config_
     effective_alloc = {}
     
     # 1. Harvest Surplus from Gated Bots
+    # Cycles a bot must sit gated before its capital is released (5-min
+    # accountant cycles: 3 = 15 minutes). Read from cfo_settings so tuning
+    # doesn't require a code change.
+    threshold = cfo_settings.get("gate_idle_threshold_cycles", 3)
     for bot in base.keys():
-        threshold = 3 # Release capital much faster (from 50 mins down to 15 mins)
-        
         if bot_status[bot]["gated"] and bot_status[bot]["idle_cycles"] >= threshold:
             locked_capital = bot_status[bot]["positions_held"]
             # Floor is strictly the higher of its absolute minimum percentage, or its actual existing positions
@@ -335,12 +331,10 @@ def run_accountant():
             except Exception as e:
                 logger.error(f"[Orphan] sweep error: {e}")
 
-            unrealized_stats = {
-                "survivor_bot": 0.0, "trend_bot": 0.0,
-                "wheel_bot": 0.0, "crypto_grid": 0.0,
-                "condor_bot": 0.0,
-                "moon_bot": 0.0  # realized breakout P&L reported here (crypto positions still owned by crypto_grid)
-            }
+            # One P&L bucket per registry bot. (moon_bot's realized breakout
+            # P&L reports here even though crypto positions resolve to
+            # crypto_grid in ownership.)
+            unrealized_stats = {name: 0.0 for name in fleet_registry.BOTS}
             allocation_stats = unrealized_stats.copy()
 
             for p in positions:

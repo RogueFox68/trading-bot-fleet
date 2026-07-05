@@ -8,6 +8,7 @@ import datetime
 import os
 import yfinance as yf
 from logger import registry, logger
+import fleet_registry
 
 # --- CONFIGURATION ---
 CHECK_INTERVAL = 900   # 15 Minutes
@@ -110,15 +111,14 @@ def update_bot_config(regime, vix_val, climate):
         # Apply Status to ALL Bots
         # (We no longer micromanage who is paused during 'Sideways')
         for bot_name in bots.keys():
-            # Accountant always runs
-            if bot_name == "accountant": continue
-            
-            # Phase 7: Disable Condor/Moon Bot Revivals
-            # We completely skip these bots here so that any manual state 
-            # set by the user in bot_config.json is never overwritten by the analyst.
-            if bot_name in ["condor_bot", "moon_bot"]:
+            # Only manage bots the registry knows and that aren't flagged
+            # manual_state. Infra entries in bot_config (accountant) are not
+            # registry bots, so they're skipped automatically; manual_state
+            # bots (moon_bot) keep whatever status the user set.
+            reg = fleet_registry.BOTS.get(bot_name)
+            if reg is None or reg["manual_state"]:
                 continue
-            
+
             if bots[bot_name]['status'] != target_status:
                 bots[bot_name]['status'] = target_status
                 changes_made.append(f"{bot_name} -> {target_status}")

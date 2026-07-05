@@ -8,50 +8,97 @@
 
 ## Project Overview
 
-Autonomous multi-strategy trading bot fleet for US equities, options, and cryptocurrency via Alpaca Markets. The fleet consists of 5 active trading strategies and 3 infrastructure services, orchestrated through PM2 and controlled via Discord.
+Autonomous multi-strategy trading bot fleet for US equities, options, and cryptocurrency via
+Alpaca Markets. Five active trading strategies and four infrastructure services run as PM2
+processes **inside the `trading-fleet` Docker container** on the Beelink, controlled via Discord.
 
-**Language:** Python 3 (100%)  
+**Language:** Python 3.11  
 **Broker API:** Alpaca Markets (paper trading — live trading capable)  
-**Process Manager:** PM2  
-**Monitoring:** InfluxDB 1.8 + Grafana (both Dockerized on the Beelink)  
+**Deployment:** Docker container (`trading-fleet`) with PM2 inside; repo live-mounted at `/app/code`  
+**Monitoring:** InfluxDB 1.8 + Grafana (sibling containers on the same compose network)  
 **Notifications:** Discord webhooks + Discord bot commands
 
-## Repository Structure
+## Deployment Reality (read this before assuming anything)
 
-This is a flat repository with no subdirectories. All Python modules live at the root level.
+The bots do **not** run natively on the host. The Beelink runs a homelab Docker stack
+(`~/homelab/docker-compose.yml`) with these services:
+
+| Container | Purpose |
+|-----------|---------|
+| `trading-fleet` | This repo. PM2 inside the container runs every bot + infra process |
+| `influxdb` (1.8) | Time-series storage; reached as `http://influxdb:8086` via Docker DNS |
+| `grafana` | Dashboards, reads InfluxDB |
+| `wg-easy` | WireGuard VPN (unrelated to trading) |
+| `searxng` | Search engine (unrelated to trading) |
+
+Key consequences:
+
+- **The repo is live-mounted** (`/home/trader/bots/repo` → `/app/code`). `git pull` on the host
+  changes code inside the running container instantly; running processes pick it up on
+  `pm2 restart` (or container restart).
+- **The PM2 process list is `deploy/ecosystem.config.js`** — version-controlled here, baked into
+  the image at build. Changing it requires an image rebuild (`docker compose build trading-fleet`).
+- **Config truth is `config.py`** (gitignored, lives in the repo dir on the host). There is no
+  env-var config layer. `INFLUX_HOST` must be `"influxdb"` (Docker DNS), **not** `localhost` —
+  inside the container, localhost is the container itself.
+- **`docker exec trading-fleet pm2 ls`** is the ground truth for what's running. Never trust
+  docs (including this one) over that output.
+- Build files live in `deploy/` (Dockerfile, entrypoint.sh, ecosystem.config.js, README with the
+  compose block). The entrypoint exits hard if the code mount is missing — it never falls back
+  to a stale code snapshot.
+
+Day-to-day deploy: `git pull` on the host, then `docker exec trading-fleet pm2 restart all`.
+Rebuild only when `requirements.txt` or `deploy/` changes.
+
+## Repository Structure
 
 ```
 trading-bot-fleet/
 ├── CLAUDE.md                    # This file
-├── requirements.txt             # Python dependencies
+├── RUNBOOK.md                   # Ops: deploy, incident response, error pipeline
+├── requirements.txt             # Single dependency manifest (image installs THIS file)
 ├── bot_config.template.json     # Runtime config template (copy to bot_config.json)
-├── .gitignore                   # Ignores secrets, logs, live config
+│
+├── deploy/                      # Container build: Dockerfile, entrypoint.sh,
+│   │                            # ecosystem.config.js (canonical PM2 process list)
+│   └── README.md                # Compose service block + rebuild instructions
+│
+├── Core architecture
+│   ├── fleet_registry.py        # THE bot registry — single source of truth per bot
+│   ├── fleet_bot.py             # Shared runner: scaffolding every bot used to copy-paste
+│   ├── new_bot_template.py      # Copy-fill-register template for a new strategy
+│   ├── utils.py                 # Ownership resolution, budget checks, order submission
+│   │                            # safety gates, targets loader, fill reconciliation
+│   ├── tiered_hold.py           # CLOSE_EOD / HOLD_OVERNIGHT / HOLD_SWING scoring
+│   └── logger.py                # Per-bot rotating logs + JSONL error registry
 │
 ├── Trading Bots (Active)
-│   ├── wheel_bot.py             # Options premium selling (40% base allocation, VIX/regime gated)
-│   ├── trend_bot.py             # EMA momentum, long/short capable (30% base allocation)
-│   ├── survivor_bot.py          # RSI mean-reversion dip buying (20% base allocation)
-│   ├── crypto_grid.py           # BTC/ETH/SOL grid trading on Alpaca (5% base allocation)
-│   └── crypto_breakout.py       # Donchian breakout for crypto (moon_bot, 5% allocation)
+│   ├── wheel_bot.py             # Options premium selling (38% base, VIX/regime gated)
+│   ├── trend_bot.py             # EMA momentum, long/short (28% base)
+│   ├── survivor_bot.py          # RSI dip buying (20% base) — fleet_bot runner PILOT
+│   ├── crypto_grid.py           # BTC/ETH/SOL grid trading (5% base)
+│   └── crypto_breakout.py       # Donchian breakout, runs as moon_bot (4% base)
 │
-├── Trading Bots (Sidelined)
-│   └── condor_bot.py            # Iron condor options selling — explicitly excluded from all
-│                                # allocations. Alpaca can't handle multi-leg complexity reliably.
+├── Infrastructure (PM2 processes in the container)
+│   ├── commander.py             # Discord bot: /status /stop /start /panic /resume + watchdog
+│   ├── accountant.py            # CFO: P&L attribution, dynamic reallocation, CAPITAL_CRUNCH,
+│   │                            # orphan sweep, fill reconciliation trigger
+│   ├── market_analyst.py        # SPY regime (BULL_TREND/SIDEWAYS/BEAR_TREND/CRITICAL_VOLATILITY)
+│   │                            # + VIX → writes global_settings in bot_config.json
+│   └── error_watchdog.py        # Tails logs/fleet_error_registry.jsonl → InfluxDB
+│                                # bot_error_events (errors visible in Grafana)
 │
-├── Infrastructure
-│   ├── commander.py             # Discord bot for fleet management + watchdog
-│   ├── accountant.py            # CFO: P&L attribution, budget enforcement, InfluxDB metrics
-│   └── market_analyst.py        # Market regime detection (SPY-based: BULL_TREND/SIDEWAYS/BEAR_TREND/
-│                                # CRITICAL_VOLATILITY) + VIX monitoring
+├── Tests & tools
+│   ├── test_orphan_resolution.py  # Regression: aged-position ownership/entry-time resolution
+│   ├── export_data.py             # Export InfluxDB trade data to CSV
+│   └── fetch_trade_history.py     # Pull raw FILL activities from Alpaca
 │
-└── Utilities
-    ├── utils.py                 # Shared: BOT_MAPPING, budget checks, ownership resolution,
-    │                            # active_targets loader, parse_target()
-    ├── logger.py                # Centralized logging config
-    ├── config.py                # (gitignored) API keys, tokens, webhook URLs, InfluxDB config
-    ├── sector_scout_legacy.py   # Mothballed — scanning now handled by Corsair workstation
-    └── export_data.py           # Export InfluxDB trade data to CSV
+└── (gitignored, host repo dir)  config.py, bot_config.json, active_targets.json,
+                                 effective_budgets.json, moon_bot_state.json, logs/
 ```
+
+Retired: `condor_bot.py` (2026-07, Alpaca multi-leg unreliability — in git history if ever
+needed), `sector_scout_legacy.py`, `config_docker.py` + the container env-var config layer.
 
 ## Two-Machine Architecture
 
@@ -60,242 +107,141 @@ trading-bot-fleet/
 │   CORSAIR AI WORKSTATION        │    active_targets.json     │   BEELINK S12 MINI               │
 │   ("The Brain")                 │ ─────────────────────────► │   ("Execution Node")             │
 │                                 │    3x daily (08:30,        │                                  │
-│   AMD Strix Halo (96GB)        │    12:00, 15:00 CT)        │   Intel N100 (16GB)              │
-│   LM Studio → Gemma 4 21B MoE  │                            │   Ubuntu Linux                   │
-│   Native Windows               │                            │                                  │
-│   (RTX 5080 for CUDA tasks)    │                            │   Native: Trading bot fleet      │
-│   Task Scheduler (3x daily)    │                            │   Docker: InfluxDB 1.8 + Grafana │
-│                                 │                            │           + WireGuard/wg-easy    │
+│   AMD Strix Halo (96GB)        │    12:00, 15:00 CT)        │   Intel N100 (16GB), Ubuntu      │
+│   LM Studio → Gemma 4 21B MoE  │                            │   Docker: trading-fleet (bots    │
+│   Native Windows               │    lands in                │     under PM2), InfluxDB 1.8,    │
+│   Task Scheduler (3x daily)    │    ~/bots/repo/            │     Grafana, wg-easy, searxng    │
 │   Repo: TradingAgent           │                            │   Repo: trading-bot-fleet        │
 └─────────────────────────────────┘                            └──────────────────────────────────┘
 ```
 
-**Data flow:** Corsair scans the Alpaca universe → filters to liquid candidates → runs
-Gemma 4 21B MoE sentiment analysis on the top candidates → writes `active_targets.json` → SCP
-transfers to Beelink → bots read targets and trade against them.
+**Data flow:** Corsair scans the Alpaca universe → filters to liquid candidates → Gemma 4 21B MoE
+sentiment analysis → writes `active_targets.json` (schema v1.1) → SCP to `~/bots/repo/` on the
+Beelink → the live mount makes it visible in-container → bots trade against it.
 
-**Platform note:** The sector scout runs on the **Corsair AI workstation under native Windows**,
-using **LM Studio + Gemma 4 21B MoE** scheduled via **Windows Task Scheduler** (3x daily). An
-earlier Ubuntu/Docker/Ollama/Llama 3.3 70B setup was abandoned for Windows stability — see
-`CORSAIR_ARCHITECTURE.md` in the `TradingAgent` repo for the authoritative hardware/model history.
+## The Plug-and-Play Architecture
 
-## Architecture
+Two files make a new strategy cheap to add:
 
-### Bot Fleet Design
+- **`fleet_registry.py`** — one entry per bot: script, InfluxDB measurement, webhook config key,
+  static symbols, reconciliation flag, gating rule, manual-state flag. Ownership tags,
+  accountant queries/reporting, analyst pause behavior, and fill reconciliation ALL derive from
+  it. **Never re-introduce a per-bot list anywhere else.**
+- **`fleet_bot.py`** — the shared runner. Provides clients, Discord, market-hours gate,
+  regime/VIX, targets loading, ownership priming, pending-order tracking, budget gate, EOD
+  windows, failed-symbol cooldowns, tagged+safety-gated order submission, sizing, and the main
+  loop. A bot script is just its strategy (see `survivor_bot.py`, the pilot port).
 
-Each bot is a standalone Python script with an infinite loop (`while True` + `time.sleep()`).
-PM2 manages process lifecycle. The commander bot monitors and auto-restarts bots based on
-`bot_config.json`. Bots are launched with a 10-second staggered delay between starts to avoid
-API rate limiting at boot.
+### Adding a new bot
+
+1. Copy `new_bot_template.py` → `<your_bot>.py`, write the strategy in `cycle()`.
+2. Add one entry to `fleet_registry.BOTS` (the registry key becomes the PM2 name, order-tag
+   prefix, budget key, and measurement mapping).
+3. Add the bot to `bot_config.json` `bots{}` (status + allocation) — and to `cfo_settings`
+   (base_allocations, minimum_reserves, reallocation_priority) if it joins CFO reallocation.
+4. Add `WEBHOOK_<NAME>` to `config.py` (optional; unset skips Discord).
+5. Add an app block to `deploy/ecosystem.config.js`, then
+   `docker compose build trading-fleet && docker compose up -d trading-fleet`.
+
+Migration status: **survivor_bot** runs on the runner (pilot). trend_bot, wheel_bot, and the
+crypto pair still carry their own legacy scaffolding — port them only after the pilot has
+paper-validated for a few sessions.
+
+## Architecture Notes
 
 ### Position Ownership Model
 
-Central to the system is preventing "bot fratricide" — multiple bots fighting over the same
-positions. This is enforced through:
+Prevents "bot fratricide" — multiple bots fighting over one position:
 
-- **`BOT_MAPPING`** in `utils.py` — Static baseline: crypto tickers assigned to `crypto_grid`
-  and `moon_bag`. Stock/option assignments are empty lists (dynamic resolution handles them).
-- **`_build_order_based_map()`** — Queries the last 500 Alpaca orders and builds a
-  `symbol → bot_name` lookup from the `client_order_id` prefix (format:
-  `{bot_name}-{symbol}-{timestamp}`). Cached for 60 seconds.
-- **`get_bot_owner(symbol, asset_class, trading_client)`** — Resolution order:
-  1. Crypto → `crypto_grid`
-  2. Options → extract root symbol, check order history, default to `condor_bot`
-  3. Stocks → check order history, default to `trend_bot`
+- Orders are tagged `client_order_id = {bot_name}-{symbol}-{timestamp}`.
+- `utils._build_order_based_map()` pages Alpaca order history (`_fetch_orders_covering`) until
+  every held symbol's opening order is found — never a single bounded window (that caused the
+  GEN/APTV orphaning bug). 60s cache; bots prime it each cycle via `utils.prime_ownership`.
+- `utils.get_bot_owner()` resolution: crypto → `crypto_grid`; options → order-history tag, else
+  `wheel_bot`; stocks → order-history tag, else `trend_bot` (fallback is logged + metered as
+  `ownership_fallback` so orphans stay visible).
+- The accountant runs an orphan sweep each cycle (`orphan_position` measurement + overseer alert).
+- **Crypto special case:** crypto_grid and moon_bot share BTC/ETH/SOL. Ownership resolves the
+  *positions* to crypto_grid; moon_bot tracks its own coins in `moon_bot_state.json` so its
+  trailing stop only sells what it bought, and its entries don't depend on the shared position.
 
 ### CFO / Budget Enforcement
 
-`utils.check_budget(bot_name, trading_client)` enforces per-bot equity allocation limits from
-`bot_config.json`. Every bot calls this before placing orders. The CFO:
+`utils.check_budget(bot_name, client)` before every entry:
 
-- Calculates budget as `equity × allocation_pct`
-- Sums current position market values owned by the bot
-- Sums pending (unfilled) order values from orders tagged with the bot's `client_order_id`
-- For options, parses strike price from OCC symbol to calculate collateral at risk
-- Returns `True` (under budget) or `False` (over budget)
-- **Defaults to allowing trades on error** (fail-open — deliberate design choice for paper trading)
+- Budget = dynamic `effective_budgets.json` (written by the accountant's reallocation) with
+  fallback to `bot_config.json` allocation × equity.
+- **Fail-closed** when `bot_config.json` is missing or the bot has no allocation.
+  **Fail-open** on runtime/API errors (deliberate for paper trading — revisit before live).
+- Counts held positions (options at collateral) + pending tagged orders.
+- The accountant also flips `CAPITAL_CRUNCH` in `bot_config.json` at >90% utilization
+  (released <80%), and reallocates gated bots' surplus to active bots
+  (`cfo_settings.reallocation_*`, `gate_idle_threshold_cycles` honored).
 
-**Designed but not yet fully implemented:**
-- **Dynamic capital allocation** — CFO can reallocate idle capital from gated bots (primarily
-  wheel_bot's surplus) to active bots, with a gradual per-cycle movement cap and 5% cash
-  reserve buffer. Spec: `fleet_upgrade_spec.md`.
-- **Tiered hold system** — Replaces binary EOD liquidation with scored
-  CLOSE_EOD / HOLD_OVERNIGHT / HOLD_SWING decisions based on P&L direction, signal validity,
-  entry confidence, hold duration, and regime/VIX penalties. Includes a pre-market gap check
-  at 8:00 AM ET. Spec: `fleet_upgrade_spec.md`.
+### Safety Gates (in `utils.submit_and_log_order`)
 
-### wheel_bot Gating
+- Daily loss cap: `MAX_DAILY_LOSS` (-$5,000) blocks all orders.
+- Notional cap ($20k) + symbol exposure cap ($5k) on any **equity order that opens or increases
+  exposure** — long entries AND short entries. Risk-reducing orders (closes, covers) are exempt.
+  Options rely on the bots' own collateral/BP checks; crypto is exempt.
+- Trade rows are written to InfluxDB **from confirmed fills** (broker price/qty/time), with the
+  accountant reconciling late fills from Alpaca (`utils.reconcile_fills`, `RECONCILED_BOTS`).
 
-wheel_bot is gated from new put entries when VIX > 22 or regime is BEAR_TREND /
-CRITICAL_VOLATILITY. It continues monitoring existing positions for take-profit opportunities
-while gated. This is an architectural response — the wheel strategy is structurally wrong in
-bear conditions, not a code failure.
+### Market Regime & Gating
 
-### crypto_grid as Capital Consumer
+`market_analyst` (15-min cycle) writes `market_condition`, `vix`, `macro_climate` into
+`bot_config.json`. VIX > 28 pauses all non-manual bots. Per-bot entry gating lives in the
+registry (`gated_when`): wheel_bot gates on BEAR_TREND/CRITICAL_VOLATILITY or VIX > 22;
+crypto_grid on bear regimes. Gated bots keep managing existing positions.
 
-crypto_grid trades on **Alpaca** (not Coinbase), drawing from the shared USD pool. It has a 5%
-base allocation and explicit CFO budget-check integration. This was a structural blind spot
-that required deliberate attention — without a budget line, it was an invisible capital consumer.
+### Tiered Hold System
 
-### Configuration System
-
-- **`config.py`** (gitignored) — API keys, tokens, webhook URLs, InfluxDB connection params.
-  Required at runtime.
-  - `INFLUX_HOST = "localhost"` (bots run natively on same box as Dockerized InfluxDB)
-  - `INFLUX_PORT = 8086`
-  - `INFLUX_DB_NAME = "trading_bots"` (must match docker-compose `INFLUXDB_DB` exactly)
-- **`bot_config.json`** (gitignored, template provided) — Runtime state: bot status
-  (active/paused), allocation percentages, market condition, emergency stop flag.
-- **`active_targets.json`** (gitignored) — Dynamic watchlists SCP'd from Corsair. Keys:
-  `wheel_targets`, `condor_targets`, `trend_targets`, `survivor_targets`, `short_targets`,
-  `updated`.
-
-### Monitoring Stack (Docker)
-
-All three services share a Docker network on the Beelink (`docker-compose.yml` in `~/homelab/`):
-
-| Container | Image | Port | Purpose |
-|-----------|-------|------|---------|
-| `influxdb` | `influxdb:1.8` | 8086 | Time-series storage (v1 write API, no auth) |
-| `grafana` | `grafana/grafana-oss:latest` | 3000 | Dashboard visualization |
-| `wg-easy` | `ghcr.io/wg-easy/wg-easy` | 51820/udp, 51821/tcp | WireGuard VPN |
-
-**Important networking notes:**
-- Bots write to `localhost:8086` (host port mapped into the InfluxDB container)
-- Grafana references InfluxDB as `http://influxdb:8086` (container hostname, same Docker network)
-- InfluxDB 1.8 was chosen deliberately over 2.x for compatibility with the bots' v1 write API
-  (`/write?db=trading_bots`, no auth tokens)
-
-### Data Flow
-
-```
-Corsair (Gemma 4 21B analysis) ──SCP──► active_targets.json on Beelink
-                                              │
-Market Data (Alpaca/yfinance) ──► Bot Analysis ──► Trade Execution (Alpaca)
-                                                          │
-                                                          ▼
-                                                InfluxDB (trade logs)
-                                                          │
-                                                          ▼
-                                      Accountant (P&L calc) ──► Grafana (dashboards)
-                                                          │
-                                                          ▼
-                                                Discord (notifications)
-```
+`tiered_hold.py` scores positions (P&L, signal validity, confidence, duration, regime/VIX
+penalties) into CLOSE_EOD / HOLD_OVERNIGHT / HOLD_SWING at the 15:30 ET window; 15:45+ ET
+liquidates CLOSE_EOD. `max_hold_days_for_tier` is the hard backstop exit (3d/7d).
+*Partially wired:* `OVERNIGHT_STOPS` stop/trailing percentages and `premarket_check()` are
+defined but not yet enforced anywhere — only `max_hold_days` is live.
 
 ## Key Conventions
 
-### Code Patterns
+- **One name per bot, everywhere.** The registry key (e.g. `moon_bot`) is the PM2 process name,
+  bot_config key, order-tag prefix, and budget key. (The old `moon_bag` PM2 name is retired.)
+- InfluxDB measurements use the `_trades` suffix; webhook keys use the `WEBHOOK_` prefix
+  (moon_bot's is `WEBHOOK_MOONBAG`, historical).
+- Webhooks are skipped when unset or containing `"YOUR"` (unconfigured sentinel).
+- Crypto bots run 24/7; equity bots gate on market hours.
+- **Commit style:** lowercase, concise, no conventional-commit prefixes.
 
-- **Discord notifications:** Each bot has a `send_discord(msg)` function using its own webhook.
-  Webhooks are skipped if the URL contains `"YOUR"` (unconfigured sentinel).
-- **InfluxDB logging:** Each bot has a `log_to_influx()` function writing to bot-specific
-  measurements (`trades`, `wheel_trades`, `condor_trades`, `survivor_trades`, `crypto_trades`,
-  `breakout_trades`).
-- **Market hours check:** Bots check if markets are open before trading. Crypto bots run 24/7.
-- **Error handling:** Try/except blocks with fallback defaults. Budget check defaults to allowing
-  trades on error. Bots sleep and retry on exceptions.
-- **Config imports:** All bots import `config` (the gitignored secrets file) and most import
-  `utils` for shared functions.
-- **Order tagging:** All orders use `client_order_id` format `{bot_name}-{symbol}-{timestamp}`
-  for ownership resolution.
+## Testing
 
-### Known Issues / Tech Debt
+`python -m unittest test_orphan_resolution -v` — regression suite for the ownership/entry-time
+paging fix. Run it after touching `utils.py` ownership/order code. Strategy changes are still
+validated through paper trading; there is no backtest harness.
 
-- **Silent InfluxDB failures (resolved):** `log_to_influx()` functions previously used bare
-  `except: pass`, causing write failures to fail silently (root cause of the initial
-  empty-dashboard issue after the Grafana migration). They now check the HTTP status code and
-  log a warning on failure. Remaining bare `except: pass` are limited to best-effort Discord
-  sends in `commander.py`.
-- **accountant.py BOT_MAPPING divergence (resolved):** The accountant's duplicate `BOT_MAPPING`
-  copy has been removed; ownership is now resolved solely via `utils.get_bot_owner`.
-- **Position orphaning from bounded order window (resolved):** `_build_order_based_map` and
-  `get_position_entry_times` derived ownership + entry time from a single `limit=500` order
-  lookup. High-frequency `crypto_grid` orders flooded that window, so an aged equity position's
-  opening order scrolled out — silently stripping its owner tag and hold duration and disabling
-  stop-loss / max-hold exits (GEN/APTV bled for ~3 weeks). Fixed by paging order history
-  (`utils._fetch_orders_covering`, stops early once held symbols are covered), priming the
-  ownership cache each cycle (`utils.prime_ownership`), a hard `max_hold_days` backstop exit in
-  `trend_bot`/`survivor_bot` (`tiered_hold.max_hold_days_for_tier`), a logged+metered ownership
-  fallback (`ownership_fallback` measurement), and an accountant orphan sweep
-  (`orphan_position` measurement + overseer alert). Regression coverage in
-  `test_orphan_resolution.py`.
-- **Iron condor bot:** Sidelined and excluded from allocations. Do not reactivate without
-  solving Alpaca's multi-leg position tracking limitations.
+## Known Issues / Tech Debt
 
-### Naming Conventions
-
-- Bot scripts are named descriptively: `wheel_bot.py`, `trend_bot.py`, etc.
-- InfluxDB measurements use `_trades` suffix: `wheel_trades`, `condor_trades`, etc.
-- Discord webhook config keys use `WEBHOOK_` prefix: `WEBHOOK_WHEEL`, `WEBHOOK_TREND`, etc.
-- Bot names in `bot_config.json` match script names without `.py` extension.
-
-### Commit Style
-
-Commits use lowercase, concise descriptions focused on what changed:
-- `fixed condor from opening half condors`
-- `fixed wheel bot to account for open orders`
-- `bot fratricide fixes`
-
-No conventional commit prefixes (feat:, fix:, etc.) are used. Keep messages short and direct.
-
-## Dependencies
-
-```
-alpaca-py          # Alpaca Markets API client (trading + data)
-pandas             # DataFrames for trade analysis
-ta                 # Technical analysis indicators (RSI, EMA, ADX) — used by trend_bot/survivor_bot
-yfinance           # Yahoo Finance market data
-requests           # HTTP for webhooks and InfluxDB writes
-pytz               # Timezone handling (US/Eastern)
-discord.py         # Discord bot framework (commander.py)
-```
-
-Install: `pip install -r requirements.txt`
-
-## External Services Required
-
-| Service | Purpose | Config Location |
-|---------|---------|-----------------|
-| Alpaca Markets | Trading API (paper/live) | `config.API_KEY`, `config.SECRET_KEY`, `config.PAPER` |
-| InfluxDB 1.8 | Time-series trade logging | `config.INFLUX_HOST` (localhost), `config.INFLUX_PORT` (8086), `config.INFLUX_DB_NAME` (trading_bots) |
-| Discord | Notifications + fleet control | `config.DISCORD_TOKEN`, `config.DISCORD_CHANNEL_ID`, `WEBHOOK_*` |
-| PM2 | Process management | External, not in repo |
-| Grafana | Dashboard visualization | Reads from InfluxDB, configured at `http://<beelink-ip>:3000` |
-
-## Running the Fleet
-
-Each bot is started as a PM2 process (staggered 10s apart):
-
-```bash
-pm2 start wheel_bot.py --name wheel_bot
-pm2 start trend_bot.py --name trend_bot
-pm2 start survivor_bot.py --name survivor_bot
-pm2 start crypto_grid.py --name crypto_grid
-pm2 start crypto_breakout.py --name moon_bag
-pm2 start accountant.py --name accountant
-pm2 start commander.py --name commander
-```
-
-The commander bot's watchdog task auto-restarts bots based on `bot_config.json` status.
+- **wheel_bot dual budget path:** it checks `utils.check_budget` AND reads
+  `effective_budgets.json` directly (`get_my_budget`, $20k fallback). Consolidate when wheel
+  ports to the runner.
+- **tiered_hold overnight stops unwired** (see above) — `max_hold_days` is the only enforced
+  backstop.
+- **trend/wheel/crypto still on legacy scaffolding** pending the survivor pilot verdict.
+- **commander bare `except: pass`** remains on best-effort Discord sends.
+- Historical postmortems (GEN/APTV orphaning root cause, InfluxDB silent-failure eras) live in
+  git history and `test_orphan_resolution.py`'s docstring.
 
 ## Important Rules for Code Changes
 
-1. **Never commit secrets.** `config.py`, `bot_config.json`, and `keys.json` are gitignored.
-2. **Position ownership is sacred.** Adding new tickers requires updating `BOT_MAPPING` in
-   `utils.py` to prevent bot fratricide.
-3. **Budget allocations must sum reasonably.** Check `bot_config.template.json` for current
-   splits. Crypto bots share some allocation overlap.
-4. **Crypto bots share tickers.** `crypto_grid` and `moon_bag` both trade BTC/USD. The
-   ownership model defaults crypto to `crypto_grid`.
-5. **No formal tests exist.** Changes should be validated through paper trading. Be extra
-   careful with order logic and position sizing.
-6. **InfluxDB measurements are bot-specific.** If adding a new bot, create a corresponding
-   measurement name and update `accountant.py` queries.
-7. **Silent failures are fleet killers.** The CFO import error cascade (GetOrdersRequest) and
-   bare `except: pass` in InfluxDB writes both caused multi-day silent failures. Always add
-   meaningful error logging.
-8. **Iron condor bot is excluded from all allocations.** Do not add it to CFO budget lines.
-9. **`config.py` InfluxDB settings must match docker-compose exactly.** The database name
-   `trading_bots` must be identical in both places (a past typo of `tradingbots` vs
-   `trading_bots` caused silent write failures).
+1. **Never commit secrets.** `config.py`, `bot_config.json`, `keys.json` are gitignored.
+2. **The registry is the only bot list.** New bots register in `fleet_registry.py`; do not add
+   per-bot name lists to any other module.
+3. **Position ownership is sacred.** Every order carries the bot's tag via
+   `client_order_id` — use `FleetBot.tag()`/`market_order()` or match the format exactly.
+4. **Budget allocations must sum sensibly** across `bot_config` + `cfo_settings`.
+5. **Silent failures are fleet killers.** No bare `except: pass` on anything that matters;
+   errors go through `registry.log_error` (they land in Grafana via error_watchdog).
+6. **`config.py` must say `INFLUX_HOST = "influxdb"`** and `INFLUX_DB_NAME = "trading_bots"`
+   (must match compose `INFLUXDB_DB`; a past `tradingbots` typo caused silent write failures).
+7. **Deploy changes ship with code.** Anything touching `requirements.txt` or `deploy/` needs a
+   container rebuild on the Beelink — say so in the PR/commit.
+8. **Run the orphan regression suite** after touching ownership/order-history code.
