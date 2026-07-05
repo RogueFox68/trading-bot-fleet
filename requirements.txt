@@ -1,11 +1,9 @@
 alpaca-py
 pandas
-pandas-ta-classic
+numpy
 ta
 yfinance
 requests
 pytz
 discord.py
-influxdb
-python-dotenv
 tzdata

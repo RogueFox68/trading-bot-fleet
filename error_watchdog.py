@@ -1,71 +1,103 @@
+"""Tails logs/fleet_error_registry.jsonl and ships each error event to
+InfluxDB as a bot_error_events row, so registry errors show up in Grafana
+instead of sitting in a file nobody reads.
+
+Runs as a PM2 process inside the fleet container (see
+deploy/ecosystem.config.js). Uses the same config.py + raw line-protocol
+write path as the rest of the fleet - no extra client libraries.
+"""
+import json
 import os
 import time
-import json
-from influxdb import InfluxDBClient
-from dotenv import load_dotenv
+import datetime
+import requests
+import config
 
-# Load Docker environment variables
-load_dotenv()
-
-INFLUX_HOST = os.getenv('INFLUX_HOST', 'influxdb')
-INFLUX_PORT = int(os.getenv('INFLUX_PORT', 8086))
-DB_NAME = 'trading_bots'  # Per CLAUDE.md Rule 9, must be exactly this
 REGISTRY_FILE = "logs/fleet_error_registry.jsonl"
+WRITE_URL = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
+QUERY_URL = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/query"
 
-def setup_influx():
-    client = InfluxDBClient(host=INFLUX_HOST, port=INFLUX_PORT)
-    # Ensure database exists
-    if {'name': DB_NAME} not in client.get_list_database():
-        client.create_database(DB_NAME)
-    client.switch_database(DB_NAME)
-    return client
 
-def tail_and_push(client):
-    """Tails the JSONL file and pushes new errors to InfluxDB"""
-    print(f"Starting Error Watchdog. Tailing {REGISTRY_FILE}...")
-    print(f"Pushing to InfluxDB at {INFLUX_HOST}:{INFLUX_PORT}")
-    
-    # Ensure the file exists before tailing
+def ensure_database():
+    """Idempotently create the database (matches docker-compose INFLUXDB_DB)."""
+    try:
+        requests.post(QUERY_URL, params={"q": f'CREATE DATABASE "{config.INFLUX_DB_NAME}"'}, timeout=5)
+    except Exception as e:
+        print(f"[watchdog] could not ensure database (continuing): {e}")
+
+
+def _tag(value):
+    """Sanitize a tag value for line protocol (no spaces/commas/equals)."""
+    return str(value or "unknown").replace(" ", "_").replace(",", "_").replace("=", "_")
+
+
+def _field_str(value):
+    """Escape a string field value for line protocol."""
+    return str(value or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _timestamp_ns(iso_str):
+    """Registry timestamps are naive local time; fall back to now on parse failure."""
+    try:
+        dt = datetime.datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.astimezone()
+        return int(dt.timestamp() * 1e9)
+    except Exception:
+        return time.time_ns()
+
+
+def push_error(error_data):
+    line = (
+        f"bot_error_events,"
+        f"bot_id={_tag(error_data.get('bot_id'))},"
+        f"component={_tag(error_data.get('component'))},"
+        f"error_type={_tag(error_data.get('error_type'))} "
+        f'value=1i,message="{_field_str(error_data.get("message"))}",'
+        f'context="{_field_str(error_data.get("context"))}" '
+        f"{_timestamp_ns(error_data.get('timestamp', ''))}"
+    )
+    r = requests.post(WRITE_URL, data=line.encode("utf-8"), timeout=5)
+    if r.status_code != 204:
+        print(f"[watchdog] influx write failed: {r.status_code} {r.text[:200]}")
+
+
+def tail_and_push():
+    print(f"[watchdog] tailing {REGISTRY_FILE} -> {WRITE_URL}")
+    os.makedirs(os.path.dirname(REGISTRY_FILE), exist_ok=True)
     if not os.path.exists(REGISTRY_FILE):
-        open(REGISTRY_FILE, 'a').close()
+        open(REGISTRY_FILE, "a").close()
 
-    with open(REGISTRY_FILE, 'r') as f:
-        # Seek to the end of the file (only process new errors)
-        f.seek(0, 2)
-        
-        while True:
-            line = f.readline()
-            if not line:
-                time.sleep(1) # Wait for new errors
-                continue
-                
+    f = open(REGISTRY_FILE, "r")
+    f.seek(0, 2)  # only ship errors logged after startup
+    inode = os.fstat(f.fileno()).st_ino
+
+    while True:
+        line = f.readline()
+        if line:
             try:
-                error_data = json.loads(line.strip())
-                
-                # Format payload for InfluxDB
-                json_body = [{
-                    "measurement": "bot_error_events",
-                    "tags": {
-                        "bot_id": error_data.get("bot_id", "unknown"),
-                        "component": error_data.get("component", "unknown"),
-                        "error_type": error_data.get("error_type", "unknown")
-                    },
-                    "fields": {
-                        "value": 1,
-                        "message": error_data.get("message", ""),
-                        "context": error_data.get("context", "")
-                    }
-                }]
-                
-                client.write_points(json_body)
-                print(f"Logged error to InfluxDB: {error_data.get('bot_id')} -> {error_data.get('component')}")
-                
+                push_error(json.loads(line.strip()))
             except json.JSONDecodeError:
-                pass # Ignore malformed lines to prevent the watchdog from crashing
+                continue  # skip malformed lines
             except Exception as e:
-                print(f"InfluxDB Write Failure (Watchdog surviving): {e}")
-                time.sleep(5) # Back off if DB is unreachable
+                print(f"[watchdog] write failure (surviving): {e}")
+                time.sleep(5)
+            continue
+
+        # No new data: watch for RotatingFileHandler swapping the file out
+        # under us, otherwise we'd tail a rotated file forever.
+        time.sleep(1)
+        try:
+            st = os.stat(REGISTRY_FILE)
+            if st.st_ino != inode or st.st_size < f.tell():
+                f.close()
+                f = open(REGISTRY_FILE, "r")
+                inode = os.fstat(f.fileno()).st_ino
+                print("[watchdog] registry file rotated, reopened.")
+        except FileNotFoundError:
+            pass
+
 
 if __name__ == "__main__":
-    influx_client = setup_influx()
-    tail_and_push(influx_client)
+    ensure_database()
+    tail_and_push()
