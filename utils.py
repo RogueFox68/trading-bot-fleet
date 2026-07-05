@@ -10,16 +10,16 @@ import config
 
 # --- CENTRALIZED TRADE LOGGING ---
 # Maps the bot tag embedded in client_order_id ('{bot}-{symbol}-{ts}') to its
-# InfluxDB measurement. condor_bot routes its rollback market-sells through
-# submit_and_log_order, so it is mapped here to keep those fills out of the
-# trend 'trades' measurement.
+# InfluxDB measurement. condor_bot is retired (2026-07) but its tag stays
+# mapped so any historical condor order that flows through fill logging or
+# ownership resolution never misattributes to another bot's measurement.
 MEASUREMENT_BY_BOT = {
     "trend_bot":    "trades",
     "survivor_bot": "survivor_trades",
     "wheel_bot":    "wheel_trades",
     "crypto_grid":  "crypto_trades",
     "moon_bot":     "breakout_trades",
-    "condor_bot":   "condor_trades",
+    "condor_bot":   "condor_trades",  # retired; historical orders only
 }
 
 def _log_fill_to_influx(order, logger, reason="", action=None):
@@ -67,10 +67,9 @@ else:
 # This defines which bot is allowed to trade which ticker
 BOT_MAPPING = {
     "survivor_bot": [],
-    "wheel_bot": [], 
-    "condor_bot": [],
+    "wheel_bot": [],
     "crypto_grid": ["BTC/USD", "ETH/USD", "SOL/USD"],
-    "moon_bot": ["BTC/USD", "ETH/USD"]
+    "moon_bot": ["BTC/USD", "ETH/USD", "SOL/USD"]
 }
 
 # Cache to avoid reading the file on every position in the loop
@@ -78,6 +77,7 @@ _ownership_cache = {}
 _ownership_cache_time = 0
 
 # Bot tags that can appear in a client_order_id ('{bot}-{symbol}-{ts}').
+# condor_bot is retired but kept: its tag still exists on historical orders.
 _KNOWN_BOT_TAGS = ["survivor_bot", "trend_bot", "wheel_bot", "condor_bot", "crypto_grid", "moon_bot"]
 
 def _fetch_orders_covering(trading_client, held_symbols=None, require_fill=False,
@@ -219,13 +219,16 @@ def get_bot_owner(symbol, asset_class, trading_client):
             if char.isdigit():
                 root = symbol[:i]
                 break
-        
-        # Check dynamic map for the specific contract OR the root
+
+        # Check dynamic map for the specific contract OR the root.
+        # Historical condor orders still resolve to condor_bot via the tag;
+        # untagged options default to wheel_bot (the only live options bot
+        # since condor retired).
         owner = owner_map.get(symbol) or owner_map.get(root)
         if owner in ("wheel_bot", "condor_bot"):
             return owner
-            
-        return owner if owner else "condor_bot"
+
+        return owner if owner else "wheel_bot"
     
     # 4. Stock/ETF Rules — check dynamic map for exact symbol
     owner = owner_map.get(symbol)

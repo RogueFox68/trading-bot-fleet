@@ -47,9 +47,6 @@ def get_segregated_targets():
     Returns specific survivor targets and a BLACKLIST of other bots' targets.
     This prevents Survivor from selling Trend Bot's positions.
     """
-    survivor_targets = {}
-    blacklist = []
-    
     # Helper to extract symbols
     def extract_symbols(raw_dict):
         return list(raw_dict.keys()) if isinstance(raw_dict, dict) else []
@@ -57,21 +54,17 @@ def get_segregated_targets():
     # 1. Survivor Targets (Fallback: Empty)
     survivor_targets = utils.load_and_validate_targets(TARGET_FILE, "survivor_targets", {})
 
-    # 2. Blacklist (Trend + Wheel + Condor)
+    # 2. Blacklist (Trend + Wheel). Fallbacks are empty: when targets are
+    #    stale/missing no bot is entering anything, so there is nothing of
+    #    theirs to protect.
     blacklist = []
-    
-    # Trend Fallback
-    trend_fallback = {sym: {"confidence": 0.5} for sym in ["NVDA", "TSLA", "COIN"]}
-    trend_raw = utils.load_and_validate_targets(TARGET_FILE, "trend_targets", trend_fallback)
+
+    trend_raw = utils.load_and_validate_targets(TARGET_FILE, "trend_targets", {})
     blacklist += extract_symbols(trend_raw)
-    
-    # Wheel Fallback
-    wheel_fallback = {sym: {"confidence": 0.5} for sym in utils.BOT_MAPPING.get("wheel_bot", [])}
-    wheel_raw = utils.load_and_validate_targets(TARGET_FILE, "wheel_targets", wheel_fallback)
+
+    wheel_raw = utils.load_and_validate_targets(TARGET_FILE, "wheel_targets", {})
     blacklist += extract_symbols(wheel_raw)
-    
-    # Condor Fallback (static only, removed from active_targets)
-    blacklist += utils.BOT_MAPPING.get("condor_bot", [])
+
     return survivor_targets, set(blacklist)
 
 def get_data_alpaca(symbol):

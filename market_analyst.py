@@ -113,10 +113,9 @@ def update_bot_config(regime, vix_val, climate):
             # Accountant always runs
             if bot_name == "accountant": continue
             
-            # Phase 7: Disable Condor/Moon Bot Revivals
-            # We completely skip these bots here so that any manual state 
-            # set by the user in bot_config.json is never overwritten by the analyst.
-            if bot_name in ["condor_bot", "moon_bot"]:
+            # Manual-state bots: the analyst never overwrites their status,
+            # so a state set by the user in bot_config.json sticks.
+            if bot_name in ["moon_bot"]:
                 continue
             
             if bots[bot_name]['status'] != target_status:

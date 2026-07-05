@@ -26,7 +26,9 @@ DB_QUERY_URL = f"http://{INFLUX_HOST}:{INFLUX_PORT}/query"
 
 # Options measurements log per-share premium and contract qty, so their realized
 # P&L must be scaled by the 100-share contract multiplier to express dollars.
-OPTION_MEASUREMENTS = {"wheel_trades", "condor_trades"}
+# (condor_trades history remains in InfluxDB but the retired bot is no longer
+# queried or reported.)
+OPTION_MEASUREMENTS = {"wheel_trades"}
 OPTION_CONTRACT_SIZE = 100
 
 # --- CLIENT ---
@@ -36,7 +38,7 @@ def query_influx_trades(days=30):
     """Fetches trade history from InfluxDB to calculate Realized P&L."""
     try:
         # Includes breakout_trades (moon_bot) so its realized P&L is attributed.
-        query = f"SELECT * FROM trades, crypto_trades, survivor_trades, wheel_trades, condor_trades, breakout_trades WHERE time > now() - {days}d"
+        query = f"SELECT * FROM trades, crypto_trades, survivor_trades, wheel_trades, breakout_trades WHERE time > now() - {days}d"
         params = {'db': INFLUX_DB_NAME, 'q': query, 'epoch': 's'}
         response = requests.get(DB_QUERY_URL, params=params, timeout=5)
         data = response.json()
@@ -107,7 +109,6 @@ def calculate_realized_pl(df):
             "crypto_trades": "crypto_grid",
             "survivor_trades": "survivor_bot",
             "wheel_trades": "wheel_bot",
-            "condor_trades": "condor_bot",
             "breakout_trades": "moon_bot"
         }
         bot_name = mapping.get(bot)
@@ -208,7 +209,7 @@ def detect_orphans(positions, trading_client):
 
 bot_idle_cycles = {
     "trend_bot": 0, "survivor_bot": 0, "wheel_bot": 0,
-    "crypto_grid": 0, "moon_bot": 0, "condor_bot": 0
+    "crypto_grid": 0, "moon_bot": 0
 }
 
 def is_bot_gated(bot, regime, vix):
@@ -338,7 +339,6 @@ def run_accountant():
             unrealized_stats = {
                 "survivor_bot": 0.0, "trend_bot": 0.0,
                 "wheel_bot": 0.0, "crypto_grid": 0.0,
-                "condor_bot": 0.0,
                 "moon_bot": 0.0  # realized breakout P&L reported here (crypto positions still owned by crypto_grid)
             }
             allocation_stats = unrealized_stats.copy()
