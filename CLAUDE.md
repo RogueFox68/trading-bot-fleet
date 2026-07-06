@@ -82,14 +82,16 @@ trading-bot-fleet/
 ├── Infrastructure (PM2 processes in the container)
 │   ├── commander.py             # Discord bot: /status /stop /start /panic /resume + watchdog
 │   ├── accountant.py            # CFO: P&L attribution, dynamic reallocation, CAPITAL_CRUNCH,
-│   │                            # orphan sweep, fill reconciliation trigger
+│   │                            # orphan sweep, fill + option-event (assignment) reconciliation
 │   ├── market_analyst.py        # SPY regime (BULL_TREND/SIDEWAYS/BEAR_TREND/CRITICAL_VOLATILITY)
 │   │                            # + VIX → writes global_settings in bot_config.json
 │   └── error_watchdog.py        # Tails logs/fleet_error_registry.jsonl → InfluxDB
 │                                # bot_error_events (errors visible in Grafana)
 │
 ├── Tests & tools
-│   ├── test_orphan_resolution.py  # Regression: aged-position ownership/entry-time resolution
+│   ├── test_orphan_resolution.py  # Regression: ownership/entry-time resolution + root inference
+│   ├── test_fill_logging.py       # Regression: ms-floored fill stamps, wheel close ladder
+│   ├── dedupe_trades.py           # One-off: delete pre-fix duplicate trade rows (dry-run default)
 │   ├── export_data.py             # Export InfluxDB trade data to CSV
 │   └── fetch_trade_history.py     # Pull raw FILL activities from Alpaca
 │
@@ -157,10 +159,20 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
 - `utils._build_order_based_map()` pages Alpaca order history (`_fetch_orders_covering`) until
   every held symbol's opening order is found — never a single bounded window (that caused the
   GEN/APTV orphaning bug). 60s cache; bots prime it each cycle via `utils.prime_ownership`.
-- `utils.get_bot_owner()` resolution: crypto → `crypto_grid`; options → order-history tag, else
-  `wheel_bot`; stocks → order-history tag, else `trend_bot` (fallback is logged + metered as
-  `ownership_fallback` so orphans stay visible).
-- The accountant runs an orphan sweep each cycle (`orphan_position` measurement + overseer alert).
+- `utils.get_bot_owner()` resolution: crypto → `crypto_grid`; options → order-history tag
+  (contract or root), else `wheel_bot`; stocks → order-history tag, else the root inferred from
+  a bot's own **option** orders (assigned/exercised stock → wheel_bot), else **`None` = unowned**.
+  A direct symbol tag always outranks root inference. There is deliberately no default owner:
+  the old `else trend_bot` fallback let trend_bot adopt and liquidate wheel-assigned PAAS stock
+  (2026-07-06). Unowned positions are quarantined — every bot filters holdings by its own name —
+  and metered via `ownership_fallback`.
+- The accountant runs an orphan sweep each cycle: orphan = **unowned** (the resolver's own
+  definition) → `orphan_position` metric + overseer alert. Owned positions with no resolvable
+  entry time (assignment-created stock has no opening order) emit `entry_time_missing` instead —
+  the owner manages them, but time-based backstops (max-hold) are blind for them.
+- The accountant also logs option lifecycle events (OPASN/OPEXC/OPEXP) from Alpaca account
+  activities into `wheel_trades` (actions `assigned`/`exercised`/`expired`, ignored by realized
+  P&L pairing) and pings the overseer on assignment/exercise.
 - **Crypto special case:** crypto_grid and moon_bot share BTC/ETH/SOL. Ownership resolves the
   *positions* to crypto_grid; moon_bot tracks its own coins in `moon_bot_state.json` so its
   trailing stop only sells what it bought, and its entries don't depend on the shared position.
@@ -170,7 +182,9 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
 `utils.check_budget(bot_name, client)` before every entry:
 
 - Budget = dynamic `effective_budgets.json` (written by the accountant's reallocation) with
-  fallback to `bot_config.json` allocation × equity.
+  fallback to `cfo_settings.base_allocations × (1 − unallocated_reserve) × equity` — the same
+  formula the reallocator uses, so the two paths can't drift. `bots{}.allocation` only covers
+  bots outside `cfo_settings`.
 - **Fail-closed** when `bot_config.json` is missing or the bot has no allocation.
   **Fail-open** on runtime/API errors (deliberate for paper trading — revisit before live).
 - Counts held positions (options at collateral) + pending tagged orders.
@@ -186,13 +200,32 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
   Options rely on the bots' own collateral/BP checks; crypto is exempt.
 - Trade rows are written to InfluxDB **from confirmed fills** (broker price/qty/time), with the
   accountant reconciling late fills from Alpaca (`utils.reconcile_fills`, `RECONCILED_BOTS`).
+  Rows are stamped at the fill time **floored to the millisecond** so the submit-time and
+  reconciled writes land on one point (Alpaca's two order endpoints serialize `filled_at` with
+  sub-µs differences; raw-ns stamps duplicated an unpredictable subset of fills).
+
+### Wheel Expiry Safety (post PAAS assignment postmortem)
+
+- Buy-to-closes use an escalating price ladder — midpoint → half-cross → ask
+  (`close_option_position`), ~10s per rung — never a bare midpoint limit that can't fill, and
+  a wide spread never blocks a risk-reducing close.
+- ITM contracts at DTE ≤ `FORCE_CLOSE_DTE` (5) are closed outright, with no roll target
+  required (deep ITM often has none). Rolls trigger at DTE ≤ `STALE_ROLL_DTE` (10). A close
+  that survives the full ladder `CLOSE_FAIL_ALERT_AFTER` (3) cycles in a row alerts Discord +
+  the error registry.
+- `bot_config.json` `bots.wheel_bot.force_close_symbols` / `force_roll_symbols` are per-ticker
+  runtime levers (ladder-priced, so they work on wide spreads too).
+- Covered calls only count **wheel-owned** shares (never another bot's stock) and are written
+  on owned stock even when the ticker is off the scout list — including under VIX/regime/crunch
+  gates, since a call on held shares adds no collateral and reduces risk.
 
 ### Market Regime & Gating
 
 `market_analyst` (15-min cycle) writes `market_condition`, `vix`, `macro_climate` into
 `bot_config.json`. VIX > 28 pauses all non-manual bots. Per-bot entry gating lives in the
-registry (`gated_when`): wheel_bot gates on BEAR_TREND/CRITICAL_VOLATILITY or VIX > 22;
-crypto_grid on bear regimes. Gated bots keep managing existing positions.
+registry (`gated_when`): wheel_bot gates on BEAR_TREND/CRITICAL_VOLATILITY or VIX > 22
+(covered calls on owned stock exempt); crypto_grid on bear regimes. Gated bots keep managing
+existing positions.
 
 ### Tiered Hold System
 
@@ -214,9 +247,11 @@ defined but not yet enforced anywhere — only `max_hold_days` is live.
 
 ## Testing
 
-`python -m unittest test_orphan_resolution -v` — regression suite for the ownership/entry-time
-paging fix. Run it after touching `utils.py` ownership/order code. Strategy changes are still
-validated through paper trading; there is no backtest harness.
+`python -m unittest test_orphan_resolution test_fill_logging -v` — regression suites for the
+ownership/entry-time paging fix (+ option-root inference and the no-default-owner rule) and for
+fill-row stamping / wheel close-ladder pricing. Run them after touching `utils.py`
+ownership/order/logging code or wheel close logic. Strategy changes are still validated through
+paper trading; there is no backtest harness.
 
 ## Known Issues / Tech Debt
 
