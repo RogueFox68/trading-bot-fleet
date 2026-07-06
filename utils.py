@@ -32,8 +32,16 @@ def _log_fill_to_influx(order, logger, reason="", action=None):
         bot = next((b for b in MEASUREMENT_BY_BOT if c_id.startswith(f"{b}-")), None)
         measurement = MEASUREMENT_BY_BOT.get(bot, "trades")
         act = action or ("buy" if order.side == OrderSide.BUY else "sell")
-        # Use the broker fill time, not now() — also fixes time skew.
-        ns = int(order.filled_at.timestamp() * 1e9) if getattr(order, "filled_at", None) else time.time_ns()
+        # Use the broker fill time, not now() — also fixes time skew. Floored
+        # to the millisecond: get_order_by_id and get_orders serialize
+        # filled_at with sub-µs differences, so raw-ns stamps made the
+        # submit-time write and the reconciled write land ~1µs apart as
+        # duplicate points instead of overwriting one another (inflating
+        # SUM(qty)). Same-symbol fills are never <1ms apart for these bots.
+        if getattr(order, "filled_at", None):
+            ns = int(order.filled_at.timestamp() * 1000) * 1_000_000
+        else:
+            ns = time.time_ns()
         reason_field = f',reason="{reason}"' if reason else ""
         line = (f'{measurement},symbol={order.symbol} '
                 f'price={float(order.filled_avg_price)},action="{act}",'
@@ -73,6 +81,9 @@ _ownership_cache_time = 0
 # Bot tags that can appear in a client_order_id ('{bot}-{symbol}-{ts}').
 # Includes retired tags (condor) that still exist on historical orders.
 _KNOWN_BOT_TAGS = list(fleet_registry.BOTS) + list(fleet_registry.RETIRED_BOT_MEASUREMENTS)
+
+# OCC option symbol: root + YYMMDD + P/C + strike*1000 (e.g. PAAS260702P00048000)
+_OCC_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})\d{6}[PC]\d{8}$")
 
 def _fetch_orders_covering(trading_client, held_symbols=None, require_fill=False,
                            page_size=500, max_orders=None):
@@ -170,19 +181,33 @@ def _build_order_based_map(trading_client, held_symbols=None):
     #    Newest-first: the first tagged order for a symbol wins and overrides the
     #    static baseline, so the most recent owner sticks.
     order_set = set()
+    root_claims = {}
     orders = _fetch_orders_covering(trading_client, held_symbols=held_symbols)
     for o in orders:
         # client_order_id format: "{bot_name}-{symbol}-{timestamp}"
         c_id = o.client_order_id
         if not c_id:
             continue
-        if o.symbol in order_set:
+        bot = next((b for b in _KNOWN_BOT_TAGS if c_id.startswith(f"{b}-")), None)
+        if bot is None:
             continue
-        for bot in _KNOWN_BOT_TAGS:
-            if c_id.startswith(f"{bot}-"):
-                owner_map[o.symbol] = bot
-                order_set.add(o.symbol)
-                break
+        if o.symbol not in order_set:
+            owner_map[o.symbol] = bot
+            order_set.add(o.symbol)
+        # A tagged OPTION order is also a (weaker) claim on its underlying:
+        # assignment/exercise turns the contract into bare stock that never
+        # gets a tagged order of its own, so without the root claim that
+        # stock resolves to nobody (the PAAS assignment-liquidation bug).
+        # Retired bots don't claim roots — nothing manages their positions.
+        occ = _OCC_SYMBOL_RE.match(o.symbol or "")
+        if occ and bot in fleet_registry.BOTS and occ.group(1) not in root_claims:
+            root_claims[occ.group(1)] = bot
+
+    # Direct symbol tags always outrank root inference: an explicit order on
+    # the bare symbol is an unambiguous claim; the root claim only covers
+    # shares that appeared without one (assignment/exercise).
+    for root, bot in root_claims.items():
+        owner_map.setdefault(root, bot)
 
     _ownership_cache = owner_map
     _ownership_cache_time = now
@@ -198,7 +223,15 @@ def prime_ownership(trading_client, held_symbols):
     return _build_order_based_map(trading_client, held_symbols=held_symbols)
 
 def get_bot_owner(symbol, asset_class, trading_client):
-    """Determines which bot owns a specific position based on order history."""
+    """Determines which bot owns a specific position based on order history.
+
+    Resolution: crypto -> crypto_grid; options -> tag (contract or root), else
+    wheel_bot; stocks -> tag, else root inferred from a bot's own option
+    orders (assigned/exercised stock), else None. None means NO bot manages
+    the position — callers compare against their own name, so an unowned
+    position simply drops out of every bot's holdings (quarantined) while the
+    accountant's orphan sweep keeps alerting on it.
+    """
     # 1. Crypto Rules
     if asset_class == AssetClass.CRYPTO:
         return "crypto_grid"
@@ -224,33 +257,37 @@ def get_bot_owner(symbol, asset_class, trading_client):
 
         return owner if owner else "wheel_bot"
     
-    # 4. Stock/ETF Rules — check dynamic map for exact symbol
+    # 4. Stock/ETF Rules — check dynamic map for exact symbol (includes roots
+    #    inferred from a bot's own option orders, e.g. assigned stock -> wheel)
     owner = owner_map.get(symbol)
     if owner:
         return owner
 
-    # 5. Default fallback (e.g., manually placed order without tag, or an opening
-    #    order that aged out of history entirely). This is a catch-all, not a
-    #    durable tag: surface it so orphaned positions don't stay invisible.
+    # 5. No tag anywhere (manual order, or an opening order gone from history
+    #    entirely). Do NOT hand it to a bot: a default owner lets a strategy
+    #    manage and liquidate shares it never bought (trend_bot dumped
+    #    wheel-assigned PAAS on 2026-07-06 through exactly this path). Leave
+    #    it unowned — no bot trades it — and surface it; the accountant's
+    #    orphan sweep alerts until a human resolves it.
     _note_ownership_fallback(symbol)
-    return "trend_bot"
+    return None
 
 # Throttle so a persistently-untagged symbol doesn't spam the log/metric each cycle.
 _fallback_log_times = {}
 
 def _note_ownership_fallback(symbol):
-    """Surface an untagged equity that resolved only via the trend_bot default.
+    """Surface an untagged equity that no bot owns.
 
     Logs a throttled warning (once / 10 min per symbol) and writes an
-    'ownership_fallback' InfluxDB metric, so a position whose real tag has aged
-    out of order history is visible instead of silently absorbed by the fallback.
+    'ownership_fallback' InfluxDB metric, so an unowned position is visible
+    (and stays visible) instead of being silently absorbed by a default owner.
     """
     now = time.time()
     if now - _fallback_log_times.get(symbol, 0) < 600:
         return
     _fallback_log_times[symbol] = now
     logger.warning(f"  [Ownership] {symbol}: no bot tag in order history — "
-                   f"defaulting to trend_bot (possible orphan).")
+                   f"leaving unowned (no bot will trade it; see orphan sweep).")
     try:
         line = f'ownership_fallback,symbol={symbol} count=1i {int(now * 1e9)}'
         url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
@@ -309,17 +346,27 @@ def check_budget_details(bot_name, trading_client):
                 registry.log_error("utils", "parse_budget", e)
                 logger.error(f"  [CFO] Dynamic budget parse error: {e}")
                 
-        # 2. Fallback to Static Base Budget
+        # 2. Fallback when the CFO hasn't written an effective budget yet:
+        #    derive from cfo_settings.base_allocations on allocatable equity
+        #    (equity minus the unallocated reserve) — the same formula the
+        #    reallocator uses — so this path can't drift from the CFO
+        #    baseline. Legacy bots{}.allocation only covers bots that sit
+        #    outside cfo_settings.
         if budget_dollars == 0.0:
             if not os.path.exists("bot_config.json"):
                 logger.error("  [CFO] FAIL-CLOSED: bot_config.json missing!")
                 return False, 0.0, 0.0
-                
+
             with open("bot_config.json", "r") as f:
                 config_data = json.load(f)
-            bot_settings = config_data.get("bots", {}).get(bot_name, {})
-            allocation_pct = bot_settings.get("allocation", 0.0)
-            
+            cfo = config_data.get("cfo_settings", {})
+            base = cfo.get("base_allocations", {})
+            if bot_name in base:
+                reserve_pct = float(cfo.get("unallocated_reserve", 0.0))
+                allocation_pct = float(base[bot_name]) * (1.0 - reserve_pct)
+            else:
+                allocation_pct = config_data.get("bots", {}).get(bot_name, {}).get("allocation", 0.0)
+
             if allocation_pct == 0.0:
                 logger.error(f"  [CFO] FAIL-CLOSED: No allocation configured for {bot_name}")
                 return False, equity, 0.0 # No limit set -> Reject
@@ -672,4 +719,133 @@ def reconcile_fills(trading_client, logger, lookback_days=30):
 
     if written:
         logger.info(f"  [Reconcile] wrote/updated {written} fill row(s) from Alpaca.")
+    return written
+
+def bound_session_timeout(client, timeout=15):
+    """Give an alpaca-py REST client's underlying requests.Session a default
+    read timeout.
+
+    The SDK sets none, so one hung socket blocks its caller forever — the
+    2026-07-05 accountant stall was reconcile_fills' get_orders hanging on
+    `read timeout=None`, which also freezes the orphan sweep and CFO
+    reallocation behind it. Wraps the private `_session` attribute (stable
+    across alpaca-py releases) and no-ops harmlessly if the layout changes;
+    callers that pass their own timeout are untouched.
+    """
+    session = getattr(client, "_session", None)
+    request = getattr(session, "request", None)
+    if request is None or getattr(session, "_fleet_timeout", None):
+        return client
+    def _bounded(method, url, *args, **kwargs):
+        kwargs.setdefault("timeout", timeout)
+        return request(method, url, *args, **kwargs)
+    session.request = _bounded
+    session._fleet_timeout = timeout
+    return client
+
+# --- OPTION LIFECYCLE EVENTS (assignment / exercise / expiration) ---
+# These are position mutations with NO order behind them, so submit_and_log_order
+# and reconcile_fills can never see them: the 2026-07-02 PAAS assignment turned a
+# short put into 100 shares without a single row anywhere. The accountant polls
+# Alpaca's account activities for them each cycle.
+_OPTION_EVENT_ACTIONS = {"OPASN": "assigned", "OPEXC": "exercised", "OPEXP": "expired"}
+_option_events_after = None      # ISO date watermark; restart rescans the lookback
+_alerted_event_ids = set()       # best-effort in-process Discord dedupe
+
+def _write_option_event(ev, measurement, logger, alert=None):
+    """Write one activity event as a trade row; returns 1 if written.
+
+    Rows are stamped at a deterministic per-event timestamp (activity date +
+    id-derived ms jitter), so rescans and restarts overwrite the same point
+    instead of duplicating. Actions contain neither 'buy' nor 'sell' on
+    purpose: the accountant's realized-P&L pairing must ignore these rows.
+    """
+    import datetime as dt
+    import zlib
+    act = _OPTION_EVENT_ACTIONS.get(ev.get("activity_type"))
+    sym = ev.get("symbol") or ""
+    if not act or not sym:
+        return 0
+    qty = abs(float(ev.get("qty") or 0))
+    occ = _OCC_SYMBOL_RE.match(sym)
+    root = occ.group(1) if occ else sym
+    strike = (float(sym[-8:]) / 1000.0) if occ else 0.0
+    day = ev.get("date") or (ev.get("transaction_time") or "")[:10]
+    if not day:
+        return 0
+    stamp = dt.datetime.fromisoformat(f"{day}T20:00:00+00:00")
+    jitter_ms = zlib.crc32(str(ev.get("id")).encode()) % 1000
+    ns = (int(stamp.timestamp() * 1000) + jitter_ms) * 1_000_000
+    line = (f'{measurement},symbol={sym} '
+            f'price={strike},action="{act}",qty={qty},'
+            f'reason="option_{act}",underlying="{root}" {ns}')
+    url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
+    r = requests.post(url, data=line, timeout=2)
+    if r.status_code != 204:
+        logger.warning(f"  [OptionEvents] InfluxDB write failed: {r.status_code} {r.text}")
+        return 0
+    ev_id = ev.get("id")
+    if alert and act in ("assigned", "exercised") and ev_id not in _alerted_event_ids:
+        _alerted_event_ids.add(ev_id)
+        shares = int(qty) * 100
+        alert(f"📌 **OPTION {act.upper()}: {sym}**\n"
+              f"{int(qty)} contract(s) → {shares} shares {root} @ ${strike:.2f} strike.\n"
+              f"Stock resolves to wheel_bot via option-root ownership; "
+              f"covered calls resume next wheel cycle.")
+    logger.info(f"  [OptionEvents] {act}: {sym} qty={qty} (row @ {day})")
+    return 1
+
+def reconcile_option_events(logger, lookback_days=7, alert=None):
+    """Poll account activities for OPASN/OPEXC/OPEXP and log them to the wheel
+    measurement. Returns the number of rows written. `alert` is an optional
+    callable(str) for Discord; expirations write rows but never ping (a put
+    expiring worthless is the wheel working).
+    """
+    global _option_events_after
+    import datetime as dt
+    base_url = ("https://paper-api.alpaca.markets" if getattr(config, "PAPER", True)
+                else "https://api.alpaca.markets")
+    headers = {"APCA-API-KEY-ID": config.API_KEY,
+               "APCA-API-SECRET-KEY": config.SECRET_KEY,
+               "accept": "application/json"}
+    after = _option_events_after or (
+        dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=lookback_days)
+    ).strftime("%Y-%m-%d")
+    measurement = fleet_registry.BOTS["wheel_bot"]["measurement"]
+    written = 0
+    page_token = None
+    newest_day = None
+    for _ in range(20):  # hard page cap per cycle
+        params = {"activity_types": ",".join(_OPTION_EVENT_ACTIONS),
+                  "after": after, "direction": "asc", "page_size": 100}
+        if page_token:
+            params["page_token"] = page_token
+        try:
+            r = requests.get(f"{base_url}/v2/account/activities",
+                             headers=headers, params=params, timeout=15)
+            r.raise_for_status()
+            events = r.json()
+        except Exception as e:
+            registry.log_error("utils", "reconcile_option_events", e)
+            logger.warning(f"  [OptionEvents] activities fetch failed: {e}")
+            return written
+        if not events:
+            break
+        for ev in events:
+            try:
+                written += _write_option_event(ev, measurement, logger, alert=alert)
+            except Exception as e:
+                registry.log_error("utils", "option_event_row", e,
+                                   context=str(ev.get("id")))
+        day = events[-1].get("date") or (events[-1].get("transaction_time") or "")[:10]
+        if day:
+            newest_day = day
+        if len(events) < 100:
+            break
+        page_token = events[-1].get("id")
+    # Watermark at the newest event's DATE (not time): the next cycle re-reads
+    # that day's few events and idempotently rewrites them, which is cheaper
+    # than risking a same-day gap.
+    if newest_day:
+        _option_events_after = newest_day
     return written

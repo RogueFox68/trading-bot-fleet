@@ -38,7 +38,9 @@ MEASUREMENT_TO_BOT = {
 }
 
 # --- CLIENT ---
-trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
+# Bounded read timeout: a hung Alpaca socket in reconcile_fills stalled the
+# whole 2026-07-05 accountant cycle (orphan sweep + CFO realloc sit behind it).
+trading_client = utils.bound_session_timeout(TradingClient(API_KEY, SECRET_KEY, paper=PAPER))
 
 def query_influx_trades(days=30):
     """Fetches trade history from InfluxDB to calculate Realized P&L."""
@@ -151,12 +153,14 @@ ORPHAN_ALERT_INTERVAL = 6 * 3600  # 6 hours
 def detect_orphans(positions, trading_client):
     """Flag held positions that no bot is durably managing.
 
-    Cross-checks every equity/option position against durable ownership + entry
-    time (resolved from full, paged order history). A position that carries no
-    real bot tag, or whose entry time can't be resolved, is an orphan — the exact
-    signature that silently hid GEN/APTV once their opening orders aged out of the
-    order window. Alerts (throttled) to the overseer webhook and logs a metric so
-    these are visible instead of bleeding past stops unmanaged.
+    Shares the resolver's ownership definition: a position is an orphan when
+    the owner map has no claim on it (no tag, no option-root inference) —
+    exactly when get_bot_owner returns None and no bot will trade it. Owned
+    positions with an unresolvable entry time (e.g. assignment-created stock,
+    which has no opening order) are NOT orphans — the owner manages them —
+    but time-based backstops like max-hold are blind for them, so they emit
+    an 'entry_time_missing' metric instead of an alert. Orphans alert
+    (throttled) to the overseer webhook and log an 'orphan_position' metric.
     """
     from alpaca.trading.enums import AssetClass
     managed = [p for p in positions
@@ -183,19 +187,19 @@ def detect_orphans(positions, trading_client):
                     break
         tagged = sym in owner_map or root in owner_map
         has_entry = sym in entry_times
-        if tagged and has_entry:
+        if tagged:
+            if not has_entry:
+                # Owned but no opening order to date it (assigned stock).
+                # Metric only: ownership gates trading now, but max-hold /
+                # stop timing can't see this position.
+                log_metric("entry_time_missing", {"symbol": sym}, {"detected": 1})
             continue
 
         if now - _orphan_alert_times.get(sym, 0) < ORPHAN_ALERT_INTERVAL:
             continue
         _orphan_alert_times[sym] = now
 
-        reasons = []
-        if not tagged:
-            reasons.append("no bot tag in order history")
-        if not has_entry:
-            reasons.append("no resolvable entry time")
-        detail = "; ".join(reasons)
+        detail = "no bot tag in order history"
         logger.warning(f"[Orphan] {sym} side={p.side} qty={p.qty} — {detail}")
         log_metric("orphan_position", {"symbol": sym}, {"detected": 1, "reason": detail})
         try:
@@ -205,7 +209,8 @@ def detect_orphans(positions, trading_client):
         send_overseer(f"⚠️ **ORPHANED POSITION: {sym}**\n"
                       f"Side: {p.side} | Qty: {p.qty} | Unrealized: ${upl:.2f}\n"
                       f"Issue: {detail}\n"
-                      f"No bot is durably managing this — review and close manually if needed.")
+                      f"Unowned — no bot will trade it. Review and close manually, "
+                      f"or place a tagged order to claim it.")
 
 bot_idle_cycles = {name: 0 for name in fleet_registry.BOTS}
 
@@ -314,6 +319,15 @@ def run_accountant():
                 utils.reconcile_fills(trading_client, logger)
             except Exception as e:
                 logger.error(f"[Reconcile] fill reconciliation failed: {e}")
+
+            # 0b. OPTION LIFECYCLE EVENTS — assignments/exercises/expirations
+            #     are position mutations with no order behind them; pull them
+            #     from account activities so the wheel's book reflects them
+            #     (the 2026-07-02 PAAS assignment arrived invisible).
+            try:
+                utils.reconcile_option_events(logger, alert=send_overseer)
+            except Exception as e:
+                logger.error(f"[OptionEvents] activity reconciliation failed: {e}")
 
             # 1. FETCH REALIZED P&L (HISTORY)
             history_df = query_influx_trades()
