@@ -251,6 +251,12 @@ def run_trend_bot():
                 # A) EXIT LOGIC (Manage existing trades)
                 if symbol in pos_dict:
                     pos = pos_dict[symbol]
+                    # Manage only positions that are OURS. A target symbol can
+                    # be held by another bot (or unowned, e.g. quarantined
+                    # assignment stock) — exiting it liquidates a strategy we
+                    # don't run, and entering on top of it corrupts ownership.
+                    if utils.get_bot_owner(symbol, pos.asset_class, trading_client) != "trend_bot":
+                        continue
                     qty = float(pos.qty)
                     sell_qty = int(abs(qty))
                     side = pos.side

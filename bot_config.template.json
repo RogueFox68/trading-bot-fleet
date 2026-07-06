@@ -4,7 +4,9 @@
             "script": "wheel_bot.py",
             "status": "active",
             "strategy": "conservative",
-            "allocation": 0.38
+            "allocation": 0.38,
+            "force_close_symbols": [],
+            "force_roll_symbols": []
         },
         "trend_bot": {
             "script": "trend_bot.py",

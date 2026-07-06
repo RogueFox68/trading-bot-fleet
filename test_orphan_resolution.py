@@ -144,5 +144,49 @@ class OrphanSignatureTest(unittest.TestCase):
         self.assertNotIn("ORPH", entry_times)
 
 
+class AssignedStockOwnershipTest(unittest.TestCase):
+    """Assignment turns a wheel option into bare stock with no tagged order of
+    its own. The resolver must attribute that stock to the wheel via the
+    option order's root — and never hand untagged stock to a default owner
+    (trend_bot liquidated wheel-assigned PAAS on 2026-07-06 through the old
+    `else trend_bot` fallback)."""
+
+    def setUp(self):
+        utils._ownership_cache = {}
+        utils._ownership_cache_time = 0
+
+    def test_assigned_stock_resolves_to_wheel_via_option_root(self):
+        t = NOW - datetime.timedelta(days=4)
+        client = FakeTradingClient([
+            FakeOrder("PAAS260702P00048000",
+                      "wheel_bot-PAAS260702P00048000-1782000000", t, filled_at=t),
+        ])
+        owner_map = utils._build_order_based_map(client, held_symbols=["PAAS"])
+        self.assertEqual(owner_map.get("PAAS"), "wheel_bot")
+
+    def test_direct_equity_tag_outranks_root_inference(self):
+        opt_t = NOW - datetime.timedelta(days=1)
+        eq_t = NOW - datetime.timedelta(days=10)
+        client = FakeTradingClient([
+            FakeOrder("SLB260717P00050000",
+                      "wheel_bot-SLB260717P00050000-1783000000", opt_t, filled_at=opt_t),
+            FakeOrder("SLB", "trend_bot-SLB-1782000000", eq_t, filled_at=eq_t),
+        ])
+        owner_map = utils._build_order_based_map(client, held_symbols=["SLB"])
+        # Wheel's option activity is newer, but an explicit order on the bare
+        # symbol is the stronger claim: trend's shares stay trend's.
+        self.assertEqual(owner_map.get("SLB"), "trend_bot")
+        # The contract itself still resolves to the wheel.
+        self.assertEqual(owner_map.get("SLB260717P00050000"), "wheel_bot")
+
+    def test_untagged_stock_resolves_to_no_owner(self):
+        from alpaca.trading.enums import AssetClass
+        client = FakeTradingClient([])
+        owner = utils.get_bot_owner("ORPH", AssetClass.US_EQUITY, client)
+        # None = unowned/quarantined: every bot filters holdings by its own
+        # name, so nothing manages (or liquidates) this position.
+        self.assertIsNone(owner)
+
+
 if __name__ == "__main__":
     unittest.main()
