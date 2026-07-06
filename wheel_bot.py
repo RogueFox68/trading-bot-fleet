@@ -20,12 +20,17 @@ logger = get_logger("wheel_bot")
 # --- CONFIGURATION ---
 TARGET_FILE = "active_targets.json"
 
-MIN_DTE = 25             
+MIN_DTE = 25
 MAX_DTE = 45
 TARGET_OTM_PCT = 0.05
-MIN_PREMIUM = 0.10      
-TAKE_PROFIT_PCT = 0.50 
-MAX_SPREAD_PCT = 0.25   
+MIN_PREMIUM = 0.10
+TAKE_PROFIT_PCT = 0.50
+MAX_SPREAD_PCT = 0.25
+STALE_ROLL_DTE = 10      # start rolling at/below this DTE (entries open 25-45)
+FORCE_CLOSE_DTE = 5      # ITM at/below this DTE -> close-only expiry backstop
+CLOSE_LADDER_STEPS = (0.0, 0.5, 1.0)  # fraction of mid->ask crossed per attempt
+CLOSE_POLL_SECONDS = 10  # fill wait per ladder rung
+CLOSE_FAIL_ALERT_AFTER = 3  # consecutive fully-failed closes before alerting
 
 # --- CLIENTS ---
 trading_client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=config.PAPER)
@@ -79,8 +84,93 @@ def calculate_smart_price(quote, side):
     if spread_pct > MAX_SPREAD_PCT:
         logger.debug(f"    [SKIP] Spread too wide ({spread_pct*100:.1f}%). Bid: {bid} Ask: {ask}")
         return None
-        
+
     return round(midpoint, 2)
+
+def marketable_close_price(quote, cross_frac):
+    """Buy-to-close price that can cross the spread: mid + frac*(ask-mid).
+
+    Unlike calculate_smart_price this never rejects on spread width — for a
+    risk-reducing close (near-expiry ITM, force close) paying a wide spread
+    beats assignment. cross_frac 0.0 = midpoint, 1.0 = the ask.
+    """
+    bid = float(quote.bid_price)
+    ask = float(quote.ask_price)
+    if ask <= 0:
+        return None
+    mid = (bid + ask) / 2
+    return round(mid + (ask - mid) * cross_frac, 2)
+
+# contract symbol -> consecutive cycles where the full close ladder failed
+_close_failures = {}
+
+def close_option_position(active_option, tag, reason):
+    """Buy-to-close with an escalating price ladder (midpoint -> cross -> ask).
+
+    Each rung re-quotes, submits a limit, waits CLOSE_POLL_SECONDS for the
+    fill, cancels, and escalates. The old single midpoint limit with a 10s
+    poll effectively never filled on an ITM contract — every 6/30-7/06
+    rollcls order died this way and PAAS rode DTE-0 into assignment.
+    Returns the fill limit price on success, None on failure; alerts after
+    CLOSE_FAIL_ALERT_AFTER consecutive fully-failed cycles.
+    """
+    sym = active_option.symbol
+    qty = abs(int(float(active_option.qty)))
+    if qty <= 0:
+        return None
+    for frac in CLOSE_LADDER_STEPS:
+        quote = get_option_data(sym)
+        if not quote:
+            logger.error(f"    [CLOSE ABORTED] No quote for {sym}.")
+            break
+        price = marketable_close_price(quote, frac)
+        if price is None or price <= 0:
+            logger.error(f"    [CLOSE ABORTED] No ask for {sym}.")
+            break
+        req = LimitOrderRequest(
+            symbol=sym,
+            qty=qty,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+            limit_price=price,
+            client_order_id=f"wheel_bot-{sym}-{tag}-{int(time.time())}"
+        )
+        try:
+            order = utils.submit_and_log_order(trading_client, req, logger, reason=reason)
+        except Exception as e:
+            logger.error(f"    [CLOSE ABORTED] Submit failed for {sym}: {e}")
+            break
+        filled = False
+        for _ in range(int(CLOSE_POLL_SECONDS / 0.5)):
+            time.sleep(0.5)
+            o = trading_client.get_order_by_id(order.id)
+            if o.status.value == "filled":
+                filled = True
+                break
+            if o.status.value in ("canceled", "expired", "rejected"):
+                break
+            # 'partially_filled' keeps waiting: it may complete within the window.
+        if filled:
+            _close_failures.pop(sym, None)
+            logger.info(f"    ✅ [CLOSED] {sym} @ ${price} ({reason})")
+            return price
+        try:
+            trading_client.cancel_order_by_id(order.id)
+        except Exception:
+            pass  # already terminal
+        logger.info(f"    [CLOSE RETRY] {sym} unfilled @ ${price} "
+                    f"(cross {int(frac*100)}%). Escalating.")
+    fails = _close_failures.get(sym, 0) + 1
+    _close_failures[sym] = fails
+    if fails >= CLOSE_FAIL_ALERT_AFTER:
+        err = Exception(f"buy-to-close for {sym} unfilled through the full "
+                        f"midpoint→ask ladder {fails} cycles in a row")
+        registry.log_error("wheel_bot", "close_unfilled", err, context=sym)
+        send_discord(f"🚨 **CLOSE FAILING: {sym}**\nBuy-to-close unfilled through "
+                     f"the midpoint→ask ladder {fails} cycles in a row ({reason}). "
+                     f"Check the book — assignment risk if this is ITM near expiry.")
+        _close_failures[sym] = 0  # re-alert only after another full streak
+    return None
 
 def find_best_contract(symbol, side, current_price, target_otm=TARGET_OTM_PCT):
     today = datetime.date.today()
@@ -179,50 +269,14 @@ def roll_option_position(ticker, active_option, current_stock_price, side, confi
         logger.error(f"  [ROLL ABORTED] Next contract premium too low (${new_limit_price:.2f} < ${MIN_PREMIUM:.2f}).")
         return False
         
-    # Smart pricing on closing contract
-    quote = get_option_data(active_option.symbol)
-    close_price = calculate_smart_price(quote, "BUY")
+    # Step 2: Close Leg — escalating price ladder (midpoint → cross → ask).
+    # The old midpoint-only limit with a single 10s poll effectively never
+    # filled on an ITM contract, so every roll died here and the position
+    # rode into expiry/assignment (PAAS, 2026-07-02).
+    logger.info(f"🌀 [ROLL EXECUTION] Leg 1: Closing {active_option.symbol} (ladder)...")
+    close_price = close_option_position(active_option, "rollcls", "Roll close (stale DTE)")
     if close_price is None:
-        logger.error(f"  [ROLL ABORTED] Current contract {active_option.symbol} spread too wide to close safely.")
-        return False
-
-    logger.info(f"🌀 [ROLL EXECUTION] Leg 1: Closing {active_option.symbol} @ limit ${close_price}...")
-    qty = float(active_option.qty)
-    
-    # Step 2: Close Leg
-    close_req = LimitOrderRequest(
-        symbol=active_option.symbol,
-        qty=abs(int(qty)),
-        side=OrderSide.BUY,
-        time_in_force=TimeInForce.DAY,
-        limit_price=close_price,
-        client_order_id=f"wheel_bot-{active_option.symbol}-rollcls-{int(time.time())}"
-    )
-    
-    try:
-        # Submit the order
-        close_order = utils.submit_and_log_order(trading_client, close_req, logger)
-        
-        # Poll for up to 10 seconds to make sure it fills
-        filled = False
-        for _ in range(20):
-            time.sleep(0.5)
-            o = trading_client.get_order_by_id(close_order.id)
-            if o.status.value in ["filled", "partially_filled"]:
-                filled = True
-                break
-            elif o.status.value in ["canceled", "expired", "rejected"]:
-                break
-                
-        if not filled:
-            logger.warning(f"  [ROLL ABORTED] Timeout waiting for close order {close_order.id} to fill. Canceling order.")
-            try:
-                trading_client.cancel_order_by_id(close_order.id)
-            except: pass
-            return False
-            
-    except Exception as e:
-        logger.error(f"  [ROLL ABORTED] Close order execution failed: {e}")
+        logger.warning(f"  [ROLL ABORTED] Close leg unfilled for {active_option.symbol}.")
         return False
 
     # Step 3: Open Leg
@@ -379,40 +433,54 @@ def run_wheel_bot():
                     send_discord(f"💵 **TOOK PROFIT {ticker}**\nClosed @ ${close_price} ({capture_pct*100:.0f}% Cap)")
                     continue
 
-                # B) FORCE CLOSE FROM CONFIG
+                # B) FORCE CLOSE FROM CONFIG — ladder pricing so a wide spread
+                # can't park the manual lever (it used to skip with [WAIT]).
                 if ticker in force_close_list:
                     logger.info(f"    🚨 [FORCE CLOSE] Config triggered close for {active_option.symbol}")
-                    quote = get_option_data(active_option.symbol)
-                    close_price = calculate_smart_price(quote, "BUY")
-                    
-                    if close_price is None:
-                        logger.warning(f"    [WAIT] Spread too wide to close safely.")
-                        continue
-
-                    req = LimitOrderRequest(
-                        symbol=active_option.symbol,
-                        qty=abs(int(qty)),
-                        side=OrderSide.BUY,
-                        time_in_force=TimeInForce.DAY,
-                        limit_price=close_price,
-                        client_order_id=f"wheel_bot-{active_option.symbol}-forcecls-{int(time.time())}"
-                    )
-                    utils.submit_and_log_order(trading_client, req, logger)
-                    send_discord(f"🚨 **FORCE CLOSED {active_option.symbol}**")
+                    if close_option_position(active_option, "forcecls", "Force close (config)"):
+                        send_discord(f"🚨 **FORCE CLOSED {active_option.symbol}**")
                     continue
 
-                # C) STALE ROLL (DTE <= 22 days) OR FORCE ROLL
-                is_stale = dte <= 22
+                # C) EXPIRY BACKSTOP — ITM and nearly expired: close-only. Never
+                # wait for a roll target (deep ITM often has none in the next
+                # window) and never let a wide spread block a risk-reducing
+                # exit. An ITM short left open at expiry becomes assigned
+                # stock (the PAAS chain).
+                is_itm = (side == "PUT" and 0 < current_stock_price < strike) or \
+                         (side == "CALL" and current_stock_price > strike)
+                if is_itm and dte <= FORCE_CLOSE_DTE:
+                    logger.info(f"    ⏰ [EXPIRY CLOSE] {active_option.symbol} ITM, DTE {dte} ≤ {FORCE_CLOSE_DTE}")
+                    if close_option_position(active_option, "expcls",
+                                             f"Expiry force close (DTE {dte}, ITM)"):
+                        send_discord(f"⏰ **EXPIRY CLOSE {active_option.symbol}**\n"
+                                     f"ITM with {dte} DTE — closed before assignment.")
+                    continue
+
+                # D) STALE ROLL (DTE <= STALE_ROLL_DTE) OR FORCE ROLL
+                is_stale = dte <= STALE_ROLL_DTE
                 if ticker in force_roll_list or is_stale:
                     reason = f"DTE stale ({dte} days)" if is_stale else "Force roll config"
                     logger.info(f"    🌀 [ROLL] Rolling {active_option.symbol} due to: {reason}")
-                    
+
                     confidence = target_map.get(ticker, 0.5)
                     roll_option_position(ticker, active_option, current_stock_price, side, confidence)
                     continue
 
             # --- 3. OPEN NEW POSITIONS ---
-            for ticker in clean_targets:
+            # Wheel-owned stock (assignments resolve to wheel_bot via the
+            # option-root ownership claim) must get calls written against it
+            # even when the ticker has dropped off today's scout list — that
+            # IS the wheel. Everything else about the entry path applies.
+            owned_stock = [
+                p.symbol for p in all_positions
+                if p.asset_class == AssetClass.US_EQUITY and float(p.qty) >= 100
+                and utils.get_bot_owner(p.symbol, p.asset_class, trading_client) == "wheel_bot"
+            ]
+            cc_extras = [t for t in owned_stock if t not in clean_targets]
+            if cc_extras:
+                logger.info(f"Covered-call candidates from owned stock: {cc_extras}")
+
+            for ticker in clean_targets + cc_extras:
                 # [FIX] Skip if we already have an open order for this ticker
                 if ticker in busy_tickers:
                     logger.info(f"  {ticker:<4} | [SKIP] Open Order Exists.")
@@ -423,16 +491,24 @@ def run_wheel_bot():
                     continue
 
                 stock_qty = 0
-                # Check stock position
+                # Check stock position — only OUR shares count toward covered
+                # calls. Writing calls against another bot's stock turns into a
+                # naked call the moment that bot exits (it doesn't know we
+                # sold a call on its shares).
                 for p in all_positions:
                     if p.symbol == ticker and p.asset_class == AssetClass.US_EQUITY:
-                        stock_qty = float(p.qty)
+                        if utils.get_bot_owner(p.symbol, p.asset_class, trading_client) == "wheel_bot":
+                            stock_qty = float(p.qty)
+
+                # Covered calls consume no new collateral and reduce risk on
+                # stock we already hold, so they bypass the entry gates below.
+                will_write_cc = stock_qty >= 100
 
                 current_stock_price = get_current_price(ticker)
                 if current_stock_price == 0.0:
                     continue
 
-                if not is_budget_ok:
+                if not is_budget_ok and not will_write_cc:
                     continue # Skip new entries if budget paused, but finish loop
                      
                 # NEW: Budget Enforcement
@@ -452,12 +528,14 @@ def run_wheel_bot():
                         else:
                             total_commitment += abs(float(p.market_value))
 
-                if capital_crunch:
+                if capital_crunch and not will_write_cc:
                     logger.info(f"    [GATE] {ticker:<4} | No new positions — CAPITAL_CRUNCH is active.")
                     continue
 
-                # Gate new entries by Macro Environment
-                if current_vix > 22 or current_regime in ('BEAR_TREND', 'CRITICAL_VOLATILITY'):
+                # Gate new entries by Macro Environment (covered calls exempt:
+                # selling a call on held stock lowers risk, and post-assignment
+                # bear regimes are exactly when the wheel needs to keep turning)
+                if (current_vix > 22 or current_regime in ('BEAR_TREND', 'CRITICAL_VOLATILITY')) and not will_write_cc:
                     logger.info(f"    [GATE] {ticker:<4} | No new puts — VIX {current_vix:.1f} / Regime: {current_regime}")
                     continue
                      
@@ -506,7 +584,11 @@ def run_wheel_bot():
                         continue
                         
                     new_trade_collateral = float(contract.strike_price) * 100 if side == "PUT" else 0
-                    if total_commitment + new_trade_collateral > my_budget:
+                    # Only collateral-adding trades are budget-gated: an assigned
+                    # lot already sits in total_commitment, and blocking its
+                    # covered call would freeze the wheel exactly when it needs
+                    # to keep turning.
+                    if new_trade_collateral > 0 and total_commitment + new_trade_collateral > my_budget:
                         logger.warning(f"    [SKIP] Total commitment (${total_commitment:.0f} + ${new_trade_collateral:.0f}) > Budget (${my_budget:.0f}).")
                         continue
                         
