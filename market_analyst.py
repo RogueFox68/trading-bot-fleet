@@ -231,15 +231,27 @@ def update_bot_config(regime, vix_val, climate, data_stale=False):
                 changes_made.append(f"{bot_name} -> {target_status}")
 
         gs = current_config.setdefault('global_settings', {})
-        prev_regime = gs.get('market_condition')
-        prev_stale = gs.get('data_stale', False)
+        vix_rounded = round(vix_val, 2)
+        # Persist whenever ANY published field moves — not only on a regime-label
+        # flip or a status change. VIX drifts every cycle and macro_climate can
+        # flip (MACRO_BEAR<->MACRO_BULL on price vs SMA200) while the label holds
+        # (e.g. SIDEWAYS). Bots read THIS file, not InfluxDB, so a label-only write
+        # guard left their routine VIX gating (wheel vix>22, etc.) running off a
+        # frozen VIX. The kill-switch still fired — crossing 28 flips the label and
+        # forces a write — but everything below it was stale.
+        prev_published = (gs.get('market_condition'), gs.get('macro_climate'),
+                          gs.get('vix'), gs.get('data_stale', False))
+        new_published = (forced_regime, climate, vix_rounded, data_stale)
+
         gs['market_condition'] = forced_regime
         gs['macro_climate'] = climate
-        gs['vix'] = round(vix_val, 2)
+        gs['vix'] = vix_rounded
         gs['data_stale'] = data_stale
-        gs['regime_updated'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-        if changes_made or prev_regime != forced_regime or prev_stale != data_stale:
+        if changes_made or prev_published != new_published:
+            # Stamp the persisted-time only when we actually write, so
+            # regime_updated reflects the last time a published value landed.
+            gs['regime_updated'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             with open(CONFIG_FILE, 'w') as f:
                 json.dump(current_config, f, indent=4)
 
