@@ -169,6 +169,39 @@ class UpdateBotConfigTests(unittest.TestCase):
         for bot in MANAGED_BOTS:
             self.assertEqual(cfg["bots"][bot]["status"], "active")
 
+    def test_vix_change_persists_without_label_or_status_change(self):
+        """Regression: VIX/climate move while the regime label AND all statuses
+        hold (e.g. SIDEWAYS) — the value must still be persisted, because bots
+        read this file, not InfluxDB. The old label-only guard dropped it, so
+        routine VIX gating ran off a frozen VIX."""
+        seeded = json.loads(json.dumps(BASE_CONFIG))
+        seeded["global_settings"].update(
+            {"market_condition": "SIDEWAYS", "vix": 17.95,
+             "macro_climate": "MACRO_BEAR"})
+        self._write(seeded)
+
+        ma.update_bot_config("SIDEWAYS", 16.45, "MACRO_BULL")
+
+        gs = self._read()["global_settings"]
+        self.assertEqual(gs["market_condition"], "SIDEWAYS")   # label unchanged
+        self.assertEqual(gs["vix"], 16.45)                     # live VIX persisted
+        self.assertEqual(gs["macro_climate"], "MACRO_BULL")    # live climate too
+        # statuses untouched (no pause/resume this cycle)
+        for bot in MANAGED_BOTS:
+            self.assertEqual(self._read()["bots"][bot]["status"], "active")
+
+    def test_identical_values_skip_rewrite(self):
+        """Churn guard: when nothing published changed, don't rewrite the file."""
+        seeded = json.loads(json.dumps(BASE_CONFIG))
+        seeded["global_settings"].update(
+            {"market_condition": "SIDEWAYS", "vix": 16.45,
+             "macro_climate": "MACRO_BULL", "data_stale": False})
+        self._write(seeded)
+
+        with mock.patch.object(ma.json, "dump") as dump:
+            ma.update_bot_config("SIDEWAYS", 16.45, "MACRO_BULL")
+            dump.assert_not_called()
+
     def test_missing_config_logs_error_no_crash(self):
         os.remove(self.path)
         with mock.patch.object(ma.registry, "log_error") as le:
