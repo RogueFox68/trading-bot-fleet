@@ -215,6 +215,11 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
   a wide spread never blocks a risk-reducing close. Each rung re-submits only the **unfilled
   remainder** (it subtracts a rung's partial fill before escalating), so a partial-then-escalate
   can't re-buy the original quantity and over-close a multi-contract short into a net long.
+  A rung's partial fill has no stable broker `filled_at`, so it's logged as a `terminal_partial`
+  row (`utils.log_terminal_partial_fill`) — idempotent (deterministic synthetic stamp), gated to
+  TERMINAL orders with no `filled_at` so it can't double-count the full-fill path, and also
+  recovered by `reconcile_fills` — so a close spread across partial rungs isn't under-counted in
+  realized P&L.
 - ITM contracts at DTE ≤ `FORCE_CLOSE_DTE` (5) are closed outright, with no roll target
   required (deep ITM often has none). Rolls trigger at DTE ≤ `STALE_ROLL_DTE` (10). A close
   that survives the full ladder `CLOSE_FAIL_ALERT_AFTER` (3) cycles in a row alerts Discord +

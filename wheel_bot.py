@@ -169,6 +169,12 @@ def close_option_position(active_option, tag, reason):
         except Exception:
             just_filled = 0
         if just_filled > 0:
+            # This rung's partial fill has no stable broker filled_at, so
+            # reconcile_fills' full-fill path can't log it. Record it now so a
+            # close completed across partial rungs isn't under-counted in P&L.
+            # Idempotent (deterministic stamp) and a no-op unless the order is
+            # terminal, so reconcile_fills re-firing on it is harmless.
+            utils.log_terminal_partial_fill(done, logger)
             remaining -= just_filled
             logger.info(f"    [CLOSE PARTIAL] {sym} filled {just_filled}; "
                         f"{remaining} contract(s) left.")

@@ -689,6 +689,73 @@ def _fill_action(order):
         return "sell_put" if is_option.group(1) == "P" else "sell_call"
     return "sell"
 
+def log_terminal_partial_fill(order, logger):
+    """Log a TERMINAL order's partial fill as a first-class trade row.
+
+    A close-ladder rung (wheel_bot.close_option_position) can partially fill and
+    then be canceled. That partial carries no stable broker `filled_at`, so
+    reconcile_fills' full-fill path skips it and the closed qty goes unlogged —
+    under-counting realized P&L for a close spread across several partial rungs.
+
+    GUARDRAILS (these keep it from double-counting the full-fill path):
+      - status must be TERMINAL (canceled/expired/rejected). A terminal order can
+        never later reach 'filled', so no future full-fill row can clash with
+        this one. NEVER call this on an OPEN 'partially_filled' order — it may yet
+        fully fill and be logged at filled_at, double-counting the partial.
+      - filled_qty > 0 with a fill price.
+      - filled_at is None: if the broker DID stamp a fill time, the full-fill path
+        (_log_fill_to_influx) owns that row — we stay out so the same contracts
+        can't land as two differently-stamped points.
+
+    Idempotent: with no filled_at to key on, the row is stamped at a deterministic
+    synthetic time — the terminal time (canceled/updated/submitted) floored to the
+    ms plus id-derived jitter — so an inline write and any later reconcile re-run
+    overwrite ONE point (the same trick as _write_option_event). Callers may fire
+    both paths freely. Returns 1 if a row was written, else 0.
+    """
+    import zlib
+    try:
+        raw_status = getattr(order, "status", None)
+        status = getattr(raw_status, "value", raw_status)
+        if status not in ("canceled", "expired", "rejected"):
+            return 0
+        if getattr(order, "filled_at", None) is not None:
+            return 0  # a broker fill stamp -> the full-fill path owns this order
+        filled_qty = float(getattr(order, "filled_qty", 0) or 0)
+        price = getattr(order, "filled_avg_price", None)
+        if filled_qty <= 0 or price is None:
+            return 0
+
+        c_id = getattr(order, "client_order_id", "") or ""
+        bot = next((b for b in MEASUREMENT_BY_BOT if c_id.startswith(f"{b}-")), None)
+        measurement = MEASUREMENT_BY_BOT.get(bot, "trades")
+
+        # No filled_at exists; synthesize a STABLE stamp from the (immutable, once
+        # terminal) order time so re-writes overwrite instead of duplicating.
+        term_time = (getattr(order, "canceled_at", None)
+                     or getattr(order, "updated_at", None)
+                     or getattr(order, "submitted_at", None))
+        base_ms = int(term_time.timestamp() * 1000) if term_time else int(time.time() * 1000)
+        oid = str(getattr(order, "id", "") or c_id)
+        ns = (base_ms + zlib.crc32(oid.encode()) % 1000) * 1_000_000
+
+        action = _fill_action(order)
+        line = (f'{measurement},symbol={order.symbol} '
+                f'price={float(price)},action="{action}",qty={filled_qty},'
+                f'fill_source="terminal_partial",source_order_id="{oid}" {ns}')
+        url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
+        r = requests.post(url, data=line, timeout=2)
+        if r.status_code != 204:
+            logger.warning(f"  [TerminalPartial] InfluxDB write failed: {r.status_code} {r.text}")
+            return 0
+        logger.info(f"  [TerminalPartial] {order.symbol} {action} qty={filled_qty} "
+                    f"(order {oid}, {status})")
+        return 1
+    except Exception as e:
+        registry.log_error("utils", "log_terminal_partial_fill", e,
+                           context=getattr(order, "symbol", None))
+        return 0
+
 def reconcile_fills(trading_client, logger, lookback_days=30):
     """Reconcile bot trade logs against Alpaca's authoritative fills.
 
@@ -699,11 +766,13 @@ def reconcile_fills(trading_client, logger, lookback_days=30):
     real cumulative fill (price/qty/time) to the bot's measurement via
     _log_fill_to_influx.
 
-    Only fully-filled orders are written (they carry a stable broker filled_at),
-    so the row is stamped at filled_at and re-runs overwrite the same
-    series+timestamp (idempotent) instead of duplicating. Unfilled/expired orders
-    and still-open partials produce no row. Crypto bots are excluded (see
-    RECONCILED_BOTS).
+    Fully-filled orders are stamped at their broker filled_at (idempotent re-runs
+    overwrite the same series+timestamp instead of duplicating). Terminal orders
+    that only PARTIALLY filled (canceled/expired/rejected, no filled_at) are
+    recovered via log_terminal_partial_fill at a deterministic synthetic stamp, so
+    a close spread across partial rungs isn't under-counted in realized P&L.
+    Zero-fill terminations and still-open partials produce no row. Crypto bots are
+    excluded (see RECONCILED_BOTS).
 
     Returns the number of fill rows written/updated.
     """
@@ -727,13 +796,17 @@ def reconcile_fills(trading_client, logger, lookback_days=30):
         c_id = getattr(o, "client_order_id", "") or ""
         if not any(c_id.startswith(f"{b}-") for b in RECONCILED_BOTS):
             continue
-        # Require a broker fill timestamp: guarantees a fully-filled order and a
-        # stable idempotency key. Unfilled and partial-then-canceled orders (no
-        # filled_at) are skipped here.
-        if getattr(o, "filled_at", None) is None:
-            continue
-        _log_fill_to_influx(o, logger, action=_fill_action(o))
-        written += 1
+        # Fully-filled orders carry a stable broker filled_at -> stamp there.
+        if getattr(o, "filled_at", None) is not None:
+            _log_fill_to_influx(o, logger, action=_fill_action(o))
+            written += 1
+        else:
+            # No filled_at: a terminal order (canceled/expired/rejected) that only
+            # PARTIALLY filled before it ended. The full-fill path skips it, so
+            # recover the partial here (idempotent, synthetic stamp). No-op unless
+            # terminal with filled_qty>0 — still-open partials and zero-fill
+            # terminations write nothing, so no full-fill row can be double-counted.
+            written += log_terminal_partial_fill(o, logger)
 
     if written:
         logger.info(f"  [Reconcile] wrote/updated {written} fill row(s) from Alpaca.")
