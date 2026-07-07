@@ -83,15 +83,18 @@ class MarketableClosePriceTest(unittest.TestCase):
 
 # --- reconcile_fills must page, not read a single 500-order window ---
 class _ReconcileOrder:
-    def __init__(self, symbol, client_order_id, submitted_at, filled_at, side):
+    def __init__(self, symbol, client_order_id, submitted_at, filled_at, side,
+                 status="filled", filled_qty=1):
         self.id = client_order_id  # unique -> feeds _fetch_orders_covering dedup
         self.symbol = symbol
         self.client_order_id = client_order_id
         self.submitted_at = submitted_at
         self.filled_at = filled_at
         self.side = side
+        self.status = SimpleNamespace(value=status)
         self.filled_avg_price = 1.23
-        self.filled_qty = 1
+        self.filled_qty = filled_qty
+        self.canceled_at = submitted_at
 
 
 class _ReconcileClient:
@@ -150,6 +153,37 @@ class ReconcileFillsPagingTest(unittest.TestCase):
         self.assertIn("PAAS260731P00045000", written)            # aged fill caught
         self.assertNotIn("BTC/USD", written)                     # crypto not reconciled
         self.assertEqual(n, 1)
+
+    def test_reconcile_routes_full_and_terminal_partial(self):
+        """Full fills take the filled_at path; a terminal partial-then-canceled
+        order (no filled_at) is recovered via log_terminal_partial_fill."""
+        now = datetime.datetime.now(UTC)
+        full = _ReconcileOrder(
+            "AAA260731P00045000", "wheel_bot-AAA-1",
+            now - datetime.timedelta(hours=2), now - datetime.timedelta(hours=1),
+            utils.OrderSide.BUY, status="filled")
+        partial = _ReconcileOrder(
+            "BBB260731P00045000", "wheel_bot-BBB-2",
+            now - datetime.timedelta(hours=3), None,
+            utils.OrderSide.BUY, status="canceled", filled_qty=2)
+        crypto = _ReconcileOrder(
+            "BTC/USD", "crypto_grid-9", now - datetime.timedelta(minutes=1),
+            now - datetime.timedelta(minutes=1), utils.OrderSide.BUY)
+        client = _ReconcileClient([full, partial, crypto])
+
+        full_path, partial_path = [], []
+        with mock.patch.object(
+                utils, "_log_fill_to_influx",
+                side_effect=lambda o, lg, action=None, reason="": full_path.append(o.symbol)), \
+             mock.patch.object(
+                utils, "log_terminal_partial_fill",
+                side_effect=lambda o, lg: (partial_path.append(o.symbol), 1)[1]):
+            n = utils.reconcile_fills(client, utils.logger)
+
+        self.assertEqual(full_path, ["AAA260731P00045000"])      # full-fill path
+        self.assertEqual(partial_path, ["BBB260731P00045000"])   # terminal-partial path
+        self.assertNotIn("BTC/USD", full_path + partial_path)    # crypto excluded
+        self.assertEqual(n, 2)
 
 
 # --- close_option_position must not re-buy the original qty after a partial ---
@@ -233,6 +267,86 @@ class ClosePositionPartialFillTest(unittest.TestCase):
         self.assertEqual([q for _, q in client.submitted], [5, 3])
         self.assertEqual(len(client.submitted), 2)    # no third rung needed
         self.assertIsNotNone(price)
+
+    def test_partial_rung_is_logged(self):
+        """The canceled rung's partial fill is handed to log_terminal_partial_fill
+        so it isn't lost from the P&L measurement."""
+        import wheel_bot
+        client = _CloseClient([
+            {"poll": "partially_filled", "filled_qty": 2},
+            {"poll": "filled", "filled_qty": 3},
+        ])
+        active = SimpleNamespace(symbol="PAAS260731P00045000", qty="-5")
+        quote = mock.Mock(bid_price=1.0, ask_price=1.2)
+        with mock.patch.object(wheel_bot, "trading_client", client), \
+             mock.patch.object(wheel_bot, "get_option_data", return_value=quote), \
+             mock.patch.object(wheel_bot.utils, "submit_and_log_order",
+                               side_effect=_make_submit(client)), \
+             mock.patch.object(wheel_bot.utils, "log_terminal_partial_fill") as logp, \
+             mock.patch.object(wheel_bot.time, "sleep"):
+            wheel_bot.close_option_position(active, "rollcls", "test")
+        self.assertEqual(logp.call_count, 1)                             # the rung-1 partial
+        self.assertEqual(int(float(logp.call_args[0][0].filled_qty)), 2)  # 2 contracts
+
+
+# --- log_terminal_partial_fill: recover canceled-rung partials, no double-count ---
+class _TerminalOrder:
+    def __init__(self, status="canceled", filled_qty=2, filled_avg_price=0.42,
+                 filled_at=None, oid="ord-123", symbol="PAAS260731P00045000",
+                 client_order_id="wheel_bot-PAAS260731P00045000-abc", side=None):
+        self.symbol = symbol
+        self.status = SimpleNamespace(value=status)
+        self.filled_qty = filled_qty
+        self.filled_avg_price = filled_avg_price
+        self.filled_at = filled_at
+        self.id = oid
+        self.client_order_id = client_order_id
+        self.side = side if side is not None else utils.OrderSide.BUY
+        t = datetime.datetime(2026, 7, 7, 15, 0, 0, tzinfo=UTC)
+        self.canceled_at = self.updated_at = self.submitted_at = t
+
+
+def _capture_partial(order):
+    with mock.patch.object(utils.requests, "post") as post:
+        post.return_value = mock.Mock(status_code=204)
+        n = utils.log_terminal_partial_fill(order, utils.logger)
+        line = post.call_args.kwargs["data"] if post.called else None
+    return n, line, post.call_count
+
+
+class TerminalPartialFillTest(unittest.TestCase):
+    def test_writes_row_for_terminal_partial(self):
+        n, line, calls = _capture_partial(_TerminalOrder())
+        self.assertEqual((n, calls), (1, 1))
+        self.assertIn("wheel_trades,symbol=PAAS260731P00045000", line)
+        self.assertIn('action="buy_close"', line)
+        self.assertIn("qty=2", line)
+        self.assertIn('fill_source="terminal_partial"', line)
+        self.assertIn('source_order_id="ord-123"', line)
+
+    def test_expired_partial_is_logged(self):
+        n, _, calls = _capture_partial(_TerminalOrder(status="expired"))
+        self.assertEqual((n, calls), (1, 1))
+
+    def test_open_partial_is_never_logged(self):
+        # Critical guardrail: an OPEN partially_filled may still fully fill and be
+        # logged at filled_at — logging it here too would double-count.
+        n, _, calls = _capture_partial(_TerminalOrder(status="partially_filled"))
+        self.assertEqual((n, calls), (0, 0))
+
+    def test_order_with_filled_at_left_to_full_fill_path(self):
+        n, _, calls = _capture_partial(
+            _TerminalOrder(status="canceled", filled_at=datetime.datetime.now(UTC)))
+        self.assertEqual((n, calls), (0, 0))
+
+    def test_zero_fill_writes_nothing(self):
+        n, _, calls = _capture_partial(_TerminalOrder(filled_qty=0))
+        self.assertEqual((n, calls), (0, 0))
+
+    def test_stamp_is_deterministic_for_idempotent_reruns(self):
+        _, line_a, _ = _capture_partial(_TerminalOrder())
+        _, line_b, _ = _capture_partial(_TerminalOrder())
+        self.assertEqual(line_a.rsplit(" ", 1)[1], line_b.rsplit(" ", 1)[1])
 
 
 if __name__ == "__main__":
