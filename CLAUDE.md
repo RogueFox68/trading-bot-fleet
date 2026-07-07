@@ -227,6 +227,22 @@ registry (`gated_when`): wheel_bot gates on BEAR_TREND/CRITICAL_VOLATILITY or VI
 (covered calls on owned stock exempt); crypto_grid on bear regimes. Gated bots keep managing
 existing positions.
 
+**Data sources & resilience (post 2026-06-24 silent-outage postmortem):** SPY (which drives
+the regime) comes from **Alpaca `get_stock_bars`** — reliable, already authenticated. VIX stays
+on **yfinance** because alpaca-py exposes no index feed, but as a hardened, *isolated*
+single-ticker fetch (retry + backoff) so a Yahoo hiccup can't take the regime down with it.
+Failures are **loud**: an empty/failed fetch logs `registry.log_error` + a throttled Discord
+ping and **never silently skips** (the original bug: a two-ticker `yf.download` returned an
+empty frame, the publish block skipped with no `else`, and VIX froze — disabling the kill-switch
+for ~12 days). A fresh `market_regime` InfluxDB row is written **only on a fully-successful
+fetch**, so its recency is the fleet's "regime is live" heartbeat. If no good fetch lands for
+`STALE_REGIME_SECONDS` (45 min), the analyst **fails safe**: it degrades to `CRITICAL_VOLATILITY`
++ an elevated sentinel VIX (25, above the wheel/crypto gates but below the 28 full-kill so a data
+outage can't self-inflict a total halt) flagged `global_settings.data_stale=true`, rather than
+trusting the frozen low VIX. The **accountant** runs a cross-process backstop
+(`check_regime_freshness`) that alerts the overseer if the `market_regime` measurement hasn't
+been written in > 30 min — catching a wedged/dead analyst its own in-process fail-safe can't.
+
 ### Tiered Hold System
 
 `tiered_hold.py` scores positions (P&L, signal validity, confidence, duration, regime/VIX
@@ -247,11 +263,13 @@ defined but not yet enforced anywhere — only `max_hold_days` is live.
 
 ## Testing
 
-`python -m unittest test_orphan_resolution test_fill_logging -v` — regression suites for the
-ownership/entry-time paging fix (+ option-root inference and the no-default-owner rule) and for
-fill-row stamping / wheel close-ladder pricing. Run them after touching `utils.py`
-ownership/order/logging code or wheel close logic. Strategy changes are still validated through
-paper trading; there is no backtest harness.
+`python -m unittest test_orphan_resolution test_fill_logging test_market_analyst -v` —
+regression suites for the ownership/entry-time paging fix (+ option-root inference and the
+no-default-owner rule), fill-row stamping / wheel close-ladder pricing, and the market-regime
+pipeline (SPY-df normalization, VIX>28 kill-switch, loud-failure + stale fail-safe). Run the
+first two after touching `utils.py` ownership/order/logging code or wheel close logic, and
+`test_market_analyst` after touching `market_analyst.py`. Strategy changes are still validated
+through paper trading; there is no backtest harness.
 
 ## Known Issues / Tech Debt
 
@@ -262,8 +280,12 @@ paper trading; there is no backtest harness.
   backstop.
 - **trend/wheel/crypto still on legacy scaffolding** pending the survivor pilot verdict.
 - **commander bare `except: pass`** remains on best-effort Discord sends.
-- Historical postmortems (GEN/APTV orphaning root cause, InfluxDB silent-failure eras) live in
-  git history and `test_orphan_resolution.py`'s docstring.
+- **VIX still depends on yfinance** — alpaca-py has no index feed, so the VIX spot can't move to
+  Alpaca like SPY did. The stale fail-safe + accountant freshness watchdog bound the blast radius
+  (degrade safe, alert loud) but a paid index source would remove the last external-data SPOF.
+- Historical postmortems (GEN/APTV orphaning root cause, InfluxDB silent-failure eras, the
+  2026-06-24 market-regime silent yfinance outage) live in git history and the
+  `test_orphan_resolution.py` / `test_market_analyst.py` docstrings.
 
 ## Important Rules for Code Changes
 
