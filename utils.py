@@ -86,7 +86,7 @@ _KNOWN_BOT_TAGS = list(fleet_registry.BOTS) + list(fleet_registry.RETIRED_BOT_ME
 _OCC_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})\d{6}[PC]\d{8}$")
 
 def _fetch_orders_covering(trading_client, held_symbols=None, require_fill=False,
-                           page_size=500, max_orders=None):
+                           page_size=500, max_orders=None, status="all", after=None):
     """Fetch recent Alpaca orders newest-first, paging past the 500-order cap.
 
     A single GetOrdersRequest is capped at limit=500. A high-velocity bot
@@ -102,6 +102,11 @@ def _fetch_orders_covering(trading_client, held_symbols=None, require_fill=False
     symbol is covered (a filled order too, if `require_fill`), keeping the common
     case to a single page; only a genuinely aged position pages deep. Returns a
     de-duplicated list, newest-first.
+
+    `status` and `after` are passed straight through to each page request, so a
+    caller with no coverage target (held_symbols=None) can sweep a whole time
+    window — e.g. reconcile_fills paging every CLOSED order back to `after`,
+    rather than trusting one bounded limit=500 read behind a crypto flood.
     """
     if max_orders is None:
         # With a coverage target we can stop early, so page deep enough to reach
@@ -116,7 +121,9 @@ def _fetch_orders_covering(trading_client, held_symbols=None, require_fill=False
     until = None
     while len(orders) < max_orders:
         try:
-            kwargs = {"status": "all", "limit": page_size}
+            kwargs = {"status": status, "limit": page_size}
+            if after is not None:
+                kwargs["after"] = after
             if until is not None:
                 kwargs["until"] = until
             page = trading_client.get_orders(filter=GetOrdersRequest(**kwargs))
@@ -662,6 +669,12 @@ RECONCILED_BOTS = tuple(
     name for name, cfg in fleet_registry.BOTS.items() if cfg["reconciled"]
 )
 
+# Safety cap on how many closed orders reconcile_fills will page through in one
+# cycle. `after` (the lookback window) is the natural stop; this only bounds a
+# pathological flood so the accountant cycle can't run away. Hitting it is
+# logged loudly (coverage may be incomplete that cycle).
+RECONCILE_MAX_ORDERS = 10000
+
 def _fill_action(order):
     """Best-effort trade action for a reconciled fill, from the order side/symbol.
 
@@ -696,14 +709,19 @@ def reconcile_fills(trading_client, logger, lookback_days=30):
     """
     from datetime import datetime, timezone, timedelta
     written = 0
-    try:
-        after = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-        req = GetOrdersRequest(status="closed", limit=500, after=after)
-        orders = trading_client.get_orders(filter=req)
-    except Exception as e:
-        registry.log_error("utils", "reconcile_fills", e)
-        logger.warning(f"  [Reconcile] Failed to fetch orders: {e}")
-        return written
+    after = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    # Page the whole lookback window — never a single limit=500 read. A
+    # crypto-order flood, or a catch-up run after downtime, can bury a
+    # RECONCILED_BOT's late fill far past the newest 500 CLOSED orders (a wheel
+    # option that fills days after submission sorts by its old submitted_at), so
+    # a bounded window silently drops it — the same trap that orphaned aged
+    # equity positions. _fetch_orders_covering walks back via `until` to `after`.
+    orders = _fetch_orders_covering(trading_client, status="closed", after=after,
+                                    max_orders=RECONCILE_MAX_ORDERS)
+    if len(orders) >= RECONCILE_MAX_ORDERS:
+        logger.warning(f"  [Reconcile] hit the {RECONCILE_MAX_ORDERS}-order page "
+                       f"cap; fills older than the covered window may be missed "
+                       f"this cycle.")
 
     for o in orders:
         c_id = getattr(o, "client_order_id", "") or ""

@@ -200,6 +200,10 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
   Options rely on the bots' own collateral/BP checks; crypto is exempt.
 - Trade rows are written to InfluxDB **from confirmed fills** (broker price/qty/time), with the
   accountant reconciling late fills from Alpaca (`utils.reconcile_fills`, `RECONCILED_BOTS`).
+  Reconcile **pages the whole lookback window** (`_fetch_orders_covering`, capped at
+  `RECONCILE_MAX_ORDERS`), never a single `limit=500` read — a wheel option that fills days after
+  submission sorts by its old `submitted_at`, so a crypto-order flood (or a catch-up after
+  downtime) would bury it past a bounded window, the same trap that orphaned aged positions.
   Rows are stamped at the fill time **floored to the millisecond** so the submit-time and
   reconciled writes land on one point (Alpaca's two order endpoints serialize `filled_at` with
   sub-µs differences; raw-ns stamps duplicated an unpredictable subset of fills).
@@ -208,7 +212,9 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
 
 - Buy-to-closes use an escalating price ladder — midpoint → half-cross → ask
   (`close_option_position`), ~10s per rung — never a bare midpoint limit that can't fill, and
-  a wide spread never blocks a risk-reducing close.
+  a wide spread never blocks a risk-reducing close. Each rung re-submits only the **unfilled
+  remainder** (it subtracts a rung's partial fill before escalating), so a partial-then-escalate
+  can't re-buy the original quantity and over-close a multi-contract short into a net long.
 - ITM contracts at DTE ≤ `FORCE_CLOSE_DTE` (5) are closed outright, with no roll target
   required (deep ITM often has none). Rolls trigger at DTE ≤ `STALE_ROLL_DTE` (10). A close
   that survives the full ladder `CLOSE_FAIL_ALERT_AFTER` (3) cycles in a row alerts Discord +

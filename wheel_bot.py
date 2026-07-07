@@ -118,6 +118,7 @@ def close_option_position(active_option, tag, reason):
     qty = abs(int(float(active_option.qty)))
     if qty <= 0:
         return None
+    remaining = qty
     for frac in CLOSE_LADDER_STEPS:
         quote = get_option_data(sym)
         if not quote:
@@ -129,7 +130,7 @@ def close_option_position(active_option, tag, reason):
             break
         req = LimitOrderRequest(
             symbol=sym,
-            qty=qty,
+            qty=remaining,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.DAY,
             limit_price=price,
@@ -158,6 +159,23 @@ def close_option_position(active_option, tag, reason):
             trading_client.cancel_order_by_id(order.id)
         except Exception:
             pass  # already terminal
+        # Subtract whatever DID fill on this rung before escalating, so the next
+        # rung re-submits only what's left. Re-sending the original qty after a
+        # partial fill would over-close: buying back more contracts than are
+        # still short and flipping the position net long.
+        try:
+            done = trading_client.get_order_by_id(order.id)
+            just_filled = int(float(getattr(done, "filled_qty", 0) or 0))
+        except Exception:
+            just_filled = 0
+        if just_filled > 0:
+            remaining -= just_filled
+            logger.info(f"    [CLOSE PARTIAL] {sym} filled {just_filled}; "
+                        f"{remaining} contract(s) left.")
+            if remaining <= 0:
+                _close_failures.pop(sym, None)
+                logger.info(f"    ✅ [CLOSED] {sym} via partial fills ({reason})")
+                return price
         logger.info(f"    [CLOSE RETRY] {sym} unfilled @ ${price} "
                     f"(cross {int(frac*100)}%). Escalating.")
     fails = _close_failures.get(sym, 0) + 1
