@@ -25,6 +25,16 @@ INFLUX_PORT = config.INFLUX_PORT
 INFLUX_DB_NAME = config.INFLUX_DB_NAME
 DB_QUERY_URL = f"http://{INFLUX_HOST}:{INFLUX_PORT}/query"
 
+# --- REGIME STALENESS WATCHDOG ---
+# market_analyst writes a market_regime row only on a fully-successful SPY+VIX
+# fetch, so the age of the newest row is the fleet's "regime is live" signal.
+# If it goes stale the VIX>28 kill-switch is running blind (the 2026-06-24
+# outage ran ~12 days unseen). This backstop is cross-process: it fires even if
+# the analyst is wedged/dead and its own in-process fail-safe never runs.
+REGIME_STALE_SECONDS = 30 * 60
+REGIME_STALE_ALERT_INTERVAL = 3600  # throttle overseer pings to once/hour
+_last_regime_stale_alert = 0
+
 # Options measurements log per-share premium and contract qty, so their realized
 # P&L must be scaled by the 100-share contract multiplier to express dollars.
 # (Retired measurements like condor_trades stay in InfluxDB but are no longer
@@ -144,6 +154,45 @@ def send_overseer(msg):
         requests.post(hook, json={"content": msg}, timeout=5)
     except Exception as e:
         logger.error(f"Overseer webhook failed: {e}")
+
+def check_regime_freshness():
+    """Alert if market_analyst hasn't written a fresh market_regime row lately.
+
+    Cross-process backstop for the analyst's own in-process fail-safe: catches a
+    wedged/dead analyst (or a sustained data-feed outage) that leaves the fleet
+    trading on a frozen regime with the VIX>28 kill-switch running blind. Writes
+    a regime_freshness metric every cycle (Grafana) and pings the overseer
+    (throttled) once the newest row is older than REGIME_STALE_SECONDS.
+    """
+    global _last_regime_stale_alert
+    try:
+        params = {'db': INFLUX_DB_NAME,
+                  'q': 'SELECT last(regime_score) FROM market_regime',
+                  'epoch': 's'}
+        resp = requests.get(DB_QUERY_URL, params=params, timeout=5)
+        series = resp.json().get('results', [{}])[0].get('series')
+        last_ts = series[0]['values'][0][0] if series else None
+
+        now = time.time()
+        age = None if last_ts is None else now - float(last_ts)
+        is_stale = (age is None) or (age > REGIME_STALE_SECONDS)
+
+        log_metric("regime_freshness", {"source": "market_regime"},
+                   {"age_seconds": float(age) if age is not None else -1.0,
+                    "stale": 1 if is_stale else 0})
+
+        if is_stale and (now - _last_regime_stale_alert) > REGIME_STALE_ALERT_INTERVAL:
+            _last_regime_stale_alert = now
+            age_str = "no rows on record" if age is None else f"{age / 60:.0f} min old"
+            logger.warning(f"[RegimeWatch] market_regime STALE: {age_str}")
+            send_overseer(
+                f"⚠️ **MARKET REGIME STALE**\n"
+                f"Newest market_regime row is {age_str} "
+                f"(threshold {REGIME_STALE_SECONDS // 60} min).\n"
+                f"market_analyst may be wedged or its data feed is down — the "
+                f"VIX>28 kill-switch is running blind. Check the analyst process.")
+    except Exception as e:
+        logger.error(f"[RegimeWatch] freshness check failed: {e}")
 
 # Throttle orphan alerts so a persistently-orphaned position pings once, not
 # every 5-minute accountant cycle.
@@ -328,6 +377,14 @@ def run_accountant():
                 utils.reconcile_option_events(logger, alert=send_overseer)
             except Exception as e:
                 logger.error(f"[OptionEvents] activity reconciliation failed: {e}")
+
+            # 0c. REGIME FRESHNESS WATCHDOG — alert if market_analyst's regime
+            #     feed has gone stale (VIX kill-switch running blind).
+            #     Best-effort: never let it stall the accountant cycle.
+            try:
+                check_regime_freshness()
+            except Exception as e:
+                logger.error(f"[RegimeWatch] watchdog error: {e}")
 
             # 1. FETCH REALIZED P&L (HISTORY)
             history_df = query_influx_trades()
