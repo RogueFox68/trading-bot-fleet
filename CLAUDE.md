@@ -72,10 +72,10 @@ trading-bot-fleet/
 │   ├── tiered_hold.py           # CLOSE_EOD / HOLD_OVERNIGHT / HOLD_SWING scoring
 │   └── logger.py                # Per-bot rotating logs + JSONL error registry
 │
-├── Trading Bots (Active)
+├── Trading Bots (Active — all five run on the fleet_bot runner)
 │   ├── wheel_bot.py             # Options premium selling (38% base, VIX/regime gated)
 │   ├── trend_bot.py             # EMA momentum, long/short (28% base)
-│   ├── survivor_bot.py          # RSI dip buying (20% base) — fleet_bot runner PILOT
+│   ├── survivor_bot.py          # RSI dip buying (20% base) — was the runner pilot
 │   ├── crypto_grid.py           # BTC/ETH/SOL grid trading (5% base)
 │   └── crypto_breakout.py       # Donchian breakout, runs as moon_bot (4% base)
 │
@@ -145,9 +145,11 @@ Two files make a new strategy cheap to add:
 5. Add an app block to `deploy/ecosystem.config.js`, then
    `docker compose build trading-fleet && docker compose up -d trading-fleet`.
 
-Migration status: **survivor_bot** runs on the runner (pilot). trend_bot, wheel_bot, and the
-crypto pair still carry their own legacy scaffolding — port them only after the pilot has
-paper-validated for a few sessions.
+Migration status: **complete.** survivor_bot piloted the runner; trend_bot, wheel_bot,
+crypto_grid, and moon_bot were ported 2026-07-08 with strategy semantics preserved
+(the wheel kept its close ladder / expiry backstop / covered-call ownership rules
+verbatim). Every bot's budget number now flows through `utils.get_budget_dollars` —
+no bot reads `effective_budgets.json` directly anymore.
 
 ## Architecture Notes
 
@@ -284,12 +286,8 @@ through paper trading; there is no backtest harness.
 
 ## Known Issues / Tech Debt
 
-- **wheel_bot dual budget path:** it checks `utils.check_budget` AND reads
-  `effective_budgets.json` directly (`get_my_budget`, $20k fallback). Consolidate when wheel
-  ports to the runner.
 - **tiered_hold overnight stops unwired** (see above) — `max_hold_days` is the only enforced
   backstop.
-- **trend/wheel/crypto still on legacy scaffolding** pending the survivor pilot verdict.
 - **commander bare `except: pass`** remains on best-effort Discord sends.
 - **VIX still depends on yfinance** — alpaca-py has no index feed, so the VIX spot can't move to
   Alpaca like SPY did. The stale fail-safe + accountant freshness watchdog bound the blast radius
