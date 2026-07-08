@@ -179,7 +179,10 @@ class FleetBot:
             self.entry_times = utils.get_position_entry_times(self.trading_client,
                                                               held_symbols=equity_syms)
 
-        self.open_orders = self.trading_client.get_orders(filter=GetOrdersRequest(status="open"))
+        # limit=500 (not the API's default 50) so a busy book can't truncate
+        # pending-order awareness — wheel's busy-ticker skip depends on it.
+        self.open_orders = self.trading_client.get_orders(
+            filter=GetOrdersRequest(status="open", limit=500))
         self.pending_symbols = {o.symbol for o in self.open_orders}
 
         now_et = datetime.datetime.now(EASTERN)

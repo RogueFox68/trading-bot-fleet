@@ -230,7 +230,8 @@ class ClosePositionPartialFillTest(unittest.TestCase):
         client = _CloseClient(plans)
         active = SimpleNamespace(symbol="PAAS260731P00045000", qty=str(-qty))
         quote = mock.Mock(bid_price=1.0, ask_price=1.2)
-        with mock.patch.object(wheel_bot, "trading_client", client), \
+        # The runner owns the client now: patch it on wheel_bot.bot.
+        with mock.patch.object(wheel_bot.bot, "trading_client", client), \
              mock.patch.object(wheel_bot, "get_option_data", return_value=quote), \
              mock.patch.object(wheel_bot.utils, "submit_and_log_order",
                                side_effect=_make_submit(client)), \
@@ -278,7 +279,7 @@ class ClosePositionPartialFillTest(unittest.TestCase):
         ])
         active = SimpleNamespace(symbol="PAAS260731P00045000", qty="-5")
         quote = mock.Mock(bid_price=1.0, ask_price=1.2)
-        with mock.patch.object(wheel_bot, "trading_client", client), \
+        with mock.patch.object(wheel_bot.bot, "trading_client", client), \
              mock.patch.object(wheel_bot, "get_option_data", return_value=quote), \
              mock.patch.object(wheel_bot.utils, "submit_and_log_order",
                                side_effect=_make_submit(client)), \
