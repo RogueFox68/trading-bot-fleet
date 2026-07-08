@@ -45,17 +45,27 @@ EASTERN = pytz.timezone('America/New_York')
 
 
 class FleetBot:
-    def __init__(self, name, loop_seconds=60, market_hours=True):
+    def __init__(self, name, loop_seconds=60, market_hours=True,
+                 needs_entry_times=True, discord_username=None):
         if name not in fleet_registry.BOTS:
             raise ValueError(f"{name} is not in fleet_registry.BOTS - add it there first")
         self.name = name
         self.reg = fleet_registry.BOTS[name]
         self.loop_seconds = loop_seconds
         self.market_hours = market_hours
+        # Crypto bots pass False: their symbols resolve statically, so paging
+        # order history for ownership priming / entry times every cycle would
+        # be pure API load (a 30s grid loop would hammer it).
+        self.needs_entry_times = needs_entry_times
+        self.discord_username = discord_username
 
         self.logger = get_logger(name)
-        self.trading_client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=config.PAPER)
-        self.data_client = StockHistoricalDataClient(config.API_KEY, config.SECRET_KEY)
+        # Bounded read timeouts: one hung Alpaca socket must not freeze the
+        # whole loop (the 2026-07-05 accountant stall).
+        self.trading_client = utils.bound_session_timeout(
+            TradingClient(config.API_KEY, config.SECRET_KEY, paper=config.PAPER))
+        self.data_client = utils.bound_session_timeout(
+            StockHistoricalDataClient(config.API_KEY, config.SECRET_KEY))
         self.webhook = getattr(config, self.reg["webhook"], "")
 
         self.failed_symbols = {}
@@ -66,10 +76,12 @@ class FleetBot:
         self.positions = []
         self.pos_dict = {}
         self.entry_times = {}
+        self.open_orders = []
         self.pending_symbols = set()
         self.regime = "SIDEWAYS"
         self.vix = 15.0
         self.capital_crunch = False
+        self.bot_settings = {}          # this bot's own bot_config.json entry
         self.budget_ok = True
         self.time_str = ""
         self.is_eod_eval = False        # 15:30-15:45 ET: tiered-hold scoring window
@@ -81,7 +93,10 @@ class FleetBot:
         if not self.webhook or "YOUR" in self.webhook:
             return
         try:
-            requests.post(self.webhook, json={"content": msg})
+            payload = {"content": msg}
+            if self.discord_username:
+                payload["username"] = self.discord_username
+            requests.post(self.webhook, json=payload)
         except Exception as e:
             registry.log_error(self.name, "send_discord", e, context=str(msg)[:50])
             self.logger.error(f"Discord webhook failed: {e}")
@@ -133,14 +148,17 @@ class FleetBot:
     def _read_global_settings(self):
         try:
             with open(CONFIG_FILE, 'r') as f:
-                gs = json.load(f).get('global_settings', {})
+                cfg = json.load(f)
+            gs = cfg.get('global_settings', {})
             self.regime = gs.get('market_condition', 'SIDEWAYS')
             self.vix = gs.get('vix', 15.0)
             self.capital_crunch = gs.get('CAPITAL_CRUNCH', False)
+            self.bot_settings = cfg.get('bots', {}).get(self.name, {})
         except Exception as e:
             registry.log_error(self.name, "read_config", e)
             self.logger.error(f"[!] Config load error: {e}")
             self.regime, self.vix, self.capital_crunch = "SIDEWAYS", 15.0, False
+            self.bot_settings = {}
 
     # ---- Per-cycle context ----------------------------------------------
     def refresh(self):
@@ -152,16 +170,20 @@ class FleetBot:
         self.positions = self.trading_client.get_all_positions()
         self.pos_dict = {p.symbol: p for p in self.positions}
 
-        # Prime the ownership cache with full order-history coverage for held
-        # equities, so aged positions (opening order buried behind a crypto
-        # order flood) still resolve owner + entry time this cycle.
-        equity_syms = [p.symbol for p in self.positions if p.asset_class == AssetClass.US_EQUITY]
-        utils.prime_ownership(self.trading_client, equity_syms)
-        self.entry_times = utils.get_position_entry_times(self.trading_client,
-                                                          held_symbols=equity_syms)
+        if self.needs_entry_times:
+            # Prime the ownership cache with full order-history coverage for
+            # held equities, so aged positions (opening order buried behind a
+            # crypto order flood) still resolve owner + entry time this cycle.
+            equity_syms = [p.symbol for p in self.positions if p.asset_class == AssetClass.US_EQUITY]
+            utils.prime_ownership(self.trading_client, equity_syms)
+            self.entry_times = utils.get_position_entry_times(self.trading_client,
+                                                              held_symbols=equity_syms)
 
-        open_orders = self.trading_client.get_orders(filter=GetOrdersRequest(status="open"))
-        self.pending_symbols = {o.symbol for o in open_orders}
+        # limit=500 (not the API's default 50) so a busy book can't truncate
+        # pending-order awareness — wheel's busy-ticker skip depends on it.
+        self.open_orders = self.trading_client.get_orders(
+            filter=GetOrdersRequest(status="open", limit=500))
+        self.pending_symbols = {o.symbol for o in self.open_orders}
 
         now_et = datetime.datetime.now(EASTERN)
         self.time_str = now_et.strftime('%H:%M')
