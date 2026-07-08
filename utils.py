@@ -332,53 +332,75 @@ def get_position_entry_times(trading_client, held_symbols=None):
         registry.log_error("utils", "get_position_entry_times", e)
     return entry_times
 
+def get_budget_dollars(bot_name, trading_client, equity=None):
+    """The bot's current budget in dollars, from one place.
+
+    Resolution: the CFO's effective budget (effective_budgets.json, written by
+    the accountant's reallocator) when present; else the reallocator's own
+    base formula (cfo_settings.base_allocations on allocatable equity); else
+    legacy bots{}.allocation x equity. Returns 0.0 when nothing is configured
+    (FAIL-CLOSED - callers must treat 0.0 as "no budget", never as unlimited).
+
+    Pass `equity` if you already have it; it is only fetched from Alpaca when
+    a fallback path actually needs it. This helper replaces the bots' private
+    effective_budgets readers and their magic fallbacks (wheel's $20k,
+    grid's $5k), so every consumer sees the same number as the budget gate.
+    """
+    import os
+    # 1. Dynamic Effective Budget (CFO reallocator output)
+    if os.path.exists("effective_budgets.json"):
+        try:
+            with open("effective_budgets.json", "r") as f:
+                effective = json.load(f)
+                if bot_name in effective:
+                    return float(effective[bot_name])
+        except Exception as e:
+            registry.log_error("utils", "parse_budget", e)
+            logger.error(f"  [CFO] Dynamic budget parse error: {e}")
+
+    # 2. Fallback when the CFO hasn't written an effective budget yet:
+    #    derive from cfo_settings.base_allocations on allocatable equity
+    #    (equity minus the unallocated reserve) - the same formula the
+    #    reallocator uses - so this path can't drift from the CFO
+    #    baseline. Legacy bots{}.allocation only covers bots that sit
+    #    outside cfo_settings.
+    if not os.path.exists("bot_config.json"):
+        logger.error("  [CFO] FAIL-CLOSED: bot_config.json missing!")
+        return 0.0
+
+    with open("bot_config.json", "r") as f:
+        config_data = json.load(f)
+    cfo = config_data.get("cfo_settings", {})
+    base = cfo.get("base_allocations", {})
+    if bot_name in base:
+        reserve_pct = float(cfo.get("unallocated_reserve", 0.0))
+        allocation_pct = float(base[bot_name]) * (1.0 - reserve_pct)
+    else:
+        allocation_pct = config_data.get("bots", {}).get(bot_name, {}).get("allocation", 0.0)
+
+    if allocation_pct == 0.0:
+        logger.error(f"  [CFO] FAIL-CLOSED: No allocation configured for {bot_name}")
+        return 0.0
+
+    if equity is None:
+        equity = float(trading_client.get_account().equity)
+    return equity * allocation_pct
+
 def check_budget_details(bot_name, trading_client):
     """
     Returns (is_ok, budget_dollars, total_used)
     """
-    import os
     try:
         account = trading_client.get_account()
         equity = float(account.equity)
-        budget_dollars = 0.0
-        
-        # 1. Try fetching Dynamic Effective Budget
-        if os.path.exists("effective_budgets.json"):
-            try:
-                with open("effective_budgets.json", "r") as f:
-                    effective = json.load(f)
-                    if bot_name in effective:
-                        budget_dollars = float(effective[bot_name])
-            except Exception as e:
-                registry.log_error("utils", "parse_budget", e)
-                logger.error(f"  [CFO] Dynamic budget parse error: {e}")
-                
-        # 2. Fallback when the CFO hasn't written an effective budget yet:
-        #    derive from cfo_settings.base_allocations on allocatable equity
-        #    (equity minus the unallocated reserve) — the same formula the
-        #    reallocator uses — so this path can't drift from the CFO
-        #    baseline. Legacy bots{}.allocation only covers bots that sit
-        #    outside cfo_settings.
-        if budget_dollars == 0.0:
-            if not os.path.exists("bot_config.json"):
-                logger.error("  [CFO] FAIL-CLOSED: bot_config.json missing!")
-                return False, 0.0, 0.0
 
-            with open("bot_config.json", "r") as f:
-                config_data = json.load(f)
-            cfo = config_data.get("cfo_settings", {})
-            base = cfo.get("base_allocations", {})
-            if bot_name in base:
-                reserve_pct = float(cfo.get("unallocated_reserve", 0.0))
-                allocation_pct = float(base[bot_name]) * (1.0 - reserve_pct)
-            else:
-                allocation_pct = config_data.get("bots", {}).get(bot_name, {}).get("allocation", 0.0)
+        # Budget number comes from the single shared source (effective ->
+        # cfo base allocation -> legacy allocation). 0.0 = FAIL-CLOSED:
+        # nothing configured, reject entries and report zero available.
+        budget_dollars = get_budget_dollars(bot_name, trading_client, equity=equity)
+        if budget_dollars <= 0.0:
+            return False, 0.0, 0.0
 
-            if allocation_pct == 0.0:
-                logger.error(f"  [CFO] FAIL-CLOSED: No allocation configured for {bot_name}")
-                return False, equity, 0.0 # No limit set -> Reject
-            budget_dollars = equity * allocation_pct
-        
         # 4. Calculate Current Usage
         positions = trading_client.get_all_positions()
         current_used = 0.0
