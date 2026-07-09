@@ -42,7 +42,8 @@
     "global_settings": {
         "market_condition": "SIDEWAYS",
         "emergency_stop": false,
-        "macro_climate": "MACRO_BULL"
+        "macro_climate": "MACRO_BULL",
+        "sector_rotation": "UNKNOWN"
     },
     "cfo_settings": {
         "reallocation_enabled": true,
