@@ -146,14 +146,17 @@ class StrategyAdvisorAllocationTest(unittest.TestCase):
             config_data=self._config(),
             now=dt.datetime(2026, 7, 9, tzinfo=UTC),
             influx_realized_by_bot={"trend_bot": 10, "wheel_bot": -10},
+            influx_window_days=60,
         )
         rec = report["recommendation"]
         self.assertEqual(rec["action"], "recommend_shift")
         self.assertEqual(rec["recommended_allocations"]["trend_bot"], 0.30)
         self.assertEqual(rec["recommended_allocations"]["wheel_bot"], 0.36)
         self.assertFalse(rec["writes_effective_budgets"])
-        self.assertEqual(report["source_comparison"]["trend_bot"]["influx_realized_pl"], 10)
-        self.assertGreater(report["source_comparison"]["trend_bot"]["delta"], 0)
+        comparison = report["source_comparison"]
+        self.assertEqual(comparison["window_days"], {"alpaca_ledger": 60, "influx": 60})
+        self.assertEqual(comparison["bots"]["trend_bot"]["influx_realized_pl"], 10)
+        self.assertGreater(comparison["bots"]["trend_bot"]["delta"], 0)
 
     def test_report_can_be_written(self):
         report = advisor.build_strategy_report([], {}, {}, 100000, self._config(),
@@ -161,6 +164,94 @@ class StrategyAdvisorAllocationTest(unittest.TestCase):
         with tempfile.NamedTemporaryFile() as f:
             advisor.write_strategy_report(report, path=f.name)
             self.assertGreater(len(f.read()), 0)
+
+
+def event(etype, symbol, qty, day, eid="ev-1"):
+    return {"activity_type": etype, "symbol": symbol, "qty": qty,
+            "date": day, "id": eid}
+
+
+class StrategyAdvisorOptionEventTest(unittest.TestCase):
+    """Expirations and assignments have no order behind them; without synthetic
+    fills the ledger never realizes expired-worthless premium (the wheel's most
+    common winning outcome) and skews the wheel's score low."""
+
+    def test_expired_short_put_realizes_premium(self):
+        fills = [fill("wheel_bot", "AAA260731P00045000", "sell", 1, 1.00,
+                      days_ago=10, multiplier=100)]
+        synth, unmatched = advisor.synthetic_fills_from_events(
+            [event("OPEXP", "AAA260731P00045000", 1, "2026-07-05")], fills)
+        self.assertEqual(unmatched, 0)
+        self.assertEqual(len(synth), 1)
+        self.assertEqual(synth[0]["side"], "buy")
+        self.assertEqual(synth[0]["price"], 0.0)
+        metrics = advisor.realized_metrics(fills + synth)
+        self.assertEqual(metrics["wheel_bot"]["realized_pl"], 100.0)
+        self.assertEqual(metrics["wheel_bot"]["win_rate"], 1.0)
+
+    def test_expired_long_option_realizes_loss(self):
+        fills = [fill("trend_bot", "AAA260731C00050000", "buy", 1, 0.50,
+                      days_ago=10, multiplier=100)]
+        synth, _ = advisor.synthetic_fills_from_events(
+            [event("OPEXP", "AAA260731C00050000", 1, "2026-07-05")], fills)
+        self.assertEqual(synth[0]["side"], "sell")
+        metrics = advisor.realized_metrics(fills + synth)
+        self.assertEqual(metrics["trend_bot"]["realized_pl"], -50.0)
+
+    def test_assigned_short_put_realizes_premium_and_books_stock_at_strike(self):
+        fills = [fill("wheel_bot", "AAA260731P00045000", "sell", 1, 1.00,
+                      days_ago=10, multiplier=100)]
+        synth, unmatched = advisor.synthetic_fills_from_events(
+            [event("OPASN", "AAA260731P00045000", 1, "2026-07-05")], fills)
+        self.assertEqual(unmatched, 0)
+        legs = {(s["symbol"], s["side"]): s for s in synth}
+        self.assertIn(("AAA260731P00045000", "buy"), legs)
+        stock = legs[("AAA", "buy")]
+        self.assertEqual(stock["qty"], 100)
+        self.assertEqual(stock["price"], 45.0)
+        self.assertEqual(stock["multiplier"], 1)
+        # a later stock sale pairs against the strike-priced basis
+        exit_fill = fill("wheel_bot", "AAA", "sell", 100, 47.0, days_ago=1)
+        metrics = advisor.realized_metrics(fills + synth + [exit_fill])
+        self.assertEqual(metrics["wheel_bot"]["realized_pl"], 100.0 + 200.0)
+
+    def test_assigned_covered_call_sells_stock_at_strike(self):
+        fills = [
+            fill("wheel_bot", "AAA", "buy", 100, 44.0, days_ago=20),
+            fill("wheel_bot", "AAA260731C00045000", "sell", 1, 0.80,
+                 days_ago=10, multiplier=100),
+        ]
+        synth, _ = advisor.synthetic_fills_from_events(
+            [event("OPASN", "AAA260731C00045000", 1, "2026-07-05")], fills)
+        stock = [s for s in synth if s["symbol"] == "AAA"][0]
+        self.assertEqual(stock["side"], "sell")
+        self.assertEqual(stock["price"], 45.0)
+        metrics = advisor.realized_metrics(fills + synth)
+        # +80 call premium, +100 stock gain (45 strike - 44 basis) x 100 shares
+        self.assertEqual(metrics["wheel_bot"]["realized_pl"], 180.0)
+
+    def test_event_without_open_lot_is_skipped_and_counted(self):
+        synth, unmatched = advisor.synthetic_fills_from_events(
+            [event("OPEXP", "AAA260731P00045000", 1, "2026-07-05")], [])
+        self.assertEqual(synth, [])
+        self.assertEqual(unmatched, 1)
+
+    def test_event_qty_capped_at_open_qty(self):
+        fills = [fill("wheel_bot", "AAA260731P00045000", "sell", 1, 1.00,
+                      days_ago=10, multiplier=100)]
+        synth, unmatched = advisor.synthetic_fills_from_events(
+            [event("OPEXP", "AAA260731P00045000", 3, "2026-07-05")], fills)
+        self.assertEqual(len(synth), 1)
+        self.assertEqual(synth[0]["qty"], 1)
+        self.assertEqual(unmatched, 1)
+
+    def test_event_before_open_does_not_close_anything(self):
+        fills = [fill("wheel_bot", "AAA260731P00045000", "sell", 1, 1.00,
+                      days_ago=1, multiplier=100)]
+        synth, unmatched = advisor.synthetic_fills_from_events(
+            [event("OPEXP", "AAA260731P00045000", 1, "2026-07-01")], fills)
+        self.assertEqual(synth, [])
+        self.assertEqual(unmatched, 1)
 
 
 if __name__ == "__main__":

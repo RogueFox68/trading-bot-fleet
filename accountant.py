@@ -40,6 +40,10 @@ _last_regime_stale_alert = 0
 # recommended_allocations.json for review; it never mutates effective_budgets.json.
 STRATEGY_ADVISOR_INTERVAL = 3600
 _last_strategy_advisor_run = 0
+# The advisor's Alpaca ledger spans max(WINDOW_DAYS) days; the Influx side of
+# its source comparison must cover the same span or the deltas are meaningless.
+# The CFO's own realized_scores stays a 30d read and is unaffected.
+ADVISOR_COMPARE_DAYS = max(strategy_advisor.WINDOW_DAYS)
 
 # Options measurements log per-share premium and contract qty, so their realized
 # P&L must be scaled by the 100-share contract multiplier to express dollars.
@@ -486,6 +490,13 @@ def run_accountant():
 
                 if time.time() - _last_strategy_advisor_run > STRATEGY_ADVISOR_INTERVAL:
                     try:
+                        try:
+                            advisor_influx_realized = calculate_realized_pl(
+                                query_influx_trades(days=ADVISOR_COMPARE_DAYS))
+                        except Exception as influx_err:
+                            logger.warning(f"[StrategyAdvisor] {ADVISOR_COMPARE_DAYS}d "
+                                           f"influx compare unavailable: {influx_err}")
+                            advisor_influx_realized = {}
                         strategy_advisor.generate_and_write_report(
                             trading_client=trading_client,
                             unrealized_by_bot=unrealized_stats,
@@ -493,7 +504,8 @@ def run_accountant():
                             equity=total_equity,
                             config_data=config_data,
                             logger=logger,
-                            influx_realized_by_bot=realized_scores,
+                            influx_realized_by_bot=advisor_influx_realized,
+                            influx_window_days=ADVISOR_COMPARE_DAYS,
                         )
                         _last_strategy_advisor_run = time.time()
                     except Exception as advisor_err:

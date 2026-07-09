@@ -20,8 +20,9 @@ MIN_FILLS = 3
 MAX_ALLOCATION_SHIFT = 0.02
 MIN_SCORE_SPREAD = 0.03
 OPTION_CONTRACT_SIZE = 100
+OPTION_EVENT_TYPES = ("OPASN", "OPEXC", "OPEXP")
 
-_OCC_RE = re.compile(r"^[A-Z]{1,6}\d{6}[PC]\d{8}$")
+_OCC_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([PC])(\d{8})$")
 
 
 def utc_now():
@@ -126,6 +127,110 @@ def fill_from_order(order):
 def fills_from_orders(orders):
     fills = [fill_from_order(o) for o in orders]
     return sorted([f for f in fills if f], key=lambda f: f["filled_at"])
+
+
+def _occ_parts(symbol):
+    """(root, right, strike) from an OCC symbol, or (None, None, None)."""
+    match = _OCC_RE.match(symbol or "")
+    if not match:
+        return None, None, None
+    return match.group(1), match.group(3), int(match.group(4)) / 1000.0
+
+
+def _event_time(ev):
+    """Deterministic UTC stamp for an activity event: its date @ 20:00 UTC,
+    the same convention the accountant's option-event rows use."""
+    day = ev.get("date") or (ev.get("transaction_time") or "")[:10]
+    if not day:
+        return None
+    try:
+        return dt.datetime.fromisoformat(f"{day}T20:00:00+00:00")
+    except ValueError:
+        return None
+
+
+def _synthetic_fill(bot, symbol, side, qty, price, multiplier, filled_at, event):
+    return {
+        "bot": bot,
+        "symbol": symbol,
+        "side": side,
+        "qty": qty,
+        "price": price,
+        "multiplier": multiplier,
+        "notional": price * qty * multiplier,
+        "filled_at": filled_at,
+        "client_order_id": f"synthetic-{event['type']}-{symbol}-{event.get('id')}",
+        "adverse_slippage_bps": None,
+        "synthetic_event": event["type"],
+    }
+
+
+def synthetic_fills_from_events(events, fills):
+    """Turn OPASN/OPEXC/OPEXP account activities into $0 option closes (plus a
+    strike-priced stock leg for assignments/exercises).
+
+    Expirations and assignments have no order behind them, so an orders-only
+    ledger never realizes the premium of a short put that expires worthless —
+    the wheel's most common winning outcome — and never books assigned stock
+    at its strike basis. Events only close what the replayed ledger actually
+    holds at event time; an event on a position opened before the lookback
+    window has no lot to close and is skipped. Returns (synthetic_fills,
+    unmatched_count) where unmatched counts events not fully matched to lots.
+    """
+    parsed = []
+    for ev in events or []:
+        etype = str(ev.get("activity_type") or "").upper()
+        symbol = ev.get("symbol") or ""
+        root, right, strike = _occ_parts(symbol)
+        qty = abs(_as_float(ev.get("qty"), 0.0))
+        when = _event_time(ev)
+        if etype not in OPTION_EVENT_TYPES or root is None or qty <= 0 or when is None:
+            continue
+        parsed.append({"type": etype, "symbol": symbol, "root": root, "right": right,
+                       "strike": strike, "qty": qty, "at": when, "id": ev.get("id")})
+    if not parsed:
+        return [], 0
+    parsed.sort(key=lambda e: e["at"])
+
+    option_fills = sorted(
+        (f for f in fills if f["multiplier"] == OPTION_CONTRACT_SIZE),
+        key=lambda f: f["filled_at"])
+    idx = 0
+    net = {}  # (bot, contract) -> signed open qty, replayed up to each event
+    synthetic = []
+    unmatched = 0
+    for event in parsed:
+        while idx < len(option_fills) and option_fills[idx]["filled_at"] <= event["at"]:
+            f = option_fills[idx]
+            key = (f["bot"], f["symbol"])
+            net[key] = net.get(key, 0.0) + (f["qty"] if f["side"] == "buy" else -f["qty"])
+            idx += 1
+        remaining = event["qty"]
+        for (bot, contract), open_qty in sorted(net.items()):
+            if contract != event["symbol"] or abs(open_qty) < 1e-9 or remaining < 1e-9:
+                continue
+            closed = min(remaining, abs(open_qty))
+            close_side = "buy" if open_qty < 0 else "sell"
+            synthetic.append(_synthetic_fill(
+                bot, contract, close_side, closed, 0.0, OPTION_CONTRACT_SIZE,
+                event["at"], event))
+            if event["type"] in ("OPASN", "OPEXC"):
+                # The stock leg trades at the strike: puts move shares the same
+                # direction as the option close (assigned short put -> buy
+                # shares), calls the opposite (covered call assigned -> shares
+                # called away).
+                if event["right"] == "P":
+                    stock_side = close_side
+                else:
+                    stock_side = "sell" if close_side == "buy" else "buy"
+                synthetic.append(_synthetic_fill(
+                    bot, event["root"], stock_side, closed * OPTION_CONTRACT_SIZE,
+                    event["strike"], 1, event["at"], event))
+            net[(bot, contract)] = open_qty + (closed if open_qty < 0 else -closed)
+            remaining -= closed
+        if remaining > 1e-9:
+            unmatched += 1
+    return synthetic, unmatched
 
 
 def _empty_realized():
@@ -315,19 +420,26 @@ def recommend_allocations(metrics_by_window, config_data, context):
     }
 
 
-def source_comparison(metrics_by_window, influx_realized_by_bot=None):
+def source_comparison(metrics_by_window, influx_realized_by_bot=None,
+                      influx_window_days=None):
+    """Alpaca-ledger vs Influx realized P&L. Only meaningful when both sides
+    cover the same span, so the windows are stated explicitly in the output."""
     influx_realized_by_bot = influx_realized_by_bot or {}
-    comparison = {}
-    sixty_day = metrics_by_window.get("60d", {})
+    bots = {}
+    longest = metrics_by_window.get(f"{max(WINDOW_DAYS)}d", {})
     for bot in fleet_registry.BOTS:
-        alpaca_realized = _as_float(sixty_day.get(bot, {}).get("realized_pl"), 0.0)
+        alpaca_realized = _as_float(longest.get(bot, {}).get("realized_pl"), 0.0)
         influx_realized = _as_float(influx_realized_by_bot.get(bot), 0.0)
-        comparison[bot] = {
+        bots[bot] = {
             "alpaca_ledger_realized_pl": round(alpaca_realized, 2),
             "influx_realized_pl": round(influx_realized, 2),
             "delta": round(alpaca_realized - influx_realized, 2),
         }
-    return comparison
+    return {
+        "window_days": {"alpaca_ledger": max(WINDOW_DAYS), "influx": influx_window_days},
+        "note": "influx side uses the accountant's avg-cost approximation",
+        "bots": bots,
+    }
 
 
 def macro_scorecard(metrics_by_window, context):
@@ -339,7 +451,8 @@ def macro_scorecard(metrics_by_window, context):
     }
 
 
-def fetch_alpaca_fills(trading_client, lookback_days=max(WINDOW_DAYS), max_orders=10000):
+def fetch_alpaca_fills(trading_client, lookback_days=max(WINDOW_DAYS), max_orders=10000,
+                       logger=None):
     """Fetch recent closed Alpaca orders and return normalized fill rows."""
     import utils
 
@@ -350,11 +463,53 @@ def fetch_alpaca_fills(trading_client, lookback_days=max(WINDOW_DAYS), max_order
         after=after,
         max_orders=max_orders,
     )
+    if logger and len(orders) >= max_orders:
+        logger.warning(
+            f"[StrategyAdvisor] order fetch hit max_orders={max_orders}; the "
+            f"{lookback_days}d window is truncated at its old end and the "
+            f"{max(WINDOW_DAYS)}d metrics undercount early fills.")
     return fills_from_orders(orders)
 
 
+def fetch_option_events(lookback_days=max(WINDOW_DAYS), max_pages=20):
+    """Fetch OPASN/OPEXC/OPEXP account activities covering the ledger window.
+
+    Same endpoint and paging the accountant's reconcile_option_events uses,
+    kept self-contained so this paper-only layer never touches the hardened
+    reconcile path.
+    """
+    import config
+    import requests
+
+    base_url = ("https://paper-api.alpaca.markets" if getattr(config, "PAPER", True)
+                else "https://api.alpaca.markets")
+    headers = {"APCA-API-KEY-ID": config.API_KEY,
+               "APCA-API-SECRET-KEY": config.SECRET_KEY,
+               "accept": "application/json"}
+    after = (utc_now() - dt.timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    events = []
+    page_token = None
+    for _ in range(max_pages):
+        params = {"activity_types": ",".join(OPTION_EVENT_TYPES),
+                  "after": after, "direction": "asc", "page_size": 100}
+        if page_token:
+            params["page_token"] = page_token
+        r = requests.get(f"{base_url}/v2/account/activities",
+                         headers=headers, params=params, timeout=15)
+        r.raise_for_status()
+        page = r.json()
+        if not page:
+            break
+        events.extend(page)
+        if len(page) < 100:
+            break
+        page_token = page[-1].get("id")
+    return events
+
+
 def build_strategy_report(fills, unrealized_by_bot, allocation_by_bot, equity,
-                          config_data, now=None, influx_realized_by_bot=None):
+                          config_data, now=None, influx_realized_by_bot=None,
+                          influx_window_days=None, option_events_included=None):
     now = now or utc_now()
     metrics_by_window = {
         f"{days}d": build_window_metrics(
@@ -365,18 +520,24 @@ def build_strategy_report(fills, unrealized_by_bot, allocation_by_bot, equity,
     context = regime_context(config_data)
     recommendation = recommend_allocations(metrics_by_window, config_data, context)
     return {
-        "version": "1.0",
+        "version": "1.1",
         "updated": now.isoformat(),
-        "source": "alpaca_orders_and_live_positions",
+        "source": "alpaca_orders_option_events_and_live_positions",
         "status": "success",
         "recommendation": recommendation,
         "windows": metrics_by_window,
         "macro_scorecard": macro_scorecard(metrics_by_window, context),
-        "source_comparison": source_comparison(metrics_by_window, influx_realized_by_bot),
+        "source_comparison": source_comparison(metrics_by_window, influx_realized_by_bot,
+                                               influx_window_days),
         "assumptions": {
             "paper_only": True,
             "does_not_write_effective_budgets": True,
             "thin_samples_hold_current_allocations": True,
+            "option_lifecycle_events_included": option_events_included,
+            "crypto_attribution_caveat": (
+                "unrealized P&L and capital for shared coins resolve to "
+                "crypto_grid, so moon_bot vs crypto_grid scores are not "
+                "directly comparable; realized P&L is order-tag accurate"),
         },
     }
 
@@ -388,11 +549,30 @@ def write_strategy_report(report, path=OUTPUT_FILE):
 
 def generate_and_write_report(trading_client, unrealized_by_bot, allocation_by_bot,
                               equity, config_data, logger=None, path=OUTPUT_FILE,
-                              influx_realized_by_bot=None):
-    fills = fetch_alpaca_fills(trading_client)
+                              influx_realized_by_bot=None, influx_window_days=None):
+    fills = fetch_alpaca_fills(trading_client, logger=logger)
+    option_events_ok = False
+    unmatched = 0
+    try:
+        events = fetch_option_events()
+        synthetic, unmatched = synthetic_fills_from_events(events, fills)
+        fills = sorted(fills + synthetic, key=lambda f: f["filled_at"])
+        option_events_ok = True
+    except Exception as e:
+        # Loud but non-fatal: without lifecycle events the wheel's expired/
+        # assigned premium is missing from this run's realized numbers.
+        if logger:
+            logger.error(f"[StrategyAdvisor] option lifecycle fetch failed; "
+                         f"expiry/assignment premium missing this run: {e}")
+    if unmatched and logger:
+        logger.warning(f"[StrategyAdvisor] {unmatched} option event(s) had no open "
+                       f"lot in the {max(WINDOW_DAYS)}d ledger (opened earlier); "
+                       f"their premium is not counted.")
     report = build_strategy_report(fills, unrealized_by_bot, allocation_by_bot,
                                    equity, config_data,
-                                   influx_realized_by_bot=influx_realized_by_bot)
+                                   influx_realized_by_bot=influx_realized_by_bot,
+                                   influx_window_days=influx_window_days,
+                                   option_events_included=option_events_ok)
     write_strategy_report(report, path=path)
     if logger:
         rec = report["recommendation"]
