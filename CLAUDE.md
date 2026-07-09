@@ -69,6 +69,7 @@ trading-bot-fleet/
 │   ├── new_bot_template.py      # Copy-fill-register template for a new strategy
 │   ├── utils.py                 # Ownership resolution, budget checks, order submission
 │   │                            # safety gates, targets loader, fill reconciliation
+│   ├── strategy_advisor.py      # Paper-only performance ledger + allocation recommendations
 │   ├── tiered_hold.py           # CLOSE_EOD / HOLD_OVERNIGHT / HOLD_SWING scoring
 │   └── logger.py                # Per-bot rotating logs + JSONL error registry
 │
@@ -91,12 +92,14 @@ trading-bot-fleet/
 ├── Tests & tools
 │   ├── test_orphan_resolution.py  # Regression: ownership/entry-time resolution + root inference
 │   ├── test_fill_logging.py       # Regression: ms-floored fill stamps, wheel close ladder
+│   ├── test_strategy_advisor.py   # Regression: advisor attribution, P&L, drawdown, allocation recs
 │   ├── dedupe_trades.py           # One-off: delete pre-fix duplicate trade rows (dry-run default)
 │   ├── export_data.py             # Export InfluxDB trade data to CSV
 │   └── fetch_trade_history.py     # Pull raw FILL activities from Alpaca
 │
 └── (gitignored, host repo dir)  config.py, bot_config.json, active_targets.json,
                                  effective_budgets.json, moon_bot_state.json, logs/
+                                 recommended_allocations.json
 ```
 
 Retired: `condor_bot.py` (2026-07, Alpaca multi-leg unreliability — in git history if ever
@@ -193,6 +196,10 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
 - The accountant also flips `CAPITAL_CRUNCH` in `bot_config.json` at >90% utilization
   (released <80%), and reallocates gated bots' surplus to active bots
   (`cfo_settings.reallocation_*`, `gate_idle_threshold_cycles` honored).
+- `strategy_advisor.py` is a separate, paper-only decision layer. The accountant runs it
+  hourly and writes `recommended_allocations.json` using Alpaca fills plus live positions,
+  rolling 5d/20d/60d risk-adjusted bot scores, and the current regime/VIX/macro/sector bucket.
+  It never writes `effective_budgets.json`; recommendations are for review until promoted.
 
 ### Safety Gates (in `utils.submit_and_log_order`)
 
@@ -276,13 +283,14 @@ defined but not yet enforced anywhere — only `max_hold_days` is live.
 
 ## Testing
 
-`python -m unittest test_orphan_resolution test_fill_logging test_market_analyst -v` —
+`python -m unittest test_orphan_resolution test_fill_logging test_market_analyst test_strategy_advisor -v` —
 regression suites for the ownership/entry-time paging fix (+ option-root inference and the
 no-default-owner rule), fill-row stamping / wheel close-ladder pricing, and the market-regime
-pipeline (SPY-df normalization, VIX>28 kill-switch, loud-failure + stale fail-safe). Run the
+pipeline (SPY-df normalization, VIX>28 kill-switch, loud-failure + stale fail-safe), plus the
+paper-only allocation advisor. Run the
 first two after touching `utils.py` ownership/order/logging code or wheel close logic, and
-`test_market_analyst` after touching `market_analyst.py`. Strategy changes are still validated
-through paper trading; there is no backtest harness.
+`test_market_analyst` after touching `market_analyst.py`. Strategy/advisor changes are still
+validated through paper trading; there is no backtest harness.
 
 ## Known Issues / Tech Debt
 

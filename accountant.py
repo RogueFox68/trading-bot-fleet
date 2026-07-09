@@ -8,6 +8,7 @@ from alpaca.trading.enums import AssetClass
 from logger import logger
 import utils
 import fleet_registry
+import strategy_advisor
 
 
 # --- CONFIGURATION ---
@@ -34,6 +35,11 @@ DB_QUERY_URL = f"http://{INFLUX_HOST}:{INFLUX_PORT}/query"
 REGIME_STALE_SECONDS = 30 * 60
 REGIME_STALE_ALERT_INTERVAL = 3600  # throttle overseer pings to once/hour
 _last_regime_stale_alert = 0
+
+# Paper-only allocation recommendation cadence. This writes
+# recommended_allocations.json for review; it never mutates effective_budgets.json.
+STRATEGY_ADVISOR_INTERVAL = 3600
+_last_strategy_advisor_run = 0
 
 # Options measurements log per-share premium and contract qty, so their realized
 # P&L must be scaled by the 100-share contract multiplier to express dollars.
@@ -356,6 +362,7 @@ def calculate_dynamic_allocations(equity, allocation_stats, regime, vix, config_
 # Removed duplicated get_bot_owner. Accountant now uses utils.get_bot_owner directly.
 def run_accountant():
     import json
+    global _last_strategy_advisor_run
     logger.info("--- 🧾 SMART ACCOUNTANT (Condor Aware) STARTED ---")
 
     while True:
@@ -476,6 +483,21 @@ def run_accountant():
                             json.dump(config_data, f, indent=4)
                 
                 calculate_dynamic_allocations(total_equity, allocation_stats, regime, vix, config_data)
+
+                if time.time() - _last_strategy_advisor_run > STRATEGY_ADVISOR_INTERVAL:
+                    try:
+                        strategy_advisor.generate_and_write_report(
+                            trading_client=trading_client,
+                            unrealized_by_bot=unrealized_stats,
+                            allocation_by_bot=allocation_stats,
+                            equity=total_equity,
+                            config_data=config_data,
+                            logger=logger,
+                            influx_realized_by_bot=realized_scores,
+                        )
+                        _last_strategy_advisor_run = time.time()
+                    except Exception as advisor_err:
+                        logger.error(f"[StrategyAdvisor] recommendation failed: {advisor_err}")
             except Exception as e:
                 logger.error(f"[CFO] Reallocation and Utilization process failed: {e}")
             
