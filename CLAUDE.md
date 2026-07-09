@@ -199,6 +199,10 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
 - `strategy_advisor.py` is a separate, paper-only decision layer. The accountant runs it
   hourly and writes `recommended_allocations.json` using Alpaca fills plus live positions,
   rolling 5d/20d/60d risk-adjusted bot scores, and the current regime/VIX/macro/sector bucket.
+  Option lifecycle activities (OPASN/OPEXC/OPEXP) are synthesized into the ledger as $0
+  option closes plus strike-priced stock legs — without them an orders-only ledger never
+  realizes expired-worthless premium and scores the wheel low. Its source comparison is
+  window-matched (60d Alpaca ledger vs a dedicated 60d Influx read, not the CFO's 30d one).
   It never writes `effective_budgets.json`; recommendations are for review until promoted.
 
 ### Safety Gates (in `utils.submit_and_log_order`)
