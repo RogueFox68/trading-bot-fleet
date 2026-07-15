@@ -209,6 +209,20 @@ def check_regime_freshness():
 _orphan_alert_times = {}
 ORPHAN_ALERT_INTERVAL = 6 * 3600  # 6 hours
 
+def _skip_orphan_sweep(reason):
+    """Stand the sweep down for a cycle, visibly but without paging anyone.
+
+    2026-07-15: three ReadTimeouts on the order fetch emptied the ownership
+    map and the sweep alert-flagged the entire 9-position book as orphaned in
+    one shot. An Alpaca outage must not masquerade as a fleet-wide orphan
+    event — when order history is unfetchable, "not in the map" means
+    "unknown", not "untagged". The skip is logged and metered (Grafana:
+    orphan_sweep) so suppression during a storm is itself observable.
+    """
+    logger.warning(f"[Orphan] sweep SKIPPED this cycle — {reason}")
+    log_metric("orphan_sweep", {"status": "skipped"},
+               {"skipped": 1, "reason": reason.replace('"', "'")})
+
 def detect_orphans(positions, trading_client):
     """Flag held positions that no bot is durably managing.
 
@@ -220,6 +234,11 @@ def detect_orphans(positions, trading_client):
     but time-based backstops like max-hold are blind for them, so they emit
     an 'entry_time_missing' metric instead of an alert. Orphans alert
     (throttled) to the overseer webhook and log an 'orphan_position' metric.
+
+    Fail-safe: the sweep only runs against a freshly-fetched map. If the
+    order-history fetch failed (or the map was served from the stale
+    fallback cache), the whole sweep — alerts AND metrics — stands down
+    until order history is healthy again (see _skip_orphan_sweep).
     """
     from alpaca.trading.enums import AssetClass
     managed = [p for p in positions
@@ -229,7 +248,23 @@ def detect_orphans(positions, trading_client):
     syms = [p.symbol for p in managed]
     try:
         owner_map = utils._build_order_based_map(trading_client, held_symbols=syms)
+        if utils.ownership_map_degraded() or not utils.order_history_healthy():
+            # Don't launch the entry-times fetch into a known storm — it
+            # would just burn another retries-x-timeout round to no purpose.
+            _skip_orphan_sweep("order-history fetch failed; ownership served "
+                               "from last-known-good cache")
+            return
         entry_times = utils.get_position_entry_times(trading_client, held_symbols=syms)
+        if not utils.order_history_healthy():
+            # The map fetched clean but the entry-times read failed right
+            # after it — same storm, partial data. Missing entries would read
+            # as 'entry_time_missing' for the whole book; stand down instead.
+            _skip_orphan_sweep("entry-time fetch failed after a clean "
+                               "ownership fetch")
+            return
+    except utils.OrderFetchError as e:
+        _skip_orphan_sweep(f"order-history fetch failed with no cached map ({e})")
+        return
     except Exception as e:
         logger.error(f"[Orphan] detection failed: {e}")
         return

@@ -85,6 +85,50 @@ _KNOWN_BOT_TAGS = list(fleet_registry.BOTS) + list(fleet_registry.RETIRED_BOT_ME
 # OCC option symbol: root + YYMMDD + P/C + strike*1000 (e.g. PAAS260702P00048000)
 _OCC_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})\d{6}[PC]\d{8}$")
 
+
+class OrderFetchError(Exception):
+    """Alpaca order-history fetch failed (after retries).
+
+    Raised by _fetch_orders_covering so callers can tell "the API failed"
+    from "no orders exist". Treating those the same is what turned the
+    2026-07-15 ReadTimeout storm into a fleet-wide phantom orphan event:
+    the fetch returned an empty set, the ownership map collapsed, and the
+    accountant alert-flagged all 9 held positions as unowned at once.
+
+    Carries the pages fetched before the failure in `.partial` (newest-
+    first). Idempotent consumers (reconcile_fills, entry times) may use
+    them; ownership/orphan logic MUST NOT — a missing older tail is
+    indistinguishable from a missing tag.
+    """
+    def __init__(self, cause, partial=None):
+        super().__init__(str(cause))
+        self.partial = partial if partial is not None else []
+
+
+# Per-page retry policy for the paginated order fetch. Alpaca timeout storms
+# come in bursts (85+ timeouts logged in the days around 2026-07-15), so one
+# bare attempt per page fails exactly when coverage matters most.
+ORDER_FETCH_ATTEMPTS = 3
+ORDER_FETCH_BACKOFF = 2.0  # seconds; doubles per retry (2s, 4s)
+
+# Time of the most recent paginated-fetch failure (any caller). The orphan
+# sweep uses this to stand down around an API outage instead of reading an
+# empty/stale map as "the whole book is untagged".
+_last_order_fetch_failure = 0.0
+ORDER_HISTORY_HEALTH_WINDOW = 180  # seconds a failure keeps history "unhealthy"
+
+
+def order_history_healthy(within=ORDER_HISTORY_HEALTH_WINDOW):
+    """False while a paginated order fetch failed in the last `within` seconds.
+
+    Deliberately time-decayed rather than reset-on-success: during a storm,
+    one lucky fetch between timeouts must not re-arm alert paths that a
+    failing sibling fetch (e.g. entry times right after the ownership map)
+    just invalidated.
+    """
+    return (time.time() - _last_order_fetch_failure) >= within
+
+
 def _fetch_orders_covering(trading_client, held_symbols=None, require_fill=False,
                            page_size=500, max_orders=None, status="all", after=None):
     """Fetch recent Alpaca orders newest-first, paging past the 500-order cap.
@@ -107,7 +151,14 @@ def _fetch_orders_covering(trading_client, held_symbols=None, require_fill=False
     caller with no coverage target (held_symbols=None) can sweep a whole time
     window — e.g. reconcile_fills paging every CLOSED order back to `after`,
     rather than trusting one bounded limit=500 read behind a crypto flood.
+
+    Each page is retried ORDER_FETCH_ATTEMPTS times with backoff; if a page
+    still can't be fetched this RAISES OrderFetchError (partial results
+    attached) instead of returning what it has. Returning a short list here
+    is how the 2026-07-15 timeout storm masqueraded as a fleet-wide orphan
+    event — callers must be able to tell an outage from an empty history.
     """
+    global _last_order_fetch_failure
     if max_orders is None:
         # With a coverage target we can stop early, so page deep enough to reach
         # a weeks-old opening order behind a crypto flood. Without one, just take
@@ -120,17 +171,29 @@ def _fetch_orders_covering(trading_client, held_symbols=None, require_fill=False
     remaining = set(held_symbols) if held_symbols else None
     until = None
     while len(orders) < max_orders:
-        try:
-            kwargs = {"status": status, "limit": page_size}
-            if after is not None:
-                kwargs["after"] = after
-            if until is not None:
-                kwargs["until"] = until
-            page = trading_client.get_orders(filter=GetOrdersRequest(**kwargs))
-        except Exception as e:
-            registry.log_error("utils", "fetch_orders_paginated", e)
-            logger.error(f"  [Orders] paginated order fetch failed: {e}")
-            break
+        kwargs = {"status": status, "limit": page_size}
+        if after is not None:
+            kwargs["after"] = after
+        if until is not None:
+            kwargs["until"] = until
+        page = None
+        for attempt in range(ORDER_FETCH_ATTEMPTS):
+            try:
+                page = trading_client.get_orders(filter=GetOrdersRequest(**kwargs))
+                break
+            except Exception as e:
+                if attempt + 1 < ORDER_FETCH_ATTEMPTS:
+                    delay = ORDER_FETCH_BACKOFF * (2 ** attempt)
+                    logger.warning(f"  [Orders] page fetch failed (attempt "
+                                   f"{attempt + 1}/{ORDER_FETCH_ATTEMPTS}), "
+                                   f"retrying in {delay:.0f}s: {e}")
+                    time.sleep(delay)
+                    continue
+                _last_order_fetch_failure = time.time()
+                registry.log_error("utils", "fetch_orders_paginated", e)
+                logger.error(f"  [Orders] paginated order fetch failed after "
+                             f"{ORDER_FETCH_ATTEMPTS} attempts: {e}")
+                raise OrderFetchError(e, partial=orders)
         if not page:
             break
 
@@ -161,6 +224,26 @@ def _fetch_orders_covering(trading_client, held_symbols=None, require_fill=False
 
     return orders
 
+# True while ownership lookups are being served from a stale cache (or failed
+# outright) because the order-history fetch is failing. get_bot_owner reads it
+# to quarantine unknowns QUIETLY, and the accountant reads it to stand the
+# orphan sweep down — during an outage "not in the map" means "unknown", never
+# "untagged".
+_ownership_map_degraded = False
+
+# After a fetch failure, serve the stale cache for this long before trying the
+# API again. Without it, every per-position get_bot_owner call during a storm
+# would re-run a full retries-x-timeout fetch (~90s worst case) and stall its
+# caller's cycle.
+OWNERSHIP_FETCH_FAIL_COOLDOWN = 120
+
+
+def ownership_map_degraded():
+    """True when the last ownership-map build could not fetch order history
+    (the map in use is last-known-good or absent, not current truth)."""
+    return _ownership_map_degraded
+
+
 def _build_order_based_map(trading_client, held_symbols=None):
     """
     Builds a symbol -> bot_name lookup from Alpaca order history.
@@ -168,14 +251,30 @@ def _build_order_based_map(trading_client, held_symbols=None):
     Cached for 60 seconds to avoid API spam. When `held_symbols` is provided the
     cache is only reused if it already covers every one of those symbols, so an
     aged position can't be served a stale, incomplete map.
+
+    FAILS SAFE, NEVER OPEN (2026-07-15 postmortem): when the order fetch
+    fails, this returns the last-known-good cache — however old, coverage
+    check waived — and flags the map degraded. It never builds, caches, or
+    returns a map from a failed fetch: doing so collapsed the whole book to
+    unowned during a ReadTimeout storm and fired orphan alerts for all 9
+    positions. With no cache to fall back on it raises OrderFetchError —
+    "ownership is unknowable right now" must stay loud and distinguishable.
     """
-    import time
-    global _ownership_cache, _ownership_cache_time
+    global _ownership_cache, _ownership_cache_time, _ownership_map_degraded
 
     now = time.time()
     if _ownership_cache and (now - _ownership_cache_time) < 60:
         if not held_symbols or all(s in _ownership_cache for s in held_symbols):
             return _ownership_cache
+
+    # Recent fetch failure -> cooldown: keep serving last-known-good without
+    # touching the API (see OWNERSHIP_FETCH_FAIL_COOLDOWN).
+    if not order_history_healthy(within=OWNERSHIP_FETCH_FAIL_COOLDOWN):
+        _ownership_map_degraded = True
+        if _ownership_cache:
+            return _ownership_cache
+        raise OrderFetchError(
+            "order-history fetch in failure cooldown with no cached ownership map")
 
     owner_map = {}
 
@@ -189,7 +288,20 @@ def _build_order_based_map(trading_client, held_symbols=None):
     #    static baseline, so the most recent owner sticks.
     order_set = set()
     root_claims = {}
-    orders = _fetch_orders_covering(trading_client, held_symbols=held_symbols)
+    try:
+        orders = _fetch_orders_covering(trading_client, held_symbols=held_symbols)
+    except OrderFetchError:
+        _ownership_map_degraded = True
+        if _ownership_cache:
+            age = now - _ownership_cache_time
+            logger.warning(f"  [Ownership] order fetch FAILED — serving the "
+                           f"last-known-good map ({age:.0f}s old) instead of an "
+                           f"empty one; unknowns quarantine quietly and the "
+                           f"orphan sweep stands down until a clean fetch.")
+            return _ownership_cache
+        logger.error("  [Ownership] order fetch FAILED with no cached map — "
+                     "ownership is unresolvable this cycle.")
+        raise
     for o in orders:
         # client_order_id format: "{bot_name}-{symbol}-{timestamp}"
         c_id = o.client_order_id
@@ -218,6 +330,7 @@ def _build_order_based_map(trading_client, held_symbols=None):
 
     _ownership_cache = owner_map
     _ownership_cache_time = now
+    _ownership_map_degraded = False
     return owner_map
 
 def prime_ownership(trading_client, held_symbols):
@@ -276,6 +389,13 @@ def get_bot_owner(symbol, asset_class, trading_client):
     #    wheel-assigned PAAS on 2026-07-06 through exactly this path). Leave
     #    it unowned — no bot trades it — and surface it; the accountant's
     #    orphan sweep alerts until a human resolves it.
+    if _ownership_map_degraded:
+        # The map is a stale fallback behind a failed fetch: a symbol missing
+        # from it is UNKNOWN, not untagged (a position opened after the cache
+        # was built has no entry yet). Quarantine it — still no bot trades it
+        # — but skip the fallback metric/log until a clean fetch settles it,
+        # so an API blip doesn't page anyone about phantom unowned positions.
+        return None
     _note_ownership_fallback(symbol)
     return None
 
@@ -319,8 +439,18 @@ def get_position_entry_times(trading_client, held_symbols=None):
     """
     entry_times = {}
     try:
-        orders = _fetch_orders_covering(trading_client, held_symbols=held_symbols,
-                                        require_fill=True)
+        try:
+            orders = _fetch_orders_covering(trading_client, held_symbols=held_symbols,
+                                            require_fill=True)
+        except OrderFetchError as e:
+            # Salvage the pages fetched before the failure: paging is
+            # newest-first, so any symbol covered by them has its most recent
+            # fill in hand (correct entry); uncovered symbols stay unknown.
+            # The fetch already stamped order-history unhealthy, so the orphan
+            # sweep won't read the gaps as 'entry_time_missing' this cycle.
+            logger.warning(f"  [Orders] entry-time fetch degraded — salvaged "
+                           f"{len(e.partial)} order(s) fetched before the failure: {e}")
+            orders = e.partial
         for o in orders:
             filled_at = getattr(o, "filled_at", None)
             if filled_at is None:
@@ -807,8 +937,18 @@ def reconcile_fills(trading_client, logger, lookback_days=30):
     # option that fills days after submission sorts by its old submitted_at), so
     # a bounded window silently drops it — the same trap that orphaned aged
     # equity positions. _fetch_orders_covering walks back via `until` to `after`.
-    orders = _fetch_orders_covering(trading_client, status="closed", after=after,
-                                    max_orders=RECONCILE_MAX_ORDERS)
+    try:
+        orders = _fetch_orders_covering(trading_client, status="closed", after=after,
+                                        max_orders=RECONCILE_MAX_ORDERS)
+    except OrderFetchError as e:
+        # Safe to use what we got: fill rows are idempotent (stamped at broker
+        # filled_at / deterministic synthetic time) and the whole lookback
+        # window is re-read next cycle, so the un-fetched tail is only
+        # deferred, never lost.
+        orders = e.partial
+        logger.warning(f"  [Reconcile] order fetch failed mid-window — "
+                       f"reconciling the {len(orders)} order(s) fetched before "
+                       f"the failure; the rest are re-read next cycle.")
     if len(orders) >= RECONCILE_MAX_ORDERS:
         logger.warning(f"  [Reconcile] hit the {RECONCILE_MAX_ORDERS}-order page "
                        f"cap; fills older than the covered window may be missed "
@@ -834,7 +974,7 @@ def reconcile_fills(trading_client, logger, lookback_days=30):
         logger.info(f"  [Reconcile] wrote/updated {written} fill row(s) from Alpaca.")
     return written
 
-def bound_session_timeout(client, timeout=15):
+def bound_session_timeout(client, timeout=30):
     """Give an alpaca-py REST client's underlying requests.Session a default
     read timeout.
 
@@ -844,6 +984,11 @@ def bound_session_timeout(client, timeout=15):
     reallocation behind it. Wraps the private `_session` attribute (stable
     across alpaca-py releases) and no-ops harmlessly if the layout changes;
     callers that pass their own timeout are untouched.
+
+    Default was 15s; raised to 30s after the 2026-07-15 Alpaca storm, where
+    slow-but-alive order reads kept tripping the tighter bound. 30s still
+    can't wedge a cycle (that's what the bound is for) and the paginated
+    fetch adds retry-with-backoff on top for the reads that matter.
     """
     session = getattr(client, "_session", None)
     request = getattr(session, "request", None)
