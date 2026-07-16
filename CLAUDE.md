@@ -175,6 +175,17 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
   definition) → `orphan_position` metric + overseer alert. Owned positions with no resolvable
   entry time (assignment-created stock has no opening order) emit `entry_time_missing` instead —
   the owner manages them, but time-based backstops (max-hold) are blind for them.
+- **A failed order fetch is not an empty one** (2026-07-15 storm postmortem: three ReadTimeouts
+  emptied the fetch and the sweep alert-flagged all 9 held positions as orphans at once).
+  `_fetch_orders_covering` retries each page with backoff, then **raises `utils.OrderFetchError`**
+  (partial pages attached) instead of returning a short list. The map build fails safe: it serves
+  the last-known-good cache (never builds/caches a map from a failed fetch; raises if there's no
+  cache at all), flags it via `utils.ownership_map_degraded()`, and cools down 120s between fetch
+  attempts. While degraded, `get_bot_owner` quarantines unknowns **without** the
+  `ownership_fallback` metric, and the accountant stands the orphan sweep down entirely
+  (`orphan_sweep` skip metric, no alerts) until `utils.order_history_healthy()`.
+  `reconcile_fills` and entry times salvage the partial pages (idempotent / newest-first-correct).
+  The Alpaca session read timeout is 30s (`bound_session_timeout`), raised from 15s.
 - The accountant also logs option lifecycle events (OPASN/OPEXC/OPEXP) from Alpaca account
   activities into `wheel_trades` (actions `assigned`/`exercised`/`expired`, ignored by realized
   P&L pairing) and pings the overseer on assignment/exercise.

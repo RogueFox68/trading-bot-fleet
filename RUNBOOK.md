@@ -60,6 +60,11 @@ Safety is centralized in `utils.py`:
     `error_watchdog` ships them to InfluxDB (`bot_error_events`) → visible in Grafana.
 *   **Orphan alerts:** the accountant flags held positions no bot is managing
     (`orphan_position` measurement + overseer webhook). Investigate before closing manually.
+    The sweep stands down (no alerts, `orphan_sweep` skip metric instead) while the Alpaca
+    order-history fetch is failing — a 2026-07-15 timeout storm once alert-flagged the whole
+    book as orphaned off an empty fetch. A burst of orphan alerts during API trouble is
+    suspect; a *sustained* `orphan_sweep skipped` streak means order history has been
+    unfetchable for a while and deserves a look.
 *   **Pending orders:** clear via the Alpaca dashboard.
 
 ## Target File Contract
