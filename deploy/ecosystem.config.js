@@ -7,6 +7,15 @@
 
 const APP_DIR = process.env.APP_DIR || '/app/code';
 
+// Memory backstop. The Beelink has 16GB shared with InfluxDB/Grafana/wg-easy,
+// and a bot that ratchets its RSS has nothing else to catch it. PM2 restarts
+// the process (and commander's watchdog reports the restart to Grafana) rather
+// than letting the box swap. The accountant gets more headroom: it holds a 30d
+// InfluxDB trade DataFrame plus a paged order window every cycle, so its
+// working set is legitimately the largest in the fleet.
+const MAX_MEM = '600M';
+const MAX_MEM_ACCOUNTANT = '1G';
+
 const infra = (name, opts = {}) => ({
   name,
   script: `${APP_DIR}/${name}.py`,
@@ -15,6 +24,7 @@ const infra = (name, opts = {}) => ({
   autorestart: true,
   max_restarts: 10,
   restart_delay: 5000,
+  max_memory_restart: MAX_MEM,
   env: { PYTHONUNBUFFERED: '1' },
   ...opts,
 });
@@ -27,6 +37,7 @@ const bot = (name, script) => ({
   autorestart: true,
   max_restarts: 10,
   restart_delay: 10000,
+  max_memory_restart: MAX_MEM,
   env: { PYTHONUNBUFFERED: '1' },
 });
 
@@ -34,7 +45,7 @@ module.exports = {
   apps: [
     // ---- INFRASTRUCTURE (start first) ----
     infra('market_analyst'),
-    infra('accountant'),
+    infra('accountant', { max_memory_restart: MAX_MEM_ACCOUNTANT }),
     infra('commander'),
     // Ships logs/fleet_error_registry.jsonl into InfluxDB (bot_error_events)
     infra('error_watchdog'),

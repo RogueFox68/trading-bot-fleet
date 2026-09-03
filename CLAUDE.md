@@ -186,6 +186,23 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
   (`orphan_sweep` skip metric, no alerts) until `utils.order_history_healthy()`.
   `reconcile_fills` and entry times salvage the partial pages (idempotent / newest-first-correct).
   The Alpaca session read timeout is 30s (`bound_session_timeout`), raised from 15s.
+- **A symbol with no covering order is proven uncoverable once, not every cycle.** Some held
+  positions never get a covering order by design — assignment/exercise makes bare stock with no
+  opening order, and unowned positions are quarantined until a human acts. For those the paged
+  fetch's coverage target could never be met, so every call walked the full `max_orders` window
+  (24 pages / 12,000 orders instead of 2 / 1,000), twice per `FleetBot.refresh()`, every 60s —
+  and it defeated the 60s ownership cache outright, since the coverage check can never be
+  satisfied by a symbol that isn't in the map. That churn was the fleet's memory high-water
+  mark. `_fetch_orders_covering` now memos such symbols (`_uncoverable_symbols`,
+  `UNCOVERABLE_RECHECK_SECONDS` = 1h, keyed by `require_fill`) and stops letting them drive
+  paging; `_build_order_based_map` treats a memoed symbol as covered ("unowned" IS the map's
+  answer, represented by absence). The first walk still pages exhaustively — the GEN/APTV
+  guarantee is untouched — and a tagged order placed later to claim an orphan still resolves on
+  the next cycle, because it lands on page 1 of newest-first history.
+- **Per-symbol throttle/dedupe state is bounded.** `_fallback_log_times`, `_alerted_event_ids`,
+  `wheel_bot._close_failures`, `survivor_bot._daily_sma_cache`, `accountant._orphan_alert_times`
+  and `FleetBot.failed_symbols` all evict (by TTL, by cap, or against currently-held symbols).
+  Symbols churn constantly, and a month-long PM2 process kept one entry per symbol ever seen.
 - The accountant also logs option lifecycle events (OPASN/OPEXC/OPEXP) from Alpaca account
   activities into `wheel_trades` (actions `assigned`/`exercised`/`expired`, ignored by realized
   P&L pairing) and pings the overseer on assignment/exercise.
@@ -221,7 +238,9 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
 - Daily loss cap: `MAX_DAILY_LOSS` (-$5,000) blocks all orders.
 - Notional cap ($20k) + symbol exposure cap ($5k) on any **equity order that opens or increases
   exposure** — long entries AND short entries. Risk-reducing orders (closes, covers) are exempt.
-  Options rely on the bots' own collateral/BP checks; crypto is exempt.
+  Options rely on the bots' own collateral/BP checks; crypto is exempt. The gate's price lookup
+  reuses one lazily-built, `bound_session_timeout`-wrapped data client (`_safety_price_client`)
+  instead of constructing a fresh, unbounded-timeout client per order.
 - Trade rows are written to InfluxDB **from confirmed fills** (broker price/qty/time), with the
   accountant reconciling late fills from Alpaca (`utils.reconcile_fills`, `RECONCILED_BOTS`).
   Reconcile **pages the whole lookback window** (`_fetch_orders_covering`, capped at
@@ -312,6 +331,10 @@ validated through paper trading; there is no backtest harness.
 - **tiered_hold overnight stops unwired** (see above) — `max_hold_days` is the only enforced
   backstop.
 - **commander bare `except: pass`** remains on best-effort Discord sends.
+- **`bot_monitor.memory` / `.cpu` in Grafana were flat 0 until 2026-09.** `pm2 jlist` reports
+  live resource usage under `monit`, not `pm2_env`; commander read the wrong key, so the fleet's
+  only per-process memory series never carried data. Fixed — but every `bot_monitor` point
+  written before that fix has memory=0 and cpu=0, so historical panels are empty by construction.
 - **VIX still depends on yfinance** — alpaca-py has no index feed, so the VIX spot can't move to
   Alpaca like SPY did. The stale fail-safe + accountant freshness watchdog bound the blast radius
   (degrade safe, alert loud) but a paid index source would remove the last external-data SPOF.

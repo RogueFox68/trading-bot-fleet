@@ -21,6 +21,7 @@ Two ways the fleet has manufactured phantom orphans:
 Run: python -m unittest test_orphan_resolution -v
 """
 import datetime
+import time
 import unittest
 from unittest import mock
 
@@ -43,6 +44,7 @@ def reset_ownership_state():
     utils._ownership_map_degraded = False
     utils._last_order_fetch_failure = 0.0
     utils._fallback_log_times.clear()
+    utils.reset_coverage_memo()
 
 
 class FakeOrder:
@@ -140,6 +142,140 @@ class AgedOrderResolutionTest(unittest.TestCase):
         max_days = tiered_hold.max_hold_days_for_tier(tier)
         if max_days is not None:
             self.assertGreaterEqual(hours_held / 24.0, max_days)
+
+
+class UncoverableSymbolPagingTest(unittest.TestCase):
+    """A held symbol with NO covering order must not re-walk history forever.
+
+    Assignment/exercise turns an option into bare stock with no opening order,
+    and an unowned position is deliberately quarantined until a human resolves
+    it — so `remaining` can never empty for those symbols and every fetch ran
+    to the full max_orders window (24 pages / 12,000 orders instead of 2 /
+    1,000), twice per FleetBot.refresh(), every 60s. It also defeated the 60s
+    ownership cache, whose coverage check such a symbol can never satisfy.
+    That churn was the fleet's memory high-water mark.
+
+    The negative-coverage memo must cut the repeat cost WITHOUT weakening the
+    GEN/APTV guarantee: the first walk still pages exhaustively, and a tagged
+    order placed later (how a human claims an orphan) still resolves on the
+    very next cycle, because it lands on page 1 of newest-first history.
+    """
+
+    def setUp(self):
+        reset_ownership_state()
+        # 6000 crypto orders (~4 500-order pages deep) + one tagged equity open.
+        orders = []
+        gen_open = NOW - datetime.timedelta(days=21)
+        orders.append(FakeOrder("GEN", "trend_bot-GEN-1", gen_open, filled_at=gen_open))
+        for i in range(6000):
+            ts = NOW - datetime.timedelta(minutes=i)
+            orders.append(FakeOrder("BTC/USD", f"crypto_grid-BTC/USD-{i}", ts, filled_at=ts))
+        self.orders = orders
+        self.client = FakeTradingClient(orders)
+
+    def test_first_walk_still_pages_exhaustively(self):
+        """Coverage is still PROVEN once — the memo is earned, not assumed."""
+        utils._build_order_based_map(self.client, held_symbols=["GEN", "PAAS"])
+        self.assertGreater(self.client.call_count, 4)
+        self.assertTrue(utils._coverage_deferred("PAAS", False))
+        # The tagged symbol resolved, so it is never memoed as uncoverable.
+        self.assertFalse(utils._coverage_deferred("GEN", False))
+
+    def _cycles(self, held, n=5):
+        """Average pages per cycle after the first walk, for a held set."""
+        reset_ownership_state()
+        client = FakeTradingClient(self.orders)
+        utils._build_order_based_map(client, held_symbols=held)
+        after_first = client.call_count
+        for _ in range(n):
+            utils._ownership_cache_time = 0  # expire only the 60s map cache
+            utils._build_order_based_map(client, held_symbols=held)
+        return (client.call_count - after_first) / float(n)
+
+    def test_uncoverable_symbol_adds_no_repeat_paging_cost(self):
+        """After the first walk proves it, an uncoverable symbol must cost the
+        same as not holding it at all. A genuinely aged-but-TAGGED position
+        (GEN) still pages as deep as its opening order — that coverage
+        guarantee is the GEN/APTV fix and stays untouched."""
+        tagged_only = self._cycles(["GEN"])
+        with_orphan = self._cycles(["GEN", "PAAS"])
+        self.assertEqual(with_orphan, tagged_only,
+                         "an uncoverable symbol is still driving extra paging")
+
+    def test_uncoverable_symbol_alone_costs_one_page(self):
+        """Holding only assignment-created stock: one page, not the full
+        12,000-order max_orders walk it used to take every cycle."""
+        self.assertLessEqual(self._cycles(["PAAS"]), 1.0)
+
+    def test_uncoverable_symbol_no_longer_defeats_the_60s_cache(self):
+        utils._build_order_based_map(self.client, held_symbols=["GEN", "PAAS"])
+        first_walk = self.client.call_count
+        # Same cycle, cache still warm: these must not touch the API at all.
+        for _ in range(3):
+            utils._build_order_based_map(self.client, held_symbols=["GEN", "PAAS"])
+        self.assertEqual(self.client.call_count, first_walk)
+
+    def test_claiming_order_still_resolves_on_the_next_cycle(self):
+        utils._build_order_based_map(self.client, held_symbols=["GEN", "PAAS"])
+        self.assertTrue(utils._coverage_deferred("PAAS", False))
+        # A human claims the orphan with a tagged order -> newest in history.
+        claim = FakeOrder("PAAS", "wheel_bot-PAAS-999", NOW, filled_at=NOW)
+        client = FakeTradingClient(self.orders + [claim])
+        utils._ownership_cache_time = 0
+        owner_map = utils._build_order_based_map(client, held_symbols=["GEN", "PAAS"])
+        self.assertEqual(owner_map.get("PAAS"), "wheel_bot")
+
+    def test_memo_is_keyed_by_require_fill(self):
+        """Entry times need a FILLED order; ownership only needs a tagged one.
+        A symbol uncoverable for one predicate must not silence the other."""
+        unfilled = FakeOrder("XYZ", "trend_bot-XYZ-1", NOW, filled_at=None)
+        client = FakeTradingClient(self.orders + [unfilled])
+        utils.get_position_entry_times(client, held_symbols=["XYZ"])
+        self.assertTrue(utils._coverage_deferred("XYZ", True))
+        self.assertFalse(utils._coverage_deferred("XYZ", False))
+
+    def test_memo_prunes_itself(self):
+        utils._note_uncoverable(["OLD"], False,
+                                now=time.time() - utils.UNCOVERABLE_RECHECK_SECONDS * 2)
+        self.assertFalse(utils._coverage_deferred("OLD", False))
+        utils._note_uncoverable(["NEW"], False)
+        self.assertNotIn(("OLD", False), utils._uncoverable_symbols)
+
+
+class BoundedProcessStateTest(unittest.TestCase):
+    """Per-symbol throttle/dedupe state in month-long processes must not grow
+    without bound. Symbols churn constantly — every assigned lot, every option
+    contract, every scout rotation — so these maps kept one entry per symbol
+    ever seen, for the life of the PM2 process."""
+
+    def setUp(self):
+        reset_ownership_state()
+
+    def test_ownership_fallback_throttle_evicts_stale_symbols(self):
+        with mock.patch.object(utils.requests, "post") as post:
+            post.return_value = mock.Mock(status_code=204)
+            # An old symbol that has long since stopped being held.
+            utils._fallback_log_times["GONE"] = time.time() - 4000
+            utils._note_ownership_fallback("CURRENT")
+        self.assertIn("CURRENT", utils._fallback_log_times)
+        self.assertNotIn("GONE", utils._fallback_log_times)
+
+    def test_option_event_alert_dedupe_is_bounded(self):
+        utils._alerted_event_ids.clear()
+        utils._alerted_event_fifo.clear()
+        cap = utils._alerted_event_fifo.maxlen
+        with mock.patch.object(utils.requests, "post") as post:
+            post.return_value = mock.Mock(status_code=204)
+            for i in range(cap + 50):
+                utils._write_option_event(
+                    {"activity_type": "OPASN", "symbol": "PAAS260702P00048000",
+                     "qty": 1, "date": "2026-07-02", "id": f"ev-{i}"},
+                    "wheel_trades", utils.logger, alert=lambda _m: None)
+        self.assertEqual(len(utils._alerted_event_ids), cap)
+        self.assertEqual(len(utils._alerted_event_fifo), cap)
+        # Newest kept, oldest evicted — the watermark never rescans that far back.
+        self.assertIn(f"ev-{cap + 49}", utils._alerted_event_ids)
+        self.assertNotIn("ev-0", utils._alerted_event_ids)
 
 
 class OrphanSignatureTest(unittest.TestCase):

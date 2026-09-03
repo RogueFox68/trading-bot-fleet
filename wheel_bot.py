@@ -535,6 +535,15 @@ def cycle(bot):
         and utils.get_bot_owner(p.symbol, p.asset_class, bot.trading_client) == "wheel_bot"
     ]
 
+    # Contracts churn on every roll/expiry, so drop close-failure streaks for
+    # symbols we no longer hold — otherwise this map keeps one entry per
+    # contract the wheel has ever struggled to close, for the life of the
+    # process.
+    held_option_symbols = {p.symbol for p in wheel_option_positions}
+    for sym in list(_close_failures):
+        if sym not in held_option_symbols:
+            del _close_failures[sym]
+
     managed_option_tickers = set()
     for active_option in wheel_option_positions:
         # Extract ticker root from OCC symbol (e.g. AAPL260626P00140000 -> AAPL)

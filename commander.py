@@ -48,8 +48,13 @@ def log_process_to_influx(proc):
         pm2_env = proc.get('pm2_env', {})
         status = pm2_env.get('status')
         status_code = 1 if status == 'online' else 0
-        memory = pm2_env.get('memory', 0)
-        cpu = pm2_env.get('cpu', 0)
+        # `pm2 jlist` reports live resource usage under 'monit', NOT 'pm2_env'
+        # (which carries status/uptime/restart_time). Reading them off pm2_env
+        # meant bot_monitor.memory and .cpu were hardcoded 0 in Grafana — the
+        # fleet's only per-process memory series has been flat since day one.
+        monit = proc.get('monit', {}) or {}
+        memory = monit.get('memory', 0) or 0
+        cpu = monit.get('cpu', 0) or 0
         restart_count = pm2_env.get('restart_time', 0)
         
         # Calculate uptime

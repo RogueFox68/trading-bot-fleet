@@ -1,5 +1,6 @@
 import json
 import time
+import collections
 import re
 import requests
 from alpaca.trading.enums import AssetClass, OrderSide, OrderStatus
@@ -117,6 +118,49 @@ ORDER_FETCH_BACKOFF = 2.0  # seconds; doubles per retry (2s, 4s)
 _last_order_fetch_failure = 0.0
 ORDER_HISTORY_HEALTH_WINDOW = 180  # seconds a failure keeps history "unhealthy"
 
+# Symbols an exhaustive history walk has ALREADY proven have no covering order,
+# keyed (symbol, require_fill) -> time of that walk.
+#
+# Some held positions never get a covering order, by design: assignment/exercise
+# turns an option into bare stock with no opening order of its own, and an
+# unowned position is deliberately quarantined until a human resolves it. For
+# those, `remaining` can never empty, so every call walked the full max_orders
+# window (measured: 24 pages / 12,000 orders instead of 2 / 1,000) — twice per
+# FleetBot.refresh(), every 60s, forever. That churn is the fleet's memory
+# high-water mark, and it also defeated the 60s ownership cache outright (the
+# coverage check can never be satisfied by a symbol that isn't in the map).
+#
+# Re-proving the same negative every minute buys nothing: a NEW tagged order —
+# the way a human claims an orphan — lands at the TOP of the newest-first
+# history, so page 1 still finds it on the very next cycle. Only the deep
+# re-search is skipped, and only until the memo expires.
+_uncoverable_symbols = {}
+UNCOVERABLE_RECHECK_SECONDS = 3600
+
+
+def _coverage_deferred(symbol, require_fill, now=None):
+    """True while an exhaustive walk has recently proven `symbol` uncoverable."""
+    seen = _uncoverable_symbols.get((symbol, bool(require_fill)))
+    if seen is None:
+        return False
+    return ((now or time.time()) - seen) < UNCOVERABLE_RECHECK_SECONDS
+
+
+def _note_uncoverable(symbols, require_fill, now=None):
+    """Record that a full walk ended without covering `symbols`, and drop
+    memo entries that have aged out (this map stays held-position sized)."""
+    now = now or time.time()
+    for sym in symbols:
+        _uncoverable_symbols[(sym, bool(require_fill))] = now
+    for key, seen in list(_uncoverable_symbols.items()):
+        if (now - seen) >= UNCOVERABLE_RECHECK_SECONDS:
+            del _uncoverable_symbols[key]
+
+
+def reset_coverage_memo():
+    """Forget every uncoverable-symbol memo (tests; manual re-check)."""
+    _uncoverable_symbols.clear()
+
 
 def order_history_healthy(within=ORDER_HISTORY_HEALTH_WINDOW):
     """False while a paginated order fetch failed in the last `within` seconds.
@@ -169,6 +213,12 @@ def _fetch_orders_covering(trading_client, held_symbols=None, require_fill=False
     orders = []
     seen_ids = set()
     remaining = set(held_symbols) if held_symbols else None
+    # Symbols a recent exhaustive walk already proved uncoverable don't get to
+    # drive paging again — they'd page to max_orders every single call. They
+    # still resolve from whatever this fetch returns (a claiming order would be
+    # on page 1), they just no longer force the deep search.
+    if remaining:
+        remaining -= {s for s in remaining if _coverage_deferred(s, require_fill)}
     until = None
     while len(orders) < max_orders:
         kwargs = {"status": status, "limit": page_size}
@@ -222,6 +272,15 @@ def _fetch_orders_covering(trading_client, held_symbols=None, require_fill=False
             break
         until = oldest
 
+    # Walked the whole window (history exhausted or max_orders hit) and some
+    # symbols still had no covering order: memo them so the next call doesn't
+    # re-prove the same negative. Only symbols that actually drove THIS walk are
+    # recorded — already-memoed ones were dropped above, so their timestamps
+    # stay put and keep aging out. A FAILED fetch never reaches here (it
+    # raises), so an outage can never be mistaken for a proven negative.
+    if remaining:
+        _note_uncoverable(remaining, require_fill)
+
     return orders
 
 # True while ownership lookups are being served from a stale cache (or failed
@@ -264,7 +323,14 @@ def _build_order_based_map(trading_client, held_symbols=None):
 
     now = time.time()
     if _ownership_cache and (now - _ownership_cache_time) < 60:
-        if not held_symbols or all(s in _ownership_cache for s in held_symbols):
+        # A symbol an exhaustive walk already proved untagged is COVERED by the
+        # map — "unowned" is the map's answer for it, represented by absence.
+        # Without this the coverage check could never be satisfied for such a
+        # symbol, so every prime_ownership call rebuilt the map from scratch and
+        # the 60s cache was dead for the whole process.
+        if not held_symbols or all(s in _ownership_cache
+                                   or _coverage_deferred(s, False, now)
+                                   for s in held_symbols):
             return _ownership_cache
 
     # Recent fetch failure -> cooldown: keep serving last-known-good without
@@ -413,6 +479,11 @@ def _note_ownership_fallback(symbol):
     if now - _fallback_log_times.get(symbol, 0) < 600:
         return
     _fallback_log_times[symbol] = now
+    # Symbols churn (every assigned lot, every manual order), so drop entries
+    # past the throttle window rather than keeping one per symbol forever.
+    for sym, seen in list(_fallback_log_times.items()):
+        if now - seen >= 1200:
+            del _fallback_log_times[sym]
     logger.warning(f"  [Ownership] {symbol}: no bot tag in order history — "
                    f"leaving unowned (no bot will trade it; see orphan sweep).")
     try:
@@ -611,6 +682,23 @@ def get_available_budget(bot_name, trading_client):
     is_ok, budget_dollars, total_used = check_budget_details(bot_name, trading_client)
     return max(0.0, budget_dollars - total_used)
 
+# Shared data client for the safety gates' price lookup. Built once, lazily:
+# a fresh client per order meant a new TLS session and connection pool on every
+# submit, and it was the one Alpaca client in the fleet that never went through
+# bound_session_timeout — so a hung socket here had NO read timeout at all,
+# exactly the stall the rest of the fleet was hardened against.
+_safety_data_client = None
+
+
+def _safety_price_client():
+    global _safety_data_client
+    if _safety_data_client is None:
+        from alpaca.data.historical import StockHistoricalDataClient
+        _safety_data_client = bound_session_timeout(
+            StockHistoricalDataClient(config.API_KEY, config.SECRET_KEY))
+    return _safety_data_client
+
+
 def submit_and_log_order(trading_client, order_data, logger, reason="", log_action=None):
     """
     Submits an order and polls for a few seconds to log fill-confirmation.
@@ -654,11 +742,9 @@ def submit_and_log_order(trading_client, order_data, logger, reason="", log_acti
                 else:
                     # For market orders, fetch a rough current price from Alpaca
                     from alpaca.data.requests import StockLatestTradeRequest
-                    from alpaca.data.historical import StockHistoricalDataClient
                     try:
-                        dc = StockHistoricalDataClient(config.API_KEY, config.SECRET_KEY)
                         req = StockLatestTradeRequest(symbol_or_symbols=symbol)
-                        res = dc.get_stock_latest_trade(req)
+                        res = _safety_price_client().get_stock_latest_trade(req)
                         est_price = float(res[symbol].price)
                     except Exception as e:
                         logger.warning(f"  [SAFETY] price lookup failed for {symbol}: {e}")
@@ -1008,7 +1094,11 @@ def bound_session_timeout(client, timeout=30):
 # Alpaca's account activities for them each cycle.
 _OPTION_EVENT_ACTIONS = {"OPASN": "assigned", "OPEXC": "exercised", "OPEXP": "expired"}
 _option_events_after = None      # ISO date watermark; restart rescans the lookback
-_alerted_event_ids = set()       # best-effort in-process Discord dedupe
+# Best-effort in-process Discord dedupe. Bounded: the watermark only ever
+# rescans the newest day, so old ids can never come back around, and an
+# unbounded set in a process that runs for months is just a slow leak.
+_alerted_event_ids = set()
+_alerted_event_fifo = collections.deque(maxlen=2000)  # eviction order for the set
 
 def _write_option_event(ev, measurement, logger, alert=None):
     """Write one activity event as a trade row; returns 1 if written.
@@ -1044,6 +1134,9 @@ def _write_option_event(ev, measurement, logger, alert=None):
         return 0
     ev_id = ev.get("id")
     if alert and act in ("assigned", "exercised") and ev_id not in _alerted_event_ids:
+        if len(_alerted_event_fifo) == _alerted_event_fifo.maxlen:
+            _alerted_event_ids.discard(_alerted_event_fifo[0])
+        _alerted_event_fifo.append(ev_id)
         _alerted_event_ids.add(ev_id)
         shares = int(qty) * 100
         alert(f"📌 **OPTION {act.upper()}: {sym}**\n"

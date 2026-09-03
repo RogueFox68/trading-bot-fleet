@@ -112,7 +112,13 @@ class FleetBot:
         return False
 
     def cooldown(self, symbol):
-        self.failed_symbols[symbol] = time.time()
+        now = time.time()
+        self.failed_symbols[symbol] = now
+        # in_cooldown() only evicts symbols it is asked about again; a symbol
+        # that drops off the target list never is, so sweep on write.
+        for sym, t in list(self.failed_symbols.items()):
+            if (now - t) >= FAILED_SYMBOL_COOLDOWN:
+                del self.failed_symbols[sym]
 
     # ---- Orders --------------------------------------------------------
     def tag(self, symbol):
