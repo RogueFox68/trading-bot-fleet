@@ -270,6 +270,13 @@ def detect_orphans(positions, trading_client):
         return
 
     now = time.time()
+    # Throttle timestamps are only meaningful for positions we still hold;
+    # without this the map keeps one entry per symbol ever orphaned, forever.
+    held = {p.symbol for p in managed}
+    for sym in list(_orphan_alert_times):
+        if sym not in held:
+            del _orphan_alert_times[sym]
+
     for p in managed:
         sym = p.symbol
         # Options may be tagged by full contract or by root symbol.

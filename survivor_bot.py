@@ -81,6 +81,12 @@ def get_trend_sma(symbol, window=200):
             return None
         sma = float(df['close'].tail(window).mean())
         _daily_sma_cache[symbol] = (now, sma)
+        # The scout rotates targets 3x daily out of a ~4800-symbol universe, so
+        # evict past-TTL entries instead of accumulating one per symbol ever
+        # scanned for the life of the process.
+        for sym, (seen, _) in list(_daily_sma_cache.items()):
+            if (now - seen) >= _DAILY_SMA_TTL:
+                del _daily_sma_cache[sym]
         return sma
     except Exception as e:
         registry.log_error("survivor_bot", "get_trend_sma", e, context=symbol)
