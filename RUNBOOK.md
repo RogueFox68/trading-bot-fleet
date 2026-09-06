@@ -15,6 +15,26 @@ to `~/bots/repo/` 3x daily; the live mount makes it visible in-container.
 *   **Generated files** (`active_targets.json`, `bot_config.json`, `effective_budgets.json`,
     `moon_bot_state.json`, `logs/`) are runtime state in the repo dir on the host, gitignored.
 
+## First Command in Any Incident
+
+```bash
+docker exec -w /app/code trading-fleet python3 fleet_doctor.py
+```
+
+`fleet_doctor.py` checks, in the container, against the code the fleet actually runs:
+where it is running from, whether every `.py` parses and every PM2 process survives
+**import**, whether `config.py` is complete (and `INFLUX_HOST` is not `localhost`),
+Alpaca auth + SPY bars, **each VIX source independently**, an InfluxDB round-trip, and
+the freshness of `bot_config.json` / `active_targets.json` plus live `pm2` state.
+Read-only apart from one InfluxDB test point; it never places an order.
+Exit code 0 = clean, 1 = something failed. `--skip-network` for an offline code check.
+
+It exists because an import-time crash is the one failure a bot's own `try/except`
+main loop cannot catch — the loop never starts — so it looks identical from Discord
+to every other kind of outage. It also answers the "did my edit land in the right
+place?" question directly: it prints the running file's hash, its mtime, the git
+HEAD, and any uncommitted drift.
+
 ## Daily Operations
 
 ```bash
@@ -28,6 +48,7 @@ docker exec trading-fleet pm2 restart all
 # Deploy when requirements.txt or deploy/ changed
 cd ~/homelab
 docker compose build trading-fleet && docker compose up -d trading-fleet
+docker exec -w /app/code trading-fleet python3 fleet_doctor.py   # verify the rebuild
 
 # Logs
 docker logs -f trading-fleet          # PM2 + process stdout
@@ -66,6 +87,19 @@ Safety is centralized in `utils.py`:
     suspect; a *sustained* `orphan_sweep skipped` streak means order history has been
     unfetchable for a while and deserves a look.
 *   **Pending orders:** clear via the Alpaca dashboard.
+*   **A bot keeps "crashing":** the alert now says which kind. `CRASHED` means PM2 gave
+    up after repeated exits (an import-time failure — bad dependency, syntax error in a
+    shared module, missing `config.py` key); the alert carries the tail of the PM2 error
+    log. `NOT RUNNING` means the process is merely stopped while `bot_config` says active.
+    Down-alerts are throttled to one per process per 15 min, and a bot commander itself
+    paused (analyst VIX > 28) resumes silently. Full reason:
+    `docker exec trading-fleet pm2 logs <name> --err --lines 40 --nostream`.
+*   **VIX / regime dark:** `/status` shows the live VIX **and which source produced it**
+    (`vix_source`, also a tag on the InfluxDB `market_regime` row). `stale_failsafe` means
+    no source answered for 45 min and the fleet is on CRITICAL_VOLATILITY + VIX 25 with
+    `data_stale=true` — entries are gated, which is the safe posture, but it is not a
+    market reading. `fleet_doctor.py` tests each source separately and tells you whether
+    it is one provider or container egress.
 
 ## Target File Contract
 The Corsair scout must emit the v1.1 dictionary schema:

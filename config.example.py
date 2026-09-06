@@ -12,8 +12,14 @@ DISCORD_TOKEN      = "..."
 DISCORD_CHANNEL_ID = "..."
 
 # ---- InfluxDB ----
-INFLUX_HOST    = "localhost"
+# MUST be "influxdb" — the bots run INSIDE the trading-fleet container, where
+# localhost is the container itself, so a localhost here sends every metric and
+# error into the void with no visible failure. "influxdb" is the sibling
+# container's name on the compose network (Docker DNS resolves it).
+INFLUX_HOST    = "influxdb"
 INFLUX_PORT    = 8086
+# Must match compose INFLUXDB_DB exactly; a past "tradingbots" typo silently
+# dropped every write.
 INFLUX_DB_NAME = "trading_bots"
 
 # ---- Discord Webhooks ----

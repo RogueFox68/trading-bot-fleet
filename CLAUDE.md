@@ -56,7 +56,7 @@ Rebuild only when `requirements.txt` or `deploy/` changes.
 trading-bot-fleet/
 ├── CLAUDE.md                    # This file
 ├── RUNBOOK.md                   # Ops: deploy, incident response, error pipeline
-├── requirements.txt             # Single dependency manifest (image installs THIS file)
+├── requirements.txt             # Single dependency manifest, PINNED (image installs THIS file)
 ├── bot_config.template.json     # Runtime config template (copy to bot_config.json)
 │
 ├── deploy/                      # Container build: Dockerfile, entrypoint.sh,
@@ -90,6 +90,9 @@ trading-bot-fleet/
 │                                # bot_error_events (errors visible in Grafana)
 │
 ├── Tests & tools
+│   ├── fleet_doctor.py            # RUN THIS FIRST in any incident (in-container preflight:
+│   │                              # imports, config, Alpaca, each VIX source, Influx, pm2)
+│   ├── test_commander.py          # Regression: watchdog alert throttling, crash-vs-stop wording
 │   ├── test_orphan_resolution.py  # Regression: ownership/entry-time resolution + root inference
 │   ├── test_fill_logging.py       # Regression: ms-floored fill stamps, wheel close ladder
 │   ├── test_strategy_advisor.py   # Regression: advisor attribution, P&L, drawdown, allocation recs
@@ -281,10 +284,19 @@ registry (`gated_when`): wheel_bot gates on BEAR_TREND/CRITICAL_VOLATILITY or VI
 (covered calls on owned stock exempt); crypto_grid on bear regimes. Gated bots keep managing
 existing positions.
 
-**Data sources & resilience (post 2026-06-24 silent-outage postmortem):** SPY (which drives
-the regime) comes from **Alpaca `get_stock_bars`** — reliable, already authenticated. VIX stays
-on **yfinance** because alpaca-py exposes no index feed, but as a hardened, *isolated*
-single-ticker fetch (retry + backoff) so a Yahoo hiccup can't take the regime down with it.
+**Data sources & resilience (post 2026-06-24 silent-outage and 2026-09 yfinance-death
+postmortems):** SPY (which drives the regime) comes from **Alpaca `get_stock_bars`** — reliable,
+already authenticated. VIX cannot: alpaca-py exposes no index feed and this account 403s on the
+index endpoints. So VIX runs a **multi-source fallback chain** (`market_analyst.VIX_SOURCES`):
+stooq CSV → CBOE delayed-quote JSON → yfinance, first sane reading wins. Every source returns
+**true index points**, so the 22/28 gates need no recalibration whichever answers; a dollar-priced
+proxy (VIXY/VXX) is deliberately excluded, since a mis-scaled number feeding a kill-switch is
+worse than no number (the stale fail-safe already covers "no number"). Readings outside
+`[VIX_MIN, VIX_MAX]` = [5, 150] are rejected as garbage rather than published. yfinance is **last
+and imported lazily** — it broke the fleet twice (2026-06 rate-limiting, 2026-09 outright), and a
+broken install of an optional fallback must not kill the regime process at import. The winning
+source is published to `global_settings.vix_source`, tagged on the InfluxDB `market_regime` row,
+and shown by `/status` — so which provider carries the kill-switch is never a mystery.
 Failures are **loud**: an empty/failed fetch logs `registry.log_error` + a throttled Discord
 ping and **never silently skips** (the original bug: a two-ticker `yf.download` returned an
 empty frame, the publish block skipped with no `else`, and VIX froze — disabling the kill-switch
@@ -317,14 +329,23 @@ defined but not yet enforced anywhere — only `max_hold_days` is live.
 
 ## Testing
 
-`python -m unittest test_orphan_resolution test_fill_logging test_market_analyst test_strategy_advisor -v` —
+`python -m unittest test_orphan_resolution test_fill_logging test_market_analyst test_strategy_advisor test_commander -v` —
 regression suites for the ownership/entry-time paging fix (+ option-root inference and the
 no-default-owner rule), fill-row stamping / wheel close-ladder pricing, and the market-regime
 pipeline (SPY-df normalization, VIX>28 kill-switch, loud-failure + stale fail-safe), plus the
 paper-only allocation advisor. Run the
 first two after touching `utils.py` ownership/order/logging code or wheel close logic, and
-`test_market_analyst` after touching `market_analyst.py`. Strategy/advisor changes are still
-validated through paper trading; there is no backtest harness.
+`test_market_analyst` after touching `market_analyst.py` (it covers each VIX source's parsing
+and the chain's fall-through/rejection rules), and `test_commander` after touching the watchdog's
+alerting. Strategy/advisor changes are still validated through paper trading; there is no
+backtest harness.
+
+**`fleet_doctor.py`** is the diagnostic entry point — run it *in the container* against the code
+the fleet actually runs:
+`docker exec -w /app/code trading-fleet python3 fleet_doctor.py`. It verifies location, syntax +
+uncommitted drift, config completeness, that **every PM2 process survives import** (the one
+failure class a bot's own main-loop `try/except` cannot catch), Alpaca, each VIX source
+separately, an InfluxDB round-trip, and runtime freshness/pm2 state. Read-only; never orders.
 
 ## Known Issues / Tech Debt
 
@@ -335,9 +356,22 @@ validated through paper trading; there is no backtest harness.
   live resource usage under `monit`, not `pm2_env`; commander read the wrong key, so the fleet's
   only per-process memory series never carried data. Fixed — but every `bot_monitor` point
   written before that fix has memory=0 and cpu=0, so historical panels are empty by construction.
-- **VIX still depends on yfinance** — alpaca-py has no index feed, so the VIX spot can't move to
-  Alpaca like SPY did. The stale fail-safe + accountant freshness watchdog bound the blast radius
-  (degrade safe, alert loud) but a paid index source would remove the last external-data SPOF.
+- **VIX depends on free public providers.** alpaca-py has no index feed, so VIX can't move to
+  Alpaca like SPY did. The 2026-09 chain (stooq → CBOE → yfinance) removes the *single*-provider
+  SPOF, and the stale fail-safe + accountant freshness watchdog still bound the blast radius, but
+  all three are unauthenticated endpoints that can rate-limit or change shape without notice. A
+  paid index feed remains the only way to actually own this input. `fleet_doctor.py` reports each
+  source's health individually.
+- **`ta` is an sdist-only, effectively unmaintained dependency** (trend_bot's EMA/ADX,
+  survivor_bot's RSI). It builds and computes correctly under the pinned pandas 3.x / numpy 2.x
+  set, but it is the one package here that can fail a container rebuild outright on a toolchain
+  change. `market_analyst.TechnicalMath` and `market_scanner.TechnicalMath` already implement the
+  same indicators natively, so replacing it is a contained job if it breaks — the reason it hasn't
+  been done pre-emptively is that it would change live indicator math with no backtest to validate
+  against.
+- **commander has no `__main__` guard on its Discord commands' side effects** beyond the
+  `bot.run(TOKEN)` guard added in 2026-09; importing it constructs the Discord and Alpaca clients
+  (harmless, no connection).
 - Historical postmortems (GEN/APTV orphaning root cause, InfluxDB silent-failure eras, the
   2026-06-24 market-regime silent yfinance outage) live in git history and the
   `test_orphan_resolution.py` / `test_market_analyst.py` docstrings.
@@ -356,4 +390,11 @@ validated through paper trading; there is no backtest harness.
    (must match compose `INFLUXDB_DB`; a past `tradingbots` typo caused silent write failures).
 7. **Deploy changes ship with code.** Anything touching `requirements.txt` or `deploy/` needs a
    container rebuild on the Beelink — say so in the PR/commit.
-8. **Run the orphan regression suite** after touching ownership/order-history code.
+8. **`requirements.txt` stays pinned.** It was unpinned until 2026-09, which meant a rebuild
+   resolved whatever PyPI served that day — a container nobody had tested, decided by the
+   calendar. Bump a pin deliberately, run the suites and `fleet_doctor.py`, then rebuild.
+9. **Alerts must survive being right.** A watchdog that fires every cycle for every bot is
+   indistinguishable from noise, and the 2026-09 storm buried a real failure under ~9 identical
+   pings per cycle. Anything that alerts on a *persistent* condition needs a throttle, and its
+   wording must distinguish the conditions it covers (see `commander._alert_down`).
+10. **Run the orphan regression suite** after touching ownership/order-history code.
