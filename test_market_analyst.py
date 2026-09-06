@@ -2,7 +2,9 @@
 
 Covers the fix for the 2026-06-24 silent-outage postmortem:
   - SPY moved to Alpaca get_stock_bars (df normalization, empty -> None).
-  - VIX hardened on yfinance (empty -> None, no Alpaca index feed exists).
+  - VIX on a multi-source fallback chain (stooq -> cboe -> yfinance; first
+    sane reading wins, all-down -> None). Added 2026-09 after Yahoo broke
+    for good and a single provider proved to be a SPOF for the kill-switch.
   - VIX>28 emergency pause fires on a simulated high-VIX reading (the headline
     kill-switch that sat inert for ~12 days).
   - Failures are LOUD: an incomplete fetch logs an error and never silently
@@ -192,15 +194,44 @@ class UpdateBotConfigTests(unittest.TestCase):
 
     def test_identical_values_skip_rewrite(self):
         """Churn guard: when nothing published changed, don't rewrite the file."""
+        ma.last_vix_source = "stooq"
+        self.addCleanup(setattr, ma, "last_vix_source", None)
         seeded = json.loads(json.dumps(BASE_CONFIG))
         seeded["global_settings"].update(
             {"market_condition": "SIDEWAYS", "vix": 16.45,
-             "macro_climate": "MACRO_BULL", "data_stale": False})
+             "macro_climate": "MACRO_BULL", "data_stale": False,
+             "vix_source": "stooq"})
         self._write(seeded)
 
         with mock.patch.object(ma.json, "dump") as dump:
             ma.update_bot_config("SIDEWAYS", 16.45, "MACRO_BULL")
             dump.assert_not_called()
+
+    def test_source_change_alone_persists(self):
+        """The chain falling through to a different provider is a published
+        change: bot_config is how a human sees which source is carrying VIX."""
+        ma.last_vix_source = "stooq"
+        self.addCleanup(setattr, ma, "last_vix_source", None)
+        seeded = json.loads(json.dumps(BASE_CONFIG))
+        seeded["global_settings"].update(
+            {"market_condition": "SIDEWAYS", "vix": 16.45,
+             "macro_climate": "MACRO_BULL", "data_stale": False,
+             "vix_source": "cboe"})
+        self._write(seeded)
+
+        ma.update_bot_config("SIDEWAYS", 16.45, "MACRO_BULL")
+        self.assertEqual(self._read()["global_settings"]["vix_source"], "stooq")
+
+    def test_stale_failsafe_records_no_live_source(self):
+        ma.last_vix_source = "stooq"
+        self.addCleanup(setattr, ma, "last_vix_source", None)
+        self._write(BASE_CONFIG)
+
+        ma.update_bot_config("CRITICAL_VOLATILITY", ma.STALE_VIX_SENTINEL,
+                             "MACRO_BEAR", data_stale=True)
+        gs = self._read()["global_settings"]
+        self.assertEqual(gs["vix_source"], "stale_failsafe")
+        self.assertTrue(gs["data_stale"])
 
     def test_missing_config_logs_error_no_crash(self):
         os.remove(self.path)
@@ -244,28 +275,158 @@ class GetSpyDataTests(unittest.TestCase):
             self.assertTrue(le.called)
 
 
+class _Resp:
+    """Minimal requests.Response stand-in for the HTTP VIX sources."""
+    def __init__(self, status_code=200, text="", payload=None):
+        self.status_code = status_code
+        self.text = text
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+STOOQ_OK = "Symbol,Date,Time,Open,High,Low,Close\n^VIX,2026-09-05,21:14:00,14.9,15.2,14.4,14.53\n"
+
+
+class VixSourceTests(unittest.TestCase):
+    """Each source parses its own provider's shape and nothing else."""
+
+    def test_stooq_parses_close_column(self):
+        with mock.patch.object(ma.requests, "get",
+                               return_value=_Resp(text=STOOQ_OK)):
+            self.assertAlmostEqual(ma._vix_from_stooq(), 14.53)
+
+    def test_stooq_no_quote_raises(self):
+        body = "Symbol,Date,Time,Open,High,Low,Close\n^VIX,N/D,N/D,N/D,N/D,N/D,N/D\n"
+        with mock.patch.object(ma.requests, "get", return_value=_Resp(text=body)):
+            with self.assertRaises(ValueError):
+                ma._vix_from_stooq()
+
+    def test_stooq_non_200_raises(self):
+        with mock.patch.object(ma.requests, "get",
+                               return_value=_Resp(status_code=429, text="slow down")):
+            with self.assertRaises(RuntimeError):
+                ma._vix_from_stooq()
+
+    def test_cboe_parses_current_price(self):
+        payload = {"data": {"current_price": 15.75, "close": 15.1}}
+        with mock.patch.object(ma.requests, "get",
+                               return_value=_Resp(payload=payload)):
+            self.assertAlmostEqual(ma._vix_from_cboe(), 15.75)
+
+    def test_cboe_falls_back_to_close_key(self):
+        payload = {"data": {"current_price": 0, "close": 15.1}}
+        with mock.patch.object(ma.requests, "get",
+                               return_value=_Resp(payload=payload)):
+            self.assertAlmostEqual(ma._vix_from_cboe(), 15.1)
+
+    def test_yfinance_returns_latest_close(self):
+        df = pd.DataFrame({"Close": [18.0, 19.5, 21.25]},
+                          index=pd.date_range("2025-01-01", periods=3))
+        fake = types.SimpleNamespace(download=lambda *a, **k: df)
+        with mock.patch.object(ma, "yf", fake):
+            self.assertAlmostEqual(ma._vix_from_yfinance(), 21.25)
+
+    def test_yfinance_multiindex_columns_squeezed(self):
+        cols = pd.MultiIndex.from_tuples([("Close", "^VIX")])
+        df = pd.DataFrame([[18.0], [30.0]], columns=cols,
+                          index=pd.date_range("2025-01-01", periods=2))
+        fake = types.SimpleNamespace(download=lambda *a, **k: df)
+        with mock.patch.object(ma, "yf", fake):
+            self.assertAlmostEqual(ma._vix_from_yfinance(), 30.0)
+
+    def test_yfinance_empty_returns_none(self):
+        fake = types.SimpleNamespace(download=lambda *a, **k: pd.DataFrame())
+        with mock.patch.object(ma, "yf", fake):
+            self.assertIsNone(ma._vix_from_yfinance())
+
+    def test_broken_yfinance_import_is_not_fatal(self):
+        """The 2026-09 shape: yfinance itself won't import. It is an OPTIONAL
+        fallback, so the source yields None and the process stays up."""
+        with mock.patch.object(ma, "yf", None), \
+             mock.patch.object(ma, "_yf_unavailable", False), \
+             mock.patch.dict("sys.modules", {"yfinance": None}), \
+             mock.patch("builtins.__import__",
+                        side_effect=ImportError("no module named yfinance")), \
+             mock.patch.object(ma.registry, "log_error") as le:
+            self.assertIsNone(ma._vix_from_yfinance())
+            self.assertTrue(le.called)
+
+
 class GetVixValueTests(unittest.TestCase):
+    """The chain: first sane source wins; a dead one is skipped, not fatal."""
+
     def setUp(self):
         s = mock.patch.object(ma.time, "sleep")
         s.start()
         self.addCleanup(s.stop)
+        ma.last_vix_source = None
+        self.addCleanup(setattr, ma, "last_vix_source", None)
 
-    def test_returns_latest_close(self):
-        df = pd.DataFrame({"Close": [18.0, 19.5, 21.25]},
-                          index=pd.date_range("2025-01-01", periods=3))
-        with mock.patch.object(ma.yf, "download", return_value=df):
-            self.assertAlmostEqual(ma.get_vix_value(), 21.25)
+    @staticmethod
+    def _chain(*pairs):
+        """Build a VIX_SOURCES tuple from (name, value_or_exception) pairs."""
+        def make(v):
+            def fetch():
+                if isinstance(v, Exception):
+                    raise v
+                return v
+            return fetch
+        return tuple((name, make(v)) for name, v in pairs)
 
-    def test_multiindex_columns_squeezed(self):
-        cols = pd.MultiIndex.from_tuples([("Close", "^VIX")])
-        df = pd.DataFrame([[18.0], [30.0]], columns=cols,
-                          index=pd.date_range("2025-01-01", periods=2))
-        with mock.patch.object(ma.yf, "download", return_value=df):
-            self.assertAlmostEqual(ma.get_vix_value(), 30.0)
+    def test_first_source_wins(self):
+        with mock.patch.object(ma, "VIX_SOURCES",
+                               self._chain(("stooq", 14.5), ("cboe", 99.0))):
+            self.assertAlmostEqual(ma.get_vix_value(), 14.5)
+            self.assertEqual(ma.last_vix_source, "stooq")
 
-    def test_empty_returns_none(self):
-        with mock.patch.object(ma.yf, "download", return_value=pd.DataFrame()):
+    def test_falls_through_to_next_source(self):
+        chain = self._chain(("stooq", RuntimeError("HTTP 403")), ("cboe", 15.25))
+        with mock.patch.object(ma, "VIX_SOURCES", chain), \
+             mock.patch.object(ma.registry, "log_error") as le:
+            self.assertAlmostEqual(ma.get_vix_value(), 15.25)
+            self.assertEqual(ma.last_vix_source, "cboe")
+            self.assertTrue(le.called)   # the dead source is still LOUD
+
+    def test_none_from_a_source_is_skipped(self):
+        chain = self._chain(("yfinance", None), ("cboe", 16.0))
+        with mock.patch.object(ma, "VIX_SOURCES", chain):
+            self.assertAlmostEqual(ma.get_vix_value(), 16.0)
+
+    def test_out_of_band_value_is_rejected_not_published(self):
+        """A rate-limit page parsing to 0.0 must never reach the 22/28 gates."""
+        chain = self._chain(("stooq", 0.0), ("cboe", 17.5))
+        with mock.patch.object(ma, "VIX_SOURCES", chain), \
+             mock.patch.object(ma.registry, "log_error") as le:
+            self.assertAlmostEqual(ma.get_vix_value(), 17.5)
+            self.assertTrue(le.called)
+
+    def test_absurdly_high_value_is_rejected(self):
+        chain = self._chain(("stooq", 1453.0))
+        with mock.patch.object(ma, "VIX_SOURCES", chain):
             self.assertIsNone(ma.get_vix_value())
+
+    def test_all_sources_down_returns_none(self):
+        chain = self._chain(("stooq", RuntimeError("boom")),
+                            ("cboe", RuntimeError("boom")),
+                            ("yfinance", None))
+        with mock.patch.object(ma, "VIX_SOURCES", chain):
+            self.assertIsNone(ma.get_vix_value())
+            self.assertIsNone(ma.last_vix_source)
+
+    def test_whole_chain_is_retried(self):
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise RuntimeError("transient")
+            return 13.0
+
+        with mock.patch.object(ma, "VIX_SOURCES", (("stooq", flaky),)):
+            self.assertAlmostEqual(ma.get_vix_value(), 13.0)
+        self.assertEqual(calls["n"], 3)
 
 
 class _StopLoop(Exception):

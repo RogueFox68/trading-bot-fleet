@@ -14,15 +14,24 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
-# yfinance is retained ONLY for the VIX spot index. Alpaca's data SDK exposes
-# no index feed (there is no get_index_* / IndexHistoricalDataClient in
-# alpaca-py), so SPY — which drives the regime — moves to Alpaca (reliable,
-# already authenticated) while VIX stays on yfinance but as a hardened,
-# isolated single-ticker fetch with retry + LOUD failure. This is the fix for
-# the 2026-06-24 silent outage: yf.download(["SPY","^VIX"]) returned an empty
-# frame (Yahoo rate-limiting), the compute-and-publish block skipped with no
-# error, and VIX froze — disabling the VIX>28 kill-switch for ~12 days.
-import yfinance as yf
+# SPY — which drives the regime — comes from Alpaca (reliable, already
+# authenticated). VIX cannot: Alpaca's data SDK exposes no index feed (there is
+# no get_index_* / IndexHistoricalDataClient in alpaca-py) and this account gets
+# 403 on the index endpoints, so VIX is fetched from public sources in a
+# fallback CHAIN (see VIX_SOURCES below).
+#
+# 2026-06-24 postmortem: yf.download(["SPY","^VIX"]) returned an empty frame
+# (Yahoo rate-limiting), the compute-and-publish block skipped with no error,
+# and VIX froze — disabling the VIX>28 kill-switch for ~12 days. That was fixed
+# by isolating the fetch and failing LOUD.
+#
+# 2026-09: Yahoo broke again, and this time it stayed broken. A single external
+# provider is a single point of failure for the fleet's kill-switch no matter
+# how hard the fetch around it is retried, so VIX now tries several independent
+# sources per cycle and takes the first sane reading. yfinance is imported
+# LAZILY (see _load_yfinance) — it is the one dependency that has broken by
+# itself twice, and a broken install of an optional fallback must not take the
+# regime process down at import time.
 
 # --- CONFIGURATION ---
 CHECK_INTERVAL = 900   # 15 Minutes
@@ -34,6 +43,16 @@ MARKET_SYMBOL = "SPY"
 FETCH_RETRIES = 3
 FETCH_BACKOFF = 3      # seconds base; 3s, 6s, 12s
 MIN_BARS = 200         # need >=200 daily closes for SMA200
+
+# --- VIX SOURCE CHAIN ---
+# Every source below returns the VIX in TRUE INDEX POINTS, so the 22/28 gates
+# downstream need no recalibration whichever one answers. A dollar-priced proxy
+# (VIXY/VXX) is deliberately NOT in this chain: it would need calibration and a
+# mis-scaled number feeding a kill-switch is worse than no number at all — the
+# stale fail-safe already handles "no number".
+VIX_HTTP_TIMEOUT = 8   # per-request; the chain is tried FETCH_RETRIES times
+VIX_MIN, VIX_MAX = 5.0, 150.0   # sanity band; rejects garbage/rate-limit rows
+VIX_USER_AGENT = "trading-fleet/1.0"
 
 # Staleness fail-safe. If no fully-successful SPY+VIX fetch lands in this long,
 # stop trusting the frozen (possibly low) VIX and degrade to an elevated-risk
@@ -111,7 +130,10 @@ def log_to_influx(price, vix, adx, regime, sma, ema):
     silently-dropped write is exactly what let this pipeline die unseen."""
     try:
         regime_score = 1 if "BULL" in regime else (-1 if "BEAR" in regime else 0)
-        data_str = (f'market_regime,symbol=SPY '
+        # vix_source is a TAG (indexed) so Grafana can show which provider is
+        # carrying the kill-switch, and alert when the chain falls through.
+        source = last_vix_source or "unknown"
+        data_str = (f'market_regime,symbol=SPY,vix_source={source} '
                     f'price={price},vix={vix},adx={adx},sma200={sma},ema20={ema},'
                     f'regime_score={regime_score},regime="{regime}" {time.time_ns()}')
         r = requests.post(INFLUX_URL, data=data_str, timeout=2)
@@ -157,36 +179,152 @@ def get_spy_data():
             time.sleep(FETCH_BACKOFF * (2 ** attempt))
     return None
 
+# --- VIX SOURCES -----------------------------------------------------------
+# Each fetcher returns a float in VIX points, or None if THIS source could not
+# answer. Raising is fine too — the chain catches, logs, and moves on. None of
+# them may raise out of get_vix_value(): its contract is `float | None`.
+
+def _vix_from_stooq():
+    """stooq.com delayed CSV quote. No key, no cookie, plain requests."""
+    r = requests.get("https://stooq.com/q/l/?s=^vix&f=sd2t2ohlc&h&e=csv",
+                     timeout=VIX_HTTP_TIMEOUT,
+                     headers={"User-Agent": VIX_USER_AGENT})
+    if r.status_code != 200 or not r.text:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    # Symbol,Date,Time,Open,High,Low,Close  -> Close is the VIX level.
+    lines = [ln for ln in r.text.strip().splitlines() if ln.strip()]
+    if len(lines) < 2:
+        raise ValueError(f"short CSV: {r.text[:80]!r}")
+    close = lines[-1].split(",")[-1].strip()
+    if not close or close.upper() == "N/D":
+        raise ValueError(f"no quote: {r.text[:80]!r}")
+    return float(close)
+
+
+def _vix_from_cboe():
+    """CBOE's own delayed-quote JSON — the index's home exchange."""
+    r = requests.get(
+        "https://cdn.cboe.com/api/global/delayed_quotes/quotes/_VIX.json",
+        timeout=VIX_HTTP_TIMEOUT, headers={"User-Agent": VIX_USER_AGENT})
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    data = (r.json() or {}).get("data") or {}
+    for key in ("current_price", "close", "last_trade_price", "prev_day_close"):
+        val = data.get(key)
+        if val not in (None, "", 0):
+            return float(val)
+    raise ValueError(f"no usable price key in {sorted(data)[:8]}")
+
+
+# yfinance is imported lazily: it is an OPTIONAL fallback here, and a broken
+# install of it (it has changed its HTTP stack under us, and 2026-09 shipped a
+# curl_cffi dependency) must not crash the regime process at import time — the
+# fleet's whole kill-switch hangs off this module staying alive.
+yf = None
+_yf_unavailable = False
+
+
+def _load_yfinance():
+    """Import yfinance on first use. Returns the module, or None if it can't be
+    imported (logged once, then remembered)."""
+    global yf, _yf_unavailable
+    if yf is not None or _yf_unavailable:
+        return yf
+    try:
+        import yfinance as _yf_mod
+    except Exception as e:
+        _yf_unavailable = True
+        registry.log_error("market_analyst", "_load_yfinance", e,
+                           context="VIX fallback source disabled")
+        logger.error(f"[Analyst] yfinance import failed ({e}) — that VIX "
+                     f"fallback is disabled; other sources still apply.")
+        return None
+    yf = _yf_mod
+    return yf
+
+
+def _vix_from_yfinance():
+    """Yahoo via yfinance. Last in the chain: it broke the fleet's VIX twice
+    (2026-06 rate-limiting, 2026-09 outright), but it costs nothing to keep as
+    a fallback and it recovers on its own when Yahoo comes back."""
+    mod = _load_yfinance()
+    if mod is None:
+        return None
+    df = mod.download("^VIX", period="5d", interval="1d", progress=False)
+    if df is None or df.empty:
+        return None
+    # yfinance may hand back MultiIndex columns (e.g. ('Close','^VIX')) for a
+    # single ticker depending on version — flatten to the field.
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    if "Close" not in df.columns:
+        return None
+    close = df["Close"]
+    if isinstance(close, pd.DataFrame):   # duplicate-labeled cols
+        close = close.iloc[:, 0]
+    close = pd.to_numeric(close, errors="coerce").dropna()
+    if close.empty:
+        return None
+    return float(close.iloc[-1])
+
+
+# Tried in order, first sane reading wins. Ordered cheapest/most-reliable first;
+# yfinance last because it is the one that has failed the fleet before.
+VIX_SOURCES = (
+    ("stooq", _vix_from_stooq),
+    ("cboe", _vix_from_cboe),
+    ("yfinance", _vix_from_yfinance),
+)
+
+# Name of the source that answered the last successful get_vix_value(), or None.
+# Published to bot_config.global_settings.vix_source and tagged on the InfluxDB
+# market_regime row, so which provider is actually carrying the kill-switch is
+# visible without shell access to the box.
+last_vix_source = None
+
+
 def get_vix_value():
-    """Latest VIX spot from yfinance (single ticker, hardened + retried). Alpaca
-    has no index feed, so VIX stays here — but isolated from SPY so a VIX hiccup
-    can't take the regime down with it. Returns None (loud) on repeated
-    empty/failed responses."""
+    """Latest VIX spot in index points, from the first source in VIX_SOURCES
+    that answers with a sane value. Retries the whole chain with backoff.
+
+    Returns None (LOUD — the caller alerts and eventually engages the stale
+    fail-safe) only when every source failed on every attempt. Contract is
+    unchanged from the yfinance-only version: no args, `float | None`."""
+    global last_vix_source
     for attempt in range(FETCH_RETRIES):
-        try:
-            df = yf.download("^VIX", period="5d", interval="1d", progress=False)
-            if df is not None and not df.empty:
-                # yfinance may hand back MultiIndex columns (e.g. ('Close','^VIX'))
-                # for a single ticker depending on version — flatten to the field.
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                if "Close" in df.columns:
-                    close = df["Close"]
-                    if isinstance(close, pd.DataFrame):  # duplicate-labeled cols
-                        close = close.iloc[:, 0]
-                    close = pd.to_numeric(close, errors="coerce").dropna()
-                    if not close.empty:
-                        val = float(close.iloc[-1])
-                        if val > 0:
-                            return val
-            logger.error(f"[Analyst] VIX data empty (attempt {attempt + 1})")
-        except Exception as e:
-            registry.log_error("market_analyst", "get_vix_value", e,
-                               context=f"attempt {attempt + 1}")
-            logger.error(f"[Analyst] VIX fetch failed (attempt {attempt + 1}): {e}")
+        for name, fetch in VIX_SOURCES:
+            try:
+                val = fetch()
+            except Exception as e:
+                registry.log_error("market_analyst", "get_vix_value", e,
+                                   context=f"{name} attempt {attempt + 1}")
+                logger.error(f"[Analyst] VIX({name}) failed "
+                             f"(attempt {attempt + 1}): {e}")
+                continue
+            if val is None:
+                logger.error(f"[Analyst] VIX({name}) returned no data "
+                             f"(attempt {attempt + 1}).")
+                continue
+            if not (VIX_MIN <= val <= VIX_MAX):
+                # Out-of-band means the source is serving garbage (a rate-limit
+                # page, a zeroed row). Rejecting is the point: a bad number here
+                # silently mis-sets the 22/28 gates.
+                registry.log_error(
+                    "market_analyst", "get_vix_value",
+                    ValueError(f"VIX {val} outside [{VIX_MIN}, {VIX_MAX}]"),
+                    context=f"{name} attempt {attempt + 1}")
+                logger.error(f"[Analyst] VIX({name}) out of band: {val}")
+                continue
+            if name != last_vix_source:
+                logger.warning(f"[Analyst] VIX source now '{name}' "
+                               f"(was '{last_vix_source}'): {val:.2f}")
+            last_vix_source = name
+            return float(val)
         if attempt < FETCH_RETRIES - 1:
             time.sleep(FETCH_BACKOFF * (2 ** attempt))
+    last_vix_source = None
     return None
+
 
 def update_bot_config(regime, vix_val, climate, data_stale=False):
     """
@@ -239,14 +377,21 @@ def update_bot_config(regime, vix_val, climate, data_stale=False):
         # guard left their routine VIX gating (wheel vix>22, etc.) running off a
         # frozen VIX. The kill-switch still fired — crossing 28 flips the label and
         # forces a write — but everything below it was stale.
+        # Which provider carried this reading. On the stale fail-safe there is
+        # no provider, so it is recorded as such rather than left showing the
+        # last one that worked.
+        vix_source = "stale_failsafe" if data_stale else (last_vix_source or "unknown")
+
         prev_published = (gs.get('market_condition'), gs.get('macro_climate'),
-                          gs.get('vix'), gs.get('data_stale', False))
-        new_published = (forced_regime, climate, vix_rounded, data_stale)
+                          gs.get('vix'), gs.get('data_stale', False),
+                          gs.get('vix_source'))
+        new_published = (forced_regime, climate, vix_rounded, data_stale, vix_source)
 
         gs['market_condition'] = forced_regime
         gs['macro_climate'] = climate
         gs['vix'] = vix_rounded
         gs['data_stale'] = data_stale
+        gs['vix_source'] = vix_source
 
         if changes_made or prev_published != new_published:
             # Stamp the persisted-time only when we actually write, so
@@ -258,7 +403,8 @@ def update_bot_config(regime, vix_val, climate, data_stale=False):
             if changes_made:
                 flag = " [STALE FAIL-SAFE]" if data_stale else ""
                 msg = (f"**Analyst Protocol Change**{flag}\n"
-                       f"Condition: {forced_regime} (VIX: {vix_val:.2f})\n"
+                       f"Condition: {forced_regime} "
+                       f"(VIX: {vix_val:.2f} via {vix_source})\n"
                        f"Adjustments: {', '.join(changes_made)}")
                 send_discord(msg)
                 print(f"  -> Config Updated: {len(changes_made)} changes.")
@@ -315,7 +461,8 @@ def _alert_failure(missing, stale_secs):
 
 def run_analyst():
     print("--- 🧠 MARKET ANALYST V6 (Alpaca SPY + hardened VIX) ---")
-    print("    SPY via Alpaca; VIX via yfinance (no Alpaca index feed).")
+    print("    SPY via Alpaca; VIX via source chain "
+          f"({', '.join(n for n, _ in VIX_SOURCES)}) — no Alpaca index feed.")
     print("    Loud on failure; degrades safe on staleness. Pause on VIX > 28.")
 
     # Start optimistic: the stale clock only starts counting once fetches begin
@@ -345,7 +492,8 @@ def run_analyst():
                 if spy_df is None:
                     missing.append("SPY(Alpaca)")
                 if vix_val is None:
-                    missing.append("VIX(yfinance)")
+                    missing.append("VIX(" +
+                                   "/".join(n for n, _ in VIX_SOURCES) + ")")
                 stale_secs = time.monotonic() - last_good
                 registry.log_error(
                     "market_analyst", "get_market_data",

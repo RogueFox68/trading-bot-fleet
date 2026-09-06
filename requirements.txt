@@ -1,9 +1,51 @@
-alpaca-py
-pandas
-numpy
-ta
-yfinance
-requests
-pytz
-discord.py
-tzdata
+# Trading Bot Fleet — dependency manifest.
+#
+# The image installs THIS file (deploy/Dockerfile), and the build context is the
+# repo root, so this is the single manifest for both the image and the code.
+#
+# PINNED, deliberately. This file was unpinned until 2026-09, which meant the
+# dependency set was decided by the calendar: `docker compose build` after a
+# months-idle host produced a container nobody had ever tested. In this repo's
+# case that silently moved yfinance from the 0.2.x line to 1.x — a different
+# HTTP stack (curl_cffi) — at the same moment the VIX feed stopped answering,
+# which made one failure look like the other. A trading fleet should not
+# rediscover its dependency set on every rebuild.
+#
+# Verified together on Python 3.11: fleet test suites pass, and ta's indicators
+# compute correctly against pandas 3.x / numpy 2.x.
+#
+# To move a pin: bump it here, rebuild, and run
+#   python -m unittest test_orphan_resolution test_fill_logging \
+#       test_market_analyst test_strategy_advisor
+#   python3 fleet_doctor.py        # in the container
+# before restarting the fleet.
+
+# -- Broker --
+alpaca-py==0.44.0
+
+# -- Data / math --
+pandas==3.0.5
+numpy==2.4.6
+
+# ta is an sdist-only build (no wheels) and effectively unmaintained. It builds
+# fine under pip's default build isolation today, but it is the one dependency
+# here that can fail a rebuild outright on a toolchain change. trend_bot (EMA,
+# ADX) and survivor_bot (RSI) are its only consumers, and market_analyst /
+# market_scanner already carry native TechnicalMath equivalents of the same
+# indicators — so dropping it is a contained job if it ever does break.
+ta==0.11.0
+
+# -- HTTP --
+requests==2.34.2
+
+# yfinance is now only the LAST fallback in market_analyst's VIX source chain,
+# and it is imported lazily, so a broken install degrades one source instead of
+# killing the regime process. Kept because it recovers by itself when Yahoo does.
+yfinance==1.7.0
+
+# -- Time --
+pytz==2026.3.post1
+tzdata==2026.3
+
+# -- Discord (commander) --
+discord.py==2.7.1
