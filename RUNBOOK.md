@@ -65,6 +65,10 @@ tail -f ~/bots/repo/logs/<bot>.log    # per-bot rotating logs (host-visible)
 
 ## Safety Gates
 Safety is centralized in `utils.py`:
+*   **Containment:** orders are refused unless the process is inside a container. A second
+    fleet on this account (see the duplicate-fleet entry under Incident Response) can alert
+    and crash-loop, but it cannot trade. Deliberate host-side work:
+    `FLEET_ALLOW_UNCONTAINED_ORDERS=1`. `fleet_doctor` section 1 reports the verdict.
 *   **Fail-Closed Budget Checks:** entries pause if `bot_config.json` is missing or the bot
     has no allocation. (Runtime API errors currently fail-open — paper-trading choice.)
 *   **Target Freshness:** `active_targets.json` older than 24h is rejected → standby mode.

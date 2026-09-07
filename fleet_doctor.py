@@ -115,6 +115,35 @@ def check_location():
              "The bots resolve bot_config.json / active_targets.json RELATIVE to\n"
              "cwd, so run this from the repo dir (-w /app/code) or paths will lie.")
 
+    # The containment guard decides whether orders are allowed at all, so its
+    # verdict has to be visible BEFORE it silently blocks a live fleet.
+    try:
+        sys.path.insert(0, REPO)
+        import utils
+    except Exception as e:
+        warn("location", f"Could not import utils to check the order guard: {e}")
+        return
+    contained = utils.running_in_fleet_container()
+    override = utils.uncontained_override_active()
+    if contained:
+        ok("location", "Order containment guard: orders ALLOWED "
+                       "(detected as running in a container).")
+    elif override:
+        warn("location",
+             f"Order containment guard: orders ALLOWED via "
+             f"{utils.UNCONTAINED_OVERRIDE_ENV}, but this is NOT a container.",
+             "Only correct for a deliberate manual session. If this is a\n"
+             "resurrected host-level fleet, it is trading on the same account\n"
+             "as the container — stop it (see section 7b).")
+    else:
+        bad("location",
+            "Order containment guard: orders are BLOCKED here.",
+            "Correct if this is the host. If this IS the fleet container, the\n"
+            "guard has misfired and the fleet cannot trade — check that\n"
+            "/.dockerenv exists and the code is mounted at "
+            f"{utils.FLEET_CONTAINER_CODE_DIR}.\n"
+            f"Emergency override: {utils.UNCONTAINED_OVERRIDE_ENV}=1")
+
 
 # --- 2. CODE INTEGRITY ---------------------------------------------------
 def check_code():

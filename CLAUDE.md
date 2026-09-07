@@ -94,6 +94,7 @@ trading-bot-fleet/
 │   │                              # imports, config, Alpaca, each VIX source, Influx,
 │   │                              # duplicate-fleet detection, regime heartbeat, pm2)
 │   ├── test_commander.py          # Regression: watchdog alert throttling, crash-vs-stop wording
+│   ├── test_containment.py        # Regression: orders refused outside the fleet container
 │   ├── test_orphan_resolution.py  # Regression: ownership/entry-time resolution + root inference
 │   ├── test_fill_logging.py       # Regression: ms-floored fill stamps, wheel close ladder
 │   ├── test_strategy_advisor.py   # Regression: advisor attribution, P&L, drawdown, allocation recs
@@ -239,6 +240,17 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
 
 ### Safety Gates (in `utils.submit_and_log_order`)
 
+- **Containment (gate 0, before any broker call):** orders are refused outright unless the
+  process is running inside a container (`utils.assert_order_allowed_here`). The fleet runs
+  only in `trading-fleet`; a second copy on the same `config.py` trades the same Alpaca
+  account and submits orders tagged identically to the real ones, which the ownership model
+  cannot tell apart. Detection is deliberately generous — `/.dockerenv`, `/run/.containerenv`,
+  the code living at `/app/code`, or a container cgroup, any one is enough — because a false
+  negative would stop the real fleet trading. Blocks route to `registry.log_error`
+  (`containment_guard`) so a rogue fleet is visible in Grafana rather than silently idle.
+  Deliberate host-side work sets `FLEET_ALLOW_UNCONTAINED_ORDERS=1`, which warns once
+  (not per order) and proceeds. `fleet_doctor` reports the guard's verdict in section 1,
+  so a misfire is visible before it bites.
 - Daily loss cap: `MAX_DAILY_LOSS` (-$5,000) blocks all orders.
 - Notional cap ($20k) + symbol exposure cap ($5k) on any **equity order that opens or increases
   exposure** — long entries AND short entries. Risk-reducing orders (closes, covers) are exempt.
@@ -334,7 +346,7 @@ defined but not yet enforced anywhere — only `max_hold_days` is live.
 
 ## Testing
 
-`python -m unittest test_orphan_resolution test_fill_logging test_market_analyst test_strategy_advisor test_commander -v` —
+`python -m unittest test_orphan_resolution test_fill_logging test_market_analyst test_strategy_advisor test_commander test_containment -v` —
 regression suites for the ownership/entry-time paging fix (+ option-root inference and the
 no-default-owner rule), fill-row stamping / wheel close-ladder pricing, and the market-regime
 pipeline (SPY-df normalization, VIX>28 kill-switch, loud-failure + stale fail-safe), plus the
@@ -342,7 +354,8 @@ paper-only allocation advisor. Run the
 first two after touching `utils.py` ownership/order/logging code or wheel close logic, and
 `test_market_analyst` after touching `market_analyst.py` (it covers each VIX source's parsing
 and the chain's fall-through/rejection rules), and `test_commander` after touching the watchdog's
-alerting. Strategy/advisor changes are still validated through paper trading; there is no
+alerting. Run `test_containment` after touching anything in the order-submission path —
+its load-bearing assertion is that an uncontained fleet never reaches the broker at all. Strategy/advisor changes are still validated through paper trading; there is no
 backtest harness.
 
 **`fleet_doctor.py`** is the diagnostic entry point — run it *in the container* against the code
@@ -381,12 +394,17 @@ judged against that schedule rather than a flat 24h.
   same indicators natively, so replacing it is a contained job if it breaks — the reason it hasn't
   been done pre-emptively is that it would change live indicator math with no backtest to validate
   against.
-- **Two fleets can run at once, and nothing used to say so.** The fleet is supposed to
+- **Two fleets can run at once.** Confirmed on 2026-09-06: `pm2 ls` *on the Beelink host*
+  returned a full nine-process fleet with restart counts in the thousands (and a `moon_bag`
+  fossil from before the containerisation), resurrected by a `pm2-trader.service` systemd
+  unit when a long-deferred OS update rebooted the box — while
+  `docker exec trading-fleet pm2 ls` showed nine healthy processes at zero restarts. Both
+  were true, of different PM2 daemons. Orders are now blocked off-container (see Safety
+  Gates), and both halves of the diagnosis are automated: The fleet is supposed to
   run only inside `trading-fleet`. A commander started anywhere else (a host-level PM2
   daemon resurrected by a reboot, a second container) watches a *different* PM2 daemon
-  and alerts Discord about *its* processes — which is why 2026-09 produced "bot down"
-  pings that `docker exec trading-fleet pm2 ls` flatly contradicted. Both were true, of
-  different daemons. Two defences now: every commander alert carries
+  and alerts Discord about *its* processes — which is why it produced "bot down" pings the
+  container flatly contradicted. Every commander alert carries
   `commander._source_tag()` (hostname + pid + in-container-or-not), and `fleet_doctor`
   reads the `host` tag on `bot_monitor` to report every commander currently writing
   telemetry. More than one live host = a second fleet.
