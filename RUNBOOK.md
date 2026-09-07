@@ -65,6 +65,10 @@ tail -f ~/bots/repo/logs/<bot>.log    # per-bot rotating logs (host-visible)
 
 ## Safety Gates
 Safety is centralized in `utils.py`:
+*   **Containment:** orders are refused unless the process is inside a container. A second
+    fleet on this account (see the duplicate-fleet entry under Incident Response) can alert
+    and crash-loop, but it cannot trade. Deliberate host-side work:
+    `FLEET_ALLOW_UNCONTAINED_ORDERS=1`. `fleet_doctor` section 1 reports the verdict.
 *   **Fail-Closed Budget Checks:** entries pause if `bot_config.json` is missing or the bot
     has no allocation. (Runtime API errors currently fail-open — paper-trading choice.)
 *   **Target Freshness:** `active_targets.json` older than 24h is rejected → standby mode.
@@ -87,6 +91,22 @@ Safety is centralized in `utils.py`:
     suspect; a *sustained* `orphan_sweep skipped` streak means order history has been
     unfetchable for a while and deserves a look.
 *   **Pending orders:** clear via the Alpaca dashboard.
+*   **Discord says a bot is down but `pm2 ls` disagrees:** read the *source line* on the
+    alert — every commander message now ends with `Reported by <host> pid <n> — container`
+    or `— HOST (not the fleet container!)`. If that host is not the fleet container, a
+    second fleet is running and alerting about its own PM2 daemon. Confirm and kill it
+    **on the host**:
+    ```bash
+    docker exec -w /app/code trading-fleet python3 fleet_doctor.py   # section 7b
+    pm2 ls                       # a host-level PM2 daemon (NOT via docker exec)?
+    pm2 kill && pm2 unstartup    # stop it and remove its systemd unit
+    docker ps                    # a second fleet container?
+    systemctl list-units | grep -i pm2
+    ```
+    A host-level PM2 with a saved process list (`~/.pm2/dump.pm2`) is resurrected by its
+    systemd unit on reboot — so a long-deferred OS update that finally reboots the box can
+    bring a retired pre-container fleet back from the dead, running the same live-mounted
+    code against its own daemon.
 *   **A bot keeps "crashing":** the alert now says which kind. `CRASHED` means PM2 gave
     up after repeated exits (an import-time failure — bad dependency, syntax error in a
     shared module, missing `config.py` key); the alert carries the tail of the PM2 error

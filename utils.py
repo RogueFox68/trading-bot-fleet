@@ -1,4 +1,5 @@
 import json
+import os
 import time
 import collections
 import re
@@ -699,6 +700,91 @@ def _safety_price_client():
     return _safety_data_client
 
 
+# --- CONTAINMENT GUARD ---------------------------------------------------
+# The fleet is supposed to run ONLY inside the `trading-fleet` container.
+#
+# 2026-09: it ran in two places at once. A pre-container host-level PM2 daemon,
+# dormant since the containerisation, was resurrected by its `pm2-trader.service`
+# systemd unit when a long-deferred OS update finally rebooted the box. It ran
+# the SAME live-mounted repo against the SAME config.py — so the same Alpaca
+# account — and its commander alerted the same Discord channel about its own
+# crash-looping copies of every bot. `docker exec trading-fleet pm2 ls` showed
+# nine healthy processes the whole time. Both were true, of different daemons.
+#
+# The alerting half of that is now diagnosable (commander._source_tag, and
+# fleet_doctor's duplicate-fleet check). This is the half that matters more:
+# a second fleet on one account submits orders tagged identically to the real
+# ones, which the ownership model cannot tell apart, while both copies race on
+# the same unlocked JSON state. So orders are refused outright off-container.
+#
+# Escape hatch for deliberate host-side work (a manual close, a one-off script):
+#   FLEET_ALLOW_UNCONTAINED_ORDERS=1 python3 your_script.py
+UNCONTAINED_OVERRIDE_ENV = "FLEET_ALLOW_UNCONTAINED_ORDERS"
+FLEET_CONTAINER_CODE_DIR = "/app/code"
+
+
+class UncontainedFleetError(RuntimeError):
+    """Raised when an order is attempted outside the fleet container."""
+
+
+def running_in_fleet_container():
+    """True if this process is inside a container.
+
+    Deliberately generous — several independent positive signals, any one of
+    which is enough. A false 'no' would stop the real fleet trading, so the
+    check only refuses when nothing at all indicates a container. On the
+    Beelink host none of these are true; inside `trading-fleet` the first two
+    both are."""
+    if os.path.exists("/.dockerenv"):            # Docker
+        return True
+    if os.path.exists("/run/.containerenv"):     # Podman
+        return True
+    if os.path.dirname(os.path.abspath(__file__)) == FLEET_CONTAINER_CODE_DIR:
+        return True
+    try:                                          # cgroup v1 fallback
+        with open("/proc/1/cgroup", "r") as f:
+            body = f.read()
+        if "docker" in body or "containerd" in body or "kubepods" in body:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def uncontained_override_active():
+    return os.environ.get(UNCONTAINED_OVERRIDE_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+_uncontained_override_warned = False
+
+
+def assert_order_allowed_here():
+    """Gate every order on running inside the fleet container.
+
+    Raises UncontainedFleetError unless containerised or explicitly overridden."""
+    if running_in_fleet_container():
+        return
+    if uncontained_override_active():
+        global _uncontained_override_warned
+        if not _uncontained_override_warned:
+            _uncontained_override_warned = True
+            logger.warning(
+                f"  [CONTAINMENT] Running OUTSIDE the fleet container with "
+                f"{UNCONTAINED_OVERRIDE_ENV} set — orders are allowed. If this "
+                f"is not a deliberate manual session, stop it: a second fleet "
+                f"on this account double-submits orders the ownership model "
+                f"cannot tell apart.")
+        return
+    raise UncontainedFleetError(
+        f"Order refused: this process is not running inside the fleet "
+        f"container (host={os.uname().nodename}, pid={os.getpid()}, "
+        f"dir={os.path.dirname(os.path.abspath(__file__))}). The fleet runs "
+        f"only in `trading-fleet`; a second copy on this Alpaca account "
+        f"submits duplicate, indistinguishable orders. If this IS deliberate, "
+        f"set {UNCONTAINED_OVERRIDE_ENV}=1.")
+
+
 def submit_and_log_order(trading_client, order_data, logger, reason="", log_action=None):
     """
     Submits an order and polls for a few seconds to log fill-confirmation.
@@ -712,6 +798,10 @@ def submit_and_log_order(trading_client, order_data, logger, reason="", log_acti
     try:
         # --- SAFETY GATES ---
         try:
+            # 0. Containment. First, and before any network call: if this
+            # process should not be trading at all, nothing else matters.
+            assert_order_allowed_here()
+
             account = trading_client.get_account()
             
             # 1. Daily Loss Cap Check
@@ -775,6 +865,13 @@ def submit_and_log_order(trading_client, order_data, logger, reason="", log_acti
                         
         except Exception as gate_err:
             logger.error(f"  [SAFETY GATE TRIGGERED] Order Blocked: {gate_err}")
+            if isinstance(gate_err, UncontainedFleetError):
+                # Route to the error registry so it reaches Grafana via
+                # error_watchdog. A rogue fleet blocked in silence is still a
+                # rogue fleet nobody knows is running.
+                registry.log_error(
+                    "utils", "containment_guard", gate_err,
+                    context=getattr(order_data, "symbol", None))
             raise gate_err
 
         # --- SUBMIT ORDER ---

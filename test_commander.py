@@ -23,7 +23,17 @@ import commander
 
 
 def run(coro):
-    return asyncio.new_event_loop().run_until_complete(coro)
+    """Drive one coroutine to completion on a throwaway loop.
+
+    The loop is explicitly closed: leaking one per call left dangling selectors
+    that made an unrelated suite fail when unittest ran them in the same
+    process ("ValueError: Invalid file descriptor: -1")."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
 
 
 def proc(name, status, restarts=0, err_log=None):
@@ -163,6 +173,47 @@ class ManageFleetTests(unittest.TestCase):
         self.assertTrue(self.run_mock.called)
 
 
+class SourceIdentityTests(unittest.TestCase):
+    """Every alert must name the process that sent it.
+
+    The 2026-09 phantom alerts: Discord reported bots down every ~15 min while
+    `docker exec trading-fleet pm2 ls` showed all nine online with 0 restarts.
+    Both were true — of different PM2 daemons. Nothing in the alert said which
+    one it came from, so the contradiction was unresolvable from Discord alone.
+    """
+
+    def setUp(self):
+        commander._last_down_alert.clear()
+        commander.PAUSED_BY_COMMANDER.clear()
+        self.addCleanup(commander._last_down_alert.clear)
+        self.addCleanup(commander.PAUSED_BY_COMMANDER.clear)
+        self.channel = _Channel()
+        p = mock.patch.object(commander.bot, "fetch_channel",
+                              new=mock.AsyncMock(return_value=self.channel))
+        p.start(); self.addCleanup(p.stop)
+        mock.patch.object(commander.subprocess, "run").start()
+        mock.patch.object(commander, "CHANNEL_ID", "123").start()
+        self.addCleanup(mock.patch.stopall)
+
+    def test_source_tag_names_host_and_pid(self):
+        tag = commander._source_tag()
+        self.assertIn(commander.HOSTNAME, tag)
+        self.assertIn(str(commander.PID), tag)
+
+    def test_container_and_host_are_distinguishable(self):
+        with mock.patch.object(commander, "IN_CONTAINER", True):
+            self.assertIn("container", commander._source_tag())
+        with mock.patch.object(commander, "IN_CONTAINER", False):
+            tag = commander._source_tag()
+            self.assertIn("HOST", tag)
+            self.assertIn("not the fleet container", tag.lower())
+
+    def test_down_alert_carries_the_source(self):
+        run(commander.manage_fleet([proc("wheel_bot", "errored")], CONFIG_ACTIVE))
+        self.assertIn(commander.HOSTNAME, self.channel.sent[0])
+        self.assertIn(str(commander.PID), self.channel.sent[0])
+
+
 class ProcessMetricsTests(unittest.TestCase):
     def test_memory_and_cpu_come_from_monit(self):
         """`pm2 jlist` reports live usage under 'monit', not 'pm2_env' — reading
@@ -173,6 +224,16 @@ class ProcessMetricsTests(unittest.TestCase):
                                mock.Mock(status_code=204)):
             commander.log_process_to_influx(proc("wheel_bot", "online", restarts=2))
         self.assertIn("memory=104857600", captured.get("data", ""))
+
+    def test_points_are_tagged_with_the_writing_host(self):
+        """This tag is what lets fleet_doctor spot a second fleet: two hosts
+        writing bot_monitor concurrently means two commanders are alerting."""
+        captured = {}
+        with mock.patch.object(commander.requests, "post",
+                               side_effect=lambda *a, **k: captured.update(k) or
+                               mock.Mock(status_code=204)):
+            commander.log_process_to_influx(proc("wheel_bot", "online"))
+        self.assertIn(f"host={commander.HOSTNAME}", captured.get("data", ""))
 
 
 if __name__ == "__main__":
