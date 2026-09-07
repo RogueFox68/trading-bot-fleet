@@ -91,7 +91,8 @@ trading-bot-fleet/
 │
 ├── Tests & tools
 │   ├── fleet_doctor.py            # RUN THIS FIRST in any incident (in-container preflight:
-│   │                              # imports, config, Alpaca, each VIX source, Influx, pm2)
+│   │                              # imports, config, Alpaca, each VIX source, Influx,
+│   │                              # duplicate-fleet detection, regime heartbeat, pm2)
 │   ├── test_commander.py          # Regression: watchdog alert throttling, crash-vs-stop wording
 │   ├── test_orphan_resolution.py  # Regression: ownership/entry-time resolution + root inference
 │   ├── test_fill_logging.py       # Regression: ms-floored fill stamps, wheel close ladder
@@ -288,7 +289,11 @@ existing positions.
 postmortems):** SPY (which drives the regime) comes from **Alpaca `get_stock_bars`** — reliable,
 already authenticated. VIX cannot: alpaca-py exposes no index feed and this account 403s on the
 index endpoints. So VIX runs a **multi-source fallback chain** (`market_analyst.VIX_SOURCES`):
-stooq CSV → CBOE delayed-quote JSON → yfinance, first sane reading wins. Every source returns
+CBOE delayed-quote JSON → stooq CSV → yfinance, first sane reading wins. That order
+is measured, not assumed: from the fleet container on 2026-09-06 CBOE answered in 0.2s,
+stooq returned HTTP 404, and yfinance timed out after 130s (so yfinance carries its own
+short `VIX_YF_TIMEOUT`, since three chain attempts at 130s would stall the loop for
+minutes). Every source returns
 **true index points**, so the 22/28 gates need no recalibration whichever answers; a dollar-priced
 proxy (VIXY/VXX) is deliberately excluded, since a mis-scaled number feeding a kill-switch is
 worse than no number (the stale fail-safe already covers "no number"). Readings outside
@@ -345,7 +350,14 @@ the fleet actually runs:
 `docker exec -w /app/code trading-fleet python3 fleet_doctor.py`. It verifies location, syntax +
 uncommitted drift, config completeness, that **every PM2 process survives import** (the one
 failure class a bot's own main-loop `try/except` cannot catch), Alpaca, each VIX source
-separately, an InfluxDB round-trip, and runtime freshness/pm2 state. Read-only; never orders.
+separately, an InfluxDB round-trip, **how many commanders are writing telemetry**, the
+`market_regime` heartbeat, and pm2 state. Read-only; never orders.
+
+Two of its checks are deliberately *not* file-mtime based, because mtime lies here:
+`bot_config.json` is only rewritten when a published value moves (a closed weekend with a
+frozen VIX legitimately ages it), so the live-regime signal is the newest `market_regime`
+InfluxDB row; and `active_targets.json` is written by a weekday-only scout, so its age is
+judged against that schedule rather than a flat 24h.
 
 ## Known Issues / Tech Debt
 
@@ -369,6 +381,15 @@ separately, an InfluxDB round-trip, and runtime freshness/pm2 state. Read-only; 
   same indicators natively, so replacing it is a contained job if it breaks — the reason it hasn't
   been done pre-emptively is that it would change live indicator math with no backtest to validate
   against.
+- **Two fleets can run at once, and nothing used to say so.** The fleet is supposed to
+  run only inside `trading-fleet`. A commander started anywhere else (a host-level PM2
+  daemon resurrected by a reboot, a second container) watches a *different* PM2 daemon
+  and alerts Discord about *its* processes — which is why 2026-09 produced "bot down"
+  pings that `docker exec trading-fleet pm2 ls` flatly contradicted. Both were true, of
+  different daemons. Two defences now: every commander alert carries
+  `commander._source_tag()` (hostname + pid + in-container-or-not), and `fleet_doctor`
+  reads the `host` tag on `bot_monitor` to report every commander currently writing
+  telemetry. More than one live host = a second fleet.
 - **commander has no `__main__` guard on its Discord commands' side effects** beyond the
   `bot.run(TOKEN)` guard added in 2026-09; importing it constructs the Discord and Alpaca clients
   (harmless, no connection).
@@ -393,8 +414,12 @@ separately, an InfluxDB round-trip, and runtime freshness/pm2 state. Read-only; 
 8. **`requirements.txt` stays pinned.** It was unpinned until 2026-09, which meant a rebuild
    resolved whatever PyPI served that day — a container nobody had tested, decided by the
    calendar. Bump a pin deliberately, run the suites and `fleet_doctor.py`, then rebuild.
-9. **Alerts must survive being right.** A watchdog that fires every cycle for every bot is
+9. **An alert must name its own source.** `bot_monitor` is tagged with the writing
+   host, and every commander Discord message carries host + pid + whether it is in the
+   container. An alert that cannot say where it came from is not diagnosable when two
+   copies of the fleet are running — which has happened.
+10. **Alerts must survive being right.** A watchdog that fires every cycle for every bot is
    indistinguishable from noise, and the 2026-09 storm buried a real failure under ~9 identical
    pings per cycle. Anything that alerts on a *persistent* condition needs a throttle, and its
    wording must distinguish the conditions it covers (see `commander._alert_down`).
-10. **Run the orphan regression suite** after touching ownership/order-history code.
+11. **Run the orphan regression suite** after touching ownership/order-history code.

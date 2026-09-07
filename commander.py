@@ -16,6 +16,24 @@ from logger import registry
 BOT_CONFIG_FILE = "bot_config.json"
 CHECK_INTERVAL = 60
 HOSTNAME = socket.gethostname()
+PID = os.getpid()
+# True when this process is inside a Docker container. The fleet is SUPPOSED to
+# run only in the `trading-fleet` container; a commander running anywhere else
+# is watching a different PM2 daemon and reporting on a different set of
+# processes. See _source_tag().
+IN_CONTAINER = os.path.exists("/.dockerenv")
+
+
+def _source_tag():
+    """Identifies which commander sent a message.
+
+    Every alert carries this. The 2026-09 incident burned days on Discord pings
+    reporting bots as down while `docker exec trading-fleet pm2 ls` showed all
+    nine online with zero restarts — because the two were never looking at the
+    same PM2 daemon, and nothing in the alert said so. An alert that cannot name
+    its own source is not diagnosable; one that can is a one-line answer."""
+    where = "container" if IN_CONTAINER else "HOST (not the fleet container!)"
+    return f"`{HOSTNAME}` pid {PID} — {where}"
 
 # --- DISCORD SETUP ---
 # You must put your BOT TOKEN here or in config.py
@@ -137,6 +155,7 @@ async def _alert_down(bot_name, actual_status, pm2_env, resuming):
                   f"({restarts} restarts). Restarting...")
 
     msg = (f"{headline}\n{detail}\n"
+           f"Reported by {_source_tag()}\n"
            f"_Further alerts for this process are muted "
            f"{DOWN_ALERT_COOLDOWN // 60} min._")
     errors = _recent_errors(pm2_env)
@@ -244,6 +263,7 @@ async def watchdog_task():
                                 f"⚠️ **STALE TARGETS DETECTED**\n"
                                 f"File age: {file_age/3600:.1f} hours\n"
                                 f"Bots are using fallback watchlists.\n"
+                                f"Reported by {_source_tag()}\n"
                                 f"_The scout on the Corsair writes this file; "
                                 f"a stale one means its run or the SCP failed._"
                             )
@@ -259,7 +279,8 @@ async def watchdog_task():
                         channel = await bot.fetch_channel(int(CHANNEL_ID))
                         await channel.send(
                             "🚨 **TARGETS FILE MISSING**\n"
-                            "Check the sector scout on the Corsair.")
+                            "Check the sector scout on the Corsair.\n"
+                            f"Reported by {_source_tag()}")
                         LAST_STALE_ALERT = time.time()
                      except Exception as e:
                         registry.log_error("commander", "missing_target_alert", e)
@@ -278,6 +299,14 @@ async def before_watchdog():
 @bot.event
 async def on_ready():
     print(f'✅ COMMANDER ONLINE as {bot.user}')
+    print(f'   source: {HOSTNAME} pid {PID} '
+          f'({"container" if IN_CONTAINER else "HOST — NOT the fleet container"})')
+    if not IN_CONTAINER:
+        # Loud, because this is the shape of the 2026-09 phantom-alert incident:
+        # a second commander outside the container, watching its own PM2 daemon.
+        print('   [!] WARNING: commander is running OUTSIDE the fleet container. '
+              'If the containerised fleet is also running, there are now TWO '
+              'commanders alerting Discord about two different process lists.')
     
     # Prevent "Task already running" error on reconnects
     if not watchdog_task.is_running():

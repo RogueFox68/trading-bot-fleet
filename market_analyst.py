@@ -53,6 +53,9 @@ MIN_BARS = 200         # need >=200 daily closes for SMA200
 VIX_HTTP_TIMEOUT = 8   # per-request; the chain is tried FETCH_RETRIES times
 VIX_MIN, VIX_MAX = 5.0, 150.0   # sanity band; rejects garbage/rate-limit rows
 VIX_USER_AGENT = "trading-fleet/1.0"
+# yfinance gets its own (short) budget: it is last in the chain, optional, and
+# measurably slow to fail — see _vix_from_yfinance.
+VIX_YF_TIMEOUT = 10
 
 # Staleness fail-safe. If no fully-successful SPY+VIX fetch lands in this long,
 # stop trusting the frozen (possibly low) VIX and degrade to an elevated-risk
@@ -185,8 +188,14 @@ def get_spy_data():
 # them may raise out of get_vix_value(): its contract is `float | None`.
 
 def _vix_from_stooq():
-    """stooq.com delayed CSV quote. No key, no cookie, plain requests."""
-    r = requests.get("https://stooq.com/q/l/?s=^vix&f=sd2t2ohlc&h&e=csv",
+    """stooq.com delayed CSV quote. No key, no cookie, plain requests.
+
+    The symbol goes through `params` so requests percent-encodes the caret
+    (^vix -> %5Evix). Hand-building the URL with a literal '^' returned HTTP 404
+    from the container on 2026-09-06 — an unencoded caret is not a legal URI
+    character and intermediaries are free to mangle it."""
+    r = requests.get("https://stooq.com/q/l/",
+                     params={"s": "^vix", "f": "sd2t2ohlc", "h": "", "e": "csv"},
                      timeout=VIX_HTTP_TIMEOUT,
                      headers={"User-Agent": VIX_USER_AGENT})
     if r.status_code != 200 or not r.text:
@@ -250,7 +259,16 @@ def _vix_from_yfinance():
     mod = _load_yfinance()
     if mod is None:
         return None
-    df = mod.download("^VIX", period="5d", interval="1d", progress=False)
+    # Measured 130.6s to fail from the fleet container on 2026-09-06: yfinance
+    # retries cookie/crumb fetches internally, on top of the download itself.
+    # Unbounded, three chain attempts would stall the analyst loop for ~6.5 min
+    # every cycle. An optional last-resort fallback does not get to do that.
+    try:
+        df = mod.download("^VIX", period="5d", interval="1d", progress=False,
+                          timeout=VIX_YF_TIMEOUT)
+    except TypeError:
+        # Older yfinance without a timeout kwarg.
+        df = mod.download("^VIX", period="5d", interval="1d", progress=False)
     if df is None or df.empty:
         return None
     # yfinance may hand back MultiIndex columns (e.g. ('Close','^VIX')) for a
@@ -268,11 +286,18 @@ def _vix_from_yfinance():
     return float(close.iloc[-1])
 
 
-# Tried in order, first sane reading wins. Ordered cheapest/most-reliable first;
-# yfinance last because it is the one that has failed the fleet before.
+# Tried in order, first sane reading wins.
+#
+# CBOE is first on evidence, not preference: measured from the fleet container
+# on 2026-09-06, CBOE answered in 0.2s while stooq returned HTTP 404 and
+# yfinance timed out after 130s. It is also the index's home exchange, which
+# makes it the most defensible source to be carrying a kill-switch.
+# stooq stays as the independent second opinion (different operator, different
+# network path), and yfinance stays last because it is the one that has already
+# failed this fleet twice.
 VIX_SOURCES = (
-    ("stooq", _vix_from_stooq),
     ("cboe", _vix_from_cboe),
+    ("stooq", _vix_from_stooq),
     ("yfinance", _vix_from_yfinance),
 )
 

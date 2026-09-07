@@ -136,12 +136,16 @@ def check_code():
 
     # 2b. Uncommitted / unpushed drift. A hand-edit that works is still a
     # hand-edit: the next `git pull` silently reverts it.
-    rc, out = _run(["git", "rev-parse", "--short", "HEAD"])
+    # The container runs as a different uid than the host owns the mounted repo
+    # as, so bare `git` refuses with "dubious ownership". Scope the exception to
+    # these read-only calls rather than mutating global git config.
+    git = ["git", "-c", f"safe.directory={REPO}"]
+    rc, out = _run(git + ["rev-parse", "--short", "HEAD"])
     if rc == 0:
         head = out.strip()
-        rc2, branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+        rc2, branch = _run(git + ["rev-parse", "--abbrev-ref", "HEAD"])
         print(f"          git HEAD : {head} on {branch.strip()}")
-        rc3, dirty = _run(["git", "status", "--porcelain"])
+        rc3, dirty = _run(git + ["status", "--porcelain"])
         tracked = [ln for ln in dirty.splitlines() if ln and not ln.startswith("??")]
         if tracked:
             warn("code",
@@ -391,9 +395,129 @@ def check_influx(config):
         bad("influx", f"Write failed: {e}")
 
 
+# --- 7b. DUPLICATE FLEET -------------------------------------------------
+def check_duplicate_fleet(config):
+    header("7b. DUPLICATE FLEET — is more than one commander alerting?")
+    print("          (commander tags every bot_monitor point with its hostname,")
+    print("           so a second fleet anywhere shows up as a second host here)")
+    if config is None:
+        warn("duplicate", "Skipped: no usable config.")
+        return
+    try:
+        import requests
+    except Exception as e:
+        bad("duplicate", f"requests will not import: {e}")
+        return
+
+    url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/query"
+    try:
+        r = requests.get(url, params={
+            "db": config.INFLUX_DB_NAME,
+            "q": "SHOW TAG VALUES FROM bot_monitor WITH KEY = host",
+        }, timeout=8)
+        series = (r.json().get("results", [{}])[0].get("series") or [])
+        hosts = [v[1] for v in series[0]["values"]] if series else []
+    except Exception as e:
+        warn("duplicate", f"Could not query bot_monitor host tags: {e}")
+        return
+
+    if not hosts:
+        warn("duplicate", "No bot_monitor points on record — commander is not "
+                          "writing telemetry, so this check cannot run.")
+        return
+
+    # SHOW TAG VALUES is all-time; narrow to who is writing RIGHT NOW.
+    live = []
+    for h in hosts:
+        try:
+            r = requests.get(url, params={
+                "db": config.INFLUX_DB_NAME,
+                "q": (f"SELECT last(status_code) FROM bot_monitor "
+                      f"WHERE host = '{h}'"),
+                "epoch": "s",
+            }, timeout=8)
+            series = (r.json().get("results", [{}])[0].get("series") or [])
+            if not series:
+                continue
+            age = time.time() - float(series[0]["values"][0][0])
+            if age < 600:      # written in the last 10 minutes
+                live.append((h, age))
+        except Exception:
+            continue
+
+    me = os.uname().nodename
+    if len(live) > 1:
+        detail = "\n".join(f"{h}  (last wrote {age:.0f}s ago)" for h, age in live)
+        bad("duplicate",
+            f"{len(live)} commanders are writing telemetry RIGHT NOW.",
+            detail + f"\n\nThis container is '{me}'. Every other host in that\n"
+            "list is a second fleet watching its own PM2 daemon and alerting\n"
+            "Discord about its own processes — which is why the pings do not\n"
+            "match `docker exec trading-fleet pm2 ls`.\n"
+            "Find and stop it ON THE HOST:\n"
+            "  pm2 ls                      # a host-level PM2 daemon?\n"
+            "  pm2 kill && pm2 unstartup   # stop it and its systemd unit\n"
+            "  docker ps                   # a second fleet container?\n"
+            "  systemctl list-units | grep -i pm2")
+    elif len(live) == 1:
+        h, age = live[0]
+        if h == me:
+            ok("duplicate", f"One commander writing telemetry: '{h}' (this container).")
+        else:
+            bad("duplicate",
+                f"The only commander writing telemetry is '{h}', NOT this "
+                f"container ('{me}').",
+                "Something else is running the fleet and this container's\n"
+                "commander is not reaching InfluxDB.")
+        stale = [h2 for h2 in hosts if h2 != h]
+        if stale:
+            print(f"          (historic hosts, not currently writing: "
+                  f"{', '.join(stale)})")
+    else:
+        warn("duplicate", "No commander has written telemetry in the last 10 min.",
+             "Cannot tell how many fleets are running. Is commander online?")
+
+
 # --- 8. RUNTIME STATE ----------------------------------------------------
 def _age(path):
     return None if not os.path.exists(path) else time.time() - os.path.getmtime(path)
+
+
+def _check_regime_heartbeat():
+    """market_regime's newest row IS the fleet's 'regime is live' signal: the
+    analyst writes one only on a fully-successful fetch. Unlike bot_config's
+    mtime this cannot be faked by a quiet market."""
+    try:
+        sys.path.insert(0, REPO)
+        import config
+        import requests
+    except Exception:
+        return
+    try:
+        r = requests.get(
+            f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/query",
+            params={"db": config.INFLUX_DB_NAME,
+                    "q": "SELECT last(vix) FROM market_regime", "epoch": "s"},
+            timeout=8)
+        series = (r.json().get("results", [{}])[0].get("series") or [])
+    except Exception as e:
+        warn("state", f"Could not read the market_regime heartbeat: {e}")
+        return
+    if not series:
+        bad("state", "No market_regime rows on record — the analyst has never "
+                     "published a successful fetch.")
+        return
+    ts, vix = series[0]["values"][0][0], series[0]["values"][0][1]
+    age = time.time() - float(ts)
+    detail = f"last row: VIX {vix} at {datetime.datetime.fromtimestamp(float(ts)):%Y-%m-%d %H:%M}"
+    if age > 30 * 60:
+        bad("state", f"market_regime heartbeat is {age/60:.0f} min old "
+                     f"(threshold 30).", detail +
+            "\nThe analyst writes a row EVERY cycle it fetches successfully, "
+            "open\nor closed. This old means it is wedged, dead, or every VIX "
+            "source is down.")
+    else:
+        ok("state", f"market_regime heartbeat is {age/60:.0f} min old.", detail)
 
 
 def check_state():
@@ -429,22 +553,37 @@ def check_state():
             if paused:
                 print(f"          paused   : {', '.join(paused)}")
 
+            # NOT a freshness signal: update_bot_config only rewrites the file
+            # when a published value actually MOVES. Over a closed weekend with
+            # a frozen VIX, nothing moves and the mtime legitimately ages. The
+            # real "regime is live" heartbeat is the market_regime InfluxDB row,
+            # which is written on every fully-successful fetch — the same signal
+            # the accountant's cross-process watchdog keys off.
             age = _age(cfg_path)
-            if age is not None and age > 3600:
-                bad("state", f"bot_config.json last written {age/3600:.1f}h ago.",
-                    "market_analyst writes it every 15 min when anything moves.\n"
-                    "This old means the analyst is dead, wedged, or cannot fetch.")
+            if age is not None:
+                print(f"          file age : {age/3600:.1f}h "
+                      f"(only rewritten when a value moves — not a heartbeat)")
 
+    _check_regime_heartbeat()
+
+    # active_targets is written by the Corsair scout on WEEKDAYS only, so a
+    # weekend age is expected and says nothing. Age it from the last weekday
+    # the scout should have run, not from now.
     tgt = os.path.join(REPO, "active_targets.json")
     age = _age(tgt)
+    weekend = datetime.datetime.now().weekday() >= 5
     if age is None:
         bad("state", "active_targets.json MISSING — bots are on fallback watchlists.",
-            "It is SCP'd from the Corsair scout 3x daily.")
-    elif age > 86400:
-        bad("state", f"active_targets.json is {age/3600:.1f}h old (stale > 24h).",
-            "The scout run or the SCP is failing on the Corsair side.")
-    else:
+            "It is SCP'd from the Corsair scout 3x daily on weekdays.")
+    elif age <= 86400:
         ok("state", f"active_targets.json is {age/3600:.1f}h old.")
+    elif weekend and age < 72 * 3600:
+        ok("state", f"active_targets.json is {age/3600:.1f}h old — expected: "
+                    f"it is the weekend and the scout runs Mon-Fri.")
+    else:
+        bad("state", f"active_targets.json is {age/3600:.1f}h old (stale).",
+            "The scout run or the SCP is failing on the Corsair side. Check\n"
+            "scout_log.txt there, and whether Task Scheduler fired at all.")
 
     rc, out = _run(["pm2", "jlist"], timeout=20)
     if rc != 0:
@@ -501,6 +640,7 @@ def main():
         check_alpaca(cfg)
         check_vix()
         check_influx(cfg)
+        check_duplicate_fleet(cfg)
     check_state()
 
     fails = [r for r in _results if r[0] == "FAIL"]
