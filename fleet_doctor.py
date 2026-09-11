@@ -375,47 +375,56 @@ def check_bar_freshness(config):
         bad("bars", f"utils will not import: {e}")
         return
 
-    # (label, callable -> DataFrame|None, bar seconds, stale factor)
-    probes = []
+    # The fetchers return (df, indicators_ok) — a frame plus the bot's OWN
+    # verdict on whether it is fresh enough to compute indicators from. Both
+    # halves matter here, and the verdict is taken rather than recomputed: the
+    # bot widens its freshness bound by how far into the session it is, so a
+    # second bound computed here would disagree with the fleet every morning.
+    #
+    # That verdict is read off `bot.session_elapsed`, which FleetBot.refresh()
+    # sets during a normal cycle. Nothing calls refresh() here, so prime it the
+    # same way refresh() does, from the one shared implementation.
     try:
-        import survivor_bot
-        probes.append(("survivor_bot 15m", lambda: survivor_bot.get_data_alpaca(BAR_PROBE_SYMBOL),
-                       survivor_bot.BAR_SECONDS, utils.BAR_STALE_FACTOR))
+        import fleet_bot
     except Exception as e:
-        warn("bars", f"survivor_bot probe unavailable: {type(e).__name__}: {e}")
-    try:
-        import trend_bot
-        probes.append(("trend_bot 15m", lambda: trend_bot.get_data_alpaca(BAR_PROBE_SYMBOL),
-                       trend_bot.BAR_SECONDS, utils.BAR_STALE_FACTOR))
-    except Exception as e:
-        warn("bars", f"trend_bot probe unavailable: {type(e).__name__}: {e}")
+        bad("bars", f"fleet_bot will not import: {e}")
+        return
 
-    for label, fetch, bar_seconds, factor in probes:
+    # (label, module, callable -> (df, indicators_ok))
+    probes = []
+    for mod_name, label in (("survivor_bot", "survivor_bot 15m"),
+                            ("trend_bot", "trend_bot 15m")):
         try:
-            df = fetch()
+            mod = __import__(mod_name)
+            mod.bot.session_elapsed = fleet_bot.session_elapsed_seconds(mod.bot.market_hours)
+            probes.append((label, lambda m=mod: m.get_data_alpaca(BAR_PROBE_SYMBOL)))
+        except Exception as e:
+            warn("bars", f"{mod_name} probe unavailable: {type(e).__name__}: {e}")
+
+    for label, fetch in probes:
+        try:
+            df, indicators_ok = fetch()
         except Exception as e:
             bad("bars", f"{label}: fetch raised {type(e).__name__}: {e}")
             continue
         if df is None or len(df) == 0:
-            # The bot's own freshness guard returns None on a stale frame, so
-            # this is either "no data" or "data too old to trade" — both mean
-            # the bot is standing down on this symbol.
-            bad("bars", f"{label} ({BAR_PROBE_SYMBOL}): no usable frame — "
-                        f"empty response, or the freshness guard rejected it.",
-                "Check the bot log for a [STALE] line naming the age.")
+            # (None, False) is a failed or empty fetch. A STALE frame is NOT
+            # this case — it comes back as (df, False) and is reported below
+            # with its actual age, which is the number worth seeing.
+            bad("bars", f"{label} ({BAR_PROBE_SYMBOL}): no frame at all — "
+                        f"empty response or the request raised.",
+                "Check the bot log for the logged exception.")
             continue
         age = utils.bar_age_seconds(df)
-        if age is None:
-            bad("bars", f"{label} ({BAR_PROBE_SYMBOL}): {len(df)} bars, but no usable timestamp.")
-            continue
-        newest = df.index[-1]
-        limit_h = (bar_seconds * factor) / 3600.0
-        msg = (f"{label} ({BAR_PROBE_SYMBOL}): {len(df)} bars, newest {newest} "
-               f"({age / 3600.0:.1f}h old, limit {limit_h:.1f}h).")
-        if age > bar_seconds * factor:
-            bad("bars", msg, "The bot refuses to trade on this; the feed or the request window is wrong.")
-        else:
+        age_str = "age unknown" if age is None else f"{age / 3600.0:.1f}h old"
+        msg = (f"{label} ({BAR_PROBE_SYMBOL}): {len(df)} bars, "
+               f"newest {df.index[-1]} ({age_str}).")
+        if indicators_ok:
             ok("bars", msg)
+        else:
+            bad("bars", msg + " The bot will NOT compute indicators on this.",
+                "Entries stand down; risk exits still run off the live quote.\n"
+                "Check the bot log for the [STALE] line naming the age.")
 
     # moon_bot's Donchian levels come off crypto daily bars (its own client).
     try:
@@ -449,23 +458,38 @@ def check_vix():
         warn("vix", "No VIX_SOURCES in market_analyst — running the old single-source code.")
         return
 
-    live = 0
+    # Every source is tried before any of them is judged. A dead source is only
+    # a FAILURE when it was the last one: the chain exists precisely so that one
+    # provider can die without touching the kill-switch, and stooq has been
+    # 404ing since 2026-09-06. Reporting that as a failure every single run —
+    # and, via the exit code, making a healthy fleet look broken forever — is
+    # rule 10: an alert that fires when nothing is wrong trains you to stop
+    # reading the report that also carries the real ones.
+    results = []   # (name, is_live, message)
     for name, fetch in sources:
         t0 = time.time()
         try:
             val = fetch()
         except Exception as e:
-            bad("vix", f"{name}: {type(e).__name__}: {str(e)[:160]}")
+            results.append((name, False, f"{name}: {type(e).__name__}: {str(e)[:160]}"))
             continue
         dt = time.time() - t0
         if val is None:
-            bad("vix", f"{name}: returned no data ({dt:.1f}s).")
+            results.append((name, False, f"{name}: returned no data ({dt:.1f}s)."))
         elif not (ma.VIX_MIN <= val <= ma.VIX_MAX):
-            bad("vix", f"{name}: {val} is outside the sane band "
-                       f"[{ma.VIX_MIN}, {ma.VIX_MAX}] — rejected.")
+            results.append((name, False, f"{name}: {val} is outside the sane band "
+                                         f"[{ma.VIX_MIN}, {ma.VIX_MAX}] — rejected."))
         else:
-            live += 1
-            ok("vix", f"{name}: VIX = {val:.2f} ({dt:.1f}s).")
+            results.append((name, True, f"{name}: VIX = {val:.2f} ({dt:.1f}s)."))
+
+    live = sum(1 for _, is_live, _ in results if is_live)
+    for name, is_live, msg in results:
+        if is_live:
+            ok("vix", msg)
+        elif live:
+            warn("vix", msg + "  (covered — the chain has a live source)")
+        else:
+            bad("vix", msg)
 
     if live == 0:
         bad("vix", "NO VIX source is reachable from this container.",

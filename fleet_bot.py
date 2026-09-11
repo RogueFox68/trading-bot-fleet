@@ -48,6 +48,26 @@ EASTERN = pytz.timezone('America/New_York')
 MARKET_OPEN_ET = (9, 30)
 
 
+def session_elapsed_seconds(market_hours=True, now_et=None):
+    """Seconds since today's equity open, or None for a 24/7 bot.
+
+    Bar-freshness checks need this: at 09:30 the newest intraday bar is the
+    PREVIOUS session's, which any honest staleness bound rejects, so without it
+    every session open looks like a data outage.
+
+    It lives here, module-level, because `FleetBot.refresh()` is not the only
+    caller — `fleet_doctor` primes the same value before issuing a bot's own
+    fetcher, and a diagnostic that computed this a second way would disagree
+    with the fleet about whether a frame is fresh. One fact, one implementation.
+    """
+    if not market_hours:
+        return None
+    now_et = now_et or datetime.datetime.now(EASTERN)
+    session_open = now_et.replace(hour=MARKET_OPEN_ET[0], minute=MARKET_OPEN_ET[1],
+                                  second=0, microsecond=0)
+    return max(0.0, (now_et - session_open).total_seconds())
+
+
 class FleetBot:
     def __init__(self, name, loop_seconds=60, market_hours=True,
                  needs_entry_times=True, discord_username=None):
@@ -202,16 +222,10 @@ class FleetBot:
         self.is_eod_close = self.time_str >= "15:45"
         self.is_eod_skip_entry = self.time_str >= "14:00"
 
-        # How long today's session has been open. Bar-freshness checks need it:
-        # at 09:30 the newest intraday bar is the PREVIOUS session's, which any
-        # honest staleness bound rejects, so without this every session open
-        # looks like a data outage. None for 24/7 bots, which have no session.
-        if self.market_hours:
-            session_open = now_et.replace(hour=MARKET_OPEN_ET[0], minute=MARKET_OPEN_ET[1],
-                                          second=0, microsecond=0)
-            self.session_elapsed = max(0.0, (now_et - session_open).total_seconds())
-        else:
-            self.session_elapsed = None
+        # How long today's session has been open (None for 24/7 bots). See
+        # session_elapsed_seconds — fleet_doctor primes the same value, so the
+        # computation is shared rather than duplicated.
+        self.session_elapsed = session_elapsed_seconds(self.market_hours, now_et)
 
         # Batch budget check once per cycle to prevent log spam
         self.budget_ok = utils.check_budget(self.name, self.trading_client)
