@@ -18,7 +18,7 @@
             "script": "survivor_bot.py",
             "status": "active",
             "strategy": "long_only",
-            "allocation": 0.20
+            "allocation": 0.2
         },
         "crypto_grid": {
             "script": "crypto_grid.py",
@@ -41,23 +41,26 @@
         }
     },
     "global_settings": {
-        "market_condition": "SIDEWAYS",
+        "market_condition": "CRITICAL_VOLATILITY",
         "emergency_stop": false,
-        "macro_climate": "MACRO_BULL",
-        "sector_rotation": "UNKNOWN"
+        "macro_climate": "MACRO_BEAR",
+        "sector_rotation": "UNKNOWN",
+        "vix": 25.0,
+        "data_stale": true,
+        "CAPITAL_CRUNCH": false
     },
     "cfo_settings": {
         "reallocation_enabled": true,
         "base_allocations": {
             "trend_bot": 0.28,
-            "survivor_bot": 0.20,
+            "survivor_bot": 0.2,
             "wheel_bot": 0.38,
             "crypto_grid": 0.05,
             "moon_bot": 0.04
         },
         "minimum_reserves": {
-            "trend_bot": 0.10,
-            "survivor_bot": 0.10,
+            "trend_bot": 0.1,
+            "survivor_bot": 0.1,
             "wheel_bot": 0.05,
             "crypto_grid": 0.02,
             "moon_bot": 0.02

@@ -642,6 +642,52 @@ def _check_regime_heartbeat():
         ok("state", f"market_regime heartbeat is {age/60:.0f} min old.", detail)
 
 
+def _check_bot_config_completeness(cfg):
+    """Report keys the code reads that the LIVE bot_config.json does not define.
+
+    Not a diff against bot_config.template.json. The template is a bootstrap;
+    a live config legitimately accumulates runtime state it never had (vix,
+    vix_source, data_stale, regime_updated, CAPITAL_CRUNCH), so drift in THAT
+    direction is expected and healthy. This checks the other direction, which
+    nothing checked before: every read is a `.get(key, default)`, so a missing
+    key is silent, and two of those defaults are not conservative — an absent
+    `vix` reads 15.0 (below every gate) and an absent `unallocated_reserve`
+    reads 0.0 (no reserve at all).
+
+    bot_config.json is gitignored and lives on the host, so no config change
+    ever arrives by deploy: anything a release adds to the template is a manual
+    step on the Beelink. This is what makes that step visible.
+
+    The expected shape comes from fleet_registry, which already owns the
+    bot_config contract — so a newly registered bot is covered automatically.
+    """
+    try:
+        import fleet_registry
+    except Exception as e:
+        warn("state", f"cannot check bot_config completeness: {e}")
+        return
+
+    findings = fleet_registry.missing_config_keys(cfg)
+    if not findings:
+        ok("state", "bot_config.json defines every key the code reads.")
+    else:
+        critical = [f for f in findings if f[2] == "critical"]
+        emit = bad if critical else warn
+        emit("state",
+             f"bot_config.json is missing {len(findings)} key(s) the code reads "
+             f"({len(critical)} with an UNSAFE silent default).",
+             "Each read is .get(key, default), so these apply silently:")
+        for path, default, severity, why in findings:
+            mark = "!!" if severity == "critical" else "  "
+            print(f"       {mark} {path}  ->  {default!r}")
+            print(f"             {why}")
+
+    stray = fleet_registry.unregistered_config_bots(cfg)
+    if stray:
+        warn("state", f"bot_config has entries with no registry entry: {', '.join(stray)}",
+             "Harmless, but nothing reads them — a leftover from a retired bot.")
+
+
 def check_state():
     header("8. RUNTIME STATE — config, targets, regime freshness, processes")
 
@@ -674,6 +720,8 @@ def check_state():
                       if d.get("status") != "active"]
             if paused:
                 print(f"          paused   : {', '.join(paused)}")
+
+            _check_bot_config_completeness(cfg)
 
             # NOT a freshness signal: update_bot_config only rewrites the file
             # when a published value actually MOVES. Over a closed weekend with
