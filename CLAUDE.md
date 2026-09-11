@@ -392,6 +392,31 @@ self-inflicted halt strictly worse than the condition it reports.
 `fleet_doctor` section 5b issues each bot's **own** fetcher and prints the timestamp that
 comes back, because this failure class cannot be seen from process health or error counts.
 
+**The probe speaks the fetchers' contract, and takes their verdict rather than recomputing
+it.** Its first version did neither, and the first live run on the Beelink (2026-09-11) said:
+
+```
+[ FAIL ] survivor_bot 15m (SPY): 2 bars, but no usable timestamp.
+[ FAIL ] trend_bot 15m (SPY): 2 bars, but no usable timestamp.
+```
+
+on a completely healthy feed. `get_data_alpaca` returns `(df, indicators_ok)`; the probe used
+the return value as a DataFrame, so `len()` was the **tuple's arity** — "2 bars" — and a tuple
+has no index, hence "no usable timestamp". Both bots unpack correctly, so nothing was wrong
+with the fleet: the only broken thing was the check built to catch a frame that is plausible
+and silently wrong, reporting its own type error in exactly that shape — a specific, credible
+number produced by code that never looked at the data. The contract change and its only
+out-of-bot caller shipped in the same PR, and no test drove the caller, so neither review nor
+the suite saw it.
+
+It now also **primes `bot.session_elapsed`** before fetching, from
+`fleet_bot.session_elapsed_seconds` — the same function `FleetBot.refresh()` uses. The bots
+widen their freshness bound by how far into the session it is; `refresh()` never runs under
+fleet_doctor, so the attribute stayed `None`, the flat 45-minute bound applied, and the probe
+would have called every weekday morning a data outage while the fleet was correctly trading.
+Taking `indicators_ok` rather than recomputing a second bound is the point: a diagnostic that
+derives the same fact its own way will eventually disagree with the thing it is diagnosing.
+
 **A stale frame stops entries, never exits.** The first version of this guard returned `None`
 for stale bars, the caller did `continue`, and `manage_position` was never reached — so a
 stale history feed silently suppressed stop losses, take profits, max-hold and EOD
@@ -688,6 +713,9 @@ Run **`test_bar_freshness` after touching ANY bar request.** Its load-bearing as
 source-level: it parses every fetch site and fails if a `StockBarsRequest`/`CryptoBarsRequest`
 pairs `start` with `limit`. That is the only check that survives someone widening a window
 later, because the bug it catches produces a plausible frame rather than an error.
+It also drives `fleet_doctor`'s own section 5b and section 6 (`BarProbeContractTest`,
+`VixSourceClassificationTest`), because both shipped broken: **run it after touching
+`fleet_doctor` too**, not just after touching a bar request.
 Run `test_risk_exits` after touching either equity bot's `manage_position` — it asserts a
 stop loss fires inside the 15:30+ hold window, the case that was silently disabled.
 Run `test_crypto_grid` after touching grid entry/exit or either crypto ledger — it covers the
@@ -780,7 +808,11 @@ judged against that schedule rather than a flat 24h.
   SPOF, and the stale fail-safe + accountant freshness watchdog still bound the blast radius, but
   all three are unauthenticated endpoints that can rate-limit or change shape without notice. A
   paid index feed remains the only way to actually own this input. `fleet_doctor.py` reports each
-  source's health individually.
+  source's health individually — and a dead source is a **warning** while any source is still
+  live, a failure only when the last one dies. stooq has 404'd since 2026-09-06; reporting a
+  condition the chain is designed to absorb as `[ FAIL ]` on every run put a permanent red line
+  in the summary and, through the exit code, made a healthy fleet look broken forever (rule 10,
+  in the one section whose header already said "a red line here is not an outage by itself").
 - **`ta` is an sdist-only, effectively unmaintained dependency** (trend_bot's EMA/ADX,
   survivor_bot's RSI). It builds and computes correctly under the pinned pandas 3.x / numpy 2.x
   set, but it is the one package here that can fail a container rebuild outright on a toolchain
@@ -890,3 +922,22 @@ judged against that schedule rather than a flat 24h.
    not store, publish it as unavailable and withhold whatever depends on it. Do not
    substitute a proxy and disclose the substitution in a notes field — the number still gets
    used, and a proxy that can invert the sign of a return is worse than a gap.
+25. **The diagnostic is production code.** `fleet_doctor` is what you read when you cannot
+   trust anything else, so a broken check is worse than no check — it answers with the same
+   confident formatting whether or not it looked. Section 5b reported "2 bars" for a tuple's
+   arity on a healthy feed; the unsafe-default audit found the shipped template was missing
+   `vix`. Both were caught by running them, not by reading them. When a check cannot reach
+   the broker from the session, **stub the dependency and drive the check anyway**
+   (`BarProbeContractTest`) — "it needs a live account" is why these ship untested, and it
+   is not a reason, because the interesting half is the check's own logic.
+26. **A diagnostic reports the fleet's verdict; it does not form its own.** If the code being
+   checked already decides something — is this frame fresh, is this order closing — take that
+   answer and print it. A second implementation in the checker will drift, and then the two
+   disagree in exactly the incident where you needed one of them to be authoritative. Share
+   the function instead (`fleet_bot.session_elapsed_seconds`). This is rule 19 pointed at the
+   tooling.
+27. **A tolerated failure is a warning, not a failure.** If a design exists specifically to
+   survive something — a fallback chain, a spare, a retry — then that thing happening is not
+   a failure of the system, and reporting it as one every run burns the summary and the exit
+   code that a real failure needs. Judge it after all the alternatives are known: dead **and
+   uncovered** is the failure.

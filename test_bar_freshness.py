@@ -26,7 +26,10 @@ reads the source and fails if any bar request reintroduces `limit` next to
 `start`. The unit tests below cover the helpers; that one covers the mistake.
 """
 import ast
+import contextlib
 import datetime as dt_mod
+import io
+import sys
 import unittest
 
 import pandas as pd
@@ -214,3 +217,201 @@ class DropFormingBarTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- The diagnostic itself -------------------------------------------------
+
+class _StubBot:
+    def __init__(self):
+        self.market_hours = True
+        self.session_elapsed = None
+
+
+class _StubBotModule:
+    """Stands in for survivor_bot/trend_bot: a `bot` and a tuple-returning fetcher."""
+
+    BAR_SECONDS = 15 * 60
+
+    def __init__(self, result):
+        self.bot = _StubBot()
+        self._result = result
+        self.calls = 0
+
+    def get_data_alpaca(self, symbol):
+        self.calls += 1
+        return self._result
+
+
+class BarProbeContractTest(unittest.TestCase):
+    """fleet_doctor's probe must speak the fetchers' actual return contract.
+
+    --- The defect this pins ----------------------------------------------
+
+    `get_data_alpaca` returns `(df, indicators_ok)`. Section 5b called it and
+    used the result as a DataFrame:
+
+        df = fetch()                 # df is really a 2-tuple
+        if df is None or len(df) == 0:   # len(tuple) == 2, so it passes
+        age = utils.bar_age_seconds(df)  # a tuple has no index -> None
+        bad(f"{len(df)} bars, but no usable timestamp.")
+
+    which printed, on a live container with a perfectly healthy feed:
+
+        [ FAIL ] survivor_bot 15m (SPY): 2 bars, but no usable timestamp.
+        [ FAIL ] trend_bot 15m (SPY): 2 bars, but no usable timestamp.
+
+    "2 bars" was the tuple's arity. The bots themselves were fine — both
+    unpack correctly — so the ONLY thing broken was the check built to catch a
+    plausible-looking frame that is silently wrong. It reported its own type
+    error in exactly that shape: a specific, credible number, produced by
+    code that never looked at the data.
+
+    Both defects shipped in the same change, which is why neither review nor
+    the suite caught it: the tuple contract and its only out-of-bot caller
+    were written together, and no test drove the caller.
+    """
+
+    def setUp(self):
+        import fleet_doctor
+        self.fd = fleet_doctor
+        self._saved = {k: sys.modules.get(k)
+                       for k in ("survivor_bot", "trend_bot", "crypto_breakout")}
+        # crypto_breakout's probe is a separate try/except; keep it out of the way.
+        sys.modules["crypto_breakout"] = None
+        self.fd._results = []
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+        self.fd._results = []
+
+    def _run(self, survivor_result, trend_result):
+        mods = {"survivor_bot": _StubBotModule(survivor_result),
+                "trend_bot": _StubBotModule(trend_result)}
+        sys.modules.update(mods)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.fd.check_bar_freshness(config={"bots": {}})
+        return mods, [r for r in self.fd._results if r[1] == "bars"]
+
+    def _fresh_frame(self):
+        now = dt_mod.datetime.now(UTC)
+        return frame(now - dt_mod.timedelta(minutes=5), 200, 900)
+
+    def test_fresh_tuple_passes(self):
+        """The live-container case: a healthy feed must not read as a failure."""
+        df = self._fresh_frame()
+        mods, results = self._run((df, True), (df, True))
+        self.assertEqual(mods["survivor_bot"].calls, 1)
+        self.assertTrue(results, "the probe emitted nothing at all")
+        self.assertFalse([r for r in results if r[0] == "FAIL"],
+                         f"healthy frame reported as a failure: {results}")
+        # And the count printed is the BAR count, never the tuple's arity.
+        self.assertTrue(any("200 bars" in r[2] for r in results), results)
+        self.assertFalse(any("2 bars" in r[2] for r in results),
+                         "reported the tuple's length as a bar count")
+
+    def test_stale_tuple_fails_with_its_age(self):
+        """A stale frame is (df, False) — report the age, not 'no frame'."""
+        old = frame(dt_mod.datetime.now(UTC) - dt_mod.timedelta(days=14), 200, 900)
+        _, results = self._run((old, False), (old, False))
+        fails = [r for r in results if r[0] == "FAIL"]
+        self.assertEqual(len(fails), 2, results)
+        self.assertTrue(all("bars, newest" in r[2] for r in fails), fails)
+        self.assertTrue(all("NOT compute indicators" in r[2] for r in fails), fails)
+
+    def test_failed_fetch_reports_no_frame(self):
+        """(None, False) is the empty/raised case and must stay distinguishable."""
+        _, results = self._run((None, False), (None, False))
+        fails = [r for r in results if r[0] == "FAIL"]
+        self.assertEqual(len(fails), 2, results)
+        self.assertTrue(all("no frame at all" in r[2] for r in fails), fails)
+
+    def test_probe_primes_session_elapsed_like_a_real_cycle(self):
+        """Without this the probe false-FAILs every weekday morning.
+
+        The bot widens its freshness bound by how far into the session it is
+        (utils.bars_are_fresh(session_elapsed=...)), a value FleetBot.refresh()
+        sets each cycle. fleet_doctor never calls refresh(), so the attribute
+        stayed None and the flat 45-minute bound applied — at 09:35, with the
+        newest bar being Friday's close, the fleet is correct and the doctor
+        calls it an outage.
+        """
+        import fleet_bot
+        df = self._fresh_frame()
+        mods, _ = self._run((df, True), (df, True))
+        expected = fleet_bot.session_elapsed_seconds(True)
+        for name, mod in mods.items():
+            self.assertIsNotNone(mod.bot.session_elapsed,
+                                 f"{name}: probe left session_elapsed unprimed")
+            # Same implementation, so the two agree to within the clock tick.
+            self.assertAlmostEqual(mod.bot.session_elapsed, expected, delta=5,
+                                   msg=f"{name}: probe computed its own session bound")
+
+
+class VixSourceClassificationTest(unittest.TestCase):
+    """A dead VIX source is a failure only when it was the last one.
+
+    --- The defect this pins ----------------------------------------------
+
+    The chain exists so one provider can die without touching the kill-switch,
+    and stooq has returned HTTP 404 since 2026-09-06. Every run nonetheless
+    printed it as [ FAIL ], counted it in the summary, and — through
+    `return 1 if fails else 0` — made a completely healthy fleet exit non-zero
+    forever. That is rule 10 in the section whose own header already says "a
+    red line here is not an outage by itself".
+    """
+
+    def setUp(self):
+        import fleet_doctor
+        import market_analyst
+        self.fd = fleet_doctor
+        self.ma = market_analyst
+        self._saved_sources = market_analyst.VIX_SOURCES
+        self.fd._results = []
+
+    def tearDown(self):
+        self.ma.VIX_SOURCES = self._saved_sources
+        self.fd._results = []
+
+    def _run(self, sources):
+        self.ma.VIX_SOURCES = sources
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.fd.check_vix()
+        return [r for r in self.fd._results if r[1] == "vix"]
+
+    @staticmethod
+    def _dead():
+        def f():
+            raise RuntimeError("HTTP 404")
+        return f
+
+    def test_dead_source_with_a_spare_is_a_warning(self):
+        results = self._run([("cboe", lambda: 15.84),
+                             ("stooq", self._dead()),
+                             ("yfinance", lambda: 15.84)])
+        self.assertFalse([r for r in results if r[0] == "FAIL"],
+                         f"a covered source failed the run: {results}")
+        warns = [r for r in results if r[0] == "WARN"]
+        self.assertEqual(len(warns), 1, results)
+        self.assertIn("stooq", warns[0][2])
+        self.assertIn("covered", warns[0][2])
+
+    def test_last_source_dying_is_a_failure(self):
+        results = self._run([("cboe", self._dead()),
+                             ("stooq", self._dead()),
+                             ("yfinance", self._dead())])
+        fails = [r for r in results if r[0] == "FAIL"]
+        self.assertTrue(any("NO VIX source" in r[2] for r in fails), results)
+        # Each individual death is a failure too — nothing is covering them.
+        self.assertGreaterEqual(len(fails), 4, results)
+
+    def test_out_of_band_reading_counts_as_dead(self):
+        """A garbage number must not be mistaken for a live spare."""
+        results = self._run([("cboe", lambda: 900.0), ("stooq", self._dead())])
+        fails = [r for r in results if r[0] == "FAIL"]
+        self.assertTrue(any("NO VIX source" in r[2] for r in fails), results)

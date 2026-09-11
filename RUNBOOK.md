@@ -119,7 +119,10 @@ Safety is centralized in `utils.py`:
     no source answered for 45 min and the fleet is on CRITICAL_VOLATILITY + VIX 25 with
     `data_stale=true` — entries are gated, which is the safe posture, but it is not a
     market reading. `fleet_doctor.py` tests each source separately and tells you whether
-    it is one provider or container egress.
+    it is one provider or container egress. A dead source shows as `warn ... (covered)`
+    while any source is still live — stooq has 404'd since 2026-09-06 and that is expected,
+    not an incident. It becomes `FAIL` only when nothing answers, which is the case that
+    actually costs you the kill-switch.
 
 *   **A bot is running but its trades make no sense:** suspect the *data*, not the logic.
     A truncated bar request returns a perfectly well-formed frame of stale prices — it
@@ -130,7 +133,12 @@ Safety is centralized in `utils.py`:
     docker exec trading-fleet pm2 logs <name> --lines 60 --nostream | grep STALE
     ```
     A `[STALE]` line names the symbol and the age; the bot stands down on that symbol
-    rather than trading on it. In Grafana, `market_regime.spy_bar_age_hours` is the same
+    rather than trading on it. Section 5b prints each bot's bar count and newest
+    timestamp, and fails only when the bot itself would refuse the frame — so it agrees
+    with the bot by construction. (Read it as data, not as gospel: it shipped once
+    reporting `2 bars, but no usable timestamp` on a healthy feed, which was the probe
+    mis-reading its own return value. If section 5b disagrees with a quiet bot log, trust
+    the log and check the probe.) In Grafana, `market_regime.spy_bar_age_hours` is the same
     signal for the regime feed — the analyst's heartbeat proves the *process* is alive,
     that field proves the *data* is.
 *   **crypto_grid holds coins it won't sell:** expected immediately after the lot-ledger
