@@ -246,6 +246,13 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
   persisted — a read failure that used to merely skip a sell became destructive the moment
   durable state existed. An unreadable *ledger* likewise suspends entries instead of returning
   a tradable empty book.
+- **Grid entries are fail-closed.** `bots.crypto_grid.entries_enabled` in `bot_config.json`
+  must be explicitly `true` before the grid opens anything; absent or false means no new
+  buys. Sells, reconciliation and the ledger all run regardless, so existing inventory can
+  always wind down. Default-off is deliberate: the PR #22 review asked that entries stay off
+  until the fill-driven ledger and the migration of the pre-existing coins are verified
+  against a live account, and a lever defaulting to on makes "nobody got to it" look
+  identical to "we checked".
 - **The grid sells strict FIFO, at an executable floor.** Selling the oldest *qualifying* lot
   (skipping underwater ones) is specific-lot selection, and it disagreed with the accountant:
   buy 1 at $200 then 1 at $90, sell at $120, and execution books +$30 against the $90 lot while

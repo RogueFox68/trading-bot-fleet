@@ -144,6 +144,11 @@ Safety is centralized in `utils.py`:
     ```
     Only put a basis in that file if you know it. A guessed number defeats the profit guard
     the ledger exists to enforce.
+*   **crypto_grid never buys:** expected. Entries are fail-closed — set
+    `bots.crypto_grid.entries_enabled` to `true` in `bot_config.json` (host repo dir, then
+    `docker exec trading-fleet pm2 restart crypto_grid`) once you have verified the lot ledger
+    against a live account and decided what to do with the pre-existing coins. Sells and
+    reconciliation run either way, so held inventory is never stranded by this lever.
 *   **crypto_grid logs `[SUSPEND] New grid entries halted`:** the bot is managing what it can
     but opening nothing new, deliberately. Three causes, all in the log line: the lot ledger
     could not be read or written (`crypto_grid_state.json` — repair or remove it), an

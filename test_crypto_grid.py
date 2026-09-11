@@ -349,12 +349,53 @@ class LedgerPersistenceTest(unittest.TestCase):
         submitted = []
         crypto_grid.suspend_entries("test")
         try:
-            with mock.patch.object(crypto_grid.bot, "submit",
+            with mock.patch.object(crypto_grid.bot, "bot_settings", {"entries_enabled": True}), \
+                 mock.patch.object(crypto_grid.bot, "submit",
                                    side_effect=lambda *a, **k: submitted.append(a)):
                 crypto_grid.grid_buy("BTC/USD", 100.0, 3, st)
         finally:
             crypto_grid.resume_entries()
         self.assertEqual(submitted, [])
+
+
+class EntriesLeverTest(unittest.TestCase):
+    """New entries are fail-closed until an operator turns them on."""
+
+    def _buy_with_settings(self, settings):
+        st = state_with()
+        submitted = []
+        with mock.patch.object(crypto_grid.bot, "bot_settings", settings), \
+             mock.patch.object(crypto_grid, "per_symbol_budget", return_value=1000.0), \
+             mock.patch.object(crypto_grid.bot, "regime", "SIDEWAYS"), \
+             mock.patch.object(crypto_grid.bot, "capital_crunch", False), \
+             mock.patch.object(crypto_grid.bot, "budget_ok", True), \
+             mock.patch.object(crypto_grid.bot, "account", mock.Mock(buying_power="100000")), \
+             mock.patch.object(crypto_grid, "cancel_my_open_orders"), \
+             mock.patch.object(crypto_grid.bot, "market_order", return_value=object()), \
+             mock.patch.object(crypto_grid.bot, "submit",
+                               side_effect=lambda *a, **k: submitted.append(a) or FakeOrder("o1")):
+            crypto_grid.grid_buy("BTC/USD", 100.0, 3, st)
+        return submitted
+
+    def test_absent_key_means_disabled(self):
+        self.assertEqual(self._buy_with_settings({}), [])
+
+    def test_explicit_false_means_disabled(self):
+        self.assertEqual(self._buy_with_settings({"entries_enabled": False}), [])
+
+    def test_explicit_true_enables_entries(self):
+        self.assertEqual(len(self._buy_with_settings({"entries_enabled": True})), 1)
+
+    def test_selling_is_unaffected_by_the_lever(self):
+        # Existing inventory must always be able to wind down.
+        st = state_with(lots={"BTC/USD": [lot("L1", 1.0, 100.0)]})
+        submitted = []
+        with mock.patch.object(crypto_grid.bot, "bot_settings", {}), \
+             mock.patch.object(crypto_grid, "cancel_my_open_orders"), \
+             mock.patch.object(crypto_grid.bot, "submit",
+                               side_effect=lambda *a, **k: submitted.append(a) or FakeOrder("o2")):
+            crypto_grid.grid_sell("BTC/USD", 120.0, 5, st, held=1.0, known=True)
+        self.assertEqual(len(submitted), 1, "the entries lever blocked an exit")
 
 
 class BudgetTest(unittest.TestCase):
@@ -379,7 +420,8 @@ class BudgetTest(unittest.TestCase):
     def test_a_pending_buy_blocks_a_second_one_over_budget(self):
         st = state_with(pending={"o1": pending_buy(qty=10.0, price=100.0)})
         submitted = []
-        with mock.patch.object(crypto_grid, "per_symbol_budget", return_value=1000.0), \
+        with mock.patch.object(crypto_grid.bot, "bot_settings", {"entries_enabled": True}), \
+             mock.patch.object(crypto_grid, "per_symbol_budget", return_value=1000.0), \
              mock.patch.object(crypto_grid.bot, "regime", "SIDEWAYS"), \
              mock.patch.object(crypto_grid.bot, "capital_crunch", False), \
              mock.patch.object(crypto_grid.bot, "submit",
@@ -390,7 +432,8 @@ class BudgetTest(unittest.TestCase):
     def test_a_slice_never_overshoots_the_remaining_share(self):
         st = state_with(lots={"BTC/USD": [lot("L1", 9.6, 100.0)]})
         captured = {}
-        with mock.patch.object(crypto_grid, "per_symbol_budget", return_value=1000.0), \
+        with mock.patch.object(crypto_grid.bot, "bot_settings", {"entries_enabled": True}), \
+             mock.patch.object(crypto_grid, "per_symbol_budget", return_value=1000.0), \
              mock.patch.object(crypto_grid.bot, "regime", "SIDEWAYS"), \
              mock.patch.object(crypto_grid.bot, "capital_crunch", False), \
              mock.patch.object(crypto_grid.bot, "budget_ok", True), \
