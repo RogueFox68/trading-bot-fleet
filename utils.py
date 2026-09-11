@@ -1284,6 +1284,49 @@ def log_terminal_partial_fill(order, logger, action=None, outbox=None):
                            context=getattr(order, "symbol", None))
         return 0
 
+def _http_status(exc):
+    """HTTP status behind an exception, or None.
+
+    Deliberately duck-typed rather than keyed on alpaca's APIError class: the
+    SDK wraps and re-raises through several layers, and the only thing that
+    matters is whether the broker gave us a status at all.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def account_position_qty(trading_client, symbol, bot_name="utils"):
+    """(qty, known) for an account position, read FRESH from the broker.
+
+    `known=False` means the broker did not answer — not that the position is
+    flat. A 404 IS an answer: Alpaca says the position does not exist. Only an
+    answer may retire durable state.
+
+    Shared by both crypto bots so they cannot drift. moon_bot previously read
+    `bot.positions`, the snapshot `FleetBot.refresh()` takes BEFORE cycle()
+    runs — so it predated the cycle's own fill reconciliation, and a buy that
+    settled during the cycle was compared against a position list captured
+    while that buy was still unfilled. Position-dependent decisions need a
+    read taken AFTER settlement, not the one the runner happened to cache.
+    """
+    missing = 0
+    for candidate in (symbol, symbol.replace("/", "")):
+        try:
+            return float(trading_client.get_open_position(candidate).qty), True
+        except Exception as e:
+            if _http_status(e) == 404:
+                missing += 1          # the broker ANSWERED: no such position
+                continue
+            registry.log_error(bot_name, "check_inventory", e, context=candidate)
+            return 0.0, False         # no answer at all
+    return (0.0, True) if missing else (0.0, False)
+
+
 def log_confirmed_fill(order, logger, action=None, reason="", outbox=None):
     """Write a TERMINAL crypto order's fill to InfluxDB. Idempotent; 1 or 0.
 

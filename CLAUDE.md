@@ -261,6 +261,21 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
   stands down entirely while that symbol has an unsettled order (`symbol_has_pending`), so
   attributable fills settle first and external adjustment waits for quiet. moon_bot's
   equivalent reconcile carries the same guard.
+- **A confirmed fill outranks any position read that might predate it.** "No longer pending"
+  is not the same as "the broker's position endpoint knows". `reconcile_pending` returns the
+  set of symbols whose ledger moved on a confirmed fill **this cycle**, and external
+  adjustment skips those entirely — a just-settled buy compared against a lagging position
+  read looks exactly like an external disposal. moon_bot had the worse version of this: it
+  measured against `bot.positions`, the snapshot `FleetBot.refresh()` caches **before**
+  `cycle()` runs, so the comparison was against a list captured while the buy was still
+  unfilled. A just-confirmed 1 ETH buy left `qty=0`, no replacement-purchase guard, and — with
+  a triggered trailing stop — **zero exit submissions**. Both bots now read positions fresh,
+  per symbol, after settlement, through `utils.account_position_qty`.
+- **A triggered stop on an unreadable position is loud, not silent.** moon_bot will not sell
+  into a position it cannot see, but the old code reached that state by computing
+  `min(mine, total_held)` = 0 and simply continuing. It now routes through
+  `registry.log_error` and retries next cycle. Risk management must stay *reachable*; when it
+  cannot act, that has to be visible.
 - **Crypto fills reach InfluxDB from the bots' own reconcilers** (`utils.log_confirmed_fill`).
   Both crypto bots are `reconciled=False` in the registry, so `reconcile_fills` never visits
   them — survivable while every crypto order was a MARKET order, since `submit_and_log_order`
@@ -287,7 +302,10 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
   to land is stashed in the state file's `outbox` (bounded at `FILL_OUTBOX_MAX`, loud on
   overflow) and retried by `utils.flush_fill_outbox` at the top of every cycle until InfluxDB
   answers 204. Every queued line carries its own deterministic timestamp, so a replay
-  overwrites the same point. The outbox persists across restarts.
+  overwrites the same point. The outbox persists across restarts. **It is not a lossless
+  guarantee**: at `FILL_OUTBOX_MAX` (500) the oldest queued row is dropped with a
+  `registry.log_error`. It recovers ordinary transient failures; it does not survive an
+  arbitrarily long InfluxDB outage, and crypto has no broker-side backfill (see Known Issues).
 - **Crypto symbols are compared canonically.** Alpaca reports positions as `BTCUSD` while the
   bots' `SYMBOLS` use `BTC/USD`. moon_bot keyed its position dict on the raw broker symbol and
   looked it up with the slash form, so `total_held` came back 0, the reconcile decided the
@@ -693,6 +711,14 @@ judged against that schedule rather than a flat 24h.
   fees paid in coin reduce the position quantity rather than cash, so the grid's reconcile
   absorbs them as a ledger shortfall instead of attributing them to the trade that incurred
   them. Realized crypto P&L is therefore approximate by a small, unmeasured amount.
+- **The fill outbox is bounded, so a long InfluxDB outage still loses rows.** Failed crypto
+  fill writes queue in the bot state files and retry until a 204, but at `FILL_OUTBOX_MAX`
+  (500) the oldest is dropped with a loud `registry.log_error`. That covers a restart or a
+  transient 503; it does not cover a multi-day outage. Closing it properly needs either
+  durable spill storage or a broker-side backfill for crypto — `reconcile_fills` deliberately
+  skips both crypto bots because their `grid_buy`/`grid_sell` action vocabulary cannot be
+  rebuilt from an order alone. Until then, treat an `[Outbox] FULL` alert as data loss that
+  has already happened, not a warning that it might.
 - **`max_orders` truncation is reported, not recovered.** If the advisor's history fetch hits
   its cap, `fetch_alpaca_fills` returns `complete=False`, every bot's period return reports
   `truncated_history_fetch` and no allocation is recommended. Correct, but blunt: a long

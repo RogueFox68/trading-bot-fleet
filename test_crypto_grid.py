@@ -87,7 +87,8 @@ def reconcile_against(state, orders):
     """Run reconcile_pending with the broker returning `orders` by id."""
     with mock.patch.object(crypto_grid.bot.trading_client, "get_order_by_id",
                            side_effect=lambda oid: orders[str(oid)]):
-        return crypto_grid.reconcile_pending(state)
+        changed, _settled = crypto_grid.reconcile_pending(state)
+        return changed
 
 
 class BuyLifecycleTest(unittest.TestCase):
@@ -259,6 +260,155 @@ class InterleavedBuySellCancelTest(unittest.TestCase):
             with mock.patch.object(crypto_grid, "STATE_FILE", path):
                 st = crypto_grid.load_state()
         self.assertAlmostEqual(held(st), 0.4)
+
+
+class StaleSnapshotTest(unittest.TestCase):
+    """A confirmed fill outranks a position snapshot taken before it settled.
+
+    FleetBot.refresh() caches `bot.positions` BEFORE cycle() runs. moon_bot
+    compared its ledger against that snapshot, so a buy that filled between
+    the snapshot and the order read was measured against a position list
+    captured while it was still unfilled: the ledger looked like it
+    over-stated reality, the coin was zeroed, and with a triggered trailing
+    stop no exit was submitted. Reproduced on 68173cb as
+    qty={'ETH/USD': 0.0}, pending={}, stop submissions=0.
+    """
+
+    def setUp(self):
+        try:
+            import crypto_breakout
+        except Exception as e:  # pragma: no cover
+            self.skipTest(f"crypto_breakout unavailable: {e}")
+        self.moon = crypto_breakout
+
+    def _filled_buy(self):
+        o = FakeOrder("b1", 1.0, 1800.0, "filled")
+        o.client_order_id = "moon_bot-ETHUSD-1"
+        o.symbol = "ETH/USD"
+        o.filled_at = None
+        o.canceled_at = o.updated_at = o.submitted_at = None
+        return o
+
+    def _run_cycle(self, position_read, price=1000.0):
+        """cycle() with a buy that settles during it, against `position_read`."""
+        moon, bot = self.moon, self.moon.bot
+        state = moon._empty_state()
+        state["pending"]["b1"] = {"symbol": "ETH/USD", "side": "buy",
+                                  "requested_qty": 1.0, "applied_qty": 0.0}
+        submitted = []
+        with mock.patch.object(utils, "_post_influx_line", return_value=True), \
+             mock.patch.object(moon, "get_donchian_levels",
+                               return_value=(5000.0, 3000.0, price)), \
+             mock.patch.object(moon, "load_state", return_value=state), \
+             mock.patch.object(moon, "save_state"), \
+             mock.patch.object(moon.utils, "account_position_qty",
+                               side_effect=lambda c, s, b="": position_read), \
+             mock.patch.object(bot.trading_client, "get_order_by_id",
+                               return_value=self._filled_buy()), \
+             mock.patch.object(bot, "equity", 100000.0), \
+             mock.patch.object(bot, "positions", []), \
+             mock.patch.object(bot, "budget_ok", True), \
+             mock.patch.object(bot, "account", mock.Mock(buying_power="500000")), \
+             mock.patch.object(bot, "market_order",
+                               side_effect=lambda sym, qty, side, tif: {"sym": sym, "qty": qty}), \
+             mock.patch.object(bot, "submit",
+                               side_effect=lambda od, **k: submitted.append(od) or FakeOrder("x")):
+            moon.cycle(bot)
+        return state, submitted
+
+    def test_a_just_settled_buy_is_not_erased_by_a_lagging_read(self):
+        # The position endpoint has not caught up: it still reports flat.
+        state, submitted = self._run_cycle(position_read=(0.0, True))
+        self.assertAlmostEqual(self.moon.my_qty(state, "ETH/USD"), 1.0,
+                               msg="a confirmed 1 ETH buy was erased by a stale read")
+        self.assertEqual(submitted, [], "bought again on top of a holding it owned")
+
+    def test_an_unreadable_position_preserves_the_ledger(self):
+        state, _ = self._run_cycle(position_read=(0.0, False))
+        self.assertAlmostEqual(self.moon.my_qty(state, "ETH/USD"), 1.0)
+
+    def test_the_holding_survives_save_and_reload(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "moon.json")
+            with mock.patch.object(self.moon, "STATE_FILE", path):
+                state, _ = self._run_cycle(position_read=(0.0, True))
+                self.moon.save_state(state)
+                reloaded = self.moon.load_state()
+        self.assertAlmostEqual(self.moon.my_qty(reloaded, "ETH/USD"), 1.0)
+
+    def test_the_stop_fires_once_an_authoritative_read_confirms_the_coin(self):
+        # Next cycle: the position endpoint now agrees, and price is below the
+        # 10-day low, so the trailing stop must submit.
+        moon, bot = self.moon, self.moon.bot
+        state = moon._empty_state()
+        state["qty"]["ETH/USD"] = 1.0
+        submitted = []
+        with mock.patch.object(moon, "get_donchian_levels",
+                               return_value=(5000.0, 3000.0, 1000.0)), \
+             mock.patch.object(moon, "load_state", return_value=state), \
+             mock.patch.object(moon, "reconcile_pending", return_value=(False, set())), \
+             mock.patch.object(moon, "save_state"), \
+             mock.patch.object(moon.utils, "account_position_qty", return_value=(1.0, True)), \
+             mock.patch.object(bot, "equity", 100000.0), \
+             mock.patch.object(bot, "positions", []), \
+             mock.patch.object(bot, "budget_ok", True), \
+             mock.patch.object(bot, "account", mock.Mock(buying_power="500000")), \
+             mock.patch.object(bot, "market_order",
+                               side_effect=lambda sym, qty, side, tif: {"sym": sym, "qty": qty}), \
+             mock.patch.object(bot, "submit",
+                               side_effect=lambda od, **k: submitted.append(od) or FakeOrder("x")):
+            moon.cycle(bot)
+        self.assertEqual(len(submitted), 1, "the trailing stop did not fire")
+        self.assertAlmostEqual(submitted[0]["qty"], 1.0)
+
+    def test_a_triggered_stop_on_an_unreadable_position_is_loud_not_silent(self):
+        moon, bot = self.moon, self.moon.bot
+        state = moon._empty_state()
+        state["qty"]["ETH/USD"] = 1.0
+        submitted = []
+        with mock.patch.object(moon, "get_donchian_levels",
+                               return_value=(5000.0, 3000.0, 1000.0)), \
+             mock.patch.object(moon, "load_state", return_value=state), \
+             mock.patch.object(moon, "reconcile_pending", return_value=(False, set())), \
+             mock.patch.object(moon, "save_state"), \
+             mock.patch.object(moon.utils, "account_position_qty", return_value=(0.0, False)), \
+             mock.patch.object(moon.registry, "log_error") as logged, \
+             mock.patch.object(bot, "equity", 100000.0), \
+             mock.patch.object(bot, "positions", []), \
+             mock.patch.object(bot, "budget_ok", True), \
+             mock.patch.object(bot, "account", mock.Mock(buying_power="500000")), \
+             mock.patch.object(bot, "submit",
+                               side_effect=lambda od, **k: submitted.append(od)):
+            moon.cycle(bot)
+        self.assertEqual(submitted, [], "sold into a position it could not read")
+        self.assertTrue(logged.called, "an unverifiable live stop passed silently")
+        self.assertAlmostEqual(self.moon.my_qty(state, "ETH/USD"), 1.0)
+
+
+class GridSettledSymbolTest(unittest.TestCase):
+    """The grid needs the same guard: a lagging read is not a disposal."""
+
+    def test_a_symbol_that_settled_this_cycle_defers_external_adjustment(self):
+        st = state_with(lots={"BTC/USD": [lot("L1", 1.0, 100.0)]})
+        self.assertFalse(
+            crypto_grid.reconcile_lots(st, "BTC/USD", held=0.0, known=True,
+                                       settled={"BTC/USD"}))
+        self.assertAlmostEqual(crypto_grid.ledger_qty(st, "BTC/USD"), 1.0)
+
+    def test_reconcile_pending_reports_the_symbols_it_settled(self):
+        st = state_with(pending={"b1": pending_buy(qty=0.5, lot_id="L1")})
+        with mock.patch.object(utils, "_post_influx_line", return_value=True), \
+             mock.patch.object(crypto_grid.bot.trading_client, "get_order_by_id",
+                               return_value=FakeOrder("b1", 0.5, 100.0, "filled")):
+            changed, settled = crypto_grid.reconcile_pending(st)
+        self.assertTrue(changed)
+        self.assertEqual(settled, {"BTC/USD"})
+
+    def test_a_quiet_symbol_is_still_adjusted(self):
+        st = state_with(lots={"BTC/USD": [lot("L1", 1.0, 100.0)]})
+        self.assertTrue(
+            crypto_grid.reconcile_lots(st, "BTC/USD", held=0.6, known=True, settled=set()))
+        self.assertAlmostEqual(crypto_grid.ledger_qty(st, "BTC/USD"), 0.6)
 
 
 class FillsReachInfluxTest(unittest.TestCase):
@@ -822,7 +972,8 @@ class MoonLifecycleTest(unittest.TestCase):
     def _reconcile(self, state, orders):
         with mock.patch.object(self.moon.bot.trading_client, "get_order_by_id",
                                side_effect=lambda oid: orders[str(oid)]):
-            return self.moon.reconcile_pending(state)
+            changed, _settled = self.moon.reconcile_pending(state)
+            return changed
 
     def test_pending_buy_records_no_quantity(self):
         st = self.moon._empty_state()
@@ -858,15 +1009,13 @@ class MoonLifecycleTest(unittest.TestCase):
                 st = self.moon.load_state()
         self.assertAlmostEqual(self.moon.my_qty(st, "ETH/USD"), 3.944)
 
-    def test_broker_symbol_spelling_does_not_wipe_the_ledger(self):
-        """Alpaca reports ETHUSD; SYMBOLS say ETH/USD.
+    def test_a_readable_position_lets_the_trailing_stop_fire(self):
+        """The symbol-spelling wipe, now handled inside account_position_qty.
 
         A raw-symbol position dict looked up with a slash symbol missed every
         position, so `total_held` came back 0, the reconcile decided the
         ledger over-stated reality and zeroed the coin, and the trailing-stop
-        branch was never reached because the bot now believed it held nothing.
-        A stop that silently becomes a ledger wipe is worse than one that
-        fails loudly.
+        branch was never reached. The shared helper tries both spellings.
         """
         moon = self.moon
         bot = moon.bot
@@ -874,17 +1023,15 @@ class MoonLifecycleTest(unittest.TestCase):
         state["qty"]["ETH/USD"] = 1.0
         submitted = []
 
-        class BrokerPosition:
-            symbol = "ETHUSD"          # broker spelling, not ours
-            qty = "1.0"
-
         with mock.patch.object(moon, "get_donchian_levels",
                                return_value=(5000.0, 3000.0, 1000.0)), \
              mock.patch.object(moon, "load_state", return_value=state), \
-             mock.patch.object(moon, "reconcile_pending", return_value=False), \
+             mock.patch.object(moon, "reconcile_pending", return_value=(False, set())), \
              mock.patch.object(moon, "save_state"), \
+             mock.patch.object(moon.utils, "account_position_qty",
+                               return_value=(1.0, True)), \
              mock.patch.object(bot, "equity", 100000.0), \
-             mock.patch.object(bot, "positions", [BrokerPosition()]), \
+             mock.patch.object(bot, "positions", []), \
              mock.patch.object(bot, "budget_ok", True), \
              mock.patch.object(bot, "account", mock.Mock(buying_power="500000")), \
              mock.patch.object(bot, "market_order",
@@ -904,7 +1051,8 @@ class MoonLifecycleTest(unittest.TestCase):
         with mock.patch.object(self.moon, "get_donchian_levels",
                                return_value=(100.0, 50.0, 150.0)), \
              mock.patch.object(self.moon, "load_state", return_value=self.moon._empty_state()), \
-             mock.patch.object(self.moon, "reconcile_pending", return_value=False), \
+             mock.patch.object(self.moon, "reconcile_pending", return_value=(False, set())), \
+             mock.patch.object(self.moon.utils, "account_position_qty", return_value=(0.0, True)), \
              mock.patch.object(self.moon, "save_state"), \
              mock.patch.object(self.moon.utils, "get_available_budget", return_value=1000.0), \
              mock.patch.object(bot, "equity", 100000.0), \

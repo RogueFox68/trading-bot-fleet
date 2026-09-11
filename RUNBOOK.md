@@ -157,10 +157,14 @@ Safety is centralized in `utils.py`:
     reading it first: an empty ledger is a grid that will never sell what it holds.
 *   **A crypto bot logs `[Outbox] delivered N queued fill row(s)`:** InfluxDB refused some
     trade writes earlier and they have now landed. Normal recovery, no action. A *growing*
-    outbox (or `[Outbox] FULL`) means InfluxDB has been unreachable for a long time — check
-    the `influxdb` container and `fleet_doctor.py` section 7. The queued rows live in
-    `crypto_grid_state.json` / `moon_bot_state.json` and survive restarts, so nothing is lost
-    until the cap is hit.
+    outbox means InfluxDB has been unreachable for a while — check the `influxdb` container and
+    `fleet_doctor.py` section 7. The queued rows live in `crypto_grid_state.json` /
+    `moon_bot_state.json` and survive restarts.
+    **`[Outbox] FULL` is data loss that has already happened**, not a warning that it might:
+    at 500 queued rows the oldest is dropped. Crypto has no broker-side backfill, so those
+    trades are gone from `crypto_trades` — the ledgers and the broker are still correct, but
+    Grafana and the accountant's Influx-side P&L will under-count for that period. Note the
+    window and treat those numbers as incomplete.
 *   **The CFO logs `FAIL-CLOSED — N pending order(s) cannot be priced`:** a bot has an unfilled
     market buy with no limit price, no dollar notional, no partial fill and no existing
     position, so its capital cannot be reserved. New entries for that bot are blocked until the

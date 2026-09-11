@@ -144,11 +144,14 @@ def has_pending(state, symbol):
 
 
 def reconcile_pending(state):
-    """Apply confirmed fills for in-flight orders. Idempotent; returns changed.
+    """Apply confirmed fills for in-flight orders. Idempotent.
 
-    The ONLY path by which moon_bot's tracked quantity moves.
+    The ONLY path by which moon_bot's tracked quantity moves. Returns
+    (changed, settled_symbols) — the symbols whose ledger moved on a confirmed
+    fill during THIS cycle. External adjustment must leave those alone.
     """
     changed = False
+    settled = set()
     for order_id in list(state["pending"].keys()):
         p = state["pending"][order_id]
         try:
@@ -170,6 +173,7 @@ def reconcile_pending(state):
             current = my_qty(state, p["symbol"])
             state["qty"][p["symbol"]] = max(0.0, current + sign * new_qty)
             p["applied_qty"] = filled_qty
+            settled.add(p["symbol"])
             logger.info(f"    [LEDGER] {p['symbol']} {p['side']} filled {new_qty:.6f} "
                         f"-> tracked {state['qty'][p['symbol']]:.6f}")
             changed = True
@@ -186,7 +190,7 @@ def reconcile_pending(state):
                             f"{status} with no fill; ledger unchanged.")
             del state["pending"][order_id]
             changed = True
-    return changed
+    return changed, settled
 
 
 def track_order(state, order, symbol, side, requested_qty):
@@ -256,25 +260,26 @@ def cycle(bot):
     # Retry any fill rows InfluxDB refused earlier, then settle everything in
     # flight. Settlement applies once; delivery retries until it lands.
     dirty = bool(utils.flush_fill_outbox(state["outbox"], logger))
-    if reconcile_pending(state):
+    settled_changed, settled = reconcile_pending(state)
+    if settled_changed:
         dirty = True
     entries_blocked = bool(state.get("unreadable"))
     if entries_blocked:
         logger.error("    [SKIP] Ledger unreadable — managing nothing new this cycle.")
 
-    # Shared account-wide positions vs moon_bot's own ledger.
+    # Positions are read FRESH, per symbol, AFTER reconciliation — never from
+    # `bot.positions`.
     #
-    # Keyed on the CANONICAL symbol. Alpaca reports crypto positions as
-    # BTCUSD while SYMBOLS here are BTC/USD, so a raw-symbol dict looked up
-    # with a slash symbol missed every position: `total_held` came back 0, the
-    # reconcile treated the ledger as over-stating reality and zeroed the
-    # coin, and the trailing-stop branch was never reached because the bot now
-    # believed it held nothing. A stop that silently becomes a ledger wipe is
-    # worse than one that fails loudly.
-    pos_qty = {}
-    for p in bot.positions:
-        key = str(getattr(p, "symbol", "")).replace("/", "")
-        pos_qty[key] = pos_qty.get(key, 0.0) + float(p.qty)
+    # That snapshot is taken by FleetBot.refresh() before cycle() runs, so it
+    # predates this cycle's own fill settlement. A buy that filled between the
+    # snapshot and the order read was therefore compared against a position
+    # list captured while it was still unfilled: the ledger "over-stated"
+    # reality, the coin was zeroed, and with a triggered trailing stop no exit
+    # was submitted at all. Reproduced: a just-confirmed 1 ETH buy against a
+    # prior flat snapshot left qty=0 and zero stop submissions.
+    #
+    # utils.account_position_qty also distinguishes a 404 (an answer) from a
+    # timeout (silence); only an answer may retire inventory.
 
     logger.info(f"Scanning Markets... Equity: ${bot.equity:,.2f}")
 
@@ -283,19 +288,33 @@ def cycle(bot):
             entry_high, exit_low, current_price = get_donchian_levels(symbol)
             if current_price is None: continue
 
-            total_held = pos_qty.get(symbol.replace("/", ""), 0.0)
+            total_held, held_known = utils.account_position_qty(
+                bot.trading_client, symbol, "moon_bot")
             mine = my_qty(state, symbol)
 
-            # Ledger says we hold coins the account no longer has
-            # (manual sale / grid sweep): reconcile down to reality. Never
-            # while one of our own orders is unsettled — the order reconciler
-            # owns that quantity, and both subtracting it double-counts the
-            # same sale (see crypto_grid.reconcile_lots).
-            if mine > total_held + DUST_QTY and not has_pending(state, symbol):
-                logger.warning(f"    [{symbol}] Ledger {mine:.6f} > account {total_held:.6f}; reconciling down.")
-                mine = max(0.0, total_held)
-                state["qty"][symbol] = mine
-                dirty = True
+            # Ledger says we hold coins the account no longer has (manual
+            # sale, grid sweep): reconcile down to reality — but ONLY on
+            # evidence that outranks the ledger. Not while one of our own
+            # orders is unsettled (the order reconciler owns that quantity),
+            # not when the read failed, and not when a fill settled for this
+            # symbol during this cycle, because the position endpoint can lag
+            # the order endpoint and a just-confirmed buy would look like an
+            # external disposal.
+            if mine > total_held + DUST_QTY:
+                if not held_known:
+                    logger.warning(f"    [{symbol}] position read failed; preserving the "
+                                   f"ledger ({mine:.6f}) rather than retiring it blind.")
+                elif symbol in settled:
+                    logger.info(f"    [{symbol}] a fill settled this cycle; deferring external "
+                                f"adjustment until the next read.")
+                elif has_pending(state, symbol):
+                    logger.info(f"    [{symbol}] an order is still in flight; leaving the "
+                                f"shortfall to the order reconciler.")
+                else:
+                    logger.warning(f"    [{symbol}] Ledger {mine:.6f} > account {total_held:.6f}; reconciling down.")
+                    mine = max(0.0, total_held)
+                    state["qty"][symbol] = mine
+                    dirty = True
 
             logger.info(f"  {symbol:<8} | Price: ${current_price:,.2f} | Breakout: ${entry_high:,.2f} | Stop: ${exit_low:,.2f} | Mine: {mine:.6f}")
 
@@ -350,8 +369,21 @@ def cycle(bot):
             # --- EXIT LOGIC (sell only OUR coins, never the grid's) ---
             else:
                 if current_price < exit_low:
+                    if not held_known:
+                        # Risk management must stay REACHABLE, and it must not
+                        # sell into a position it cannot see. Loud, and retried
+                        # next cycle — never a silent no-op on a live stop.
+                        registry.log_error(
+                            "moon_bot", "stop_unverifiable",
+                            Exception("trailing stop triggered but the position read failed"),
+                            context=symbol)
+                        logger.error(f"    [!] {symbol} TRAILING STOP triggered but the position "
+                                     f"is unreadable — not selling blind. Retrying next cycle.")
+                        continue
                     sell_qty = round(min(mine, total_held), 6)
                     if sell_qty <= DUST_QTY:
+                        logger.warning(f"    [{symbol}] stop triggered but nothing sellable "
+                                       f"(ledger {mine:.6f}, account {total_held:.6f}).")
                         continue
                     logger.info(f"    [SIGNAL] TRAILING STOP! Price ${current_price} < ${exit_low} (selling {sell_qty})")
 

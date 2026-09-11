@@ -337,49 +337,18 @@ def sell_floor(lot):
 
 
 # --- BROKER READS ---------------------------------------------------------
-def _http_status(exc):
-    """HTTP status behind an exception, or None.
-
-    Deliberately duck-typed rather than keyed on alpaca's APIError class: the
-    SDK wraps and re-raises through several layers, and the only thing that
-    matters here is whether the broker gave us a status at all. A 404 is an
-    ANSWER ("no such position"); everything else is silence, and silence must
-    never be read as a flat position.
-    """
-    status = getattr(exc, "status_code", None)
-    if status is None:
-        status = getattr(getattr(exc, "response", None), "status_code", None)
-    try:
-        return int(status) if status is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
 def account_qty(symbol):
-    """(qty, known) for the SHARED account position.
+    """(qty, known) for the SHARED account position — see utils.
 
-    `known=False` means the broker did not answer — not that the position is
+    `known=False` means the broker did not answer, not that the position is
     flat. Collapsing those two was destructive once the ledger existed: one
-    timeout returned 0.0, reconciliation treated it as authoritative, and every
-    lot in the file was retired and persisted.
-
-    A 404 IS an answer: Alpaca says the position does not exist.
+    timeout returned 0.0, reconciliation treated it as authoritative, and
+    every lot in the file was retired and persisted.
     """
-    missing = 0
-    for candidate in (symbol, symbol.replace("/", "")):
-        try:
-            return float(bot.trading_client.get_open_position(candidate).qty), True
-        except Exception as e:
-            if _http_status(e) == 404:
-                missing += 1          # the broker ANSWERED: no such position
-                continue
-            registry.log_error("crypto_grid", "check_inventory", e, context=candidate)
-            return 0.0, False         # no answer at all
-    # Both symbol spellings confirmed absent.
-    return (0.0, True) if missing else (0.0, False)
+    return utils.account_position_qty(bot.trading_client, symbol, "crypto_grid")
 
 
-def reconcile_lots(state, symbol, held, known):
+def reconcile_lots(state, symbol, held, known, settled=()):
     """Trim the ledger when the account confirms it holds less than we claim.
 
     This handles EXTERNAL disposals only — a manual sale, a coin leaving by
@@ -400,6 +369,14 @@ def reconcile_lots(state, symbol, held, known):
     Returns True if anything changed.
     """
     if not known:
+        return False
+    if symbol in settled:
+        # A fill settled for this symbol during THIS cycle. The position read
+        # may not reflect it yet — the order endpoint and the position
+        # endpoint are not one view — so any shortfall we see now is far more
+        # likely to be that lag than a genuine external disposal. Wait a cycle.
+        logger.info(f"    [{symbol}] a fill settled this cycle; deferring external "
+                    f"adjustment until the next read.")
         return False
     if symbol_has_pending(state, symbol):
         have = ledger_qty(state, symbol)
@@ -444,9 +421,14 @@ def reconcile_pending(state):
     """Apply confirmed fills for every in-flight order. Idempotent.
 
     This is the ONLY path by which inventory enters or leaves the ledger.
-    Returns True if the state changed.
+    Returns (changed, settled_symbols) — the symbols whose ledger moved on a
+    confirmed fill during THIS cycle. External adjustment must leave those
+    alone: a position read can lag the order endpoint, so a just-settled buy
+    can be compared against a position that does not show it yet and be
+    retired as an "external" disposal.
     """
     changed = False
+    settled = set()
     for order_id in list(state["pending"].keys()):
         p = state["pending"][order_id]
         try:
@@ -481,6 +463,7 @@ def reconcile_pending(state):
                 else:
                     lot["acquired_qty"], lot["price"] = filled_qty, filled_price
                 p["applied_qty"] = filled_qty
+                settled.add(symbol)
                 changed = True
             if terminal:
                 utils.log_confirmed_fill(order, logger, action="grid_buy",
@@ -501,6 +484,7 @@ def reconcile_pending(state):
                     lot["disposed_qty"] = float(lot.get("disposed_qty", 0.0)) + new_qty
                     logger.info(f"    [LOT-] {symbol} sold {new_qty:.8f} @ ${filled_price:,.2f}")
                 p["applied_qty"] = filled_qty
+                settled.add(symbol)
                 changed = True
             if terminal:
                 utils.log_confirmed_fill(order, logger, action="grid_sell",
@@ -514,7 +498,7 @@ def reconcile_pending(state):
                 del state["pending"][order_id]
                 prune_empty_lots(state, symbol)
                 changed = True
-    return changed
+    return changed, settled
 
 
 def expire_stale_sells(state):
@@ -789,14 +773,12 @@ def cycle(bot):
     #    delivery retries until it lands. Without this a single 503 silently
     #    lost a trade — crypto is excluded from reconcile_fills, so nothing
     #    would ever have backfilled it.
-    if utils.flush_fill_outbox(state["outbox"], logger):
-        dirty = True
-    else:
-        dirty = False
+    dirty = bool(utils.flush_fill_outbox(state["outbox"], logger))
 
     # 1. Settle everything in flight BEFORE deciding anything new. Suspends
     #    entries by itself if an order cannot be read.
-    if reconcile_pending(state):
+    settled_changed, settled = reconcile_pending(state)
+    if settled_changed:
         dirty = True
     if expire_stale_sells(state):
         dirty = True
@@ -811,7 +793,7 @@ def cycle(bot):
             logger.warning(f"    [{symbol}] position read failed; ledger preserved, "
                            f"entries held off this cycle.")
             suspend_entries(f"position read failed for {symbol}")
-        if reconcile_lots(state, symbol, held, known):
+        if reconcile_lots(state, symbol, held, known, settled=settled):
             dirty = True
         report_unledgered_inventory(symbol, held, known, state)
 
