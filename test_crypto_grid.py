@@ -27,6 +27,7 @@
 5. A shared-symbol cancel helper cancelled EVERY open order on the symbol,
    including moon_bot's.
 """
+import datetime as dt
 import json
 import os
 import tempfile
@@ -321,6 +322,188 @@ class FillsReachInfluxTest(unittest.TestCase):
             self.assertEqual(utils.log_confirmed_fill(rejected, utils.logger), 0)
         full_path.assert_not_called()
         partial_path.assert_not_called()
+
+
+class ExternalVsOrderReconciliationTest(unittest.TestCase):
+    """One sale must not be subtracted by both reconcilers.
+
+    The order read and the position read are separate network calls, and a
+    fill landing between them is ordinary. The position read then sees the
+    coins gone and books an "external" disposal; the next cycle's order read
+    reports the same quantity as newly filled and books it again. Reordering
+    the reads does not help — they are not atomic either way. So external
+    adjustment waits until the symbol has no unsettled order.
+    """
+
+    def test_a_fill_between_the_two_reads_is_counted_once(self):
+        st = state_with(lots={"BTC/USD": [lot("L1", 1.0, 100.0)]},
+                        pending={"s1": pending_sell(qty=1.0, lot_id="L1")})
+        # Cycle N: the order read shows nothing filled...
+        reconcile_against(st, {"s1": FakeOrder("s1", 0.0, 0.0, "new")})
+        # ...then 0.4 fills, and the POSITION read sees 0.6 remaining.
+        crypto_grid.reconcile_lots(st, "BTC/USD", held=0.6, known=True)
+        # Cycle N+1: the order now reports cumulative filled_qty=0.4.
+        reconcile_against(st, {"s1": FakeOrder("s1", 0.4, 120.0, "filled")})
+        self.assertAlmostEqual(crypto_grid.ledger_qty(st, "BTC/USD"), 0.6,
+                               msg="the same sale was subtracted twice")
+
+    def test_the_ledger_still_reads_0_6_after_a_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "grid.json")
+            with mock.patch.object(crypto_grid, "STATE_FILE", path):
+                st = state_with(lots={"BTC/USD": [lot("L1", 1.0, 100.0)]},
+                                pending={"s1": pending_sell(qty=1.0, lot_id="L1")})
+                reconcile_against(st, {"s1": FakeOrder("s1", 0.0, 0.0, "new")})
+                crypto_grid.reconcile_lots(st, "BTC/USD", held=0.6, known=True)
+                crypto_grid.save_state(st)
+
+                reloaded = crypto_grid.load_state()        # restart
+                reconcile_against(reloaded, {"s1": FakeOrder("s1", 0.4, 120.0, "filled")})
+                crypto_grid.reconcile_lots(reloaded, "BTC/USD", held=0.6, known=True)
+        self.assertAlmostEqual(crypto_grid.ledger_qty(reloaded, "BTC/USD"), 0.6)
+
+    def test_a_genuine_external_sale_is_still_caught_once_quiet(self):
+        # The feature this guard protects must still work with nothing pending.
+        st = state_with(lots={"BTC/USD": [lot("L1", 1.0, 100.0)]})
+        self.assertTrue(crypto_grid.reconcile_lots(st, "BTC/USD", held=0.6, known=True))
+        self.assertAlmostEqual(crypto_grid.ledger_qty(st, "BTC/USD"), 0.6)
+
+    def test_an_in_flight_symbol_is_left_to_the_order_reconciler(self):
+        st = state_with(lots={"BTC/USD": [lot("L1", 1.0, 100.0)]},
+                        pending={"s1": pending_sell(qty=1.0, lot_id="L1")})
+        self.assertFalse(crypto_grid.reconcile_lots(st, "BTC/USD", held=0.0, known=True))
+        self.assertAlmostEqual(crypto_grid.ledger_qty(st, "BTC/USD"), 1.0)
+
+
+class FillDeliveryOutboxTest(unittest.TestCase):
+    """A refused write is a queued delivery, not a lost trade.
+
+    `_log_fill_to_influx` swallowed HTTP failures and `log_confirmed_fill`
+    returned success anyway, while the reconcilers dropped the pending order
+    regardless. Crypto is excluded from reconcile_fills, so a 503 lost the
+    row permanently with no backfill path.
+    """
+
+    def _order(self, oid="s1", qty=1.0, price=120.0, status="filled", stamped=True):
+        o = FakeOrder(oid, qty, price, status)
+        o.client_order_id = "crypto_grid-BTCUSD-1"
+        o.symbol = "BTC/USD"
+        o.filled_at = dt.datetime(2026, 9, 11, 12, 0, tzinfo=dt.timezone.utc) if stamped else None
+        return o
+
+    def test_a_refused_write_reports_failure_and_queues(self):
+        outbox = []
+        with mock.patch.object(utils, "_post_influx_line", return_value=False):
+            wrote = utils.log_confirmed_fill(self._order(), utils.logger,
+                                             action="grid_sell", outbox=outbox)
+        self.assertEqual(wrote, 0, "a refused write reported success")
+        self.assertEqual(len(outbox), 1)
+
+    def test_a_successful_write_queues_nothing(self):
+        outbox = []
+        with mock.patch.object(utils, "_post_influx_line", return_value=True):
+            wrote = utils.log_confirmed_fill(self._order(), utils.logger,
+                                             action="grid_sell", outbox=outbox)
+        self.assertEqual(wrote, 1)
+        self.assertEqual(outbox, [])
+
+    def test_a_terminal_partial_also_queues(self):
+        outbox = []
+        with mock.patch.object(utils, "_post_influx_line", return_value=False):
+            utils.log_confirmed_fill(self._order(qty=0.25, status="canceled", stamped=False),
+                                     utils.logger, action="grid_sell", outbox=outbox)
+        self.assertEqual(len(outbox), 1)
+
+    def test_the_outbox_survives_restart_and_recovers_one_row(self):
+        # 503, restart, then a successful flush producing exactly one row.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "grid.json")
+            with mock.patch.object(crypto_grid, "STATE_FILE", path):
+                st = state_with(lots={"BTC/USD": [lot("L1", 1.0, 100.0)]},
+                                pending={"s1": pending_sell(qty=1.0, lot_id="L1")})
+                with mock.patch.object(utils, "_post_influx_line", return_value=False):
+                    reconcile_against(st, {"s1": self._order()})
+                self.assertEqual(len(st["outbox"]), 1)
+                # Trading state settled regardless of the delivery failure.
+                self.assertNotIn("s1", st["pending"])
+                crypto_grid.save_state(st)
+
+                reloaded = crypto_grid.load_state()          # restart
+                self.assertEqual(len(reloaded["outbox"]), 1)
+
+                posted = []
+                with mock.patch.object(utils, "_post_influx_line",
+                                       side_effect=lambda line, lg, context="": posted.append(line) or True):
+                    utils.flush_fill_outbox(reloaded["outbox"], crypto_grid.logger)
+        self.assertEqual(len(posted), 1, "recovery did not produce exactly one row")
+        self.assertEqual(reloaded["outbox"], [])
+
+    def test_a_still_down_influx_keeps_the_row_queued(self):
+        outbox = ["crypto_trades,symbol=BTC/USD price=1,action=\"grid_sell\",qty=1 1"]
+        with mock.patch.object(utils, "_post_influx_line", return_value=False):
+            self.assertEqual(utils.flush_fill_outbox(outbox, utils.logger), 0)
+        self.assertEqual(len(outbox), 1)
+
+    def test_the_outbox_is_bounded(self):
+        outbox = [f"line{i}" for i in range(utils.FILL_OUTBOX_MAX)]
+        utils._stash(outbox, "newest", utils.logger)
+        self.assertEqual(len(outbox), utils.FILL_OUTBOX_MAX)
+        self.assertEqual(outbox[-1], "newest")
+
+
+class TerminalPartialIdentityTest(unittest.TestCase):
+    """Submit-poll and reconciler must stamp one terminal partial identically.
+
+    The market branch of submit_and_log_order called _log_fill_to_influx,
+    which stamps a no-filled_at partial with time.time_ns(); the reconciler
+    called log_terminal_partial_fill, which uses a deterministic synthetic
+    time. Two timestamps means two rows for one trade — not an idempotent
+    overwrite. This asserts the resulting QUANTITY, not merely that each
+    helper repeats itself.
+    """
+
+    def _terminal_partial(self):
+        o = FakeOrder("o7", 0.25, 120.0, "canceled")
+        o.client_order_id = "crypto_grid-BTCUSD-9"
+        o.symbol = "BTC/USD"
+        o.filled_at = None
+        o.canceled_at = dt.datetime(2026, 9, 11, 12, 0, tzinfo=dt.timezone.utc)
+        o.side = crypto_grid.OrderSide.SELL
+        return o
+
+    def test_submit_poll_and_reconciler_write_the_same_point(self):
+        order = self._terminal_partial()
+        lines = []
+        with mock.patch.object(utils, "_post_influx_line",
+                               side_effect=lambda line, lg, context="": lines.append(line) or True):
+            # What the submission poll now does...
+            utils.log_confirmed_fill(order, utils.logger, action="grid_sell")
+            # ...and what the crypto reconciler does for the same order.
+            utils.log_confirmed_fill(order, utils.logger, action="grid_sell")
+
+        self.assertEqual(len(lines), 2, "expected two write attempts")
+        stamps = {line.rsplit(" ", 1)[1] for line in lines}
+        self.assertEqual(len(stamps), 1,
+                         f"one terminal partial produced two timestamps: {stamps}")
+        self.assertEqual(lines[0], lines[1],
+                         "the two paths render the same fill differently")
+
+    def test_the_quantity_is_not_doubled_across_the_two_paths(self):
+        order = self._terminal_partial()
+        rows = {}
+
+        def capture(line, lg, context=""):
+            body, stamp = line.rsplit(" ", 1)
+            rows[stamp] = body          # same stamp => overwrite, like InfluxDB
+            return True
+
+        with mock.patch.object(utils, "_post_influx_line", side_effect=capture):
+            utils.log_confirmed_fill(order, utils.logger, action="grid_sell")
+            utils.log_confirmed_fill(order, utils.logger, action="grid_sell")
+
+        self.assertEqual(len(rows), 1, "one trade landed as two rows")
+        total = sum(float(b.split("qty=")[1].split(",")[0]) for b in rows.values())
+        self.assertAlmostEqual(total, 0.25, msg=f"quantity doubled: {total}")
 
 
 class FifoSelectionTest(unittest.TestCase):

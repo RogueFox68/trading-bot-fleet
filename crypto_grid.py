@@ -146,7 +146,8 @@ def resume_entries():
 
 # --- LEDGER ---------------------------------------------------------------
 def _empty_state():
-    return {"version": STATE_VERSION, "lots": {s: [] for s in SYMBOLS}, "pending": {}}
+    return {"version": STATE_VERSION, "lots": {s: [] for s in SYMBOLS},
+            "pending": {}, "outbox": []}
 
 
 def load_state():
@@ -219,6 +220,7 @@ def load_state():
                 "price": price,
                 "opened_at": e.get("opened_at", ""),
             })
+    state["outbox"] = [str(l) for l in (raw.get("outbox") or []) if l]
     resume_entries()
     return state
 
@@ -304,6 +306,10 @@ def lot_has_pending_buy(state, lot_id):
                for p in state["pending"].values())
 
 
+def symbol_has_pending(state, symbol):
+    return any(p["symbol"] == symbol for p in state["pending"].values())
+
+
 def sellable_lot(state, symbol, price):
     """The OLDEST open lot, if it clears its cost at `price`. Strict FIFO.
 
@@ -376,9 +382,30 @@ def account_qty(symbol):
 def reconcile_lots(state, symbol, held, known):
     """Trim the ledger when the account confirms it holds less than we claim.
 
-    Only a KNOWN read may retire inventory. Returns True if anything changed.
+    This handles EXTERNAL disposals only — a manual sale, a coin leaving by
+    some route the bot did not order. Only a KNOWN read may retire inventory.
+
+    It must not run while this symbol has an unsettled order, because the two
+    reconcilers would then subtract the same sale twice. The order read and
+    the position read are separate network calls, and a fill landing between
+    them is ordinary: the position read sees the coins gone and books an
+    "external" disposal, then the next cycle's order read reports the same
+    quantity as newly filled and books it again. Reproduced against the
+    acquired/disposed schema: a 1-coin lot with a pending sell, 0.4 filling
+    between the reads, ends up reading 0.2 in the ledger while the account
+    holds 0.6 — and the untracked 0.4 invites a replacement purchase.
+    Reordering the two reads does not help; they are not atomic either way.
+    Attributable fills settle first; external adjustment waits for quiet.
+
+    Returns True if anything changed.
     """
     if not known:
+        return False
+    if symbol_has_pending(state, symbol):
+        have = ledger_qty(state, symbol)
+        if (have - held) > DUST_QTY:
+            logger.info(f"    [{symbol}] ledger {have:.8f} > account {held:.8f}, but an order "
+                        f"is still in flight — leaving it to the order reconciler.")
         return False
     have = ledger_qty(state, symbol)
     excess = have - held
@@ -456,7 +483,8 @@ def reconcile_pending(state):
                 p["applied_qty"] = filled_qty
                 changed = True
             if terminal:
-                utils.log_confirmed_fill(order, logger, action="grid_buy")
+                utils.log_confirmed_fill(order, logger, action="grid_buy",
+                                         outbox=state["outbox"])
                 if filled_qty <= DUST_QTY and lot is not None:
                     # Rejected/canceled with nothing filled: no fabricated lot.
                     lots_for(state, symbol).pop(idx)
@@ -475,7 +503,8 @@ def reconcile_pending(state):
                 p["applied_qty"] = filled_qty
                 changed = True
             if terminal:
-                utils.log_confirmed_fill(order, logger, action="grid_sell")
+                utils.log_confirmed_fill(order, logger, action="grid_sell",
+                                         outbox=state["outbox"])
                 # Whatever did not fill stays in the lot, by construction: we
                 # only ever added what the broker confirmed to disposed_qty.
                 unfilled = max(0.0, p["requested_qty"] - filled_qty)
@@ -755,9 +784,20 @@ def report_unledgered_inventory(symbol, held, known, state):
 def cycle(bot):
     state = load_state()
 
+    # 0. Retry any fill rows InfluxDB refused earlier. Broker settlement and
+    #    Influx delivery are separate concerns: settlement applies once, and
+    #    delivery retries until it lands. Without this a single 503 silently
+    #    lost a trade — crypto is excluded from reconcile_fills, so nothing
+    #    would ever have backfilled it.
+    if utils.flush_fill_outbox(state["outbox"], logger):
+        dirty = True
+    else:
+        dirty = False
+
     # 1. Settle everything in flight BEFORE deciding anything new. Suspends
     #    entries by itself if an order cannot be read.
-    dirty = reconcile_pending(state)
+    if reconcile_pending(state):
+        dirty = True
     if expire_stale_sells(state):
         dirty = True
 

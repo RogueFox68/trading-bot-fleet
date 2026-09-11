@@ -21,7 +21,64 @@ MEASUREMENT_BY_BOT = {
 }
 MEASUREMENT_BY_BOT.update(fleet_registry.RETIRED_BOT_MEASUREMENTS)
 
-def _log_fill_to_influx(order, logger, reason="", action=None):
+# A fill row that InfluxDB refused is a trade the books will never show. The
+# write is a DELIVERY, separate from broker settlement: settlement must apply
+# once, delivery must retry. Callers pass an `outbox` list; a line that fails
+# to land is appended to it and retried by flush_fill_outbox until InfluxDB
+# answers 204. Crypto is excluded from reconcile_fills, so without this there
+# is no backfill path at all for a dropped crypto row.
+FILL_OUTBOX_MAX = 500
+
+
+def _post_influx_line(line, logger, context=""):
+    """Write one line-protocol row. True only on a real 204."""
+    try:
+        url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
+        r = requests.post(url, data=line, timeout=2)
+        if r.status_code == 204:
+            return True
+        logger.warning(f"InfluxDB trade write failed{context}: {r.status_code} {r.text}")
+    except Exception as e:
+        logger.warning(f"InfluxDB trade write error{context}: {e}")
+    return False
+
+
+def _stash(outbox, line, logger):
+    """Queue a failed delivery for retry. Bounded, and loud when it overflows."""
+    if outbox is None:
+        return
+    if len(outbox) >= FILL_OUTBOX_MAX:
+        dropped = outbox.pop(0)
+        registry.log_error("utils", "fill_outbox_overflow",
+                           Exception(f"outbox full at {FILL_OUTBOX_MAX}; dropped a fill row"),
+                           context=dropped[:80])
+        logger.error(f"  [Outbox] FULL ({FILL_OUTBOX_MAX}) — dropped the oldest undelivered "
+                     f"fill row. InfluxDB has been unreachable for a long time.")
+    outbox.append(line)
+
+
+def flush_fill_outbox(outbox, logger):
+    """Retry queued fill rows. Returns how many landed; leaves the rest queued.
+
+    Every row carries its own deterministic timestamp, so a replay overwrites
+    the same point rather than duplicating it.
+    """
+    if not outbox:
+        return 0
+    delivered = 0
+    for line in list(outbox):
+        if _post_influx_line(line, logger, context=" (outbox retry)"):
+            outbox.remove(line)
+            delivered += 1
+        else:
+            break  # InfluxDB is down; stop hammering it this cycle
+    if delivered:
+        logger.info(f"  [Outbox] delivered {delivered} queued fill row(s); "
+                    f"{len(outbox)} still waiting.")
+    return delivered
+
+
+def _log_fill_to_influx(order, logger, reason="", action=None, outbox=None):
     """Write a trade row to InfluxDB from a CONFIRMED Alpaca fill.
 
     Measurement is derived from the bot tag in client_order_id
@@ -30,7 +87,7 @@ def _log_fill_to_influx(order, logger, reason="", action=None):
     """
     try:
         if order is None or getattr(order, "filled_avg_price", None) is None:
-            return  # not filled -> do not log
+            return 0  # not filled -> do not log
         c_id = order.client_order_id or ""
         bot = next((b for b in MEASUREMENT_BY_BOT if c_id.startswith(f"{b}-")), None)
         measurement = MEASUREMENT_BY_BOT.get(bot, "trades")
@@ -49,12 +106,13 @@ def _log_fill_to_influx(order, logger, reason="", action=None):
         line = (f'{measurement},symbol={order.symbol} '
                 f'price={float(order.filled_avg_price)},action="{act}",'
                 f'qty={float(order.filled_qty)}{reason_field} {ns}')
-        url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
-        r = requests.post(url, data=line, timeout=2)
-        if r.status_code != 204:
-            logger.warning(f"InfluxDB trade write failed: {r.status_code} {r.text}")
+        if _post_influx_line(line, logger):
+            return 1
+        _stash(outbox, line, logger)
+        return 0
     except Exception as e:
         logger.warning(f"InfluxDB trade write error: {e}")
+    return 0
 
 # --- SAFETY LIMITS ---
 MAX_DAILY_LOSS = -5000.0
@@ -1030,11 +1088,15 @@ def submit_and_log_order(trading_client, order_data, logger, reason="", log_acti
                     return updated_order
                 elif status in ["canceled", "expired", "rejected"]:
                     logger.warning(f"  [ORDER FAILED] ID: {updated_order.id} | Status: {status} | Filled: {updated_order.filled_qty}")
-                    # Terminal with a partial fill: log it here. These never reach a
-                    # 'filled' status, so reconcile_fills() skips them (no filled_at)
-                    # and this is the only capture. The helper no-ops when nothing
-                    # filled, so a zero-fill cancel writes no row.
-                    _log_fill_to_influx(updated_order, logger, reason=reason, action=log_action)
+                    # Terminal with a partial fill. Routed through the SAME
+                    # canonical path the crypto reconcilers use: calling
+                    # _log_fill_to_influx directly stamped a no-filled_at
+                    # partial with time.time_ns(), while the reconciler stamped
+                    # the identical fill with log_terminal_partial_fill's
+                    # deterministic synthetic time — two timestamps, so two
+                    # rows for one trade instead of an idempotent overwrite.
+                    # One identity function, every caller.
+                    log_confirmed_fill(updated_order, logger, action=log_action, reason=reason)
                     return updated_order
                 # 'partially_filled' / 'new' / 'accepted' / 'pending_new' -> keep polling
 
@@ -1157,7 +1219,7 @@ def _fill_action(order):
         return "sell_put" if is_option.group(1) == "P" else "sell_call"
     return "sell"
 
-def log_terminal_partial_fill(order, logger, action=None):
+def log_terminal_partial_fill(order, logger, action=None, outbox=None):
     """Log a TERMINAL order's partial fill as a first-class trade row.
 
     A close-ladder rung (wheel_bot.close_option_position) can partially fill and
@@ -1211,10 +1273,8 @@ def log_terminal_partial_fill(order, logger, action=None):
         line = (f'{measurement},symbol={order.symbol} '
                 f'price={float(price)},action="{action}",qty={filled_qty},'
                 f'fill_source="terminal_partial",source_order_id="{oid}" {ns}')
-        url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
-        r = requests.post(url, data=line, timeout=2)
-        if r.status_code != 204:
-            logger.warning(f"  [TerminalPartial] InfluxDB write failed: {r.status_code} {r.text}")
+        if not _post_influx_line(line, logger, context=" [TerminalPartial]"):
+            _stash(outbox, line, logger)
             return 0
         logger.info(f"  [TerminalPartial] {order.symbol} {action} qty={filled_qty} "
                     f"(order {oid}, {status})")
@@ -1224,7 +1284,7 @@ def log_terminal_partial_fill(order, logger, action=None):
                            context=getattr(order, "symbol", None))
         return 0
 
-def log_confirmed_fill(order, logger, action=None):
+def log_confirmed_fill(order, logger, action=None, reason="", outbox=None):
     """Write a TERMINAL crypto order's fill to InfluxDB. Idempotent; 1 or 0.
 
     The crypto bots reconcile their own ledgers from broker orders, and their
@@ -1254,10 +1314,9 @@ def log_confirmed_fill(order, logger, action=None):
     if getattr(order, "filled_at", None) is not None:
         # Broker stamped the fill: the full-fill path owns the row and keys it
         # on filled_at, so repeated reconciles overwrite one point.
-        _log_fill_to_influx(order, logger, action=action)
-        return 1
+        return _log_fill_to_influx(order, logger, reason=reason, action=action, outbox=outbox)
     # No broker stamp (a terminal partial): deterministic synthetic stamp.
-    return log_terminal_partial_fill(order, logger, action=action)
+    return log_terminal_partial_fill(order, logger, action=action, outbox=outbox)
 
 
 def reconcile_fills(trading_client, logger, lookback_days=30):

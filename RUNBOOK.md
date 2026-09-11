@@ -155,6 +155,12 @@ Safety is centralized in `utils.py`:
     in-flight order could not be read from Alpaca, or a position read failed. It resumes by
     itself once the underlying read succeeds. Do NOT delete the ledger to clear it without
     reading it first: an empty ledger is a grid that will never sell what it holds.
+*   **A crypto bot logs `[Outbox] delivered N queued fill row(s)`:** InfluxDB refused some
+    trade writes earlier and they have now landed. Normal recovery, no action. A *growing*
+    outbox (or `[Outbox] FULL`) means InfluxDB has been unreachable for a long time — check
+    the `influxdb` container and `fleet_doctor.py` section 7. The queued rows live in
+    `crypto_grid_state.json` / `moon_bot_state.json` and survive restarts, so nothing is lost
+    until the cap is hit.
 *   **The CFO logs `FAIL-CLOSED — N pending order(s) cannot be priced`:** a bot has an unfilled
     market buy with no limit price, no dollar notional, no partial fill and no existing
     position, so its capital cannot be reserved. New entries for that bot are blocked until the

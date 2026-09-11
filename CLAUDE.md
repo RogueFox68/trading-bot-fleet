@@ -250,6 +250,17 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
   the record of that disposal; dropping it at either point just moves the resurrection to the
   other side of a restart. `sellable_lot` additionally refuses to sell out of an unfinished
   acquisition.
+- **One sale is never subtracted twice.** Two reconcilers can see the same fill: the ORDER
+  read (`reconcile_pending`, attributable) and the POSITION read (`reconcile_lots`, which
+  exists to catch *external* disposals). They are separate network calls, and a fill landing
+  between them is ordinary — the position read books an "external" disposal, then the next
+  cycle's order read reports the same quantity as newly filled and books it again. A 1-coin
+  lot with a pending sell, 0.4 filling between the reads, ended up reading **0.2** in the
+  ledger while the account held **0.6**, and the untracked 0.4 invites a replacement purchase.
+  Reordering the reads does not help; they are not atomic either way. `reconcile_lots` now
+  stands down entirely while that symbol has an unsettled order (`symbol_has_pending`), so
+  attributable fills settle first and external adjustment waits for quiet. moon_bot's
+  equivalent reconcile carries the same guard.
 - **Crypto fills reach InfluxDB from the bots' own reconcilers** (`utils.log_confirmed_fill`).
   Both crypto bots are `reconciled=False` in the registry, so `reconcile_fills` never visits
   them — survivable while every crypto order was a MARKET order, since `submit_and_log_order`
@@ -260,6 +271,23 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
   only (an open partial may yet fill completely and be logged at its broker `filled_at`), and
   routes a broker-stamped fill to `_log_fill_to_influx` and a terminal partial to
   `log_terminal_partial_fill` — both idempotent, so repeated reconciliation overwrites one point.
+- **Every terminal-partial write goes through ONE identity function.** The market branch of
+  `submit_and_log_order` used to call `_log_fill_to_influx` directly, which stamps a partial
+  with no broker `filled_at` using `time.time_ns()`, while the crypto reconciler stamped the
+  identical fill with `log_terminal_partial_fill`'s deterministic synthetic time. Two
+  timestamps means **two rows for one trade**, not an idempotent overwrite — it doubled the
+  quantity for grid market buys and moon market buys/sells. The submission poll now calls
+  `log_confirmed_fill` like everyone else. Repeatability of each helper individually was never
+  the property that mattered; agreement between them is.
+- **A refused write is a queued delivery, not a lost trade.** `_log_fill_to_influx` swallowed
+  HTTP failures, `log_confirmed_fill` reported success anyway, and the reconcilers dropped the
+  pending order regardless — so one 503 lost a crypto trade permanently, with no backfill path
+  because crypto is excluded from `reconcile_fills`. Broker **settlement** and InfluxDB
+  **delivery** are now separate: settlement applies once, delivery retries. A line that fails
+  to land is stashed in the state file's `outbox` (bounded at `FILL_OUTBOX_MAX`, loud on
+  overflow) and retried by `utils.flush_fill_outbox` at the top of every cycle until InfluxDB
+  answers 204. Every queued line carries its own deterministic timestamp, so a replay
+  overwrites the same point. The outbox persists across restarts.
 - **Crypto symbols are compared canonically.** Alpaca reports positions as `BTCUSD` while the
   bots' `SYMBOLS` use `BTC/USD`. moon_bot keyed its position dict on the raw broker symbol and
   looked it up with the slash form, so `total_held` came back 0, the reconcile decided the
@@ -766,11 +794,18 @@ judged against that schedule rather than a flat 24h.
    has to ask what the order *does* first: exposure-increasing orders can be refused,
    risk-reducing ones must have a path through. Classify with
    `utils.exposure_increasing_qty` so every gate agrees on what "closing" means.
-19. **A log line is not a control.** If a condition should change behavior, it has to be
+19. **Idempotence is a property of the SYSTEM, not of a helper.** Two functions that each
+   overwrite their own row still produce two rows if they stamp the same event differently.
+   When more than one path can write the same fact, they must share one identity function —
+   and the test must assert the resulting quantity, not that each helper repeats itself.
+20. **Settlement and delivery are different jobs.** Applying a fill to trading state must
+   happen exactly once; getting it into the reporting database must retry until it lands.
+   Never let a failed write silently finish a state transition — queue the delivery.
+21. **A log line is not a control.** If a condition should change behavior, it has to be
    returned and acted on, not warned about. "Hitting max_orders will make returns
    unavailable" was logged while the same plain fill list went downstream and got ranked
    anyway.
-20. **Report an unmeasurable number as unmeasurable.** If a metric needs data the fleet does
+22. **Report an unmeasurable number as unmeasurable.** If a metric needs data the fleet does
    not store, publish it as unavailable and withhold whatever depends on it. Do not
    substitute a proxy and disclose the substitution in a notes field — the number still gets
    used, and a proxy that can invert the sign of a return is worse than a gap.

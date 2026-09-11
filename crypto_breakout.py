@@ -64,7 +64,7 @@ DUST_QTY = 1e-8
 
 
 def _empty_state():
-    return {"version": STATE_VERSION, "qty": {}, "pending": {}}
+    return {"version": STATE_VERSION, "qty": {}, "pending": {}, "outbox": []}
 
 
 def load_state():
@@ -101,6 +101,7 @@ def load_state():
             state["qty"][str(k)] = float(v)
         except (TypeError, ValueError):
             continue
+    state["outbox"] = [str(l) for l in (raw.get("outbox") or []) if l]
     for order_id, p in (raw.get("pending") or {}).items():
         try:
             state["pending"][str(order_id)] = {
@@ -178,7 +179,8 @@ def reconcile_pending(state):
             # submit_and_log_order's market-order poll. Idempotent either way.
             utils.log_confirmed_fill(
                 order, logger,
-                action="buy_breakout" if p["side"] == "buy" else "sell_breakout")
+                action="buy_breakout" if p["side"] == "buy" else "sell_breakout",
+                outbox=state["outbox"])
             if filled_qty <= DUST_QTY:
                 logger.info(f"    [LEDGER] {p['symbol']} {p['side']} {order_id} ended "
                             f"{status} with no fill; ledger unchanged.")
@@ -251,8 +253,11 @@ def cycle(bot):
     buying_power = float(bot.account.buying_power)
 
     state = load_state()
-    # Settle everything in flight BEFORE deciding anything new.
-    dirty = reconcile_pending(state)
+    # Retry any fill rows InfluxDB refused earlier, then settle everything in
+    # flight. Settlement applies once; delivery retries until it lands.
+    dirty = bool(utils.flush_fill_outbox(state["outbox"], logger))
+    if reconcile_pending(state):
+        dirty = True
     entries_blocked = bool(state.get("unreadable"))
     if entries_blocked:
         logger.error("    [SKIP] Ledger unreadable — managing nothing new this cycle.")
@@ -282,8 +287,11 @@ def cycle(bot):
             mine = my_qty(state, symbol)
 
             # Ledger says we hold coins the account no longer has
-            # (manual sale / grid sweep): reconcile down to reality.
-            if mine > total_held + DUST_QTY:
+            # (manual sale / grid sweep): reconcile down to reality. Never
+            # while one of our own orders is unsettled — the order reconciler
+            # owns that quantity, and both subtracting it double-counts the
+            # same sale (see crypto_grid.reconcile_lots).
+            if mine > total_held + DUST_QTY and not has_pending(state, symbol):
                 logger.warning(f"    [{symbol}] Ledger {mine:.6f} > account {total_held:.6f}; reconciling down.")
                 mine = max(0.0, total_held)
                 state["qty"][symbol] = mine
