@@ -63,7 +63,7 @@ class StrategyAdvisorMetricsTest(unittest.TestCase):
             fill("wheel_bot", "AAA260731P00045000", "buy", 1, 0.40, multiplier=100),
         ]
 
-        metrics = advisor.realized_metrics(rows)
+        metrics, _ = advisor.realized_metrics(rows)
         self.assertEqual(metrics["trend_bot"]["realized_pl"], 30)
         self.assertEqual(metrics["trend_bot"]["closed_trades"], 2)
         self.assertEqual(metrics["trend_bot"]["win_rate"], 1.0)
@@ -76,7 +76,7 @@ class StrategyAdvisorMetricsTest(unittest.TestCase):
             fill("survivor_bot", "BBB", "buy", 10, 10),
             fill("survivor_bot", "BBB", "sell", 10, 13),
         ]
-        metrics = advisor.realized_metrics(rows)
+        metrics, _ = advisor.realized_metrics(rows)
         self.assertEqual(metrics["survivor_bot"]["realized_pl"], 10)
         self.assertEqual(metrics["survivor_bot"]["max_drawdown"], 20)
 
@@ -185,7 +185,7 @@ class StrategyAdvisorOptionEventTest(unittest.TestCase):
         self.assertEqual(len(synth), 1)
         self.assertEqual(synth[0]["side"], "buy")
         self.assertEqual(synth[0]["price"], 0.0)
-        metrics = advisor.realized_metrics(fills + synth)
+        metrics, _ = advisor.realized_metrics(fills + synth)
         self.assertEqual(metrics["wheel_bot"]["realized_pl"], 100.0)
         self.assertEqual(metrics["wheel_bot"]["win_rate"], 1.0)
 
@@ -195,7 +195,7 @@ class StrategyAdvisorOptionEventTest(unittest.TestCase):
         synth, _ = advisor.synthetic_fills_from_events(
             [event("OPEXP", "AAA260731C00050000", 1, "2026-07-05")], fills)
         self.assertEqual(synth[0]["side"], "sell")
-        metrics = advisor.realized_metrics(fills + synth)
+        metrics, _ = advisor.realized_metrics(fills + synth)
         self.assertEqual(metrics["trend_bot"]["realized_pl"], -50.0)
 
     def test_assigned_short_put_realizes_premium_and_books_stock_at_strike(self):
@@ -212,7 +212,7 @@ class StrategyAdvisorOptionEventTest(unittest.TestCase):
         self.assertEqual(stock["multiplier"], 1)
         # a later stock sale pairs against the strike-priced basis
         exit_fill = fill("wheel_bot", "AAA", "sell", 100, 47.0, days_ago=1)
-        metrics = advisor.realized_metrics(fills + synth + [exit_fill])
+        metrics, _ = advisor.realized_metrics(fills + synth + [exit_fill])
         self.assertEqual(metrics["wheel_bot"]["realized_pl"], 100.0 + 200.0)
 
     def test_assigned_covered_call_sells_stock_at_strike(self):
@@ -226,7 +226,7 @@ class StrategyAdvisorOptionEventTest(unittest.TestCase):
         stock = [s for s in synth if s["symbol"] == "AAA"][0]
         self.assertEqual(stock["side"], "sell")
         self.assertEqual(stock["price"], 45.0)
-        metrics = advisor.realized_metrics(fills + synth)
+        metrics, _ = advisor.realized_metrics(fills + synth)
         # +80 call premium, +100 stock gain (45 strike - 44 basis) x 100 shares
         self.assertEqual(metrics["wheel_bot"]["realized_pl"], 180.0)
 

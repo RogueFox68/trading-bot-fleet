@@ -121,6 +121,37 @@ Safety is centralized in `utils.py`:
     market reading. `fleet_doctor.py` tests each source separately and tells you whether
     it is one provider or container egress.
 
+*   **A bot is running but its trades make no sense:** suspect the *data*, not the logic.
+    A truncated bar request returns a perfectly well-formed frame of stale prices — it
+    cannot be seen from `pm2 ls`, error counts, or Grafana process panels, and three of the
+    fleet's four fetch sites were in that state for months. Check the bar ages first:
+    ```bash
+    docker exec -w /app/code trading-fleet python3 fleet_doctor.py   # section 5b
+    docker exec trading-fleet pm2 logs <name> --lines 60 --nostream | grep STALE
+    ```
+    A `[STALE]` line names the symbol and the age; the bot stands down on that symbol
+    rather than trading on it. In Grafana, `market_regime.spy_bar_age_hours` is the same
+    signal for the regime feed — the analyst's heartbeat proves the *process* is alive,
+    that field proves the *data* is.
+*   **crypto_grid holds coins it won't sell:** expected immediately after the lot-ledger
+    migration. The grid only sells lots it recorded buying, and the pre-migration inventory
+    has none — the log says so once per symbol at startup. It cannot over-buy on top of them
+    (`budget_ok` counts real positions), but it will not wind them down either. Either close
+    those coins by hand on the Alpaca dashboard, or seed `crypto_grid_state.json` with the
+    real basis:
+    ```json
+    {"BTC/USD": [], "ETH/USD": [{"qty": 0.5, "price": 2800.0, "opened_at": "2026-08-01T00:00:00+00:00"}], "SOL/USD": []}
+    ```
+    Only put a basis in that file if you know it. A guessed number defeats the profit guard
+    the ledger exists to enforce.
+*   **The advisor recommends moving capital into crypto:** check
+    `recommended_allocations.json` → `assumptions.negative_basis_positions` before acting.
+    A non-empty list means the broker is reporting a negative cost basis on those symbols,
+    so their unrealized P&L — which feeds the scores — is not trustworthy. Also compare
+    `source_comparison`: a large Alpaca-vs-Influx delta on one bot means the two ledgers
+    disagree about that strategy and neither should pick a winner. The advisor never
+    writes `effective_budgets.json`; promotion is always a human step.
+
 ## Target File Contract
 The Corsair scout must emit the v1.1 dictionary schema:
 ```json

@@ -1,8 +1,9 @@
 """Moon Bot — Donchian channel breakout on BTC/ETH/SOL, 24/7.
 
 Ported onto the fleet_bot runner (market_hours=False, no entry-time paging).
-Strategy semantics unchanged: buy a 20-day-high breakout with 10% of equity,
-trail out on a 10-day-low break.
+Strategy: buy a 20-day-high breakout, trail out on a 10-day-low break. Size is
+10% of equity CLIPPED to the CFO budget remaining — the uncapped 10% overshot
+moon_bot's 4% allocation by ~2.5x on every entry.
 
 moon_bot shares its symbols with crypto_grid, and Alpaca positions are
 per-symbol, not per-bot — so a ledger file records what moon_bot itself
@@ -17,13 +18,19 @@ from alpaca.data.requests import CryptoBarsRequest, CryptoLatestTradeRequest
 from alpaca.data.timeframe import TimeFrame
 import datetime
 
+import utils
 from fleet_bot import FleetBot
 
 # --- STRATEGY SETTINGS ---
 SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD"]
 LOOKBACK_ENTRY = 20  # Buy if we break the 20-day high
 LOOKBACK_EXIT = 10   # Sell if we break the 10-day low
-RISK_PCT = 0.10      # Allocate 10% of equity per trade (Aggressive)
+RISK_PCT = 0.10      # Target size per trade, before the CFO budget clip
+HISTORY_DAYS = 60    # Daily bars fetched; must comfortably exceed LOOKBACK_ENTRY
+DAILY_BAR_SECONDS = 24 * 3600
+# Crypto trades every calendar day, so a daily bar older than ~2 days is a
+# feed failure, not a weekend.
+DAILY_STALE_FACTOR = 2.0
 
 # Ledger of moon_bot's own holdings. Gitignored (*.json); missing file = flat.
 STATE_FILE = "moon_bot_state.json"
@@ -58,21 +65,36 @@ def save_state(state):
 def get_donchian_levels(symbol):
     try:
         # 1. Fetch History for Levels
-        start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=60)
+        #
+        # The old request paired start=-60d with limit=30, and crypto trades
+        # every calendar day - so it returned days 1-30 of the window and the
+        # "20-day high" was a month old. Compounding it, `df.iloc[:-1]` then
+        # dropped what it assumed was today's forming bar but was in fact a
+        # completed one. Both are structural now: no `limit`, and the forming
+        # bar is identified by its timestamp (utils.drop_forming_bar).
+        start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=HISTORY_DAYS)
         req = CryptoBarsRequest(
             symbol_or_symbols=[symbol],
             timeframe=TimeFrame.Day,
             start=start_time,
-            limit=30
         )
         bars = crypto_data_client.get_crypto_bars(req)
         df = bars.df.loc[symbol]
 
-        # Exclude current incomplete bar for levels
-        completed_candles = df.iloc[:-1]
+        if not utils.bars_are_fresh(df, DAILY_BAR_SECONDS, "moon_bot", symbol, "donchian",
+                                    stale_factor=DAILY_STALE_FACTOR):
+            return None, None, None
 
-        entry_high = completed_candles['high'].tail(LOOKBACK_ENTRY).max()
-        exit_low = completed_candles['low'].tail(LOOKBACK_EXIT).min()
+        # Exclude the current incomplete bar for levels
+        completed_candles = utils.drop_forming_bar(df, DAILY_BAR_SECONDS)
+
+        needed = max(LOOKBACK_ENTRY, LOOKBACK_EXIT)
+        if len(completed_candles) < needed:
+            logger.error(f"    [!] {symbol}: only {len(completed_candles)} completed daily bars, need {needed}")
+            return None, None, None
+
+        entry_high = utils.newest_bars(completed_candles, LOOKBACK_ENTRY)['high'].max()
+        exit_low = utils.newest_bars(completed_candles, LOOKBACK_EXIT)['low'].min()
 
         # 2. Fetch REAL-TIME Price for Execution
         trade_req = CryptoLatestTradeRequest(symbol_or_symbols=symbol)
@@ -121,9 +143,25 @@ def cycle(bot):
                         logger.warning(f"    [SKIP] Breakout buy blocked — CFO Budget limit reached.")
                         continue
 
-                    # Calculate Size
-                    target_val = bot.equity * RISK_PCT
+                    # Calculate Size.
+                    #
+                    # RISK_PCT is a TARGET, not an entitlement: 10% of equity
+                    # against a 4% base allocation overshoots the CFO budget by
+                    # ~2.5x on every breakout. `budget_ok` above is only a
+                    # boolean — it says there is room, never how much — so the
+                    # order has to be clipped to the dollars actually left.
+                    available = utils.get_available_budget("moon_bot", bot.trading_client)
+                    target_val = min(bot.equity * RISK_PCT, available)
+                    if target_val <= 0:
+                        logger.warning(f"    [SKIP] {symbol} no budget left (available ${available:,.2f}).")
+                        continue
+                    if target_val < bot.equity * RISK_PCT:
+                        logger.info(f"    [CLIP] {symbol} target ${bot.equity * RISK_PCT:,.2f} "
+                                    f"-> ${target_val:,.2f} (CFO budget remaining).")
                     qty_to_buy = round(target_val / current_price, 4)
+                    if qty_to_buy <= 0:
+                        logger.warning(f"    [SKIP] {symbol} budget ${target_val:,.2f} rounds to zero qty.")
+                        continue
 
                     if (qty_to_buy * current_price) > buying_power:
                         logger.info("    [!] Insufficient Buying Power")

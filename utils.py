@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 import time
@@ -1183,6 +1184,131 @@ def bound_session_timeout(client, timeout=30):
     session.request = _bounded
     session._fleet_timeout = timeout
     return client
+
+# --- BAR SELECTION & FRESHNESS -------------------------------------------
+# Alpaca returns bars ASCENDING from `start`, and `limit` truncates the
+# response at THAT end - so `StockBarsRequest(start=<wide>, limit=N)` yields
+# the OLDEST N bars in the window, never the newest. Every fetch site that
+# paired a wide `start` with a `limit` smaller than the window was therefore
+# computing indicators on a frozen historical slice and calling it "latest".
+#
+# Measured on 2026-09-11 (the performance follow-up), against live requests
+# issued with the deployed SDK from inside the fleet container:
+#
+#   survivor 15m   start=-20d  limit=200  -> newest bar Aug 27  (~2wk stale)
+#   survivor SMA200 start=-460d limit=250  -> newest bar Jun 5   (~14wk stale)
+#   moon daily     start=-60d  limit=30   -> newest bar Aug 12  (~4wk stale)
+#   trend 15m      start=-10d  limit=500  -> current (the ONLY site whose
+#                                            limit exceeded its window)
+#
+# That is why trend's data was fine and nobody noticed for months: the bug is
+# invisible unless limit < bars-in-window, and it fails by returning plausible
+# numbers rather than an error.
+#
+# The fix is structural, not a tuning change: size `start` to the history the
+# indicator actually needs and DO NOT pass `limit` (alpaca-py paginates the
+# window for you), then take the newest rows with `newest_bars`. `limit` is
+# only ever safe as an over-cap that the window cannot reach, and encoding
+# that distinction in every call site is exactly how this regressed - so the
+# rule here is simply: no `limit` alongside `start`.
+#
+# Belt and braces, `bars_are_fresh` refuses to let a stale frame drive a
+# decision even if some future feed change reintroduces the truncation. A
+# silently stale indicator is the same failure class as the 2026-06-24 frozen
+# VIX: the number is present, confident, and wrong.
+
+# A frame is stale once its newest bar is older than this many bar-widths.
+# 3 absorbs a normal gap (a halted symbol, a thin crypto minute, the first
+# bar after an outage) without absorbing a two-week hole.
+BAR_STALE_FACTOR = 3.0
+
+
+def _bar_timestamp(df, position=-1):
+    """Timezone-aware UTC datetime of one bar, or None if undeterminable."""
+    try:
+        if df is None or len(df) == 0:
+            return None
+        ts = df.index[position]
+        to_pydatetime = getattr(ts, "to_pydatetime", None)
+        if to_pydatetime is not None:
+            ts = to_pydatetime()
+        if not isinstance(ts, datetime.datetime):
+            return None
+        if ts.tzinfo is None:
+            return ts.replace(tzinfo=datetime.timezone.utc)
+        return ts.astimezone(datetime.timezone.utc)
+    except Exception:
+        return None
+
+
+def newest_bars(df, count):
+    """The newest `count` rows, ascending. Use INSTEAD of a request `limit`.
+
+    Bars come back oldest-first, so the newest rows are the tail. Callers that
+    need exactly N periods (an SMA window, a Donchian lookback) must slice
+    here, after the fetch, rather than asking the API for N bars.
+    """
+    if df is None or count is None or count <= 0:
+        return df
+    return df.tail(int(count))
+
+
+def bar_age_seconds(df, now=None):
+    """Age in seconds of the newest bar, or None if undeterminable."""
+    ts = _bar_timestamp(df)
+    if ts is None:
+        return None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    return (now - ts).total_seconds()
+
+
+def bars_are_fresh(df, bar_seconds, bot_name, symbol, context="",
+                   stale_factor=BAR_STALE_FACTOR, now=None):
+    """True if the newest bar is recent enough to trade on.
+
+    Stale or undateable frames are a LOUD failure (registry.log_error, so they
+    surface in Grafana like any other), never a silent skip - the whole point
+    is that the previous behavior looked exactly like success.
+    """
+    age = bar_age_seconds(df, now=now)
+    if age is None:
+        registry.log_error(bot_name, "bar_freshness",
+                           Exception("bars carry no usable timestamp index"),
+                           context=f"{symbol} {context}".strip())
+        logger.error(f"  [STALE] {bot_name} {symbol} {context}: bars have no usable timestamp")
+        return False
+
+    max_age = float(bar_seconds) * float(stale_factor)
+    if age > max_age:
+        registry.log_error(
+            bot_name, "bar_freshness",
+            Exception(f"newest bar is {age / 3600.0:.1f}h old (limit {max_age / 3600.0:.1f}h)"),
+            context=f"{symbol} {context}".strip())
+        logger.error(f"  [STALE] {bot_name} {symbol} {context}: newest bar "
+                     f"{age / 3600.0:.1f}h old > {max_age / 3600.0:.1f}h limit - refusing to trade on it")
+        return False
+    return True
+
+
+def drop_forming_bar(df, bar_seconds, now=None):
+    """Drop the final bar only if it is still forming.
+
+    `df.iloc[:-1]` was the old idiom for "exclude the current incomplete
+    candle". It is only correct when the frame actually ends at now: on a
+    truncated (stale) frame it silently discards a COMPLETED bar, which is how
+    moon_bot's 30-day-old Donchian levels became 31-day-old ones. Deciding
+    from the timestamp works on both fresh and stale frames.
+    """
+    if df is None or len(df) == 0:
+        return df
+    ts = _bar_timestamp(df)
+    if ts is None:
+        return df.iloc[:-1]  # can't date it; keep the old conservative behavior
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if (ts + datetime.timedelta(seconds=float(bar_seconds))) > now:
+        return df.iloc[:-1]
+    return df
+
 
 # --- OPTION LIFECYCLE EVENTS (assignment / exercise / expiration) ---
 # These are position mutations with NO order behind them, so submit_and_log_order

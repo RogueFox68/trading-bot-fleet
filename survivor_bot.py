@@ -20,6 +20,7 @@ from ta.momentum import RSIIndicator
 import datetime
 
 import tiered_hold
+import utils
 from fleet_bot import FleetBot
 from logger import registry
 
@@ -34,18 +35,29 @@ bot = FleetBot("survivor_bot", loop_seconds=60, market_hours=True)
 logger = bot.logger
 
 
+# RSI(14) needs 15 bars; ask for a few sessions so a holiday or a halted
+# morning can't leave the window short. NO `limit` alongside `start` - that
+# returns the OLDEST bars in the window (see utils.newest_bars), which is how
+# this fetch spent months computing RSI on two-week-old prices.
+INTRADAY_LOOKBACK_DAYS = 5
+INTRADAY_BARS = 200
+BAR_SECONDS = 15 * 60
+
+
 def get_data_alpaca(symbol):
     try:
-        start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=20)
+        start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=INTRADAY_LOOKBACK_DAYS)
         req = StockBarsRequest(
             symbol_or_symbols=[symbol],
             timeframe=TimeFrame(15, TimeFrameUnit.Minute),
             start=start_time,
-            limit=200
         )
         bars = bot.data_client.get_stock_bars(req)
         if not bars.data: return None
-        df = bars.df.xs(symbol)
+        df = utils.newest_bars(bars.df.xs(symbol), INTRADAY_BARS)
+        # Freshness is checked in UTC, before the display-only tz conversion.
+        if not utils.bars_are_fresh(df, BAR_SECONDS, "survivor_bot", symbol, "15m"):
+            return None
         df.index = df.index.tz_convert('America/New_York')
         return df
     except Exception as e:
@@ -57,6 +69,10 @@ def get_data_alpaca(symbol):
 # per symbol — it barely moves intraday, so we refresh every few hours.
 _daily_sma_cache = {}  # symbol -> (epoch, sma_value)
 _DAILY_SMA_TTL = 6 * 3600
+DAILY_BAR_SECONDS = 24 * 3600
+# Daily bars legitimately age over a weekend or a holiday run; 4 calendar days
+# clears the longest US market close without clearing a real feed outage.
+DAILY_STALE_FACTOR = 4.0
 
 
 def get_trend_sma(symbol, window=200):
@@ -71,7 +87,6 @@ def get_trend_sma(symbol, window=200):
             symbol_or_symbols=[symbol],
             timeframe=TimeFrame.Day,
             start=start_time,
-            limit=window + 50
         )
         bars = bot.data_client.get_stock_bars(req)
         if not bars.data or symbol not in bars.data:
@@ -79,7 +94,12 @@ def get_trend_sma(symbol, window=200):
         df = bars.df.xs(symbol)
         if len(df) < window:
             return None
-        sma = float(df['close'].tail(window).mean())
+        # A daily SMA200 built on bars ending three months ago is not a
+        # long-term trend filter, it is a lagged one - and it gated entries.
+        if not utils.bars_are_fresh(df, DAILY_BAR_SECONDS, "survivor_bot", symbol,
+                                    f"SMA{window}", stale_factor=DAILY_STALE_FACTOR):
+            return None
+        sma = float(utils.newest_bars(df, window)['close'].mean())
         _daily_sma_cache[symbol] = (now, sma)
         # The scout rotates targets 3x daily out of a ~4800-symbol universe, so
         # evict past-TTL entries instead of accumulating one per symbol ever
@@ -145,28 +165,21 @@ def manage_position(symbol, pos, rsi, price):
             )
             return
 
-    # --- TIERED HOLD (EOD policy) ---
-    is_held_overnight = False
-    if bot.time_str >= "15:30":
-        score = tiered_hold.calculate_hold_score("survivor_bot", live_price, entry_price,
-                                                 {"rsi": float(rsi)}, bot.regime, bot.vix,
-                                                 hours_held=hours_held)
-        tier = tiered_hold.get_hold_tier(score, "survivor_bot")
-        if tier != "CLOSE_EOD":
-            is_held_overnight = True
-            if bot.is_eod_eval:
-                logger.info(f"    [HOLD] 🌙 Overriding EOD sweep for {symbol}. Tier: {tier} (Score: {score})")
-                return
-
+    # --- RISK EXITS (evaluated BEFORE any hold branch) ---
+    #
+    # Ordering here is the whole point. The tiered-hold block below used to run
+    # first and `return` outright on a HOLD_OVERNIGHT/HOLD_SWING tier, so from
+    # 15:30 ET a position that scored "hold" had NO stop loss and NO take
+    # profit — for the rest of the session and straight through the overnight
+    # gap, the window where a gap-down actually happens. tiered_hold's own
+    # OVERNIGHT_STOPS percentages are still unwired, so nothing downstream
+    # covered it either.
+    #
+    # A hold decision is a decision about the EOD sweep, not a waiver on risk
+    # management. Stop/target/signal exits are evaluated first and unconditionally.
     should_sell = False
     reason = ""
-    if bot.is_eod_close:
-        if is_held_overnight:
-            logger.info(f"    [HOLD] 🌙 Overriding EOD sweep for {symbol} (15:45+ ET).")
-        else:
-            should_sell = True
-            reason = "EOD Liquidation (15:45+ ET)"
-    elif rsi > RSI_SELL:
+    if rsi > RSI_SELL:
         should_sell = True
         reason = f"RSI Overbought ({rsi:.0f})"
     elif pct_gain > 0.05:
@@ -175,6 +188,28 @@ def manage_position(symbol, pos, rsi, price):
     elif pct_gain < -0.03:
         should_sell = True
         reason = "Stop Loss (-3%)"
+
+    # --- TIERED HOLD (EOD policy) ---
+    # Only reached when no risk exit fired.
+    if not should_sell:
+        is_held_overnight = False
+        if bot.time_str >= "15:30":
+            score = tiered_hold.calculate_hold_score("survivor_bot", live_price, entry_price,
+                                                     {"rsi": float(rsi)}, bot.regime, bot.vix,
+                                                     hours_held=hours_held)
+            tier = tiered_hold.get_hold_tier(score, "survivor_bot")
+            if tier != "CLOSE_EOD":
+                is_held_overnight = True
+                if bot.is_eod_eval:
+                    logger.info(f"    [HOLD] 🌙 Overriding EOD sweep for {symbol}. Tier: {tier} (Score: {score})")
+                    return
+
+        if bot.is_eod_close:
+            if is_held_overnight:
+                logger.info(f"    [HOLD] 🌙 Overriding EOD sweep for {symbol} (15:45+ ET).")
+            else:
+                should_sell = True
+                reason = "EOD Liquidation (15:45+ ET)"
 
     if should_sell:
         if hours_held is not None:

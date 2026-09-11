@@ -245,10 +245,31 @@ def _empty_realized():
     }
 
 
-def realized_metrics(fills):
-    """FIFO realized P&L supporting longs, shorts, and option premium trades."""
+def realized_metrics(fills, opening_lots=None, count_from=None):
+    """FIFO realized P&L supporting longs, shorts, and option premium trades.
+
+    `opening_lots` seeds the FIFO books with inventory already held when the
+    period opened ({(bot, symbol): [lot, ...]}, oldest first) - see
+    opening_inventory(). Without it, a sell whose opening buy predates the
+    window has nothing to close against: the old code appended it as a fresh
+    SHORT lot, so the sale booked zero realized P&L and any later buy in the
+    window was scored as covering a short that never existed. On a book that
+    turns over constantly and is never flat - crypto_grid - essentially every
+    window boundary landed mid-position.
+
+    `count_from` (a datetime) restricts which closes are BOOKED, without
+    restricting which fills are replayed. Callers that want a window's P&L
+    should pass the full fill history plus count_from, or prior inventory via
+    opening_lots; both give a window matched against real cost bases.
+
+    Returns (metrics, residual_lots): the lots still open at the end. The
+    residual is what makes window-scoped unrealized attribution possible.
+    """
     metrics = {bot: _empty_realized() for bot in fleet_registry.BOTS}
     lots = {}
+    if opening_lots:
+        for key, book in opening_lots.items():
+            lots[key] = [dict(lot) for lot in book]
     cumulative = {bot: 0.0 for bot in fleet_registry.BOTS}
     peaks = {bot: 0.0 for bot in fleet_registry.BOTS}
     hold_hours = {bot: [] for bot in fleet_registry.BOTS}
@@ -278,16 +299,17 @@ def realized_metrics(fills):
                 lot["qty"] += closed_qty
                 remaining -= closed_qty
 
-            metrics[bot]["realized_pl"] += pnl
-            metrics[bot]["closed_trades"] += 1
-            if pnl > 0:
-                metrics[bot]["winning_trades"] += 1
-            if lot.get("opened_at"):
-                hold_hours[bot].append((fill["filled_at"] - lot["opened_at"]).total_seconds() / 3600.0)
+            if count_from is None or fill["filled_at"] >= count_from:
+                metrics[bot]["realized_pl"] += pnl
+                metrics[bot]["closed_trades"] += 1
+                if pnl > 0:
+                    metrics[bot]["winning_trades"] += 1
+                if lot.get("opened_at"):
+                    hold_hours[bot].append((fill["filled_at"] - lot["opened_at"]).total_seconds() / 3600.0)
 
-            cumulative[bot] += pnl
-            peaks[bot] = max(peaks[bot], cumulative[bot])
-            metrics[bot]["max_drawdown"] = max(metrics[bot]["max_drawdown"], peaks[bot] - cumulative[bot])
+                cumulative[bot] += pnl
+                peaks[bot] = max(peaks[bot], cumulative[bot])
+                metrics[bot]["max_drawdown"] = max(metrics[bot]["max_drawdown"], peaks[bot] - cumulative[bot])
 
             if abs(lot["qty"]) <= 1e-9:
                 book.pop(0)
@@ -302,7 +324,7 @@ def realized_metrics(fills):
         data["avg_adverse_slippage_bps"] = (
             sum(slippage[bot]) / len(slippage[bot]) if slippage[bot] else None
         )
-    return metrics
+    return metrics, lots
 
 
 def risk_adjusted_score(metric, equity):
@@ -314,16 +336,74 @@ def risk_adjusted_score(metric, equity):
     return total_return - (0.50 * drawdown_penalty) + win_bonus - slippage_penalty
 
 
+def opening_inventory(fills, before):
+    """FIFO books as they stood at `before`, from the fills that precede it.
+
+    This is the window's starting position. Everything a window reports about
+    cost basis depends on it.
+    """
+    prior = [f for f in fills if f["filled_at"] < before]
+    _, residual = realized_metrics(prior)
+    return residual
+
+
+def _open_notional_by_bot(lots, opened_from=None):
+    """Open exposure per bot, optionally only lots opened at/after a time."""
+    totals = {bot: 0.0 for bot in fleet_registry.BOTS}
+    for (bot, _symbol), book in (lots or {}).items():
+        if bot not in totals:
+            continue
+        for lot in book:
+            if opened_from is not None:
+                opened = lot.get("opened_at")
+                if opened is None or opened < opened_from:
+                    continue
+            totals[bot] += abs(_as_float(lot.get("qty"))) * abs(_as_float(lot.get("price")))
+    return totals
+
+
+def window_unrealized(bot, lifetime_unrealized, residual_lots, cutoff):
+    """The share of a bot's live unrealized P&L this window is responsible for.
+
+    `unrealized_by_bot` is a LIFETIME figure read off the current positions -
+    a coin bought in April carries its whole run-up. Adding it unchanged to
+    the 5d, 20d and 60d windows alike credited the same gain three times and
+    attributed months of drift to the last five days. On the 2026-09-11
+    snapshot that was ~$4,914 of reported crypto unrealized (on positions the
+    broker reports with a NEGATIVE cost basis) landing in every window, and it
+    is the main reason the advisor wanted to move another 2% out of Trend and
+    into Grid.
+
+    Apportioning by the open notional the window itself opened keeps the
+    lifetime total intact across windows while stopping a short window from
+    claiming an old position's gain. It is an apportionment, not a
+    mark-to-market reconstruction: without historical marks per position we
+    cannot compute the true change in unrealized P&L across the window, and
+    inventing one would be the same mistake in a new place.
+    """
+    total = _open_notional_by_bot(residual_lots).get(bot, 0.0)
+    if total <= 0:
+        return 0.0
+    mine = _open_notional_by_bot(residual_lots, opened_from=cutoff).get(bot, 0.0)
+    return lifetime_unrealized * (mine / total)
+
+
 def build_window_metrics(fills, unrealized_by_bot, allocation_by_bot, equity, window_days, now=None):
     now = now or utc_now()
     cutoff = now - dt.timedelta(days=window_days)
     window_fills = [f for f in fills if f["filled_at"] >= cutoff]
-    realized = realized_metrics(window_fills)
+    # Seed with what was already held at the cutoff, so an in-window sell is
+    # matched against the basis it actually closed rather than booking its
+    # full proceeds as profit.
+    realized, residual = realized_metrics(window_fills,
+                                          opening_lots=opening_inventory(fills, cutoff))
     out = {}
     for bot in fleet_registry.BOTS:
         r = dict(realized.get(bot, _empty_realized()))
         r["fills"] = sum(1 for f in window_fills if f["bot"] == bot)
-        r["unrealized_pl"] = round(_as_float(unrealized_by_bot.get(bot)), 2)
+        r["lifetime_unrealized_pl"] = round(_as_float(unrealized_by_bot.get(bot)), 2)
+        r["unrealized_pl"] = round(
+            window_unrealized(bot, _as_float(unrealized_by_bot.get(bot)), residual, cutoff), 2)
         r["capital_used"] = round(_as_float(allocation_by_bot.get(bot)), 2)
         r["capital_utilization"] = r["capital_used"] / equity if equity > 0 else 0.0
         r["total_pl"] = round(r["realized_pl"] + r["unrealized_pl"], 2)
@@ -509,7 +589,8 @@ def fetch_option_events(lookback_days=max(WINDOW_DAYS), max_pages=20):
 
 def build_strategy_report(fills, unrealized_by_bot, allocation_by_bot, equity,
                           config_data, now=None, influx_realized_by_bot=None,
-                          influx_window_days=None, option_events_included=None):
+                          influx_window_days=None, option_events_included=None,
+                          negative_basis_positions=None):
     now = now or utc_now()
     metrics_by_window = {
         f"{days}d": build_window_metrics(
@@ -538,6 +619,22 @@ def build_strategy_report(fills, unrealized_by_bot, allocation_by_bot, equity,
                 "unrealized P&L and capital for shared coins resolve to "
                 "crypto_grid, so moon_bot vs crypto_grid scores are not "
                 "directly comparable; realized P&L is order-tag accurate"),
+            "unrealized_is_apportioned": (
+                "each window's unrealized_pl is the lifetime figure "
+                "apportioned by the open notional that window opened; "
+                "lifetime_unrealized_pl carries the raw number. Without "
+                "historical per-position marks the true change in unrealized "
+                "P&L across a window cannot be computed"),
+            "realized_uses_opening_inventory": (
+                "window realized P&L replays inventory held before the "
+                "cutoff, so a sell whose opening buy predates the window is "
+                "matched against its real basis"),
+            "negative_basis_positions": negative_basis_positions or [],
+            "negative_basis_caveat": (
+                "the broker reports these positions with a NEGATIVE cost "
+                "basis, so their unrealized P&L is not a trustworthy input; "
+                "treat any score leaning on it as unestablished"
+                if negative_basis_positions else None),
         },
     }
 
@@ -549,7 +646,8 @@ def write_strategy_report(report, path=OUTPUT_FILE):
 
 def generate_and_write_report(trading_client, unrealized_by_bot, allocation_by_bot,
                               equity, config_data, logger=None, path=OUTPUT_FILE,
-                              influx_realized_by_bot=None, influx_window_days=None):
+                              influx_realized_by_bot=None, influx_window_days=None,
+                              negative_basis_positions=None):
     fills = fetch_alpaca_fills(trading_client, logger=logger)
     option_events_ok = False
     unmatched = 0
@@ -572,9 +670,15 @@ def generate_and_write_report(trading_client, unrealized_by_bot, allocation_by_b
                                    equity, config_data,
                                    influx_realized_by_bot=influx_realized_by_bot,
                                    influx_window_days=influx_window_days,
-                                   option_events_included=option_events_ok)
+                                   option_events_included=option_events_ok,
+                                   negative_basis_positions=negative_basis_positions)
     write_strategy_report(report, path=path)
     if logger:
         rec = report["recommendation"]
         logger.info(f"[StrategyAdvisor] {rec['action']} | {', '.join(rec['reason_codes'])}")
+        if negative_basis_positions:
+            logger.warning(f"[StrategyAdvisor] {len(negative_basis_positions)} position(s) "
+                           f"report a NEGATIVE cost basis "
+                           f"({', '.join(negative_basis_positions)}); their unrealized "
+                           f"P&L feeds these scores and is not trustworthy.")
     return report

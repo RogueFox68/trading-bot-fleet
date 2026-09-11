@@ -125,12 +125,19 @@ def send_discord(msg):
         registry.log_error("market_analyst", "send_discord", e, context=msg[:50])
         logger.error(f"Discord webhook failed: {e}")
 
-def log_to_influx(price, vix, adx, regime, sma, ema):
+def log_to_influx(price, vix, adx, regime, sma, ema, spy_bar_age_hours=-1.0):
     """Write one fresh market_regime row. Only called on a fully-successful
     fetch, so the presence/recency of a row is the fleet's 'regime is live'
     signal (the accountant's staleness watchdog keys off this measurement's
     last-write time). Write failures route through registry.log_error — a
-    silently-dropped write is exactly what let this pipeline die unseen."""
+    silently-dropped write is exactly what let this pipeline die unseen.
+
+    `spy_bar_age_hours` is the age of the newest SPY bar the regime was
+    computed from (-1 = undeterminable). The heartbeat above proves the
+    ANALYST is alive; this proves the DATA is. They are different failures:
+    a feed that keeps serving last week's bars answers every fetch
+    successfully, so nothing in the existing fail-safe can see it. That is
+    exactly how the bots' own indicators went stale for months."""
     try:
         regime_score = 1 if "BULL" in regime else (-1 if "BEAR" in regime else 0)
         # vix_source is a TAG (indexed) so Grafana can show which provider is
@@ -138,6 +145,7 @@ def log_to_influx(price, vix, adx, regime, sma, ema):
         source = last_vix_source or "unknown"
         data_str = (f'market_regime,symbol=SPY,vix_source={source} '
                     f'price={price},vix={vix},adx={adx},sma200={sma},ema20={ema},'
+                    f'spy_bar_age_hours={spy_bar_age_hours},'
                     f'regime_score={regime_score},regime="{regime}" {time.time_ns()}')
         r = requests.post(INFLUX_URL, data=data_str, timeout=2)
         if r.status_code != 204:
@@ -181,6 +189,37 @@ def get_spy_data():
         if attempt < FETCH_RETRIES - 1:
             time.sleep(FETCH_BACKOFF * (2 ** attempt))
     return None
+
+# How old the newest SPY daily bar may be before we say so out loud. SPY is
+# NOT gated on this, deliberately: the analyst runs 24/7 and a Friday close
+# plus a Monday holiday legitimately ages the newest bar past three days, so
+# refusing the frame would force CRITICAL_VOLATILITY over a normal long
+# weekend - a self-inflicted halt strictly worse than the condition it
+# reports. 5 days clears every US market close (the longest is 4 calendar
+# days) while still catching a feed genuinely stuck in the past.
+SPY_BAR_WARN_HOURS = 5 * 24
+
+
+def check_spy_bar_age(spy_df):
+    """Age in hours of the newest SPY bar; logs loudly past the warn bound.
+
+    Returns None if undeterminable. Reports only - see SPY_BAR_WARN_HOURS for
+    why this does not gate the regime.
+    """
+    age_seconds = utils.bar_age_seconds(spy_df)
+    if age_seconds is None:
+        return None
+    age_hours = age_seconds / 3600.0
+    if age_hours > SPY_BAR_WARN_HOURS:
+        registry.log_error(
+            "market_analyst", "spy_bar_age",
+            Exception(f"newest SPY bar is {age_hours:.1f}h old "
+                      f"(warn above {SPY_BAR_WARN_HOURS}h)"))
+        logger.error(f"[Analyst] SPY bars are {age_hours:.1f}h old — the fetch is "
+                     f"succeeding but the DATA is stale; regime is computed on "
+                     f"old closes.")
+    return round(age_hours, 2)
+
 
 # --- VIX SOURCES -----------------------------------------------------------
 # Each fetcher returns a float in VIX points, or None if THIS source could not
@@ -501,6 +540,7 @@ def run_analyst():
 
             if spy_df is not None and vix_val is not None:
                 regime, climate, price, sma200, ema20, adx = compute_regime(spy_df)
+                bar_age = check_spy_bar_age(spy_df)
                 stale_flag = " [was stale]" if (time.monotonic() - last_good) > STALE_REGIME_SECONDS else ""
                 print(f"[{datetime.datetime.now().strftime('%H:%M')}] "
                       f"{regime} | VIX: {vix_val:.2f}{stale_flag}")
@@ -508,7 +548,8 @@ def run_analyst():
                 # Publish: config drives gating/kill-switch; influx row is the
                 # fleet's 'regime is live' heartbeat for the staleness watchdog.
                 update_bot_config(regime, vix_val, climate, data_stale=False)
-                log_to_influx(price, vix_val, adx, regime, sma200, ema20)
+                log_to_influx(price, vix_val, adx, regime, sma200, ema20,
+                              spy_bar_age_hours=bar_age if bar_age is not None else -1.0)
                 last_good = time.monotonic()
             else:
                 # LOUD failure — never a silent skip. Log every cycle (Grafana

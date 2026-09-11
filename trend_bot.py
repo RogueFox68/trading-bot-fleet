@@ -49,18 +49,29 @@ bot = FleetBot("trend_bot", loop_seconds=60, market_hours=True)
 logger = bot.logger
 
 
+# This site was the fleet's only CORRECT bar fetch, and only by luck: a 10-day
+# 15m window holds ~280 bars, so its limit=500 never truncated. The limit is
+# gone anyway - a correct-by-accident call is one window change away from the
+# silent staleness that hit survivor and moon (see utils.newest_bars).
+INTRADAY_LOOKBACK_DAYS = 10
+INTRADAY_BARS = 500
+BAR_SECONDS = 15 * 60
+
+
 def get_data_alpaca(symbol):
     try:
-        start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=10)
+        start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=INTRADAY_LOOKBACK_DAYS)
         req = StockBarsRequest(
             symbol_or_symbols=[symbol],
             timeframe=TimeFrame(15, TimeFrameUnit.Minute),
             start=start_time,
-            limit=500
         )
         bars = bot.data_client.get_stock_bars(req)
         if not bars.data: return None
-        df = bars.df.xs(symbol)
+        df = utils.newest_bars(bars.df.xs(symbol), INTRADAY_BARS)
+        # Freshness is checked in UTC, before the display-only tz conversion.
+        if not utils.bars_are_fresh(df, BAR_SECONDS, "trend_bot", symbol, "15m"):
+            return None
         df.index = df.index.tz_convert('America/New_York')
         return df
     except Exception as e:
@@ -135,7 +146,41 @@ def manage_position(symbol, pos, latest, price, local_adx, bull_cross, bear_cros
                            f"⏳ **MAX HOLD CLOSE {side_txt} {symbol}**\nHeld {hours_held/24:.1f}d (cap {max_days}d)\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
             return
 
+    # --- RISK EXITS (evaluated BEFORE any hold branch) ---
+    #
+    # Ordering here is the whole point. The tiered-hold block used to run first
+    # and `return` outright on a HOLD_OVERNIGHT/HOLD_SWING tier, so from 15:30
+    # ET a position that scored "hold" had NO stop loss and NO take profit —
+    # for the rest of the session and straight through the overnight gap, the
+    # window where a gap against a leveraged short actually happens.
+    # tiered_hold's own OVERNIGHT_STOPS percentages are still unwired, so
+    # nothing downstream covered it either.
+    #
+    # A hold decision is a decision about the EOD sweep, not a waiver on risk
+    # management. Stop/target/crossover exits run first and unconditionally.
+    if pnl_pct <= STOP_LOSS:
+        logger.info(f"    🛑 STOP LOSS {side_txt} {symbol} ({pnl_pct:.1%})")
+        close_position(symbol, side, sell_qty, "Stop Loss",
+                       f"🛑 **STOP LOSS {side_txt} {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
+        return
+    if pnl_pct >= TAKE_PROFIT:
+        logger.info(f"    💰 TAKE PROFIT {side_txt} {symbol} ({pnl_pct:.1%})")
+        close_position(symbol, side, sell_qty, "Take Profit",
+                       f"💰 **TAKE PROFIT {side_txt} {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
+        return
+    if is_long and (not bull_cross and bear_cross):
+        logger.info(f"    📉 CLOSE LONG {symbol} (Crossover)")
+        close_position(symbol, side, sell_qty, "Bearish Crossover",
+                       f"📉 **SELL/CLOSE {symbol}** (Cross)\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
+        return
+    if (not is_long) and (not bear_cross and bull_cross):
+        logger.info(f"    📉 CLOSE SHORT {symbol} (Crossover)")
+        close_position(symbol, side, sell_qty, "Bullish Crossover",
+                       f"📉 **BUY TO COVER {symbol}** (Bull Cross)\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
+        return
+
     # --- TIERED HOLD (EOD policy) ---
+    # Only reached when no risk exit fired.
     is_held_overnight = False
     if bot.time_str >= "15:30":
         score = tiered_hold.calculate_hold_score(bt, price, entry_price, indicators,
@@ -155,23 +200,6 @@ def manage_position(symbol, pos, latest, price, local_adx, bull_cross, bear_cros
             close_position(symbol, side, sell_qty, "EOD Liquidation",
                            f"📉 **EOD CLOSE {side_txt} {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
         return
-
-    if pnl_pct <= STOP_LOSS:
-        logger.info(f"    🛑 STOP LOSS {side_txt} {symbol} ({pnl_pct:.1%})")
-        close_position(symbol, side, sell_qty, "Stop Loss",
-                       f"🛑 **STOP LOSS {side_txt} {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
-    elif pnl_pct >= TAKE_PROFIT:
-        logger.info(f"    💰 TAKE PROFIT {side_txt} {symbol} ({pnl_pct:.1%})")
-        close_position(symbol, side, sell_qty, "Take Profit",
-                       f"💰 **TAKE PROFIT {side_txt} {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
-    elif is_long and (not bull_cross and bear_cross):
-        logger.info(f"    📉 CLOSE LONG {symbol} (Crossover)")
-        close_position(symbol, side, sell_qty, "Bearish Crossover",
-                       f"📉 **SELL/CLOSE {symbol}** (Cross)\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
-    elif (not is_long) and (not bear_cross and bull_cross):
-        logger.info(f"    📉 CLOSE SHORT {symbol} (Crossover)")
-        close_position(symbol, side, sell_qty, "Bullish Crossover",
-                       f"📉 **BUY TO COVER {symbol}** (Bull Cross)\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
 
 
 def try_entry(symbol, is_long, price, local_adx, df, bull_cross, bear_cross,
