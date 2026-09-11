@@ -347,7 +347,7 @@ class OpeningInventoryCoverageTest(unittest.TestCase):
 
         with mock.patch.object(advisor, "utc_now", return_value=NOW), \
              mock.patch("utils._fetch_orders_covering", side_effect=fake_fetch):
-            advisor.fetch_alpaca_fills(object())
+            advisor.fetch_alpaca_fills(object())[0]
         span_days = (NOW - captured["after"]).days
         self.assertGreaterEqual(span_days, max(advisor.WINDOW_DAYS) + 90)
 
@@ -357,6 +357,51 @@ class OpeningInventoryCoverageTest(unittest.TestCase):
         self.assertEqual(sig.parameters["lookback_days"].default,
                          advisor.LEDGER_LOOKBACK_DAYS)
 
+    def test_hitting_the_fetch_cap_reports_incomplete(self):
+        # Truncation used to be a log line and nothing else: the same plain
+        # fill list came back, nothing downstream could act, and a truncated
+        # history that happened to look flat was still ranked.
+        def capped_fetch(client, status=None, after=None, max_orders=None):
+            return [object()] * max_orders
+
+        with mock.patch("utils._fetch_orders_covering", side_effect=capped_fetch), \
+             mock.patch.object(advisor, "fills_from_orders", return_value=[]):
+            _fills, complete = advisor.fetch_alpaca_fills(object(), max_orders=5)
+        self.assertFalse(complete)
+
+    def test_a_truncated_history_voids_every_period_return(self):
+        # Even a book that looks perfectly flat: its starting inventory is
+        # unverifiable, which is exactly the case that would be ranked.
+        fills = [fill(2, "crypto_grid", "buy", 100.0, 10.0)]
+        got = advisor.build_window_metrics(
+            fills, {"crypto_grid": 500.0}, {}, equity=74000.0, window_days=5,
+            now=NOW, history_complete=False)["crypto_grid"]
+        self.assertFalse(got["period_return_available"])
+        self.assertIsNone(got["total_pl"])
+        self.assertEqual(got["period_return_unavailable_reason"], "truncated_history_fetch")
+        self.assertEqual(got["risk_adjusted_score"], 0.0)
+
+    def test_a_truncated_history_withholds_the_recommendation(self):
+        fills = [fill(2, "crypto_grid", "buy", 100.0, 10.0),
+                 fill(2, "trend_bot", "buy", 50.0, 10.0)]
+        with mock.patch.object(advisor, "fetch_alpaca_fills", return_value=(fills, False)), \
+             mock.patch.object(advisor, "fetch_option_events", return_value=[]), \
+             mock.patch.object(advisor, "utc_now", return_value=NOW), \
+             mock.patch.object(advisor, "write_strategy_report"):
+            report = advisor.generate_and_write_report(
+                trading_client=object(), unrealized_by_bot={}, allocation_by_bot={},
+                equity=74000.0, config_data={})
+        self.assertFalse(report["assumptions"]["history_complete"])
+        self.assertEqual(report["recommendation"]["action"], "no_change")
+        self.assertIn("crypto_grid", report["recommendation"]["unranked_bots"])
+
+    def test_a_complete_history_still_ranks_normally(self):
+        fills = [fill(2, "crypto_grid", "buy", 100.0, 10.0)]
+        got = advisor.build_window_metrics(
+            fills, {"crypto_grid": 500.0}, {}, equity=74000.0, window_days=5,
+            now=NOW, history_complete=True)["crypto_grid"]
+        self.assertTrue(got["period_return_available"])
+
     def test_production_path_seeds_the_longest_window(self):
         # End to end through generate_and_write_report: a buy 90 days ago and a
         # sell yesterday must book +$10, not $0.
@@ -364,7 +409,7 @@ class OpeningInventoryCoverageTest(unittest.TestCase):
                  fill(1, "crypto_grid", "sell", 110.0, 1.0)]
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "rec.json")
-            with mock.patch.object(advisor, "fetch_alpaca_fills", return_value=fills), \
+            with mock.patch.object(advisor, "fetch_alpaca_fills", return_value=(fills, True)), \
                  mock.patch.object(advisor, "fetch_option_events", return_value=[]), \
                  mock.patch.object(advisor, "utc_now", return_value=NOW):
                 report = advisor.generate_and_write_report(

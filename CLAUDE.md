@@ -239,6 +239,33 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
   orders persist across a restart. moon_bot carries the same discipline on its per-coin
   quantity. Both save atomically (temp + `os.replace`); a failed write suspends entries rather
   than trading on an unpersisted ledger.
+- **A lot stores cumulative acquisition and disposal, never a net quantity.** With a single
+  `qty`, a BUY update could overwrite a SELL's effect: a buy that filled 0.5 of 1 and stayed
+  pending could have that 0.5 sold and the lot emptied, and when the buy was later CANCELED
+  still reporting cumulative `filled_qty=0.5`, restating `qty` from it **resurrected** a
+  0.5-coin lot for coins already gone — on a shared symbol, a later sell would then reach
+  moon_bot's inventory to cover it. `acquired_qty` is the buy's to restate, `disposed_qty` is
+  the sells' to add to, and `lot_qty()` is the difference. An exhausted lot is kept — by
+  `prune_empty_lots` **and by `load_state`** — while its buy is still pending, because it is
+  the record of that disposal; dropping it at either point just moves the resurrection to the
+  other side of a restart. `sellable_lot` additionally refuses to sell out of an unfinished
+  acquisition.
+- **Crypto fills reach InfluxDB from the bots' own reconcilers** (`utils.log_confirmed_fill`).
+  Both crypto bots are `reconciled=False` in the registry, so `reconcile_fills` never visits
+  them — survivable while every crypto order was a MARKET order, since `submit_and_log_order`
+  polls those to completion and logs the fill inline. The moment the grid's exits became LIMIT
+  orders it stopped being survivable: a resting limit order returns unlogged, so completed grid
+  **sells** had no path into `crypto_trades` while its **buys** still did, and the accountant
+  would have seen a book that only ever bought. `log_confirmed_fill` fires on TERMINAL orders
+  only (an open partial may yet fill completely and be logged at its broker `filled_at`), and
+  routes a broker-stamped fill to `_log_fill_to_influx` and a terminal partial to
+  `log_terminal_partial_fill` — both idempotent, so repeated reconciliation overwrites one point.
+- **Crypto symbols are compared canonically.** Alpaca reports positions as `BTCUSD` while the
+  bots' `SYMBOLS` use `BTC/USD`. moon_bot keyed its position dict on the raw broker symbol and
+  looked it up with the slash form, so `total_held` came back 0, the reconcile decided the
+  ledger over-stated reality and zeroed the coin, and the trailing-stop branch was never
+  reached — a stop that silently became a ledger wipe. `utils._same_symbol` and the canonical
+  keys in both bots settle it.
 - **A failed position read is not a flat position.** `account_qty` returns `(qty, known)`: a
   404 is an *answer* ("no such position"), a timeout or a 500 is silence. Only a **known** read
   may retire inventory. Before this distinction existed one timeout returned `0.0`,
@@ -331,10 +358,17 @@ which is safe only while the bars are fresh, and a stop loss priced off a two-we
 is worse than none because it looks like risk management. No validated price at all ⇒ the bot
 says so loudly and manages nothing that cycle.
 
-**Freshness is session-aware.** At Monday 09:30 the newest 15m bar is Friday's close, ~65h
-old, which any honest intraday bound rejects — so without `session_elapsed`
-(`FleetBot.session_elapsed`, from a hardcoded 09:30 ET open matching the existing EOD
-windows) the guard manufactures a data outage at every session open.
+**Freshness is session-aware, and the allowance widens — it never skips.** At Monday 09:30
+the newest 15m bar is Friday's close, ~65h old, which any honest intraday bound rejects, so
+without `session_elapsed` (`FleetBot.session_elapsed`, from a hardcoded 09:30 ET open
+matching the existing EOD windows) the guard manufactures a data outage at every open. But
+the first attempt at that *exempted* the frame — returning True before inspecting the
+timestamp at all — which accepted a **two-week-old** bar during the opening 45 minutes and
+skipped the undateable-frame check with it, so both equity bots could compute entry signals
+from stale data every morning. The bound is now *widened* instead: before enough session has
+elapsed to have produced a fresh bar, the newest bar may be as old as the session is plus
+`PRIOR_SESSION_GAP_SECONDS` (4.5 days — Friday 16:00 ET to Tuesday 09:30 ET across a Monday
+holiday is ~89.5h), and no older. The timestamp is always checked.
 
 ### CFO / Budget Enforcement
 
@@ -358,10 +392,14 @@ windows) the guard manufactures a data outage at every session open.
   and short options, so equity **market** buys (no `limit_price`) and **all crypto** reserved
   nothing — several in-flight entries each saw the same headroom and spent it.
   `utils._pending_unit_price` prices a pending order through limit → dollar notional →
-  partial-fill average → the current mark on a held position, and **says so** when it can
-  price none of them rather than reserving zero and calling that compliant. crypto_grid also
-  reserves its own outstanding buy notional in its ledger (`outstanding_buy_notional`), which
-  is the tighter of the two.
+  partial-fill average → the current mark on a held position → a live quote (equities only).
+  When **none** of those answer — a fresh quantity-based crypto MARKET buy has no limit, no
+  notional, no fill and no position, which is precisely the new-entry case — `check_budget`
+  now **fails closed** for that bot rather than warning and reserving zero. Warning and
+  continuing meant the next symbol saw the same headroom and spent it again. Entries resume
+  as soon as the order fills, prices, or terminates. crypto_grid also reserves its own
+  outstanding buy notional in its ledger (`outstanding_buy_notional`), which is the tighter
+  of the two.
 - The accountant also flips `CAPITAL_CRUNCH` in `bot_config.json` at >90% utilization
   (released <80%), and reallocates gated bots' surplus to active bots
   (`cfo_settings.reallocation_*`, `gate_idle_threshold_cycles` honored).
@@ -384,7 +422,10 @@ windows) the guard manufactures a data outage at every session open.
   was silently absent on the one that matters most. `opening_inventory` also reports which
   bots it could **not** reconstruct — a residual *short* lot means a close whose open predates
   the fetch, so the history is incomplete and nothing derived from that bot's basis is
-  trustworthy.
+  trustworthy. **Hitting the fetch cap is a coverage fact, not a log line**:
+  `fetch_alpaca_fills` returns `(fills, complete)`, and an incomplete fetch marks every bot
+  unreconstructable — including the ones that happen to look flat, which is exactly the case
+  that would otherwise be ranked on an unverifiable starting inventory.
 - **Period return is reported only when it can be measured** — no proxy. A window's return is
   `realized-in-window + (unrealized_end − unrealized_start)`, and `unrealized_start` needs a
   mark at the window's open that this fleet stores nowhere. So `total_pl` is populated **only**
@@ -625,9 +666,9 @@ judged against that schedule rather than a flat 24h.
   absorbs them as a ledger shortfall instead of attributing them to the trade that incurred
   them. Realized crypto P&L is therefore approximate by a small, unmeasured amount.
 - **`max_orders` truncation is reported, not recovered.** If the advisor's history fetch hits
-  its cap, opening inventory cannot be established and the affected windows report
-  `period_return_available: false` — correct, but it means a long enough order history
-  silently costs you the ranking rather than triggering a deeper page walk.
+  its cap, `fetch_alpaca_fills` returns `complete=False`, every bot's period return reports
+  `truncated_history_fetch` and no allocation is recommended. Correct, but blunt: a long
+  enough order history costs you the ranking rather than triggering a deeper page walk.
 - **commander bare `except: pass`** remains on best-effort Discord sends.
 - **`bot_monitor.memory` / `.cpu` in Grafana were flat 0 until 2026-09.** `pm2 jlist` reports
   live resource usage under `monit`, not `pm2_env`; commander read the wrong key, so the fleet's
@@ -714,11 +755,22 @@ judged against that schedule rather than a flat 24h.
 17. **A failed read is not a zero.** Distinguish "the broker said none" (a 404) from "the
    broker did not answer" (timeout, 500). Only an answer may retire durable state. This is
    the same rule as `OrderFetchError` in the ownership map, one layer down.
+17a. **Compare symbols canonically.** Alpaca spells crypto positions `BTCUSD` and orders
+   `BTC/USD`. A raw-string comparison between the two silently reads as "no position", which
+   downstream becomes a ledger wipe or a phantom short. Use `utils._same_symbol`.
+17b. **A widened bound is not a skipped check.** When a guard must be relaxed for a known
+   legitimate case, raise the threshold — never return early before validating. The early
+   return also skips every *other* check on that path, which is how a session-open allowance
+   came to accept two-week-old bars and undateable frames alike.
 18. **A risk control must not trap you inside the position.** Anything that blocks orders
    has to ask what the order *does* first: exposure-increasing orders can be refused,
    risk-reducing ones must have a path through. Classify with
    `utils.exposure_increasing_qty` so every gate agrees on what "closing" means.
-19. **Report an unmeasurable number as unmeasurable.** If a metric needs data the fleet does
+19. **A log line is not a control.** If a condition should change behavior, it has to be
+   returned and acted on, not warned about. "Hitting max_orders will make returns
+   unavailable" was logged while the same plain fill list went downstream and got ranked
+   anyway.
+20. **Report an unmeasurable number as unmeasurable.** If a metric needs data the fleet does
    not store, publish it as unavailable and withhold whatever depends on it. Do not
    substitute a proxy and disclose the substitution in a notes field — the number still gets
    used, and a proxy that can invert the sign of a return is worse than a gap.

@@ -141,6 +141,37 @@ class BarFreshnessTest(unittest.TestCase):
                                  session_elapsed=0),
             "a frame at the session open was treated as an outage")
 
+    def test_the_open_allowance_does_not_accept_anything(self):
+        # The first attempt at the session allowance returned True BEFORE
+        # inspecting the timestamp, so a two-week-old bar sailed through the
+        # opening 45 minutes and both equity bots could compute entry signals
+        # from it.
+        monday_open = dt_mod.datetime(2026, 9, 7, 13, 30, tzinfo=UTC)
+        ancient = frame(monday_open - dt_mod.timedelta(days=14), 200, 900)
+        self.assertFalse(
+            utils.bars_are_fresh(ancient, 900, "survivor_bot", "AAPL",
+                                 now=monday_open + dt_mod.timedelta(minutes=30),
+                                 session_elapsed=1800),
+            "a 14-day-old bar was accepted during the opening allowance")
+
+    def test_the_open_allowance_still_rejects_an_undateable_frame(self):
+        df = pd.DataFrame({"close": [1.0, 2.0]}, index=[0, 1])
+        self.assertFalse(
+            utils.bars_are_fresh(df, 900, "survivor_bot", "AAPL",
+                                 now=dt_mod.datetime(2026, 9, 7, 14, 0, tzinfo=UTC),
+                                 session_elapsed=1800),
+            "an undateable frame skipped the check entirely at the open")
+
+    def test_a_prior_session_bar_is_accepted_across_a_holiday_weekend(self):
+        # Friday close -> Tuesday open after a Monday holiday is the longest
+        # legitimate gap the equity bots see (~89.5h).
+        friday_close = dt_mod.datetime(2026, 9, 4, 20, 0, tzinfo=UTC)
+        tuesday_open = dt_mod.datetime(2026, 9, 8, 13, 35, tzinfo=UTC)
+        df = frame(friday_close, 200, 900)
+        self.assertTrue(
+            utils.bars_are_fresh(df, 900, "survivor_bot", "AAPL",
+                                 now=tuesday_open, session_elapsed=300))
+
     def test_the_check_resumes_once_the_session_is_underway(self):
         # 90 minutes in, there has been ample time for bars; a Friday frame is
         # then genuinely stale and must be rejected.

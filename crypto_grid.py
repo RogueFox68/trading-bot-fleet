@@ -109,7 +109,7 @@ PENDING_SELL_TTL_SECONDS = 30 * 60
 # The grid's OWN inventory, separate from the shared Alpaca position.
 # Gitignored (*.json); missing file = flat.
 STATE_FILE = "crypto_grid_state.json"
-STATE_VERSION = 2
+STATE_VERSION = 3
 DUST_QTY = 1e-8          # below this a lot is noise, not inventory
 
 bot = FleetBot("crypto_grid", loop_seconds=30, market_hours=False,
@@ -173,18 +173,8 @@ def load_state():
         return _empty_state()
 
     state = _empty_state()
-    for sym in SYMBOLS:
-        for e in (raw.get("lots") or {}).get(sym) or []:
-            try:
-                qty, price = float(e["qty"]), float(e["price"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if qty > DUST_QTY and price > 0:
-                state["lots"][sym].append({
-                    "lot_id": str(e.get("lot_id") or uuid.uuid4()),
-                    "qty": qty, "price": price,
-                    "opened_at": e.get("opened_at", ""),
-                })
+    # Pending FIRST: whether an exhausted lot may be dropped depends on
+    # whether its buy is still in flight.
     for order_id, p in ((raw.get("pending") or {}) if isinstance(raw.get("pending"), dict) else {}).items():
         try:
             state["pending"][str(order_id)] = {
@@ -198,6 +188,37 @@ def load_state():
             }
         except (KeyError, TypeError, ValueError):
             continue
+
+    for sym in SYMBOLS:
+        for e in (raw.get("lots") or {}).get(sym) or []:
+            try:
+                price = float(e["price"])
+                # v2 stored a single net `qty`; v3 stores cumulative
+                # acquisition and disposal separately (see reconcile_pending).
+                if "acquired_qty" in e:
+                    acquired = float(e["acquired_qty"])
+                    disposed = float(e.get("disposed_qty", 0.0))
+                else:
+                    acquired, disposed = float(e["qty"]), 0.0
+            except (KeyError, TypeError, ValueError):
+                continue
+            lot_id = str(e.get("lot_id") or uuid.uuid4())
+            if price <= 0:
+                continue
+            # An exhausted lot is normally dropped — UNLESS its buy is still
+            # pending. Then it is the record that those coins were already
+            # disposed of, and dropping it lets the buy's next reconciliation
+            # recreate the lot from cumulative filled_qty. The in-memory path
+            # guards this in prune_empty_lots; a restart must guard it too, or
+            # the resurrection simply moves to the other side of a reboot.
+            if (acquired - disposed) <= DUST_QTY and not lot_has_pending_buy(state, lot_id):
+                continue
+            state["lots"][sym].append({
+                "lot_id": lot_id,
+                "acquired_qty": acquired, "disposed_qty": disposed,
+                "price": price,
+                "opened_at": e.get("opened_at", ""),
+            })
     resume_entries()
     return state
 
@@ -228,8 +249,22 @@ def lots_for(state, symbol):
     return state["lots"].setdefault(symbol, [])
 
 
+def lot_qty(lot):
+    """Coins still held in this lot: what the broker confirmed we bought,
+    minus what it confirmed we sold. Never written directly.
+
+    Tracking a single net `qty` let a BUY update overwrite a SELL's effect. A
+    buy that filled 0.5 of 1 and stayed pending could have that 0.5 sold and
+    the lot emptied; when the buy was later CANCELED reporting cumulative
+    filled_qty=0.5, restating `qty` from it RESURRECTED a 0.5-coin lot for
+    coins already gone — and on a shared symbol a later sell would reach
+    moon_bot's inventory to cover it.
+    """
+    return max(0.0, float(lot.get("acquired_qty", 0.0)) - float(lot.get("disposed_qty", 0.0)))
+
+
 def ledger_qty(state, symbol):
-    return sum(lot["qty"] for lot in lots_for(state, symbol))
+    return sum(lot_qty(lot) for lot in lots_for(state, symbol))
 
 
 def ledger_value(state, symbol, price):
@@ -264,6 +299,11 @@ def lot_has_pending_sell(state, lot_id):
                for p in state["pending"].values())
 
 
+def lot_has_pending_buy(state, lot_id):
+    return any(p["side"] == "buy" and p["lot_id"] == lot_id
+               for p in state["pending"].values())
+
+
 def sellable_lot(state, symbol, price):
     """The OLDEST open lot, if it clears its cost at `price`. Strict FIFO.
 
@@ -273,8 +313,12 @@ def sellable_lot(state, symbol, price):
     differently. One policy, both places.
     """
     for idx, lot in enumerate(lots_for(state, symbol)):
-        if lot["qty"] <= DUST_QTY or lot_has_pending_sell(state, lot["lot_id"]):
+        if lot_qty(lot) <= DUST_QTY or lot_has_pending_sell(state, lot["lot_id"]):
             continue
+        if lot_has_pending_buy(state, lot["lot_id"]):
+            # Belt and braces alongside the acquired/disposed accounting: do
+            # not sell out of an acquisition the broker has not finished.
+            return None, None
         if price >= lot["price"] * (1.0 + REQUIRED_SPREAD_PCT):
             return idx, lot
         return None, None   # oldest lot does not clear: FIFO stops here
@@ -344,14 +388,29 @@ def reconcile_lots(state, symbol, held, known):
     logger.warning(f"    [{symbol}] Ledger {have:.8f} > account {held:.8f}; "
                    f"retiring {excess:.8f} from the oldest lots.")
     book = lots_for(state, symbol)
-    while excess > DUST_QTY and book:
-        lot = book[0]
-        take = min(lot["qty"], excess)
-        lot["qty"] -= take
+    idx = 0
+    while excess > DUST_QTY and idx < len(book):
+        lot = book[idx]
+        take = min(lot_qty(lot), excess)
+        lot["disposed_qty"] = float(lot.get("disposed_qty", 0.0)) + take
         excess -= take
-        if lot["qty"] <= DUST_QTY:
-            book.pop(0)
+        idx += 1
+    prune_empty_lots(state, symbol)
     return True
+
+
+def prune_empty_lots(state, symbol):
+    """Drop exhausted lots — but never one whose BUY is still in flight.
+
+    An empty lot with a pending buy is load-bearing: it is the record that
+    those coins were already disposed of, and removing it would let the buy's
+    next reconciliation recreate the lot from scratch.
+    """
+    book = lots_for(state, symbol)
+    state["lots"][symbol] = [
+        lot for lot in book
+        if lot_qty(lot) > DUST_QTY or lot_has_pending_buy(state, lot["lot_id"])
+    ]
 
 
 def reconcile_pending(state):
@@ -378,50 +437,53 @@ def reconcile_pending(state):
         symbol = p["symbol"]
 
         if p["side"] == "buy":
-            # The lot IS the order: restate it from the broker's cumulative
-            # numbers. Exact and idempotent however the fills arrive.
+            # The lot IS the order, so its ACQUIRED side is restated from the
+            # broker's cumulative filled_qty — exact and idempotent however the
+            # fills arrive. It never touches disposed_qty, so a sell that has
+            # already happened cannot be undone by a later buy update.
             idx, lot = find_lot(state, symbol, p["lot_id"])
             if filled_qty > DUST_QTY and filled_price > 0:
                 if lot is None:
                     lots_for(state, symbol).append({
-                        "lot_id": p["lot_id"], "qty": filled_qty, "price": filled_price,
+                        "lot_id": p["lot_id"], "acquired_qty": filled_qty,
+                        "disposed_qty": 0.0, "price": filled_price,
                         "opened_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     })
                     logger.info(f"    [LOT+] {symbol} {filled_qty:.8f} @ ${filled_price:,.2f} "
                                 f"(sells at/above ${filled_price * (1 + REQUIRED_SPREAD_PCT):,.2f})")
-                elif abs(lot["qty"] - filled_qty) > DUST_QTY or lot["price"] != filled_price:
-                    lot["qty"], lot["price"] = filled_qty, filled_price
+                else:
+                    lot["acquired_qty"], lot["price"] = filled_qty, filled_price
                 p["applied_qty"] = filled_qty
                 changed = True
             if terminal:
-                if filled_qty <= DUST_QTY:
-                    # Rejected/canceled with nothing filled: no inventory, and
-                    # no fabricated lot left behind.
-                    if lot is not None:
-                        lots_for(state, symbol).pop(idx)
+                utils.log_confirmed_fill(order, logger, action="grid_buy")
+                if filled_qty <= DUST_QTY and lot is not None:
+                    # Rejected/canceled with nothing filled: no fabricated lot.
+                    lots_for(state, symbol).pop(idx)
                     logger.info(f"    [LOT-] {symbol} buy {order_id} ended {status} with no fill.")
                 del state["pending"][order_id]
+                prune_empty_lots(state, symbol)
                 changed = True
 
         else:  # sell
             new_qty = filled_qty - p["applied_qty"]
             if new_qty > DUST_QTY:
-                idx, lot = find_lot(state, symbol, p["lot_id"])
+                _idx, lot = find_lot(state, symbol, p["lot_id"])
                 if lot is not None:
-                    lot["qty"] = max(0.0, lot["qty"] - new_qty)
-                    if lot["qty"] <= DUST_QTY:
-                        lots_for(state, symbol).pop(idx)
+                    lot["disposed_qty"] = float(lot.get("disposed_qty", 0.0)) + new_qty
                     logger.info(f"    [LOT-] {symbol} sold {new_qty:.8f} @ ${filled_price:,.2f}")
                 p["applied_qty"] = filled_qty
                 changed = True
             if terminal:
+                utils.log_confirmed_fill(order, logger, action="grid_sell")
                 # Whatever did not fill stays in the lot, by construction: we
-                # only ever subtracted what the broker confirmed.
+                # only ever added what the broker confirmed to disposed_qty.
                 unfilled = max(0.0, p["requested_qty"] - filled_qty)
                 if unfilled > DUST_QTY:
                     logger.info(f"    [{symbol}] sell {order_id} ended {status}; "
                                 f"{unfilled:.8f} stays in the ledger.")
                 del state["pending"][order_id]
+                prune_empty_lots(state, symbol)
                 changed = True
     return changed
 
@@ -603,7 +665,7 @@ def grid_sell(symbol, price, current_zone, state, held, known):
     """
     idx, lot = sellable_lot(state, symbol, price)
     if lot is None:
-        book = [l for l in lots_for(state, symbol) if l["qty"] > DUST_QTY]
+        book = [l for l in lots_for(state, symbol) if lot_qty(l) > DUST_QTY]
         if not book:
             logger.info(f"    [SKIP] {symbol} Sell Signal but no open grid lots.")
         elif lot_has_pending_sell(state, book[0]["lot_id"]):
@@ -620,9 +682,9 @@ def grid_sell(symbol, price, current_zone, state, held, known):
     if not known:
         logger.warning(f"    [SKIP] {symbol} position unreadable this cycle; not selling blind.")
         return
-    sell_qty = min(lot["qty"], held)
+    sell_qty = min(lot_qty(lot), held)
     if sell_qty <= DUST_QTY:
-        logger.warning(f"    [SKIP] {symbol} lot {lot['qty']:.8f} but account holds {held:.8f}.")
+        logger.warning(f"    [SKIP] {symbol} lot {lot_qty(lot):.8f} but account holds {held:.8f}.")
         return
 
     floor = sell_floor(lot)

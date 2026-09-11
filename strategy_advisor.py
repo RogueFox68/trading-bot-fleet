@@ -409,7 +409,7 @@ def period_return_available(bot, opening_lots, incomplete_bots):
 
 
 def build_window_metrics(fills, unrealized_by_bot, allocation_by_bot, equity, window_days,
-                         now=None, excluded_bots=()):
+                         now=None, excluded_bots=(), history_complete=True):
     now = now or utc_now()
     cutoff = now - dt.timedelta(days=window_days)
     window_fills = [f for f in fills if f["filled_at"] >= cutoff]
@@ -417,6 +417,11 @@ def build_window_metrics(fills, unrealized_by_bot, allocation_by_bot, equity, wi
     # matched against the basis it actually closed rather than booking its
     # full proceeds as profit.
     opening, incomplete = opening_inventory(fills, cutoff)
+    if not history_complete:
+        # The fetch was cut off at its old end, so EVERY bot's starting
+        # inventory is unverifiable - including the ones that happen to look
+        # flat, which is exactly the case that would otherwise be ranked.
+        incomplete = set(fleet_registry.BOTS)
     realized, _residual = realized_metrics(window_fills, opening_lots=opening)
     out = {}
     for bot in fleet_registry.BOTS:
@@ -448,6 +453,7 @@ def build_window_metrics(fills, unrealized_by_bot, allocation_by_bot, equity, wi
             r["total_pl"] = None
             r["period_return_unavailable_reason"] = (
                 "excluded_accounting_anomaly" if blocked else
+                "truncated_history_fetch" if not history_complete else
                 "incomplete_opening_history" if bot in incomplete else
                 "inventory_carried_into_window_and_no_opening_marks")
 
@@ -614,13 +620,18 @@ def fetch_alpaca_fills(trading_client, lookback_days=LEDGER_LOOKBACK_DAYS, max_o
         after=after,
         max_orders=max_orders,
     )
-    if logger and len(orders) >= max_orders:
+    # Truncation is a COVERAGE FACT, not a log line. Warning about it and
+    # returning the same plain list meant nothing downstream could act: a
+    # truncated history that happened to look flat was still ranked, and the
+    # claim that truncation reports unavailable was simply not implemented.
+    complete = len(orders) < max_orders
+    if not complete and logger:
         logger.warning(
             f"[StrategyAdvisor] order fetch hit max_orders={max_orders}; the "
             f"{lookback_days}d history is truncated at its old end, so opening "
-            f"inventory cannot be established and period returns will report "
-            f"as unavailable.")
-    return fills_from_orders(orders)
+            f"inventory cannot be established. Period returns report as "
+            f"unavailable and no allocation is recommended this run.")
+    return fills_from_orders(orders), complete
 
 
 def fetch_option_events(lookback_days=LEDGER_LOOKBACK_DAYS, max_pages=40):
@@ -666,13 +677,14 @@ def fetch_option_events(lookback_days=LEDGER_LOOKBACK_DAYS, max_pages=40):
 def build_strategy_report(fills, unrealized_by_bot, allocation_by_bot, equity,
                           config_data, now=None, influx_realized_by_bot=None,
                           influx_window_days=None, option_events_included=None,
-                          negative_basis_positions=None, excluded_bots=None):
+                          negative_basis_positions=None, excluded_bots=None,
+                          history_complete=True):
     now = now or utc_now()
     excluded_bots = tuple(excluded_bots or ())
     metrics_by_window = {
         f"{days}d": build_window_metrics(
             fills, unrealized_by_bot, allocation_by_bot, equity, days, now=now,
-            excluded_bots=excluded_bots
+            excluded_bots=excluded_bots, history_complete=history_complete
         )
         for days in WINDOW_DAYS
     }
@@ -711,6 +723,7 @@ def build_strategy_report(fills, unrealized_by_bot, allocation_by_bot, equity,
                 "cutoff, so a sell whose opening buy predates the window is "
                 "matched against its real basis"),
             "ledger_lookback_days": LEDGER_LOOKBACK_DAYS,
+            "history_complete": history_complete,
             "excluded_from_scoring": list(excluded_bots),
             "negative_basis_positions": negative_basis_positions or [],
             "negative_basis_caveat": (
@@ -731,7 +744,7 @@ def generate_and_write_report(trading_client, unrealized_by_bot, allocation_by_b
                               equity, config_data, logger=None, path=OUTPUT_FILE,
                               influx_realized_by_bot=None, influx_window_days=None,
                               negative_basis_positions=None, excluded_bots=None):
-    fills = fetch_alpaca_fills(trading_client, logger=logger)
+    fills, history_complete = fetch_alpaca_fills(trading_client, logger=logger)
     option_events_ok = False
     unmatched = 0
     try:
@@ -755,7 +768,8 @@ def generate_and_write_report(trading_client, unrealized_by_bot, allocation_by_b
                                    influx_window_days=influx_window_days,
                                    option_events_included=option_events_ok,
                                    negative_basis_positions=negative_basis_positions,
-                                   excluded_bots=excluded_bots)
+                                   excluded_bots=excluded_bots,
+                                   history_complete=history_complete)
     write_strategy_report(report, path=path)
     if logger:
         rec = report["recommendation"]

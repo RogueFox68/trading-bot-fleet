@@ -34,6 +34,7 @@ import unittest
 from unittest import mock
 
 import crypto_grid
+import utils
 
 
 class FakeAPIError(Exception):
@@ -59,8 +60,14 @@ def state_with(lots=None, pending=None):
     return st
 
 
-def lot(lot_id, qty, price):
-    return {"lot_id": lot_id, "qty": qty, "price": price, "opened_at": "t0"}
+def lot(lot_id, qty, price, disposed=0.0):
+    """A confirmed lot. Quantity held = acquired - disposed; never stored net."""
+    return {"lot_id": lot_id, "acquired_qty": qty, "disposed_qty": disposed,
+            "price": price, "opened_at": "t0"}
+
+
+def held(state, symbol="BTC/USD", index=0):
+    return crypto_grid.lot_qty(state["lots"][symbol][index])
 
 
 def pending_buy(symbol="BTC/USD", qty=0.5, lot_id="L1", applied=0.0, price=100.0):
@@ -108,16 +115,16 @@ class BuyLifecycleTest(unittest.TestCase):
         reconcile_against(st, {"o1": FakeOrder("o1", 0.5, 123.45, "filled")})
         book = st["lots"]["BTC/USD"]
         self.assertEqual(len(book), 1)
-        self.assertAlmostEqual(book[0]["qty"], 0.5)
+        self.assertAlmostEqual(crypto_grid.lot_qty(book[0]), 0.5)
         self.assertAlmostEqual(book[0]["price"], 123.45)
         self.assertNotIn("o1", st["pending"])
 
     def test_partial_then_canceled_buy_keeps_only_what_filled(self):
         st = state_with(pending={"o1": pending_buy(qty=1.0)})
         reconcile_against(st, {"o1": FakeOrder("o1", 0.25, 100.0, "partially_filled")})
-        self.assertAlmostEqual(st["lots"]["BTC/USD"][0]["qty"], 0.25)
+        self.assertAlmostEqual(held(st), 0.25)
         reconcile_against(st, {"o1": FakeOrder("o1", 0.25, 100.0, "canceled")})
-        self.assertAlmostEqual(st["lots"]["BTC/USD"][0]["qty"], 0.25)
+        self.assertAlmostEqual(held(st), 0.25)
         self.assertNotIn("o1", st["pending"])
 
     def test_repeated_reconciliation_is_idempotent(self):
@@ -126,7 +133,7 @@ class BuyLifecycleTest(unittest.TestCase):
         for _ in range(5):
             reconcile_against(st, {"o1": order})
         self.assertEqual(len(st["lots"]["BTC/USD"]), 1)
-        self.assertAlmostEqual(st["lots"]["BTC/USD"][0]["qty"], 0.5)
+        self.assertAlmostEqual(held(st), 0.5)
 
     def test_a_pending_buy_is_recovered_across_restart(self):
         with tempfile.TemporaryDirectory() as d:
@@ -137,7 +144,7 @@ class BuyLifecycleTest(unittest.TestCase):
                 reloaded = crypto_grid.load_state()          # "restart"
                 self.assertIn("o1", reloaded["pending"])
                 reconcile_against(reloaded, {"o1": FakeOrder("o1", 0.5, 100.0, "filled")})
-                self.assertAlmostEqual(reloaded["lots"]["BTC/USD"][0]["qty"], 0.5)
+                self.assertAlmostEqual(held(reloaded), 0.5)
 
     def test_an_unreadable_in_flight_order_suspends_entries(self):
         st = state_with(pending={"o1": pending_buy()})
@@ -158,14 +165,14 @@ class SellLifecycleTest(unittest.TestCase):
         st = state_with(lots={"BTC/USD": [lot("L1", 1.0, 100.0)]},
                         pending={"o1": pending_sell(qty=1.0, lot_id="L1")})
         reconcile_against(st, {"o1": FakeOrder("o1", 0.25, 120.0, "partially_filled")})
-        self.assertAlmostEqual(st["lots"]["BTC/USD"][0]["qty"], 0.75)
+        self.assertAlmostEqual(held(st), 0.75)
 
     def test_partial_then_canceled_sell_retains_the_unsold_remainder(self):
         st = state_with(lots={"BTC/USD": [lot("L1", 1.0, 100.0)]},
                         pending={"o1": pending_sell(qty=1.0, lot_id="L1")})
         reconcile_against(st, {"o1": FakeOrder("o1", 0.25, 120.0, "partially_filled")})
         reconcile_against(st, {"o1": FakeOrder("o1", 0.25, 120.0, "canceled")})
-        self.assertAlmostEqual(st["lots"]["BTC/USD"][0]["qty"], 0.75)
+        self.assertAlmostEqual(held(st), 0.75)
         self.assertNotIn("o1", st["pending"])
 
     def test_full_fill_removes_the_lot(self):
@@ -180,12 +187,140 @@ class SellLifecycleTest(unittest.TestCase):
         order = FakeOrder("o1", 0.25, 120.0, "partially_filled")
         for _ in range(5):
             reconcile_against(st, {"o1": order})
-        self.assertAlmostEqual(st["lots"]["BTC/USD"][0]["qty"], 0.75)
+        self.assertAlmostEqual(held(st), 0.75)
 
     def test_a_lot_with_a_resting_sell_is_not_offered_again(self):
         st = state_with(lots={"BTC/USD": [lot("L1", 1.0, 100.0)]},
                         pending={"o1": pending_sell(qty=1.0, lot_id="L1")})
         self.assertIsNone(crypto_grid.sellable_lot(st, "BTC/USD", 999.0)[1])
+
+
+class InterleavedBuySellCancelTest(unittest.TestCase):
+    """A buy update must never resurrect coins a sell already disposed of.
+
+    Reported sequence: a buy fills 0.5 of 1 and stays pending; a sell takes
+    that 0.5, emptying the lot; the buy is then CANCELED still reporting
+    cumulative filled_qty=0.5. Restating the lot's quantity from that figure
+    recreated a 0.5-coin lot for coins that were already gone — and on a
+    shared symbol, a later sell would reach moon_bot's inventory to cover it.
+
+    Fixed by never storing a net quantity: `acquired_qty` is the buy's to
+    restate, `disposed_qty` is the sells', and held = acquired - disposed.
+    """
+
+    def test_a_canceled_partial_buy_does_not_resurrect_sold_coins(self):
+        st = state_with(pending={"b1": pending_buy(qty=1.0, lot_id="L1")})
+        # Buy fills 0.5, still open.
+        reconcile_against(st, {"b1": FakeOrder("b1", 0.5, 100.0, "partially_filled")})
+        self.assertAlmostEqual(held(st), 0.5)
+
+        # That 0.5 is sold and fully fills.
+        st["pending"]["s1"] = pending_sell(qty=0.5, lot_id="L1")
+        reconcile_against(st, {"b1": FakeOrder("b1", 0.5, 100.0, "partially_filled"),
+                               "s1": FakeOrder("s1", 0.5, 120.0, "filled")})
+        self.assertAlmostEqual(crypto_grid.ledger_qty(st, "BTC/USD"), 0.0)
+
+        # Buy is canceled, still reporting cumulative filled_qty=0.5.
+        reconcile_against(st, {"b1": FakeOrder("b1", 0.5, 100.0, "canceled")})
+        self.assertAlmostEqual(crypto_grid.ledger_qty(st, "BTC/USD"), 0.0,
+                               msg="a canceled partial buy resurrected sold coins")
+        self.assertEqual(st["lots"]["BTC/USD"], [],
+                         "an exhausted lot outlived its terminal buy")
+
+    def test_the_same_sequence_survives_a_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "grid.json")
+            with mock.patch.object(crypto_grid, "STATE_FILE", path):
+                st = state_with(pending={"b1": pending_buy(qty=1.0, lot_id="L1")})
+                reconcile_against(st, {"b1": FakeOrder("b1", 0.5, 100.0, "partially_filled")})
+                st["pending"]["s1"] = pending_sell(qty=0.5, lot_id="L1")
+                reconcile_against(st, {"b1": FakeOrder("b1", 0.5, 100.0, "partially_filled"),
+                                       "s1": FakeOrder("s1", 0.5, 120.0, "filled")})
+                crypto_grid.save_state(st)
+
+                reloaded = crypto_grid.load_state()          # restart
+                reconcile_against(reloaded, {"b1": FakeOrder("b1", 0.5, 100.0, "canceled")})
+        self.assertAlmostEqual(crypto_grid.ledger_qty(reloaded, "BTC/USD"), 0.0,
+                               msg="the disposal was lost across a restart")
+
+    def test_a_lot_with_a_pending_buy_is_not_offered_for_sale(self):
+        st = state_with(lots={"BTC/USD": [lot("L1", 0.5, 100.0)]},
+                        pending={"b1": pending_buy(qty=1.0, lot_id="L1")})
+        self.assertIsNone(crypto_grid.sellable_lot(st, "BTC/USD", 999.0)[1],
+                          "offered coins out of an unfinished acquisition")
+
+    def test_v2_net_qty_state_migrates_forward(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "grid.json")
+            with open(path, "w") as f:
+                json.dump({"version": 2, "pending": {}, "lots": {
+                    "BTC/USD": [{"lot_id": "L1", "qty": 0.4, "price": 100.0}]}}, f)
+            with mock.patch.object(crypto_grid, "STATE_FILE", path):
+                st = crypto_grid.load_state()
+        self.assertAlmostEqual(held(st), 0.4)
+
+
+class FillsReachInfluxTest(unittest.TestCase):
+    """Grid fills must land in the trade measurement, limit orders included.
+
+    `submit_and_log_order` only polls and logs MARKET orders; a resting LIMIT
+    order returns unlogged. crypto_grid is `reconciled=False` in the registry,
+    so `reconcile_fills` never visits it either. The moment grid exits became
+    limit orders, completed SELLS had no path into `crypto_trades` while BUYS
+    still did — the accountant would have seen a book that only ever bought.
+    """
+
+    def test_a_terminal_sell_writes_exactly_one_fill_row(self):
+        st = state_with(lots={"BTC/USD": [lot("L1", 1.0, 100.0)]},
+                        pending={"s1": pending_sell(qty=1.0, lot_id="L1")})
+        order = FakeOrder("s1", 1.0, 120.0, "filled")
+        order.filled_at = None
+        order.client_order_id = "crypto_grid-BTCUSD-1"
+        order.symbol = "BTC/USD"
+        with mock.patch.object(crypto_grid.utils, "log_confirmed_fill") as logged:
+            reconcile_against(st, {"s1": order})
+        self.assertEqual(logged.call_count, 1)
+        self.assertEqual(logged.call_args.kwargs["action"], "grid_sell")
+
+    def test_a_terminal_buy_writes_exactly_one_fill_row(self):
+        st = state_with(pending={"b1": pending_buy(qty=0.5, lot_id="L1")})
+        with mock.patch.object(crypto_grid.utils, "log_confirmed_fill") as logged:
+            reconcile_against(st, {"b1": FakeOrder("b1", 0.5, 100.0, "filled")})
+        self.assertEqual(logged.call_count, 1)
+        self.assertEqual(logged.call_args.kwargs["action"], "grid_buy")
+
+    def test_an_open_order_writes_nothing_yet(self):
+        # An in-flight partial may still fill completely and be logged at its
+        # broker filled_at; writing now would double-count it.
+        st = state_with(pending={"b1": pending_buy(qty=1.0, lot_id="L1")})
+        with mock.patch.object(crypto_grid.utils, "log_confirmed_fill") as logged:
+            reconcile_against(st, {"b1": FakeOrder("b1", 0.25, 100.0, "partially_filled")})
+        logged.assert_not_called()
+
+    def test_log_confirmed_fill_routes_full_and_partial_fills_apart(self):
+        full = FakeOrder("o1", 1.0, 120.0, "filled")
+        full.filled_at = object()
+        with mock.patch.object(utils, "_log_fill_to_influx") as full_path, \
+             mock.patch.object(utils, "log_terminal_partial_fill") as partial_path:
+            utils.log_confirmed_fill(full, utils.logger, action="grid_sell")
+        full_path.assert_called_once()
+        partial_path.assert_not_called()
+
+        part = FakeOrder("o2", 0.25, 120.0, "canceled")
+        part.filled_at = None
+        with mock.patch.object(utils, "_log_fill_to_influx") as full_path, \
+             mock.patch.object(utils, "log_terminal_partial_fill") as partial_path:
+            utils.log_confirmed_fill(part, utils.logger, action="grid_sell")
+        full_path.assert_not_called()
+        partial_path.assert_called_once()
+
+    def test_a_zero_fill_writes_nothing(self):
+        rejected = FakeOrder("o3", 0.0, 0.0, "rejected")
+        with mock.patch.object(utils, "_log_fill_to_influx") as full_path, \
+             mock.patch.object(utils, "log_terminal_partial_fill") as partial_path:
+            self.assertEqual(utils.log_confirmed_fill(rejected, utils.logger), 0)
+        full_path.assert_not_called()
+        partial_path.assert_not_called()
 
 
 class FifoSelectionTest(unittest.TestCase):
@@ -243,7 +378,7 @@ class ExecutableFloorTest(unittest.TestCase):
                                 crypto_grid.sell_floor({"price": 100.0}) - 0.01)
         self.assertIn("o9", st["pending"])
         # Still one full lot: nothing leaves until a fill confirms it.
-        self.assertAlmostEqual(st["lots"]["BTC/USD"][0]["qty"], 1.0)
+        self.assertAlmostEqual(held(st), 1.0)
 
     def test_sell_is_capped_by_the_shared_account_position(self):
         st = state_with(lots={"ETH/USD": [lot("L1", 1.0, 100.0)]})
@@ -341,7 +476,7 @@ class LedgerPersistenceTest(unittest.TestCase):
                 self.assertTrue(crypto_grid.save_state(st))
                 self.assertFalse(os.path.exists(path + ".tmp"))
                 back = crypto_grid.load_state()
-            self.assertAlmostEqual(back["lots"]["BTC/USD"][0]["qty"], 1.0)
+            self.assertAlmostEqual(held(back), 1.0)
             self.assertIn("o1", back["pending"])
 
     def test_suspended_entries_block_buys(self):
@@ -539,6 +674,46 @@ class MoonLifecycleTest(unittest.TestCase):
             with mock.patch.object(self.moon, "STATE_FILE", path):
                 st = self.moon.load_state()
         self.assertAlmostEqual(self.moon.my_qty(st, "ETH/USD"), 3.944)
+
+    def test_broker_symbol_spelling_does_not_wipe_the_ledger(self):
+        """Alpaca reports ETHUSD; SYMBOLS say ETH/USD.
+
+        A raw-symbol position dict looked up with a slash symbol missed every
+        position, so `total_held` came back 0, the reconcile decided the
+        ledger over-stated reality and zeroed the coin, and the trailing-stop
+        branch was never reached because the bot now believed it held nothing.
+        A stop that silently becomes a ledger wipe is worse than one that
+        fails loudly.
+        """
+        moon = self.moon
+        bot = moon.bot
+        state = moon._empty_state()
+        state["qty"]["ETH/USD"] = 1.0
+        submitted = []
+
+        class BrokerPosition:
+            symbol = "ETHUSD"          # broker spelling, not ours
+            qty = "1.0"
+
+        with mock.patch.object(moon, "get_donchian_levels",
+                               return_value=(5000.0, 3000.0, 1000.0)), \
+             mock.patch.object(moon, "load_state", return_value=state), \
+             mock.patch.object(moon, "reconcile_pending", return_value=False), \
+             mock.patch.object(moon, "save_state"), \
+             mock.patch.object(bot, "equity", 100000.0), \
+             mock.patch.object(bot, "positions", [BrokerPosition()]), \
+             mock.patch.object(bot, "budget_ok", True), \
+             mock.patch.object(bot, "account", mock.Mock(buying_power="500000")), \
+             mock.patch.object(bot, "market_order",
+                               side_effect=lambda sym, qty, side, tif: {"qty": qty}), \
+             mock.patch.object(bot, "submit",
+                               side_effect=lambda od, **k: submitted.append(od) or FakeOrder("o1")):
+            moon.cycle(bot)
+
+        self.assertEqual(len(submitted), 1, "the trailing stop never submitted an exit")
+        self.assertAlmostEqual(submitted[0]["qty"], 1.0)
+        self.assertAlmostEqual(moon.my_qty(state, "ETH/USD"), 1.0,
+                               msg="the ledger was zeroed before the fill confirmed it")
 
     def test_entry_size_is_clipped_to_remaining_budget(self):
         captured = {}

@@ -155,6 +155,12 @@ Safety is centralized in `utils.py`:
     in-flight order could not be read from Alpaca, or a position read failed. It resumes by
     itself once the underlying read succeeds. Do NOT delete the ledger to clear it without
     reading it first: an empty ledger is a grid that will never sell what it holds.
+*   **The CFO logs `FAIL-CLOSED — N pending order(s) cannot be priced`:** a bot has an unfilled
+    market buy with no limit price, no dollar notional, no partial fill and no existing
+    position, so its capital cannot be reserved. New entries for that bot are blocked until the
+    order fills, prices or terminates — which for a crypto market order is usually seconds.
+    A *persistent* one means an order is stuck open: check it on the Alpaca dashboard and
+    cancel it if it will never fill.
 *   **The advisor says `period_return_unavailable` / `unranked_bots`:** working as intended,
     not a fault. A window's return can only be measured when the bot started that window flat;
     with inventory carried in, the honest figure needs a mark at the window's open that is not

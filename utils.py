@@ -621,6 +621,18 @@ def _pending_unit_price(order, positions=None):
                 return abs(float(p.current_price))
             except (TypeError, ValueError, AttributeError):
                 continue
+
+    # Last resort for equities: ask for a quote. Crypto has no price client
+    # here, so those fall through to 0.0 and the caller fails closed.
+    symbol = getattr(order, "symbol", "") or ""
+    if symbol and "/" not in symbol and not re.match(r"^[A-Z]{1,6}\d{6}[PC]\d{8}$", symbol):
+        try:
+            from alpaca.data.requests import StockLatestTradeRequest
+            res = _safety_price_client().get_stock_latest_trade(
+                StockLatestTradeRequest(symbol_or_symbols=symbol))
+            return abs(float(res[symbol].price))
+        except Exception as e:
+            logger.warning(f"  [CFO] quote lookup failed pricing pending {symbol}: {e}")
     return 0.0
 
 
@@ -659,6 +671,7 @@ def check_budget_details(bot_name, trading_client):
         # 5. Calculate Pending Order Usage
         open_orders = trading_client.get_orders(filter=GetOrdersRequest(status="open"))
         pending_used = 0.0
+        unpriceable = []
         
         for o in open_orders:
             # Check if this order originated from this specific bot
@@ -686,9 +699,15 @@ def check_budget_details(bot_name, trading_client):
                     if unit > 0:
                         pending_used += unfilled_qty * unit
                     else:
-                        logger.warning(
-                            f"  [CFO] {bot_name}: cannot price pending order {o.id} "
-                            f"({o.symbol}); its capital is NOT reserved.")
+                        # A fresh quantity-based MARKET buy has no limit, no
+                        # notional, no partial fill and no existing position -
+                        # precisely the new-entry case - so every fallback
+                        # returns nothing. Warning and continuing reserved
+                        # ZERO, and the next symbol saw the same headroom.
+                        # Refuse further exposure instead: the bot keeps
+                        # managing, and resumes entries as soon as the order
+                        # fills, prices, or terminates.
+                        unpriceable.append(str(getattr(o, "symbol", o.id)))
                         
                 # Options (Sell to Open / CSPs / CCs)
                 elif o.asset_class == AssetClass.US_OPTION and o.side == OrderSide.SELL:
@@ -703,6 +722,15 @@ def check_budget_details(bot_name, trading_client):
                     except Exception as e:
                         registry.log_error("utils", "parse_strike", e, context=o.symbol)
                         logger.error(f"  [CFO] Error parsing strike from {o.symbol}: {e}")
+
+        if unpriceable:
+            logger.warning(
+                f"  [CFO] {bot_name}: FAIL-CLOSED — {len(unpriceable)} pending order(s) "
+                f"cannot be priced ({', '.join(unpriceable)}), so their capital cannot be "
+                f"reserved. Blocking new entries until they fill or terminate.")
+            registry.log_error("utils", "unpriceable_pending",
+                               Exception(f"{bot_name}: {', '.join(unpriceable)}"))
+            return False, budget_dollars, budget_dollars
 
         total_used = current_used + pending_used
         available = budget_dollars - total_used
@@ -1129,7 +1157,7 @@ def _fill_action(order):
         return "sell_put" if is_option.group(1) == "P" else "sell_call"
     return "sell"
 
-def log_terminal_partial_fill(order, logger):
+def log_terminal_partial_fill(order, logger, action=None):
     """Log a TERMINAL order's partial fill as a first-class trade row.
 
     A close-ladder rung (wheel_bot.close_option_position) can partially fill and
@@ -1179,7 +1207,7 @@ def log_terminal_partial_fill(order, logger):
         oid = str(getattr(order, "id", "") or c_id)
         ns = (base_ms + zlib.crc32(oid.encode()) % 1000) * 1_000_000
 
-        action = _fill_action(order)
+        action = action or _fill_action(order)
         line = (f'{measurement},symbol={order.symbol} '
                 f'price={float(price)},action="{action}",qty={filled_qty},'
                 f'fill_source="terminal_partial",source_order_id="{oid}" {ns}')
@@ -1195,6 +1223,42 @@ def log_terminal_partial_fill(order, logger):
         registry.log_error("utils", "log_terminal_partial_fill", e,
                            context=getattr(order, "symbol", None))
         return 0
+
+def log_confirmed_fill(order, logger, action=None):
+    """Write a TERMINAL crypto order's fill to InfluxDB. Idempotent; 1 or 0.
+
+    The crypto bots reconcile their own ledgers from broker orders, and their
+    registry entries set `reconciled=False` (their grid_buy/grid_sell action
+    vocabulary cannot be rebuilt from an order alone), so `reconcile_fills`
+    never visits them. That was survivable while every crypto order was a
+    MARKET order: submit_and_log_order polls those to completion and logs the
+    fill inline. The moment the grid's exits became LIMIT orders it stopped
+    being survivable - submit_and_log_order returns a resting limit order
+    without logging anything, so completed grid SELLS had no path into
+    `crypto_trades` at all while its BUYS still did. The accountant would have
+    seen a book that only ever bought.
+
+    TERMINAL only, matching log_terminal_partial_fill's guardrails: an order
+    that is still open may yet fill completely and be logged at its broker
+    `filled_at`, and writing an in-flight partial first would double-count it.
+    """
+    if order is None:
+        return 0
+    raw_status = getattr(order, "status", None)
+    status = str(getattr(raw_status, "value", raw_status) or "").lower()
+    if status not in ("filled", "canceled", "cancelled", "expired", "rejected"):
+        return 0
+    if float(getattr(order, "filled_qty", 0) or 0) <= 0:
+        return 0
+
+    if getattr(order, "filled_at", None) is not None:
+        # Broker stamped the fill: the full-fill path owns the row and keys it
+        # on filled_at, so repeated reconciles overwrite one point.
+        _log_fill_to_influx(order, logger, action=action)
+        return 1
+    # No broker stamp (a terminal partial): deterministic synthetic stamp.
+    return log_terminal_partial_fill(order, logger, action=action)
+
 
 def reconcile_fills(trading_client, logger, lookback_days=30):
     """Reconcile bot trade logs against Alpaca's authoritative fills.
@@ -1326,6 +1390,13 @@ def bound_session_timeout(client, timeout=30):
 # bar after an outage) without absorbing a two-week hole.
 BAR_STALE_FACTOR = 3.0
 
+# The longest legitimate gap between one session's last bar and the next
+# session's open: Friday 16:00 ET to Tuesday 09:30 ET across a Monday holiday
+# is ~89.5h. 4.5 days carries that with margin and still rejects a frame that
+# has missed a whole week. Used only to widen the bound at the open, never to
+# skip a check - see bars_are_fresh.
+PRIOR_SESSION_GAP_SECONDS = 4.5 * 24 * 3600
+
 
 def _bar_timestamp(df, position=-1):
     """Timezone-aware UTC datetime of one bar, or None if undeterminable."""
@@ -1375,11 +1446,15 @@ def bars_are_fresh(df, bar_seconds, bot_name, symbol, context="",
     is that the previous behavior looked exactly like success.
 
     `session_elapsed` (seconds the current trading session has been open)
-    suppresses the check while too little of the session has passed to have
-    produced a bar yet. Without it, EVERY Monday 09:30 reading is "stale": the
-    newest 15m bar is Friday's close, ~65 hours old, and an intraday bound of
-    3 x 15min rejects it. That would stand the equity bots down at every
-    session open - a false outage manufactured by the guard itself.
+    WIDENS the allowance near the open; it never skips the check. Without any
+    allowance, every Monday 09:30 reading is "stale": the newest 15m bar is
+    Friday's close, ~65 hours old, and an intraday bound of 3 x 15min rejects
+    it - a false outage manufactured by the guard itself. But exempting the
+    frame outright (the first attempt at this) accepted ANY bar in the opening
+    45 minutes, including a two-week-old one, and skipped the undateable-frame
+    check with it. So before enough session has elapsed to have produced a
+    fresh bar, the newest bar may be as old as the session is, plus one
+    legitimate market close - and no older.
 
     A False answer means "do not compute indicators from this frame". It must
     NOT be read as "do not manage the position": risk exits run off a live
@@ -1388,7 +1463,9 @@ def bars_are_fresh(df, bar_seconds, bot_name, symbol, context="",
     """
     max_age = float(bar_seconds) * float(stale_factor)
     if session_elapsed is not None and session_elapsed < max_age:
-        return True
+        # Too little session has passed to expect a fresh bar: the newest one
+        # should be the PREVIOUS session's, not any bar at all.
+        max_age = float(session_elapsed) + PRIOR_SESSION_GAP_SECONDS
 
     age = bar_age_seconds(df, now=now)
     if age is None:

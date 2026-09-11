@@ -174,6 +174,60 @@ class PendingCapitalReservationTest(unittest.TestCase):
             ok, budget, used = utils.check_budget_details("crypto_grid", client)
         self.assertAlmostEqual(used, 500.0, msg="a pending crypto buy reserved nothing")
 
+    def test_an_unpriceable_pending_buy_fails_closed(self):
+        """A fresh quantity-based MARKET buy has nothing to price it by.
+
+        No limit_price, no notional, no partial fill, no existing position —
+        precisely the new-entry case. Warning and continuing reserved ZERO, so
+        the next symbol saw the same headroom and spent it again. Refusing
+        further exposure is the honest answer until the order resolves.
+        """
+        pending = mock.Mock(
+            client_order_id="moon_bot-BTCUSD-1", asset_class=AssetClass.CRYPTO,
+            side=OrderSide.BUY, qty="0.5", filled_qty="0", limit_price=None,
+            notional=None, filled_avg_price=None, symbol="BTC/USD", id="o1")
+        client = mock.Mock()
+        client.get_account.return_value = mock.Mock(equity="100000")
+        client.get_all_positions.return_value = []
+        client.get_orders.return_value = [pending]
+        with mock.patch.object(utils, "get_budget_dollars", return_value=1000.0):
+            ok, budget, used = utils.check_budget_details("moon_bot", client)
+        self.assertFalse(ok, "an unpriceable pending buy left headroom for another entry")
+        self.assertEqual(utils.get_available_budget("moon_bot", client), 0.0)
+
+    def test_a_second_symbol_cannot_reuse_the_first_entrys_dollars(self):
+        # Two different new symbols, first market buy accepted and completely
+        # unfilled, no existing positions.
+        pending = mock.Mock(
+            client_order_id="moon_bot-BTCUSD-1", asset_class=AssetClass.CRYPTO,
+            side=OrderSide.BUY, qty="0.5", filled_qty="0", limit_price=None,
+            notional=None, filled_avg_price=None, symbol="BTC/USD", id="o1")
+        client = mock.Mock()
+        client.get_account.return_value = mock.Mock(equity="100000")
+        client.get_all_positions.return_value = []
+        client.get_orders.return_value = [pending]
+        with mock.patch.object(utils, "get_budget_dollars", return_value=1000.0):
+            # The ETH/USD entry asks the same question and must be refused.
+            self.assertFalse(utils.check_budget("moon_bot", client))
+
+    def test_an_equity_market_buy_is_priced_from_a_quote(self):
+        # Equities have a price client, so they resolve rather than fail closed.
+        pending = mock.Mock(
+            client_order_id="trend_bot-AAPL-1", asset_class=AssetClass.US_EQUITY,
+            side=OrderSide.BUY, qty="10", filled_qty="0", limit_price=None,
+            notional=None, filled_avg_price=None, symbol="AAPL", id="o2")
+        client = mock.Mock()
+        client.get_account.return_value = mock.Mock(equity="100000")
+        client.get_all_positions.return_value = []
+        client.get_orders.return_value = [pending]
+        quote_client = mock.Mock(**{
+            "get_stock_latest_trade.return_value": {"AAPL": mock.Mock(price=50.0)}})
+        with mock.patch.object(utils, "get_budget_dollars", return_value=1000.0), \
+             mock.patch.object(utils, "_safety_price_client", return_value=quote_client):
+            ok, budget, used = utils.check_budget_details("trend_bot", client)
+        self.assertTrue(ok)
+        self.assertAlmostEqual(used, 500.0)
+
     def test_a_pending_equity_market_buy_consumes_budget(self):
         pending = mock.Mock(
             client_order_id="trend_bot-AAPL-1", asset_class=AssetClass.US_EQUITY,

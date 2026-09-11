@@ -157,6 +157,7 @@ def reconcile_pending(state):
             logger.error(f"[!] Cannot read in-flight order {order_id} ({e}); leaving it pending.")
             continue
 
+
         filled_qty = float(getattr(order, "filled_qty", 0) or 0)
         status = str(getattr(getattr(order, "status", ""), "value",
                              getattr(order, "status", ""))).lower()
@@ -172,6 +173,12 @@ def reconcile_pending(state):
                         f"-> tracked {state['qty'][p['symbol']]:.6f}")
             changed = True
         if terminal:
+            # moon_bot is reconciled=False in the registry, so reconcile_fills
+            # never visits it; its rows reach InfluxDB only from here and from
+            # submit_and_log_order's market-order poll. Idempotent either way.
+            utils.log_confirmed_fill(
+                order, logger,
+                action="buy_breakout" if p["side"] == "buy" else "sell_breakout")
             if filled_qty <= DUST_QTY:
                 logger.info(f"    [LEDGER] {p['symbol']} {p['side']} {order_id} ended "
                             f"{status} with no fill; ledger unchanged.")
@@ -250,8 +257,19 @@ def cycle(bot):
     if entries_blocked:
         logger.error("    [SKIP] Ledger unreadable — managing nothing new this cycle.")
 
-    # Shared account-wide positions vs moon_bot's own ledger
-    pos_qty = {p.symbol: float(p.qty) for p in bot.positions}
+    # Shared account-wide positions vs moon_bot's own ledger.
+    #
+    # Keyed on the CANONICAL symbol. Alpaca reports crypto positions as
+    # BTCUSD while SYMBOLS here are BTC/USD, so a raw-symbol dict looked up
+    # with a slash symbol missed every position: `total_held` came back 0, the
+    # reconcile treated the ledger as over-stating reality and zeroed the
+    # coin, and the trailing-stop branch was never reached because the bot now
+    # believed it held nothing. A stop that silently becomes a ledger wipe is
+    # worse than one that fails loudly.
+    pos_qty = {}
+    for p in bot.positions:
+        key = str(getattr(p, "symbol", "")).replace("/", "")
+        pos_qty[key] = pos_qty.get(key, 0.0) + float(p.qty)
 
     logger.info(f"Scanning Markets... Equity: ${bot.equity:,.2f}")
 
@@ -260,7 +278,7 @@ def cycle(bot):
             entry_high, exit_low, current_price = get_donchian_levels(symbol)
             if current_price is None: continue
 
-            total_held = pos_qty.get(symbol, 0)
+            total_held = pos_qty.get(symbol.replace("/", ""), 0.0)
             mine = my_qty(state, symbol)
 
             # Ledger says we hold coins the account no longer has
