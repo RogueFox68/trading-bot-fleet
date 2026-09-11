@@ -59,6 +59,13 @@ BAR_SECONDS = 15 * 60
 
 
 def get_data_alpaca(symbol):
+    """(df, indicators_ok). A stale frame returns indicators_ok=False, NOT None.
+
+    Returning None made the caller `continue`, skipping manage_position — so a
+    stale history feed silently suppressed stop losses, take profits and EOD
+    liquidation on every held position. Indicator eligibility and risk
+    management are separate questions; see manage_position(indicators_ok=...).
+    """
     try:
         start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=INTRADAY_LOOKBACK_DAYS)
         req = StockBarsRequest(
@@ -67,16 +74,19 @@ def get_data_alpaca(symbol):
             start=start_time,
         )
         bars = bot.data_client.get_stock_bars(req)
-        if not bars.data: return None
+        if not bars.data:
+            return None, False
         df = utils.newest_bars(bars.df.xs(symbol), INTRADAY_BARS)
         # Freshness is checked in UTC, before the display-only tz conversion.
-        if not utils.bars_are_fresh(df, BAR_SECONDS, "trend_bot", symbol, "15m"):
-            return None
+        fresh = utils.bars_are_fresh(df, BAR_SECONDS, "trend_bot", symbol, "15m",
+                                     session_elapsed=bot.session_elapsed)
+        if len(df) < SLOW_EMA + 2:
+            fresh = False  # not enough history for the slow EMA / crossover
         df.index = df.index.tz_convert('America/New_York')
-        return df
+        return df, fresh
     except Exception as e:
         registry.log_error("trend_bot", "get_data_alpaca", e, context=symbol)
-        return None
+        return None, False
 
 
 def momentum_signal(df, price, local_adx, bearish=False):
@@ -106,8 +116,16 @@ def close_position(symbol, pos_side, sell_qty, reason, notify_msg):
     )
 
 
-def manage_position(symbol, pos, latest, price, local_adx, bull_cross, bear_cross):
-    """Exit logic for one held position. Mirrors V4.x behavior exactly."""
+def manage_position(symbol, pos, latest, price, local_adx, bull_cross, bear_cross,
+                    indicators_ok=True):
+    """Exit logic for one held position.
+
+    Runs whether or not indicators are available: stops, targets, the max-hold
+    backstop and EOD liquidation need only a validated live price and the
+    entry price. `indicators_ok=False` suppresses exactly the decisions that
+    read the bars (the crossover exits, and the ADX/EMA inputs to the hold
+    score); `latest`, `local_adx` and the cross flags are then None.
+    """
     # Manage only positions that are OURS. A target symbol can be held by
     # another bot (or unowned, e.g. quarantined assignment stock) — exiting
     # it liquidates a strategy we don't run.
@@ -124,9 +142,35 @@ def manage_position(symbol, pos, latest, price, local_adx, bull_cross, bear_cros
     is_long = side == "long"
     entry_price = float(pos.avg_entry_price)
     hours_held = bot.hours_held(symbol)
-    ema_intact = bool(latest['ema_fast'] > latest['ema_slow']) if is_long \
-                 else bool(latest['ema_fast'] < latest['ema_slow'])
-    indicators = {"adx": float(local_adx), "ema_trend_intact": ema_intact}
+
+    # A validated live trade, or nothing. Falling back to a bar close is only
+    # safe while the bars are fresh, and the stale case is exactly why this
+    # path exists — a stop loss priced off a two-week-old close is worse than
+    # no stop loss, because it looks like one.
+    live_price = utils.live_equity_price(bot.data_client, symbol, "trend_bot")
+    if live_price is None:
+        if indicators_ok and price is not None:
+            live_price = float(price)
+            logger.warning(f"    [{symbol}] live quote unavailable; using the current bar close.")
+        else:
+            registry.log_error("trend_bot", "manage_position",
+                               Exception("no validated price: live quote failed and bars are stale"),
+                               context=symbol)
+            logger.error(f"    [!] {symbol} HELD but unmanageable this cycle — no live quote "
+                         f"and no fresh bar. Risk exits cannot be evaluated.")
+            return
+    price = live_price
+
+    # Blind on indicators => pass none. calculate_hold_score then credits no
+    # trend strength, scoring LOWER and biasing toward CLOSE_EOD — the safe
+    # direction when the signal is unreadable.
+    if indicators_ok and latest is not None and local_adx is not None:
+        ema_intact = bool(latest['ema_fast'] > latest['ema_slow']) if is_long \
+                     else bool(latest['ema_fast'] < latest['ema_slow'])
+        indicators = {"adx": float(local_adx), "ema_trend_intact": ema_intact}
+    else:
+        indicators = {}
+
     bt = "trend_long" if is_long else "trend_short"
     pnl_pct = (price - entry_price) / entry_price if is_long \
               else (entry_price - price) / entry_price
@@ -168,12 +212,12 @@ def manage_position(symbol, pos, latest, price, local_adx, bull_cross, bear_cros
         close_position(symbol, side, sell_qty, "Take Profit",
                        f"💰 **TAKE PROFIT {side_txt} {symbol}**\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
         return
-    if is_long and (not bull_cross and bear_cross):
+    if indicators_ok and is_long and (not bull_cross and bear_cross):
         logger.info(f"    📉 CLOSE LONG {symbol} (Crossover)")
         close_position(symbol, side, sell_qty, "Bearish Crossover",
                        f"📉 **SELL/CLOSE {symbol}** (Cross)\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
         return
-    if (not is_long) and (not bear_cross and bull_cross):
+    if indicators_ok and (not is_long) and (not bear_cross and bull_cross):
         logger.info(f"    📉 CLOSE SHORT {symbol} (Crossover)")
         close_position(symbol, side, sell_qty, "Bullish Crossover",
                        f"📉 **BUY TO COVER {symbol}** (Bull Cross)\nPrice: ${price:.2f}\nPnL: {pnl_pct:.2%}")
@@ -303,24 +347,26 @@ def cycle(bot):
         if "/" in symbol:  # crypto never belongs to trend
             continue
 
-        df = get_data_alpaca(symbol)
-        if df is None: continue
+        df, indicators_ok = get_data_alpaca(symbol)
 
-        df['ema_fast'] = EMAIndicator(close=df['close'], window=FAST_EMA).ema_indicator()
-        df['ema_slow'] = EMAIndicator(close=df['close'], window=SLOW_EMA).ema_indicator()
-        adx_indicator = ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=14)
-        df['adx'] = adx_indicator.adx()
+        latest = prev = price = local_adx = None
+        bull_cross = bear_cross = None
+        if indicators_ok:
+            df['ema_fast'] = EMAIndicator(close=df['close'], window=FAST_EMA).ema_indicator()
+            df['ema_slow'] = EMAIndicator(close=df['close'], window=SLOW_EMA).ema_indicator()
+            adx_indicator = ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=14)
+            df['adx'] = adx_indicator.adx()
 
-        latest = df.iloc[-1]
-        prev = df.iloc[-2]
-        price = float(latest['close'])
-        local_adx = float(latest['adx'])
+            latest = df.iloc[-1]
+            prev = df.iloc[-2]
+            price = float(latest['close'])
+            local_adx = float(latest['adx'])
 
-        bull_cross = (latest['ema_fast'] > latest['ema_slow']) and (prev['ema_fast'] <= prev['ema_slow'])
-        bear_cross = (latest['ema_fast'] < latest['ema_slow']) and (prev['ema_fast'] >= prev['ema_slow'])
+            bull_cross = (latest['ema_fast'] > latest['ema_slow']) and (prev['ema_fast'] <= prev['ema_slow'])
+            bear_cross = (latest['ema_fast'] < latest['ema_slow']) and (prev['ema_fast'] >= prev['ema_slow'])
 
         # --- DIAGNOSTICS (long-side view, entry candidates only) ---
-        if symbol not in bot.pos_dict and len(df) >= MOMENTUM_BARS + 1:
+        if indicators_ok and symbol not in bot.pos_dict and len(df) >= MOMENTUM_BARS + 1:
             momentum_ok, ema_aligned, pullback = momentum_signal(df, price, local_adx)
             ema_gap = ((latest['ema_fast'] - latest['ema_slow']) / latest['ema_slow']) * 100
             if bull_cross:
@@ -335,8 +381,12 @@ def cycle(bot):
                 logger.debug(f"  📊 {symbol:<5} ${price:>8.2f} | ADX {local_adx:>5.1f} | EMA Gap {ema_gap:>+5.1f}% | No alignment")
 
         if symbol in bot.pos_dict:
+            # ALWAYS reached for a held symbol, indicators or not. Bad bars
+            # stop us opening a position; they never stop us closing one.
             manage_position(symbol, bot.pos_dict[symbol], latest, price, local_adx,
-                            bull_cross, bear_cross)
+                            bull_cross, bear_cross, indicators_ok=indicators_ok)
+        elif not indicators_ok:
+            continue
         elif symbol in target_map_long and symbol not in bot.pending_symbols:
             try_entry(symbol, True, price, local_adx, df, bull_cross, bear_cross,
                       target_map_long, cycle_state)

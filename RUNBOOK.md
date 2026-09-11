@@ -144,6 +144,17 @@ Safety is centralized in `utils.py`:
     ```
     Only put a basis in that file if you know it. A guessed number defeats the profit guard
     the ledger exists to enforce.
+*   **crypto_grid logs `[SUSPEND] New grid entries halted`:** the bot is managing what it can
+    but opening nothing new, deliberately. Three causes, all in the log line: the lot ledger
+    could not be read or written (`crypto_grid_state.json` — repair or remove it), an
+    in-flight order could not be read from Alpaca, or a position read failed. It resumes by
+    itself once the underlying read succeeds. Do NOT delete the ledger to clear it without
+    reading it first: an empty ledger is a grid that will never sell what it holds.
+*   **The advisor says `period_return_unavailable` / `unranked_bots`:** working as intended,
+    not a fault. A window's return can only be measured when the bot started that window flat;
+    with inventory carried in, the honest figure needs a mark at the window's open that is not
+    stored anywhere. Those bots are dropped from the ranking rather than scored on a proxy.
+    `realized_pl` and `lifetime_unrealized_pl` are still reported for them.
 *   **The advisor recommends moving capital into crypto:** check
     `recommended_allocations.json` → `assumptions.negative_basis_positions` before acting.
     A non-empty list means the broker is reporting a negative cost basis on those symbols,

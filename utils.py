@@ -589,6 +589,41 @@ def get_budget_dollars(bot_name, trading_client, equity=None):
         equity = float(trading_client.get_account().equity)
     return equity * allocation_pct
 
+def _pending_unit_price(order, positions=None):
+    """Best available per-unit price for an unfilled order, or 0.0.
+
+    Tried in order of authority: the order's own limit, its dollar notional,
+    the average price of whatever has already filled, then the current mark on
+    a held position in the same symbol. Returns 0.0 when none of those exist,
+    so the caller can say the capital is unreserved instead of reserving zero
+    and calling it compliant.
+    """
+    try:
+        if getattr(order, "limit_price", None):
+            return float(order.limit_price)
+    except (TypeError, ValueError):
+        pass
+    try:
+        notional = getattr(order, "notional", None)
+        qty = float(getattr(order, "qty", 0) or 0)
+        if notional and qty > 0:
+            return float(notional) / qty
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    try:
+        if getattr(order, "filled_avg_price", None):
+            return float(order.filled_avg_price)
+    except (TypeError, ValueError):
+        pass
+    for p in positions or []:
+        if _same_symbol(getattr(p, "symbol", ""), getattr(order, "symbol", "")):
+            try:
+                return abs(float(p.current_price))
+            except (TypeError, ValueError, AttributeError):
+                continue
+    return 0.0
+
+
 def check_budget_details(bot_name, trading_client):
     """
     Returns (is_ok, budget_dollars, total_used)
@@ -635,11 +670,25 @@ def check_budget_details(bot_name, trading_client):
             if is_my_order:
                 unfilled_qty = float(o.qty) - float(o.filled_qty)
                 if unfilled_qty <= 0: continue
-                
-                # Equities (Buy Orders)
-                if o.asset_class == AssetClass.US_EQUITY and o.side == OrderSide.BUY:
-                    if o.limit_price:
-                        pending_used += unfilled_qty * float(o.limit_price)
+
+                # Equities and CRYPTO (Buy Orders).
+                #
+                # Crypto was missing entirely, and equity MARKET buys slipped
+                # through too (no limit_price, so the old branch priced them at
+                # nothing). Several not-yet-filled entries could therefore each
+                # see the same headroom and spend it. `_pending_unit_price`
+                # falls back through limit -> notional -> partial fill -> live
+                # mark, and says so out loud when it cannot price an order at
+                # all rather than silently reserving zero.
+                if o.side == OrderSide.BUY and o.asset_class in (
+                        AssetClass.US_EQUITY, AssetClass.CRYPTO):
+                    unit = _pending_unit_price(o, positions)
+                    if unit > 0:
+                        pending_used += unfilled_qty * unit
+                    else:
+                        logger.warning(
+                            f"  [CFO] {bot_name}: cannot price pending order {o.id} "
+                            f"({o.symbol}); its capital is NOT reserved.")
                         
                 # Options (Sell to Open / CSPs / CCs)
                 elif o.asset_class == AssetClass.US_OPTION and o.side == OrderSide.SELL:
@@ -786,6 +835,47 @@ def assert_order_allowed_here():
         f"set {UNCONTAINED_OVERRIDE_ENV}=1.")
 
 
+def _same_symbol(position_symbol, order_symbol):
+    """Alpaca reports crypto positions as BTCUSD while orders use BTC/USD."""
+    return (position_symbol or "").replace("/", "") == (order_symbol or "").replace("/", "")
+
+
+def exposure_increasing_qty(order_data, positions):
+    """How much of this order OPENS or INCREASES exposure, in units.
+
+    0.0 means the order is purely risk-reducing: a sell against a long, a buy
+    against a short, a buy-to-close on a short option. A partial close is also
+    0.0; an over-sell that flips the position returns only the flipping part.
+
+    Shared by the daily loss cap and the notional/exposure caps so the two
+    cannot disagree about what "closing" means. Works for every asset class:
+    positions carry a signed quantity, and crypto's BTCUSD/BTC-slash-USD
+    spelling is normalised.
+    """
+    symbol = getattr(order_data, "symbol", None)
+    qty_attr = getattr(order_data, "qty", None)
+    if not symbol or qty_attr is None:
+        return 0.0
+    try:
+        qty = abs(float(qty_attr))
+    except (TypeError, ValueError):
+        return 0.0
+
+    held_qty = 0.0   # signed: long > 0, short < 0
+    for p in positions or []:
+        if _same_symbol(getattr(p, "symbol", ""), symbol):
+            try:
+                held_qty += float(p.qty)
+            except (TypeError, ValueError):
+                continue
+
+    if getattr(order_data, "side", None) == OrderSide.BUY:
+        # Buying while short covers up to |held_qty| before opening long
+        return qty if held_qty >= 0 else max(0.0, qty + held_qty)
+    # Selling while long closes up to held_qty before opening short
+    return qty if held_qty <= 0 else max(0.0, qty - held_qty)
+
+
 def submit_and_log_order(trading_client, order_data, logger, reason="", log_action=None):
     """
     Submits an order and polls for a few seconds to log fill-confirmation.
@@ -804,12 +894,33 @@ def submit_and_log_order(trading_client, order_data, logger, reason="", log_acti
             assert_order_allowed_here()
 
             account = trading_client.get_account()
-            
+
+            # Positions are needed by both the loss cap (only once it trips)
+            # and the exposure caps. Fetch at most once, and only if asked.
+            _positions_cache = []
+
+            def _positions():
+                if not _positions_cache:
+                    _positions_cache.append(trading_client.get_all_positions())
+                return _positions_cache[0]
+
             # 1. Daily Loss Cap Check
+            #
+            # Applies ONLY to orders that open or increase exposure. The cap
+            # used to reject every order outright, including the closes that
+            # would have stopped the bleeding: a fleet down $5,000 could no
+            # longer exit a losing long, cover a short, or buy back a short
+            # option. A circuit breaker that traps you inside the position is
+            # the opposite of a risk control.
             if account.last_equity and account.equity:
                 today_pnl = float(account.equity) - float(account.last_equity)
                 if today_pnl < MAX_DAILY_LOSS:
-                    raise Exception(f"Daily Loss Cap Exceeded! PnL: ${today_pnl:.2f} < Limit: ${MAX_DAILY_LOSS:.2f}")
+                    if exposure_increasing_qty(order_data, _positions()) > 0:
+                        raise Exception(f"Daily Loss Cap Exceeded! PnL: ${today_pnl:.2f} < Limit: ${MAX_DAILY_LOSS:.2f}")
+                    logger.warning(
+                        f"  [SAFETY] Daily loss cap is active (PnL ${today_pnl:.2f}), but this "
+                        f"order only REDUCES exposure in {getattr(order_data, 'symbol', '?')} "
+                        f"— allowing it through.")
 
             # 2+3. Notional & Symbol Exposure Caps — applied to any EQUITY
             # order that OPENS or INCREASES exposure: buys beyond a held short
@@ -840,15 +951,8 @@ def submit_and_log_order(trading_client, order_data, logger, reason="", log_acti
                     except Exception as e:
                         logger.warning(f"  [SAFETY] price lookup failed for {symbol}: {e}")
 
-                positions = trading_client.get_all_positions()
-                held_qty = sum(float(p.qty) for p in positions if p.symbol == symbol)  # signed: long > 0, short < 0
-
-                if order_data.side == OrderSide.BUY:
-                    # Buying while short covers up to |held_qty| before opening long
-                    opening_qty = qty if held_qty >= 0 else max(0.0, qty + held_qty)
-                else:
-                    # Selling while long closes up to held_qty before opening short
-                    opening_qty = qty if held_qty <= 0 else max(0.0, qty - held_qty)
+                positions = _positions()
+                opening_qty = exposure_increasing_qty(order_data, positions)
 
                 if opening_qty > 0 and est_price > 0:
                     notional = opening_qty * est_price
@@ -1263,13 +1367,29 @@ def bar_age_seconds(df, now=None):
 
 
 def bars_are_fresh(df, bar_seconds, bot_name, symbol, context="",
-                   stale_factor=BAR_STALE_FACTOR, now=None):
-    """True if the newest bar is recent enough to trade on.
+                   stale_factor=BAR_STALE_FACTOR, now=None, session_elapsed=None):
+    """True if the newest bar is recent enough to compute indicators on.
 
     Stale or undateable frames are a LOUD failure (registry.log_error, so they
     surface in Grafana like any other), never a silent skip - the whole point
     is that the previous behavior looked exactly like success.
+
+    `session_elapsed` (seconds the current trading session has been open)
+    suppresses the check while too little of the session has passed to have
+    produced a bar yet. Without it, EVERY Monday 09:30 reading is "stale": the
+    newest 15m bar is Friday's close, ~65 hours old, and an intraday bound of
+    3 x 15min rejects it. That would stand the equity bots down at every
+    session open - a false outage manufactured by the guard itself.
+
+    A False answer means "do not compute indicators from this frame". It must
+    NOT be read as "do not manage the position": risk exits run off a live
+    quote and the entry price, neither of which comes from here. See the
+    bots' manage_position(indicators_ok=...).
     """
+    max_age = float(bar_seconds) * float(stale_factor)
+    if session_elapsed is not None and session_elapsed < max_age:
+        return True
+
     age = bar_age_seconds(df, now=now)
     if age is None:
         registry.log_error(bot_name, "bar_freshness",
@@ -1278,7 +1398,6 @@ def bars_are_fresh(df, bar_seconds, bot_name, symbol, context="",
         logger.error(f"  [STALE] {bot_name} {symbol} {context}: bars have no usable timestamp")
         return False
 
-    max_age = float(bar_seconds) * float(stale_factor)
     if age > max_age:
         registry.log_error(
             bot_name, "bar_freshness",
@@ -1288,6 +1407,57 @@ def bars_are_fresh(df, bar_seconds, bot_name, symbol, context="",
                      f"{age / 3600.0:.1f}h old > {max_age / 3600.0:.1f}h limit - refusing to trade on it")
         return False
     return True
+
+
+# A trade older than this is not a price you may run a stop loss against.
+LIVE_QUOTE_MAX_AGE = 15 * 60
+
+
+def live_equity_price(data_client, symbol, bot_name, max_age_seconds=LIVE_QUOTE_MAX_AGE,
+                      now=None):
+    """Current trade price for a RISK decision, or None if it can't be validated.
+
+    Deliberately has no fallback. The bots used to fall back to the latest bar
+    close when this fetch failed, which is safe only while the bars are fresh -
+    and the whole reason this function exists is the case where they are not.
+    Running a stop loss off a two-week-old close is worse than not running one,
+    because it looks like risk management. A None here means "no price", and
+    the caller must say so rather than substitute one.
+    """
+    try:
+        from alpaca.data.requests import StockLatestTradeRequest
+        trade = data_client.get_stock_latest_trade(
+            StockLatestTradeRequest(symbol_or_symbols=[symbol]))[symbol]
+    except Exception as e:
+        registry.log_error(bot_name, "live_quote", e, context=symbol)
+        logger.error(f"    [!] {bot_name} {symbol}: live quote unavailable: {e}")
+        return None
+
+    price = float(getattr(trade, "price", 0) or 0)
+    if price <= 0:
+        registry.log_error(bot_name, "live_quote",
+                           Exception(f"non-positive price {price!r}"), context=symbol)
+        return None
+
+    stamp = getattr(trade, "timestamp", None)
+    if stamp is not None:
+        to_py = getattr(stamp, "to_pydatetime", None)
+        if to_py is not None:
+            stamp = to_py()
+        if isinstance(stamp, datetime.datetime):
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=datetime.timezone.utc)
+            now = now or datetime.datetime.now(datetime.timezone.utc)
+            age = (now - stamp).total_seconds()
+            if age > max_age_seconds:
+                registry.log_error(
+                    bot_name, "live_quote",
+                    Exception(f"last trade is {age / 60.0:.0f}m old (limit "
+                              f"{max_age_seconds / 60.0:.0f}m)"), context=symbol)
+                logger.error(f"    [!] {bot_name} {symbol}: last trade {age / 60.0:.0f}m "
+                             f"old - not a price to risk-manage against")
+                return None
+    return price
 
 
 def drop_forming_bar(df, bar_seconds, now=None):

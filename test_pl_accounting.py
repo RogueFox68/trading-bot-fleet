@@ -37,6 +37,8 @@
    out of Trend and into Grid.
 """
 import datetime as dt
+import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -191,56 +193,303 @@ class AdvisorOpeningInventoryTest(unittest.TestCase):
     def test_opening_inventory_reconstructs_the_book_at_the_cutoff(self):
         fills = [fill(40, "crypto_grid", "buy", 100.0, 2.0),
                  fill(35, "crypto_grid", "sell", 120.0, 1.0)]
-        opening = advisor.opening_inventory(fills, NOW - dt.timedelta(days=5))
+        opening, incomplete = advisor.opening_inventory(fills, NOW - dt.timedelta(days=5))
+        self.assertEqual(incomplete, set())
         book = opening[("crypto_grid", "BTC/USD")]
         self.assertEqual(len(book), 1)
         self.assertAlmostEqual(book[0]["qty"], 1.0)
         self.assertAlmostEqual(book[0]["price"], 100.0)
 
 
-class AdvisorUnrealizedScopingTest(unittest.TestCase):
+class PeriodReturnAvailabilityTest(unittest.TestCase):
+    """A window's return is reported only when it can actually be measured.
 
-    def _windows(self, fills, unrealized, days):
+    The withdrawn approximation apportioned the LIFETIME unrealized figure by
+    the share of open notional each window opened. It can reverse the sign:
+    an old position up $100 and an equally sized new one down $50 net to +$50
+    lifetime, and an equal split credits the new window +$25 when its actual
+    change was -$50. That number was named total_pl and ranked the bots.
+    """
+
+    def _windows(self, fills, unrealized, days, excluded=()):
         return advisor.build_window_metrics(
-            fills, unrealized, {"crypto_grid": 1000.0},
-            equity=74000.0, window_days=days, now=NOW)
+            fills, unrealized, {"crypto_grid": 1000.0, "trend_bot": 1000.0},
+            equity=74000.0, window_days=days, now=NOW, excluded_bots=excluded)
 
-    def test_an_old_position_does_not_credit_a_short_window(self):
-        # One lot opened 40 days ago, still held, carrying $5,000 unrealized.
+    def test_inventory_carried_in_makes_the_return_unmeasurable(self):
         fills = [fill(40, "crypto_grid", "buy", 100.0, 10.0)]
         five = self._windows(fills, {"crypto_grid": 5000.0}, 5)["crypto_grid"]
-        sixty = self._windows(fills, {"crypto_grid": 5000.0}, 60)["crypto_grid"]
-        self.assertAlmostEqual(five["unrealized_pl"], 0.0,
-                               msg="a 40-day-old lot credited the 5-day window")
-        self.assertAlmostEqual(sixty["unrealized_pl"], 5000.0)
+        self.assertFalse(five["period_return_available"])
+        self.assertIsNone(five["total_pl"])
+        self.assertIsNone(five["unrealized_pl"])
+        self.assertEqual(five["period_return_unavailable_reason"],
+                         "inventory_carried_into_window_and_no_opening_marks")
 
-    def test_the_raw_lifetime_figure_is_still_reported(self):
+    def test_a_window_started_flat_reports_a_real_return(self):
+        fills = [fill(2, "crypto_grid", "buy", 100.0, 10.0)]
+        five = self._windows(fills, {"crypto_grid": 4000.0}, 5)["crypto_grid"]
+        self.assertTrue(five["period_return_available"])
+        self.assertAlmostEqual(five["unrealized_pl"], 4000.0)
+        self.assertAlmostEqual(five["total_pl"], five["realized_pl"] + 4000.0)
+
+    def test_the_sign_reversal_case_is_refused_not_approximated(self):
+        # Old lot (opened 40d ago) and a new one, equal notional. The lifetime
+        # figure nets to +50 while the new window is actually down.
+        fills = [fill(40, "crypto_grid", "buy", 100.0, 10.0),
+                 fill(2, "crypto_grid", "buy", 100.0, 10.0)]
+        five = self._windows(fills, {"crypto_grid": 50.0}, 5)["crypto_grid"]
+        self.assertFalse(five["period_return_available"],
+                         "an unmeasurable return was reported as a number")
+        self.assertIsNone(five["total_pl"])
+
+    def test_old_losing_new_profitable_is_equally_refused(self):
+        fills = [fill(40, "crypto_grid", "buy", 200.0, 10.0),
+                 fill(2, "crypto_grid", "buy", 50.0, 10.0)]
+        five = self._windows(fills, {"crypto_grid": -500.0}, 5)["crypto_grid"]
+        self.assertFalse(five["period_return_available"])
+
+    def test_carried_inventory_in_a_different_asset_still_blocks_the_bot(self):
+        # The bot, not the symbol, is what gets ranked.
+        fills = [fill(40, "crypto_grid", "buy", 100.0, 1.0, symbol="ETH/USD"),
+                 fill(2, "crypto_grid", "buy", 100.0, 1.0, symbol="BTC/USD")]
+        five = self._windows(fills, {"crypto_grid": 100.0}, 5)["crypto_grid"]
+        self.assertFalse(five["period_return_available"])
+
+    def test_a_carried_short_position_also_blocks(self):
+        fills = [fill(40, "trend_bot", "sell", 100.0, 10.0, symbol="TSLA"),
+                 fill(35, "trend_bot", "buy", 90.0, 5.0, symbol="TSLA")]
+        five = self._windows(fills, {"trend_bot": 200.0}, 5)["trend_bot"]
+        self.assertFalse(five["period_return_available"])
+
+    def test_option_lots_carry_their_contract_multiplier(self):
+        # Without the multiplier an option lot's exposure is understated 100x,
+        # which could read as "started flat" on a real open position.
+        fills = [fill(40, "wheel_bot", "sell", 2.0, 1.0,
+                      symbol="PAAS260918P00015000", multiplier=100)]
+        opening, _ = advisor.opening_inventory(fills, NOW - dt.timedelta(days=5))
+        notional = advisor._open_notional_by_bot(opening)
+        self.assertAlmostEqual(notional["wheel_bot"], 200.0)
+
+    def test_lifetime_unrealized_is_always_reported_and_labeled(self):
         fills = [fill(40, "crypto_grid", "buy", 100.0, 10.0)]
         five = self._windows(fills, {"crypto_grid": 5000.0}, 5)["crypto_grid"]
         self.assertAlmostEqual(five["lifetime_unrealized_pl"], 5000.0)
 
-    def test_unrealized_splits_between_old_and_new_lots(self):
-        # Half the open notional opened inside the window => half the credit.
-        fills = [fill(40, "crypto_grid", "buy", 100.0, 10.0),
-                 fill(2, "crypto_grid", "buy", 100.0, 10.0)]
-        five = self._windows(fills, {"crypto_grid": 4000.0}, 5)["crypto_grid"]
-        self.assertAlmostEqual(five["unrealized_pl"], 2000.0)
-
-    def test_a_window_that_opened_everything_gets_the_whole_figure(self):
-        fills = [fill(2, "crypto_grid", "buy", 100.0, 10.0)]
-        five = self._windows(fills, {"crypto_grid": 4000.0}, 5)["crypto_grid"]
-        self.assertAlmostEqual(five["unrealized_pl"], 4000.0)
-
-    def test_no_open_position_credits_nothing(self):
-        fills = [fill(40, "crypto_grid", "buy", 100.0, 1.0),
+    def test_realized_only_is_still_reported_when_the_return_is_not(self):
+        fills = [fill(40, "crypto_grid", "buy", 100.0, 2.0),
                  fill(2, "crypto_grid", "sell", 110.0, 1.0)]
         five = self._windows(fills, {"crypto_grid": 5000.0}, 5)["crypto_grid"]
-        self.assertAlmostEqual(five["unrealized_pl"], 0.0)
+        self.assertFalse(five["period_return_available"])
+        self.assertAlmostEqual(five["realized_pl"], 10.0)
 
-    def test_total_pl_uses_the_scoped_figure(self):
-        fills = [fill(40, "crypto_grid", "buy", 100.0, 10.0)]
+    def test_an_unmeasurable_bot_scores_nothing_and_is_unranked(self):
+        fills = [fill(40, "crypto_grid", "buy", 100.0, 10.0)] + [
+            fill(d, "crypto_grid", "buy", 100.0, 1.0) for d in range(1, 4)]
         five = self._windows(fills, {"crypto_grid": 5000.0}, 5)["crypto_grid"]
-        self.assertAlmostEqual(five["total_pl"], five["realized_pl"] + 0.0)
+        self.assertFalse(five["evidence_ok"])
+        self.assertEqual(five["risk_adjusted_score"], 0.0)
+
+    def test_an_excluded_bot_is_dropped_even_when_measurable(self):
+        fills = [fill(2, "crypto_grid", "buy", 100.0, 10.0)]
+        five = self._windows(fills, {"crypto_grid": 4000.0}, 5,
+                             excluded=("crypto_grid",))["crypto_grid"]
+        self.assertFalse(five["period_return_available"])
+        self.assertEqual(five["period_return_unavailable_reason"],
+                         "excluded_accounting_anomaly")
+
+    def test_the_recommendation_names_the_unranked_bots(self):
+        fills = [fill(40, "crypto_grid", "buy", 100.0, 10.0)]
+        metrics = {f"{d}d": self._windows(fills, {"crypto_grid": 5000.0}, d)
+                   for d in advisor.WINDOW_DAYS}
+        rec = advisor.recommend_allocations(metrics, {}, advisor.regime_context({}))
+        self.assertIn("crypto_grid", rec["unranked_bots"])
+        self.assertTrue(any(r.startswith("period_return_unavailable:")
+                            for r in rec["reason_codes"]))
+        self.assertEqual(rec["action"], "no_change")
+
+
+class OpeningInventoryCoverageTest(unittest.TestCase):
+    """Incomplete history must report as incomplete, not as a clean book."""
+
+    def test_a_close_with_no_open_marks_the_bot_incomplete(self):
+        # The fetch window started mid-position: we see the exit, never the
+        # entry. Booking that as a genuine new short is what let a pre-window
+        # sale report its whole proceeds as profit.
+        fills = [fill(90, "crypto_grid", "sell", 110.0, 1.0)]
+        opening, incomplete = advisor.opening_inventory(fills, NOW - dt.timedelta(days=60))
+        self.assertIn("crypto_grid", incomplete)
+
+    def test_a_complete_book_is_not_flagged(self):
+        fills = [fill(90, "crypto_grid", "buy", 100.0, 1.0),
+                 fill(80, "crypto_grid", "sell", 110.0, 1.0)]
+        opening, incomplete = advisor.opening_inventory(fills, NOW - dt.timedelta(days=60))
+        self.assertEqual(incomplete, set())
+
+    def test_incomplete_history_blocks_the_period_return(self):
+        fills = [fill(90, "crypto_grid", "sell", 110.0, 1.0)]
+        got = advisor.build_window_metrics(
+            fills, {}, {}, equity=74000.0, window_days=60, now=NOW)["crypto_grid"]
+        self.assertFalse(got["opening_inventory_complete"])
+        self.assertFalse(got["period_return_available"])
+        self.assertEqual(got["period_return_unavailable_reason"],
+                         "incomplete_opening_history")
+
+    def test_the_production_fetch_spans_more_than_the_longest_window(self):
+        # THE bug: fetch_alpaca_fills defaulted to max(WINDOW_DAYS)=60, so the
+        # 60d window's opening inventory was ALWAYS empty — the fix worked for
+        # short windows and was silently absent on the one that matters most.
+        self.assertGreater(advisor.LEDGER_LOOKBACK_DAYS, max(advisor.WINDOW_DAYS))
+        captured = {}
+
+        def fake_fetch(client, status=None, after=None, max_orders=None):
+            captured["after"] = after
+            return []
+
+        with mock.patch.object(advisor, "utc_now", return_value=NOW), \
+             mock.patch("utils._fetch_orders_covering", side_effect=fake_fetch):
+            advisor.fetch_alpaca_fills(object())
+        span_days = (NOW - captured["after"]).days
+        self.assertGreaterEqual(span_days, max(advisor.WINDOW_DAYS) + 90)
+
+    def test_the_option_event_horizon_matches_the_fill_horizon(self):
+        import inspect
+        sig = inspect.signature(advisor.fetch_option_events)
+        self.assertEqual(sig.parameters["lookback_days"].default,
+                         advisor.LEDGER_LOOKBACK_DAYS)
+
+    def test_production_path_seeds_the_longest_window(self):
+        # End to end through generate_and_write_report: a buy 90 days ago and a
+        # sell yesterday must book +$10, not $0.
+        fills = [fill(90, "crypto_grid", "buy", 100.0, 1.0),
+                 fill(1, "crypto_grid", "sell", 110.0, 1.0)]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "rec.json")
+            with mock.patch.object(advisor, "fetch_alpaca_fills", return_value=fills), \
+                 mock.patch.object(advisor, "fetch_option_events", return_value=[]), \
+                 mock.patch.object(advisor, "utc_now", return_value=NOW):
+                report = advisor.generate_and_write_report(
+                    trading_client=object(), unrealized_by_bot={}, allocation_by_bot={},
+                    equity=74000.0, config_data={}, path=path)
+        longest = report["windows"][f"{max(advisor.WINDOW_DAYS)}d"]["crypto_grid"]
+        self.assertAlmostEqual(longest["realized_pl"], 10.0,
+                               msg="the 60d window still had no opening inventory")
+
+
+class WheelMultiplierTest(unittest.TestCase):
+    """The contract multiplier follows the INSTRUMENT, not the measurement.
+
+    wheel_trades carries both option premium (per share, against a contract
+    count) AND the wheel's own stock — assigned shares, and covered-call
+    underlying. Scaling the whole measurement by 100 turned a 100-share PAAS
+    round trip into a five-figure number.
+    """
+
+    def test_wheel_owned_stock_is_not_scaled_by_a_hundred(self):
+        df = frame(row(10, "buy", 48.0, 100, "PAAS", "wheel_trades"),
+                   row(5, "sell", 40.0, 100, "PAAS", "wheel_trades"))
+        scores = accountant.calculate_realized_pl(df, window_days=30, now=NOW)
+        self.assertAlmostEqual(scores["wheel_bot"], -800.0)
+        self.assertNotAlmostEqual(scores["wheel_bot"], -80000.0)
+
+    def test_option_rows_in_the_same_measurement_still_scale(self):
+        df = frame(row(10, "sell_put", 2.0, 1, "PAAS260918P00015000", "wheel_trades"),
+                   row(5, "buy_close", 0.5, 1, "PAAS260918P00015000", "wheel_trades"))
+        scores = accountant.calculate_realized_pl(df, window_days=30, now=NOW)
+        self.assertAlmostEqual(scores["wheel_bot"], 150.0)
+
+    def test_both_instruments_in_one_window_are_summed_correctly(self):
+        df = frame(row(10, "buy", 48.0, 100, "PAAS", "wheel_trades"),
+                   row(9, "sell", 40.0, 100, "PAAS", "wheel_trades"),
+                   row(8, "sell_put", 2.0, 1, "PAAS260918P00015000", "wheel_trades"),
+                   row(7, "buy_close", 0.5, 1, "PAAS260918P00015000", "wheel_trades"))
+        scores = accountant.calculate_realized_pl(df, window_days=30, now=NOW)
+        self.assertAlmostEqual(scores["wheel_bot"], -800.0 + 150.0)
+
+
+class ImpossibleBasisTest(unittest.TestCase):
+    """A negative cost basis is normal on a SHORT. Only longs are anomalous."""
+
+    @staticmethod
+    def position(symbol, qty, cost_basis, side=None):
+        p = mock.Mock()
+        p.symbol, p.qty, p.cost_basis = symbol, str(qty), str(cost_basis)
+        p.side = side if side is not None else ("short" if qty < 0 else "long")
+        return p
+
+    def test_a_short_put_is_not_an_anomaly(self):
+        # Selling to open is a credit; this is routine wheel_bot operation.
+        self.assertFalse(accountant._has_impossible_basis(
+            self.position("PAAS260918P00015000", -1, -250.0)))
+
+    def test_a_short_stock_position_is_not_an_anomaly(self):
+        self.assertFalse(accountant._has_impossible_basis(
+            self.position("TSLA", -100, -25000.0)))
+
+    def test_a_long_with_a_negative_basis_is_an_anomaly(self):
+        # The observed case: long ETH reported at roughly -$1,196.
+        self.assertTrue(accountant._has_impossible_basis(
+            self.position("ETHUSD", 1.454, -1196.0)))
+
+    def test_an_ordinary_long_is_clean(self):
+        self.assertFalse(accountant._has_impossible_basis(
+            self.position("AAPL", 10, 2000.0)))
+
+    def test_a_short_detected_by_qty_alone_is_not_an_anomaly(self):
+        # Some option positions have been seen without a usable `side`.
+        self.assertFalse(accountant._has_impossible_basis(
+            self.position("PAAS260918P00015000", -1, -250.0, side="")))
+
+    def test_an_unparseable_basis_is_not_an_anomaly(self):
+        p = mock.Mock()
+        p.symbol, p.qty, p.cost_basis, p.side = "AAPL", "10", None, "long"
+        self.assertFalse(accountant._has_impossible_basis(p))
+
+
+class AnomalyExcludesFromScoringTest(unittest.TestCase):
+    """Flagging is not enough — the affected strategy must leave the ranking."""
+
+    def _report(self, excluded=()):
+        fills = [fill(2, "crypto_grid", "buy", 100.0, 10.0)]
+        return advisor.build_strategy_report(
+            fills=fills, unrealized_by_bot={"crypto_grid": 5000.0},
+            allocation_by_bot={"crypto_grid": 1000.0}, equity=74000.0,
+            config_data={}, now=NOW, negative_basis_positions=["ETHUSD"],
+            excluded_bots=excluded)
+
+    def test_an_anomalous_bot_loses_its_period_return(self):
+        report = self._report(excluded=("crypto_grid",))
+        window = report["windows"]["5d"]["crypto_grid"]
+        self.assertTrue(window["excluded_from_scoring"])
+        self.assertFalse(window["period_return_available"])
+        self.assertIsNone(window["total_pl"])
+        self.assertEqual(window["risk_adjusted_score"], 0.0)
+
+    def test_the_same_book_scores_when_not_excluded(self):
+        # Proves the exclusion is what changed the outcome, not the data.
+        report = self._report(excluded=())
+        window = report["windows"]["5d"]["crypto_grid"]
+        self.assertTrue(window["period_return_available"])
+        self.assertIsNotNone(window["total_pl"])
+
+    def test_the_exclusion_is_recorded_in_the_report(self):
+        report = self._report(excluded=("crypto_grid",))
+        self.assertEqual(report["assumptions"]["excluded_from_scoring"], ["crypto_grid"])
+        self.assertEqual(report["assumptions"]["negative_basis_positions"], ["ETHUSD"])
+
+    def test_an_excluded_bot_cannot_receive_an_allocation_shift(self):
+        report = self._report(excluded=("crypto_grid",))
+        self.assertIn("crypto_grid", report["recommendation"]["unranked_bots"])
+        self.assertEqual(report["recommendation"]["action"], "no_change")
+
+    def test_a_resolved_anomaly_clears_the_report(self):
+        fills = [fill(2, "crypto_grid", "buy", 100.0, 10.0)]
+        report = advisor.build_strategy_report(
+            fills=fills, unrealized_by_bot={"crypto_grid": 5000.0},
+            allocation_by_bot={"crypto_grid": 1000.0}, equity=74000.0,
+            config_data={}, now=NOW)
+        self.assertEqual(report["assumptions"]["negative_basis_positions"], [])
+        self.assertEqual(report["assumptions"]["excluded_from_scoring"], [])
+        self.assertIsNone(report["assumptions"]["negative_basis_caveat"])
 
 
 class NegativeBasisFlagTest(unittest.TestCase):

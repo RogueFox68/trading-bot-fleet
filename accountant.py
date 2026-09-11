@@ -1,4 +1,5 @@
 import config
+import re
 import time
 import datetime
 import requests
@@ -126,6 +127,9 @@ LIFECYCLE_ACTIONS = {"assigned", "exercised", "expired"}
 # P&L while its proceeds stayed in the equity curve.
 SELL_HINTS = ("sell", "sweep")
 BUY_HINTS = ("buy",)
+# OCC option symbol, e.g. PAAS260918P00015000. Anything else is an equity or
+# crypto row, whatever measurement it landed in.
+_OCC_SYMBOL = re.compile(r"^[A-Z]{1,6}\d{6}[PC]\d{8}$")
 
 
 def _row_side(action):
@@ -181,9 +185,6 @@ def calculate_realized_pl(df, window_days=PL_WINDOW_DAYS, now=None):
         if not bot_name:
             continue  # Skip any measurements we don't recognize
 
-        # Options log per-share premium against contract quantity.
-        multiplier = OPTION_CONTRACT_SIZE if measurement in OPTION_MEASUREMENTS else 1
-
         books = {}       # symbol -> [ {qty (signed), price} ], oldest first
         realized = 0.0
         for row in group.sort_values("time").itertuples(index=False):
@@ -201,6 +202,13 @@ def calculate_realized_pl(df, window_days=PL_WINDOW_DAYS, now=None):
 
             in_window = ts >= cutoff
             symbol = str(getattr(row, "symbol", "") or "")
+            # The multiplier comes from the INSTRUMENT, not the measurement.
+            # wheel_trades holds both option premium (per share, against a
+            # contract count) and the wheel's own STOCK — assigned shares, and
+            # the covered-call underlying. Scaling by measurement multiplied
+            # those share trades by 100: a 100-share PAAS buy at $48 sold at
+            # $40 reported -$80,000 instead of -$800.
+            multiplier = OPTION_CONTRACT_SIZE if _OCC_SYMBOL.match(symbol) else 1
             book = books.setdefault(symbol, [])
             remaining = qty if side == "buy" else -qty
 
@@ -504,6 +512,33 @@ def calculate_dynamic_allocations(equity, allocation_stats, regime, vix, config_
 
 
 # Removed duplicated get_bot_owner. Accountant now uses utils.get_bot_owner directly.
+def _has_impossible_basis(position):
+    """True if a LONG position reports a negative cost basis.
+
+    Shorts legitimately carry one (selling to open is a credit), so side is
+    the whole question. Alpaca signs `qty` — negative for a short — and also
+    exposes `side`; either is enough, and both are checked because option
+    positions have been seen with one missing.
+    """
+    try:
+        basis = float(position.cost_basis)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    if basis >= 0:
+        return False
+
+    side = str(getattr(getattr(position, "side", ""), "value",
+                       getattr(position, "side", ""))).lower()
+    if side == "short":
+        return False
+    try:
+        if float(position.qty) < 0:
+            return False
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return True
+
+
 def run_accountant():
     import json
     global _last_strategy_advisor_run
@@ -557,24 +592,32 @@ def run_accountant():
             # crypto_grid in ownership.)
             unrealized_stats = {name: 0.0 for name in fleet_registry.BOTS}
             allocation_stats = unrealized_stats.copy()
-            # Positions the broker reports with a NEGATIVE cost basis. Their
-            # unrealized P&L is whatever that basis implies, so it is not a
-            # trustworthy input to anything — on 2026-09-11 long ETH and SOL
-            # carried roughly -$1,196 and -$65 of basis, yielding ~$4,914 of
-            # "unrealized crypto profit" on ~$3,652 of market value, which is
-            # most of why the advisor wanted to move capital into the grid.
-            # The upstream cause is unresolved; until it is, the number is
-            # flagged rather than quietly consumed.
+            # Positions whose cost basis is impossible for their SIDE.
+            #
+            # A negative cost basis is perfectly normal on a SHORT: selling to
+            # open is a credit, so every wheel_bot short put and every
+            # trend_bot short carries one. Flagging on sign alone therefore
+            # called routine premium selling an anomaly, which is worse than
+            # not checking — a detector that fires on normal operation trains
+            # you to ignore it (see rule 10).
+            #
+            # The real anomaly is a LONG position with a negative basis: you
+            # cannot pay a negative price for something you own. On 2026-09-11
+            # long ETH and SOL carried roughly -$1,196 and -$65, yielding
+            # ~$4,914 of "unrealized crypto profit" on ~$3,652 of market value,
+            # which is most of why the advisor wanted to move capital into the
+            # grid. The upstream cause is still unresolved — so the affected
+            # STRATEGIES are dropped from scoring, not merely annotated.
             negative_basis_positions = []
+            anomalous_bots = set()
 
             for p in positions:
                 from utils import get_bot_owner
-                try:
-                    if float(p.cost_basis) < 0:
-                        negative_basis_positions.append(str(p.symbol))
-                except (TypeError, ValueError):
-                    pass
                 owner = get_bot_owner(p.symbol, p.asset_class, trading_client)
+                if _has_impossible_basis(p):
+                    negative_basis_positions.append(str(p.symbol))
+                    if owner:
+                        anomalous_bots.add(owner)
                 if owner in unrealized_stats:
                     unrealized_stats[owner] += float(p.unrealized_pl)
                     
@@ -660,6 +703,7 @@ def run_accountant():
                             influx_realized_by_bot=advisor_influx_realized,
                             influx_window_days=ADVISOR_COMPARE_DAYS,
                             negative_basis_positions=negative_basis_positions,
+                            excluded_bots=sorted(anomalous_bots),
                         )
                         _last_strategy_advisor_run = time.time()
                     except Exception as advisor_err:
@@ -668,11 +712,17 @@ def run_accountant():
                 logger.error(f"[CFO] Reallocation and Utilization process failed: {e}")
             
             if negative_basis_positions:
-                logger.warning(f"[CFO] {len(negative_basis_positions)} position(s) with a "
+                logger.warning(f"[CFO] {len(negative_basis_positions)} LONG position(s) with a "
                                f"NEGATIVE cost basis: {', '.join(negative_basis_positions)} — "
-                               f"their unrealized P&L is not trustworthy.")
-                log_metric("accounting_anomaly", {"kind": "negative_cost_basis"},
-                           {"count": len(negative_basis_positions)})
+                               f"their unrealized P&L is not trustworthy. Excluded from "
+                               f"scoring: {', '.join(sorted(anomalous_bots)) or 'none'}.")
+            # Written every cycle, zero included. A metric that only appears
+            # while something is wrong can never show that it CLEARED — the
+            # series just stops, which is indistinguishable from the writer
+            # dying.
+            log_metric("accounting_anomaly", {"kind": "negative_long_cost_basis"},
+                       {"count": len(negative_basis_positions),
+                        "affected_bots": len(anomalous_bots)})
 
             # Log Global Stats
             log_metric("account_stats", {"type": "global"}, {

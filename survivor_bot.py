@@ -14,7 +14,7 @@ budget gate, EOD windows, cooldowns, order tagging) lives in fleet_bot.
 import time
 
 from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
+from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from ta.momentum import RSIIndicator
 import datetime
@@ -27,6 +27,7 @@ from logger import registry
 # --- STRATEGY SETTINGS ---
 RSI_BUY = 38
 RSI_SELL = 70
+RSI_WINDOW = 14
 RISK_PER_TRADE = 0.05
 MIN_PRICE = 5.00          # avoid penny-stock sizing bombs
 MAX_POSITION_PCT = 0.10   # max 10% of equity per position
@@ -45,6 +46,15 @@ BAR_SECONDS = 15 * 60
 
 
 def get_data_alpaca(symbol):
+    """(df, indicators_ok). A stale frame returns indicators_ok=False, NOT None.
+
+    The distinction is load-bearing. Returning None for stale bars made the
+    caller `continue`, which skipped manage_position entirely - so a stale
+    history feed silently suppressed stop losses, take profits, the max-hold
+    backstop and EOD liquidation on every held position. That is the exact
+    failure this release exists to remove, reintroduced one layer up.
+    Indicator eligibility and risk management are separate questions.
+    """
     try:
         start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=INTRADAY_LOOKBACK_DAYS)
         req = StockBarsRequest(
@@ -53,16 +63,19 @@ def get_data_alpaca(symbol):
             start=start_time,
         )
         bars = bot.data_client.get_stock_bars(req)
-        if not bars.data: return None
+        if not bars.data:
+            return None, False
         df = utils.newest_bars(bars.df.xs(symbol), INTRADAY_BARS)
         # Freshness is checked in UTC, before the display-only tz conversion.
-        if not utils.bars_are_fresh(df, BAR_SECONDS, "survivor_bot", symbol, "15m"):
-            return None
+        fresh = utils.bars_are_fresh(df, BAR_SECONDS, "survivor_bot", symbol, "15m",
+                                     session_elapsed=bot.session_elapsed)
+        if len(df) < RSI_WINDOW + 1:
+            fresh = False  # not enough history to compute RSI at all
         df.index = df.index.tz_convert('America/New_York')
-        return df
+        return df, fresh
     except Exception as e:
         registry.log_error("survivor_bot", "get_data_alpaca", e, context=symbol)
-        return None
+        return None, False
 
 
 # Daily SMA200 (long-term trend filter) is computed on DAILY bars and cached
@@ -121,8 +134,14 @@ def get_segregated_targets():
     return survivor_targets, blacklist
 
 
-def manage_position(symbol, pos, rsi, price):
-    """Exit logic for one held position. Mirrors V3.x behavior exactly."""
+def manage_position(symbol, pos, rsi, price, indicators_ok=True):
+    """Exit logic for one held position.
+
+    Runs whether or not indicators are available: stops, targets, the max-hold
+    backstop and EOD liquidation need only a validated live price and the
+    entry price. `indicators_ok=False` suppresses exactly the decisions that
+    read the bars (the RSI exit, and the RSI input to the hold score).
+    """
     if symbol in bot.pending_symbols:
         logger.debug(f"  [SKIP] {symbol} already has a pending order.")
         return
@@ -136,13 +155,21 @@ def manage_position(symbol, pos, rsi, price):
     else:
         order_tif, order_qty = TimeInForce.GTC, sell_qty
 
-    # Fetch live price for P&L (bar close can lag)
-    try:
-        trade_req = StockLatestTradeRequest(symbol_or_symbols=[symbol])
-        live_price = float(bot.data_client.get_stock_latest_trade(trade_req)[symbol].price)
-    except Exception as e:
-        registry.log_error("survivor_bot", "fetch_live_price", e, context=symbol)
-        live_price = price  # fallback to bar close if API fails
+    # A validated live trade, or nothing. The old code fell back to the bar
+    # close here, which is only safe while the bars are fresh - and when they
+    # are not, that fallback prices a stop loss off a two-week-old close.
+    live_price = utils.live_equity_price(bot.data_client, symbol, "survivor_bot")
+    if live_price is None:
+        if indicators_ok and price is not None:
+            live_price = float(price)  # bars are fresh; their close is current
+            logger.warning(f"    [{symbol}] live quote unavailable; using the current bar close.")
+        else:
+            registry.log_error("survivor_bot", "manage_position",
+                               Exception("no validated price: live quote failed and bars are stale"),
+                               context=symbol)
+            logger.error(f"    [!] {symbol} HELD but unmanageable this cycle — no live quote "
+                         f"and no fresh bar. Risk exits cannot be evaluated.")
+            return
 
     entry_price = float(pos.avg_entry_price)
     hours_held = bot.hours_held(symbol)
@@ -150,9 +177,14 @@ def manage_position(symbol, pos, rsi, price):
 
     # --- MAX-HOLD BACKSTOP (orphan protection) ---
     # Hard time-based exit so no position can bleed indefinitely.
+    # Blind on indicators => pass none. calculate_hold_score defaults a missing
+    # RSI to 50 (no thesis credit), which scores LOWER and so biases toward
+    # CLOSE_EOD - the safe direction when we cannot see the signal.
+    hold_indicators = {"rsi": float(rsi)} if (indicators_ok and rsi is not None) else {}
+
     if hours_held is not None:
         mh_score = tiered_hold.calculate_hold_score("survivor_bot", live_price, entry_price,
-                                                    {"rsi": float(rsi)}, bot.regime, bot.vix,
+                                                    hold_indicators, bot.regime, bot.vix,
                                                     hours_held=hours_held)
         mh_tier = tiered_hold.get_hold_tier(mh_score, "survivor_bot")
         max_days = tiered_hold.max_hold_days_for_tier(mh_tier)
@@ -179,7 +211,7 @@ def manage_position(symbol, pos, rsi, price):
     # management. Stop/target/signal exits are evaluated first and unconditionally.
     should_sell = False
     reason = ""
-    if rsi > RSI_SELL:
+    if indicators_ok and rsi is not None and rsi > RSI_SELL:
         should_sell = True
         reason = f"RSI Overbought ({rsi:.0f})"
     elif pct_gain > 0.05:
@@ -195,7 +227,7 @@ def manage_position(symbol, pos, rsi, price):
         is_held_overnight = False
         if bot.time_str >= "15:30":
             score = tiered_hold.calculate_hold_score("survivor_bot", live_price, entry_price,
-                                                     {"rsi": float(rsi)}, bot.regime, bot.vix,
+                                                     hold_indicators, bot.regime, bot.vix,
                                                      hours_held=hours_held)
             tier = tiered_hold.get_hold_tier(score, "survivor_bot")
             if tier != "CLOSE_EOD":
@@ -282,29 +314,33 @@ def cycle(bot):
         if "/" in symbol:  # crypto never belongs to survivor
             continue
 
-        df = get_data_alpaca(symbol)
-        if df is None: continue
+        df, indicators_ok = get_data_alpaca(symbol)
 
-        df['rsi'] = RSIIndicator(close=df['close'], window=14).rsi()
-        latest = df.iloc[-1]
-        price = float(latest['close'])
-        rsi = float(latest['rsi'])
+        rsi = price = None
+        if indicators_ok:
+            df['rsi'] = RSIIndicator(close=df['close'], window=RSI_WINDOW).rsi()
+            latest = df.iloc[-1]
+            price = float(latest['close'])
+            rsi = float(latest['rsi'])
 
-        # --- DIAGNOSTICS ---
-        if symbol not in bot.pos_dict:
-            sma = get_trend_sma(symbol, 200)
-            sma_status = "above" if (sma and price > sma) else ("BELOW" if sma else "N/A")
-            gate_available = "Scout" if symbol in target_map else "Uptrend only"
-            if rsi < RSI_BUY:
-                logger.info(f"  📊 {symbol:<5} ${price:>8.2f} | RSI {rsi:>5.1f} | SMA200 {sma_status} | Gate: {gate_available} | 🎯 ENTRY ZONE")
-            elif rsi < RSI_BUY + 5:
-                logger.info(f"  📊 {symbol:<5} ${price:>8.2f} | RSI {rsi:>5.1f} | SMA200 {sma_status} | Gate: {gate_available} | ⏳ Near threshold")
-            else:
-                logger.debug(f"  📊 {symbol:<5} ${price:>8.2f} | RSI {rsi:>5.1f} | SMA200 {sma_status} | Gate: {gate_available}")
+            # --- DIAGNOSTICS ---
+            if symbol not in bot.pos_dict:
+                sma = get_trend_sma(symbol, 200)
+                sma_status = "above" if (sma and price > sma) else ("BELOW" if sma else "N/A")
+                gate_available = "Scout" if symbol in target_map else "Uptrend only"
+                if rsi < RSI_BUY:
+                    logger.info(f"  📊 {symbol:<5} ${price:>8.2f} | RSI {rsi:>5.1f} | SMA200 {sma_status} | Gate: {gate_available} | 🎯 ENTRY ZONE")
+                elif rsi < RSI_BUY + 5:
+                    logger.info(f"  📊 {symbol:<5} ${price:>8.2f} | RSI {rsi:>5.1f} | SMA200 {sma_status} | Gate: {gate_available} | ⏳ Near threshold")
+                else:
+                    logger.debug(f"  📊 {symbol:<5} ${price:>8.2f} | RSI {rsi:>5.1f} | SMA200 {sma_status} | Gate: {gate_available}")
 
         if symbol in bot.pos_dict:
-            manage_position(symbol, bot.pos_dict[symbol], rsi, price)
-        elif symbol not in bot.pending_symbols:
+            # ALWAYS reached for a held symbol, indicators or not. Bad bars
+            # stop us opening a position; they never stop us closing one.
+            manage_position(symbol, bot.pos_dict[symbol], rsi, price,
+                            indicators_ok=indicators_ok)
+        elif indicators_ok and symbol not in bot.pending_symbols:
             try_entry(symbol, rsi, price, target_map)
 
 

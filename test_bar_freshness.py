@@ -26,14 +26,14 @@ reads the source and fails if any bar request reintroduces `limit` next to
 `start`. The unit tests below cover the helpers; that one covers the mistake.
 """
 import ast
-import datetime
+import datetime as dt_mod
 import unittest
 
 import pandas as pd
 
 import utils
 
-UTC = datetime.timezone.utc
+UTC = dt_mod.timezone.utc
 FETCH_SITE_FILES = ["survivor_bot.py", "trend_bot.py", "crypto_breakout.py",
                     "market_analyst.py", "fleet_doctor.py"]
 BAR_REQUESTS = {"StockBarsRequest", "CryptoBarsRequest"}
@@ -42,7 +42,7 @@ BAR_REQUESTS = {"StockBarsRequest", "CryptoBarsRequest"}
 def frame(end, count, step_seconds, price=100.0):
     """`count` bars ending at `end`, ascending — the shape Alpaca returns."""
     idx = pd.to_datetime(
-        [end - datetime.timedelta(seconds=step_seconds * i) for i in range(count - 1, -1, -1)],
+        [end - dt_mod.timedelta(seconds=step_seconds * i) for i in range(count - 1, -1, -1)],
         utc=True)
     return pd.DataFrame({"open": price, "high": price, "low": price,
                          "close": price, "volume": 1.0}, index=idx)
@@ -76,7 +76,7 @@ class BarRequestShapeTest(unittest.TestCase):
 class NewestBarsTest(unittest.TestCase):
 
     def test_takes_the_tail_not_the_head(self):
-        now = datetime.datetime(2026, 9, 11, 16, 0, tzinfo=UTC)
+        now = dt_mod.datetime(2026, 9, 11, 16, 0, tzinfo=UTC)
         df = frame(now, 100, 900)
         got = utils.newest_bars(df, 10)
         self.assertEqual(len(got), 10)
@@ -84,11 +84,11 @@ class NewestBarsTest(unittest.TestCase):
         self.assertEqual(got.index[0], df.index[-10])          # oldest dropped
 
     def test_shorter_than_requested_is_returned_whole(self):
-        df = frame(datetime.datetime(2026, 9, 11, tzinfo=UTC), 5, 900)
+        df = frame(dt_mod.datetime(2026, 9, 11, tzinfo=UTC), 5, 900)
         self.assertEqual(len(utils.newest_bars(df, 50)), 5)
 
     def test_no_count_is_a_passthrough(self):
-        df = frame(datetime.datetime(2026, 9, 11, tzinfo=UTC), 5, 900)
+        df = frame(dt_mod.datetime(2026, 9, 11, tzinfo=UTC), 5, 900)
         self.assertIs(utils.newest_bars(df, 0), df)
         self.assertIs(utils.newest_bars(df, None), df)
 
@@ -96,28 +96,28 @@ class NewestBarsTest(unittest.TestCase):
 class BarFreshnessTest(unittest.TestCase):
 
     def setUp(self):
-        self.now = datetime.datetime(2026, 9, 11, 16, 0, tzinfo=UTC)
+        self.now = dt_mod.datetime(2026, 9, 11, 16, 0, tzinfo=UTC)
 
     def test_current_bars_are_fresh(self):
-        df = frame(self.now - datetime.timedelta(minutes=15), 50, 900)
+        df = frame(self.now - dt_mod.timedelta(minutes=15), 50, 900)
         self.assertTrue(utils.bars_are_fresh(df, 900, "survivor_bot", "AAPL", now=self.now))
 
     def test_the_measured_survivor_staleness_is_rejected(self):
         # Aug 27 data on Sep 11 — the actual observed 15m frame.
-        df = frame(datetime.datetime(2026, 8, 27, 9, 45, tzinfo=UTC), 200, 900)
+        df = frame(dt_mod.datetime(2026, 8, 27, 9, 45, tzinfo=UTC), 200, 900)
         self.assertFalse(utils.bars_are_fresh(df, 900, "survivor_bot", "AAPL", now=self.now))
 
     def test_the_measured_sma200_staleness_is_rejected(self):
         # Jun 5 daily closes on Sep 11 — the actual observed SMA200 frame.
-        df = frame(datetime.datetime(2026, 6, 5, tzinfo=UTC), 250, 86400)
+        df = frame(dt_mod.datetime(2026, 6, 5, tzinfo=UTC), 250, 86400)
         self.assertFalse(utils.bars_are_fresh(df, 86400, "survivor_bot", "AAPL",
                                               "SMA200", stale_factor=4.0, now=self.now))
 
     def test_a_weekend_gap_is_not_stale_for_daily_bars(self):
         # Friday's bar read on Monday must NOT trip the daily guard: a false
         # stale verdict stands a bot down on a perfectly normal market close.
-        friday = datetime.datetime(2026, 9, 4, 20, 0, tzinfo=UTC)
-        monday = datetime.datetime(2026, 9, 7, 14, 0, tzinfo=UTC)
+        friday = dt_mod.datetime(2026, 9, 4, 20, 0, tzinfo=UTC)
+        monday = dt_mod.datetime(2026, 9, 7, 14, 0, tzinfo=UTC)
         df = frame(friday, 250, 86400)
         self.assertTrue(utils.bars_are_fresh(df, 86400, "survivor_bot", "AAPL",
                                              "SMA200", stale_factor=4.0, now=monday))
@@ -126,8 +126,32 @@ class BarFreshnessTest(unittest.TestCase):
         df = pd.DataFrame({"close": [1.0, 2.0]}, index=[0, 1])
         self.assertFalse(utils.bars_are_fresh(df, 900, "survivor_bot", "AAPL", now=self.now))
 
+    def test_session_open_gap_is_not_an_outage(self):
+        # Monday 09:30. The newest 15m bar is Friday's close, ~65h old — any
+        # honest intraday bound rejects it, so without session awareness EVERY
+        # session open reads as a data outage and stands the bots down.
+        friday_close = dt_mod.datetime(2026, 9, 4, 20, 0, tzinfo=UTC)
+        monday_open = dt_mod.datetime(2026, 9, 7, 13, 30, tzinfo=UTC)
+        df = frame(friday_close, 200, 900)
+        self.assertFalse(
+            utils.bars_are_fresh(df, 900, "survivor_bot", "AAPL", now=monday_open),
+            "the raw bound should reject this; session awareness is what rescues it")
+        self.assertTrue(
+            utils.bars_are_fresh(df, 900, "survivor_bot", "AAPL", now=monday_open,
+                                 session_elapsed=0),
+            "a frame at the session open was treated as an outage")
+
+    def test_the_check_resumes_once_the_session_is_underway(self):
+        # 90 minutes in, there has been ample time for bars; a Friday frame is
+        # then genuinely stale and must be rejected.
+        friday_close = dt_mod.datetime(2026, 9, 4, 20, 0, tzinfo=UTC)
+        later = dt_mod.datetime(2026, 9, 7, 15, 0, tzinfo=UTC)
+        df = frame(friday_close, 200, 900)
+        self.assertFalse(utils.bars_are_fresh(df, 900, "survivor_bot", "AAPL",
+                                              now=later, session_elapsed=90 * 60))
+
     def test_naive_timestamps_are_read_as_utc(self):
-        idx = pd.to_datetime([self.now.replace(tzinfo=None) - datetime.timedelta(minutes=15)])
+        idx = pd.to_datetime([self.now.replace(tzinfo=None) - dt_mod.timedelta(minutes=15)])
         df = pd.DataFrame({"close": [1.0]}, index=idx)
         self.assertTrue(utils.bars_are_fresh(df, 900, "survivor_bot", "AAPL", now=self.now))
 
@@ -136,8 +160,8 @@ class DropFormingBarTest(unittest.TestCase):
     """`df.iloc[:-1]` is only correct when the frame actually ends at now."""
 
     def test_forming_bar_is_dropped(self):
-        now = datetime.datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
-        df = frame(datetime.datetime(2026, 9, 11, 0, 0, tzinfo=UTC), 30, 86400)
+        now = dt_mod.datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
+        df = frame(dt_mod.datetime(2026, 9, 11, 0, 0, tzinfo=UTC), 30, 86400)
         got = utils.drop_forming_bar(df, 86400, now=now)
         self.assertEqual(len(got), 29)
         self.assertEqual(got.index[-1], df.index[-2])
@@ -146,8 +170,8 @@ class DropFormingBarTest(unittest.TestCase):
         # The moon_bot compounding bug: on a frame that already ends in the
         # past, iloc[:-1] threw away a COMPLETED bar and aged the levels by
         # one more day on top of the truncation.
-        now = datetime.datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
-        df = frame(datetime.datetime(2026, 8, 12, 0, 0, tzinfo=UTC), 30, 86400)
+        now = dt_mod.datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
+        df = frame(dt_mod.datetime(2026, 8, 12, 0, 0, tzinfo=UTC), 30, 86400)
         got = utils.drop_forming_bar(df, 86400, now=now)
         self.assertEqual(len(got), 30)
         self.assertEqual(got.index[-1], df.index[-1])
