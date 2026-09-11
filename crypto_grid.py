@@ -1,21 +1,78 @@
 """Crypto Grid Bot — BTC/ETH/SOL zone-grid scalping, 24/7.
 
-Ported onto the fleet_bot runner (market_hours=False, no entry-time paging —
-crypto ownership resolves statically). Strategy semantics unchanged from V2:
+Runs on the fleet_bot runner (market_hours=False, no entry-time paging —
+crypto ownership resolves statically).
 
   a +/-15% 8-level grid recenters after 4 consecutive out-of-band cycles;
-  a zone drop buys a $50 slice (paused in bear regimes / CAPITAL_CRUNCH /
-  over budget), a zone rise sells the slice (or sweeps remaining dust).
+  a zone drop buys a slice, a zone rise closes the OLDEST open lot, and only
+  at a price that clears that lot's basis plus round-trip costs.
 
-Budget: the CFO number now comes from utils.get_budget_dollars (effective
-budget -> cfo base allocation -> fail-closed 0.0) instead of a private
-effective_budgets.json read with a magic $5k fallback. Fail-closed means
-buys pause; sells always continue.
+--- Why the sell side is entry-linked --------------------------------------
+
+The original bot bought on any downward zone crossing and sold on any upward
+one, each at the price prevailing when the crossing was noticed. The grid's
+"spacing" therefore constrained the ZONE INDEX, not the transaction prices:
+price ticking either side of one boundary produces a buy and a sell within
+cents of each other, and the pair books a guaranteed loss of the round-trip
+fee. Nothing compared a sell price to the price it was closing against, so
+there was no level at which that was noticed — the bot could churn a boundary
+indefinitely while the order count climbed and the dashboard showed activity.
+365 filled orders since July 13 sit behind that logic.
+
+--- Why the ledger is driven by FILLS, not submissions ----------------------
+
+`bot.submit()` returns an order, not an outcome. It can be pending,
+rejected, canceled, or partially filled. A first version of this ledger
+recorded the REQUESTED quantity at the SUBMIT price whenever no fill was
+present, and retired a whole lot whenever a sell returned any order object at
+all. Both invent inventory: an unfilled $50 buy became a real 0.5-unit lot
+with a fabricated cost basis, and a 1-unit sell that filled 0.25 erased the
+remaining 0.75 from the books while the coins stayed in the account.
+
+So nothing enters the ledger until the broker confirms it. Orders are tracked
+in `pending` by id and reconciled against Alpaca every cycle:
+
+  * a BUY's lot IS its order — reconciliation sets the lot to the order's
+    cumulative (filled_qty, filled_avg_price), which is exact and idempotent
+    no matter how many times it runs or how the fills arrive;
+  * a SELL reduces its target lot by the NEWLY filled quantity only, tracked
+    against an `applied_qty` watermark, so a partial keeps its remainder;
+  * a terminal zero-fill leaves no lot behind;
+  * pending orders live in the state file, so a restart mid-flight resumes
+    reconciliation instead of losing or double-counting the fill.
+
+--- FIFO is enforced here, not approximated --------------------------------
+
+An earlier version sold the oldest *qualifying* lot, skipping underwater
+ones. That is specific-lot selection, and it silently disagreed with the FIFO
+the accountant and strategy_advisor use: buy 1 at $200 then 1 at $90, sell at
+$120, and execution books +$30 against the $90 lot while the books book -$80
+against the $200 lot. Strict FIFO means the oldest lot is the only candidate:
+if it does not clear its cost, nothing is sold. The execution ledger and the
+reports then describe the same trade.
+
+--- Why the ledger is separate from the position ---------------------------
+
+crypto_grid and moon_bot hold the same three coins in the same Alpaca
+positions, and Alpaca positions are per-symbol, not per-bot. Reading the
+account position as "the grid's inventory" let the grid sell moon_bot's coins
+(an account-level FIFO reconstruction matched moon-origin ETH lots against
+grid sells 113 times). The account position is only ever a ceiling — and only
+when the read is KNOWN. A failed read is not a flat position: returning 0.0
+for a timeout once let one bad request retire every lot in the file.
+
+Budget: the CFO number comes from utils.get_budget_dollars, split PER SYMBOL,
+with outstanding buy notional reserved. The old per-symbol check compared one
+symbol's value against the bot's WHOLE budget, so three symbols could each
+spend all of it — a 3x overrun that read as compliant on every check.
 """
+import datetime
+import json
+import os
+import uuid
+
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
-from alpaca.trading.requests import GetOrdersRequest
-from alpaca.data.historical import CryptoHistoricalDataClient
-from alpaca.data.requests import CryptoLatestTradeRequest
+from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest
 
 import utils
 from fleet_bot import FleetBot
@@ -28,22 +85,448 @@ GRID_LEVELS = 8          # More levels = Finer scalping
 BUDGET_PER_GRID = 50     # $50 per slice
 RECALIBRATE_DELAY = 4    # Cycles out of zone before resetting (Prevent jitter)
 
+# Round-trip taker cost assumption for Alpaca crypto, both sides combined.
+# Deliberately an over-estimate: under-stating it is what makes a churn pair
+# look profitable on paper while losing money in fact.
+ROUND_TRIP_COST_PCT = 0.005   # 0.25% per side
+# Net profit required on top of costs before a lot may be closed.
+MIN_NET_PROFIT_PCT = 0.005
+# A sell must clear the lot's basis by at least this much. One zone is
+# (2 * 15%) / 8 = 3.75%, so an honest zone-to-zone round trip clears this
+# comfortably; only the boundary-hugging pairs are excluded.
+#
+# This is a LIMIT price, not a filter in front of a market order. A price
+# check followed by a market order guarantees nothing: spread, slippage and
+# fees all land after the check. The floor has to be the order's own limit or
+# it is not a floor.
+REQUIRED_SPREAD_PCT = ROUND_TRIP_COST_PCT + MIN_NET_PROFIT_PCT
+
+# A resting sell that has not filled in this long is cancelled and re-decided
+# next cycle. Explicit non-fill behavior: a GTC limit left alone forever is
+# inventory silently out of the strategy's control.
+PENDING_SELL_TTL_SECONDS = 30 * 60
+
+# The grid's OWN inventory, separate from the shared Alpaca position.
+# Gitignored (*.json); missing file = flat.
+STATE_FILE = "crypto_grid_state.json"
+STATE_VERSION = 3
+DUST_QTY = 1e-8          # below this a lot is noise, not inventory
+
 bot = FleetBot("crypto_grid", loop_seconds=30, market_hours=False,
                needs_entry_times=False)
 logger = bot.logger
-
-# Crypto data needs its own client; the runner only carries stock data.
-crypto_data_client = CryptoHistoricalDataClient()
 
 # --- STATE (per symbol, recalibrated at runtime) ---
 grids = {sym: {"top": 0, "bottom": 0, "size": 0,
                "prev_zone": GRID_LEVELS // 2, "oob": 0} for sym in SYMBOLS}
 
+# Set when the ledger or a broker read is untrustworthy. While true the bot
+# manages what it can but opens nothing new: acting on inventory you cannot
+# read is how a ledger and an account drift apart.
+_entries_suspended = False
+_suspend_reason = ""
 
+
+def suspend_entries(reason):
+    global _entries_suspended, _suspend_reason
+    if not _entries_suspended or _suspend_reason != reason:
+        logger.error(f"    [SUSPEND] New grid entries halted: {reason}")
+        registry.log_error("crypto_grid", "entries_suspended", Exception(reason))
+    _entries_suspended = True
+    _suspend_reason = reason
+
+
+def resume_entries():
+    global _entries_suspended, _suspend_reason
+    if _entries_suspended:
+        logger.info("    [RESUME] Grid entries re-enabled — state is readable again.")
+    _entries_suspended = False
+    _suspend_reason = ""
+
+
+# --- LEDGER ---------------------------------------------------------------
+def _empty_state():
+    return {"version": STATE_VERSION, "lots": {s: [] for s in SYMBOLS},
+            "pending": {}, "outbox": []}
+
+
+def load_state():
+    """The grid's confirmed lots plus its in-flight orders.
+
+    A ledger that cannot be read is NOT an empty one. Returning a clean slate
+    for a truncated file would let the bot re-buy on top of inventory it still
+    holds and re-sell lots it has already sold, so an unreadable file suspends
+    entries instead.
+    """
+    try:
+        with open(STATE_FILE) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        resume_entries()
+        return _empty_state()
+    except Exception as e:
+        registry.log_error("crypto_grid", "load_state", e, context=STATE_FILE)
+        suspend_entries(f"lot ledger unreadable ({e}) — repair or remove {STATE_FILE}")
+        return _empty_state()
+
+    if not isinstance(raw, dict):
+        suspend_entries(f"lot ledger is not an object — repair {STATE_FILE}")
+        return _empty_state()
+
+    state = _empty_state()
+    # Pending FIRST: whether an exhausted lot may be dropped depends on
+    # whether its buy is still in flight.
+    for order_id, p in ((raw.get("pending") or {}) if isinstance(raw.get("pending"), dict) else {}).items():
+        try:
+            state["pending"][str(order_id)] = {
+                "symbol": str(p["symbol"]),
+                "side": str(p["side"]),
+                "requested_qty": float(p.get("requested_qty", 0.0)),
+                "applied_qty": float(p.get("applied_qty", 0.0)),
+                "lot_id": str(p.get("lot_id") or ""),
+                "limit_price": float(p.get("limit_price", 0.0) or 0.0),
+                "submitted_at": float(p.get("submitted_at", 0.0) or 0.0),
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    for sym in SYMBOLS:
+        for e in (raw.get("lots") or {}).get(sym) or []:
+            try:
+                price = float(e["price"])
+                # v2 stored a single net `qty`; v3 stores cumulative
+                # acquisition and disposal separately (see reconcile_pending).
+                if "acquired_qty" in e:
+                    acquired = float(e["acquired_qty"])
+                    disposed = float(e.get("disposed_qty", 0.0))
+                else:
+                    acquired, disposed = float(e["qty"]), 0.0
+            except (KeyError, TypeError, ValueError):
+                continue
+            lot_id = str(e.get("lot_id") or uuid.uuid4())
+            if price <= 0:
+                continue
+            # An exhausted lot is normally dropped — UNLESS its buy is still
+            # pending. Then it is the record that those coins were already
+            # disposed of, and dropping it lets the buy's next reconciliation
+            # recreate the lot from cumulative filled_qty. The in-memory path
+            # guards this in prune_empty_lots; a restart must guard it too, or
+            # the resurrection simply moves to the other side of a reboot.
+            if (acquired - disposed) <= DUST_QTY and not lot_has_pending_buy(state, lot_id):
+                continue
+            state["lots"][sym].append({
+                "lot_id": lot_id,
+                "acquired_qty": acquired, "disposed_qty": disposed,
+                "price": price,
+                "opened_at": e.get("opened_at", ""),
+            })
+    state["outbox"] = [str(l) for l in (raw.get("outbox") or []) if l]
+    resume_entries()
+    return state
+
+
+def save_state(state):
+    """Write atomically. A half-written ledger is a suspended bot next cycle."""
+    tmp = f"{STATE_FILE}.tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE_FILE)
+        return True
+    except Exception as e:
+        registry.log_error("crypto_grid", "save_state", e, context=STATE_FILE)
+        # Losing the write means the in-memory ledger and the file disagree —
+        # a trading-state failure, not a logging inconvenience.
+        suspend_entries(f"could not persist the lot ledger ({e})")
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def lots_for(state, symbol):
+    return state["lots"].setdefault(symbol, [])
+
+
+def lot_qty(lot):
+    """Coins still held in this lot: what the broker confirmed we bought,
+    minus what it confirmed we sold. Never written directly.
+
+    Tracking a single net `qty` let a BUY update overwrite a SELL's effect. A
+    buy that filled 0.5 of 1 and stayed pending could have that 0.5 sold and
+    the lot emptied; when the buy was later CANCELED reporting cumulative
+    filled_qty=0.5, restating `qty` from it RESURRECTED a 0.5-coin lot for
+    coins already gone — and on a shared symbol a later sell would reach
+    moon_bot's inventory to cover it.
+    """
+    return max(0.0, float(lot.get("acquired_qty", 0.0)) - float(lot.get("disposed_qty", 0.0)))
+
+
+def ledger_qty(state, symbol):
+    return sum(lot_qty(lot) for lot in lots_for(state, symbol))
+
+
+def ledger_value(state, symbol, price):
+    """Mark-to-market value of the grid's OWN confirmed inventory."""
+    return ledger_qty(state, symbol) * price
+
+
+def find_lot(state, symbol, lot_id):
+    for idx, lot in enumerate(lots_for(state, symbol)):
+        if lot["lot_id"] == lot_id:
+            return idx, lot
+    return None, None
+
+
+def outstanding_buy_notional(state, symbol):
+    """Unfilled buy dollars already committed — reserved against the budget.
+
+    Without this, several not-yet-filled entries can each see the same
+    headroom and spend it.
+    """
+    total = 0.0
+    for p in state["pending"].values():
+        if p["symbol"] != symbol or p["side"] != "buy":
+            continue
+        unfilled = max(0.0, p["requested_qty"] - p["applied_qty"])
+        total += unfilled * (p["limit_price"] or 0.0)
+    return total
+
+
+def lot_has_pending_sell(state, lot_id):
+    return any(p["side"] == "sell" and p["lot_id"] == lot_id
+               for p in state["pending"].values())
+
+
+def lot_has_pending_buy(state, lot_id):
+    return any(p["side"] == "buy" and p["lot_id"] == lot_id
+               for p in state["pending"].values())
+
+
+def symbol_has_pending(state, symbol):
+    return any(p["symbol"] == symbol for p in state["pending"].values())
+
+
+def sellable_lot(state, symbol, price):
+    """The OLDEST open lot, if it clears its cost at `price`. Strict FIFO.
+
+    Returns (index, lot) or (None, None). Deliberately does not look past the
+    first lot: skipping an underwater lot to reach a profitable one is
+    specific-lot selection, which the accountant's FIFO would book
+    differently. One policy, both places.
+    """
+    for idx, lot in enumerate(lots_for(state, symbol)):
+        if lot_qty(lot) <= DUST_QTY or lot_has_pending_sell(state, lot["lot_id"]):
+            continue
+        if lot_has_pending_buy(state, lot["lot_id"]):
+            # Belt and braces alongside the acquired/disposed accounting: do
+            # not sell out of an acquisition the broker has not finished.
+            return None, None
+        if price >= lot["price"] * (1.0 + REQUIRED_SPREAD_PCT):
+            return idx, lot
+        return None, None   # oldest lot does not clear: FIFO stops here
+    return None, None
+
+
+def sell_floor(lot):
+    """The lowest price this lot may be sold at."""
+    return lot["price"] * (1.0 + REQUIRED_SPREAD_PCT)
+
+
+# --- BROKER READS ---------------------------------------------------------
+def account_qty(symbol):
+    """(qty, known) for the SHARED account position — see utils.
+
+    `known=False` means the broker did not answer, not that the position is
+    flat. Collapsing those two was destructive once the ledger existed: one
+    timeout returned 0.0, reconciliation treated it as authoritative, and
+    every lot in the file was retired and persisted.
+    """
+    return utils.account_position_qty(bot.trading_client, symbol, "crypto_grid")
+
+
+def reconcile_lots(state, symbol, held, known, settled=()):
+    """Trim the ledger when the account confirms it holds less than we claim.
+
+    This handles EXTERNAL disposals only — a manual sale, a coin leaving by
+    some route the bot did not order. Only a KNOWN read may retire inventory.
+
+    It must not run while this symbol has an unsettled order, because the two
+    reconcilers would then subtract the same sale twice. The order read and
+    the position read are separate network calls, and a fill landing between
+    them is ordinary: the position read sees the coins gone and books an
+    "external" disposal, then the next cycle's order read reports the same
+    quantity as newly filled and books it again. Reproduced against the
+    acquired/disposed schema: a 1-coin lot with a pending sell, 0.4 filling
+    between the reads, ends up reading 0.2 in the ledger while the account
+    holds 0.6 — and the untracked 0.4 invites a replacement purchase.
+    Reordering the two reads does not help; they are not atomic either way.
+    Attributable fills settle first; external adjustment waits for quiet.
+
+    Returns True if anything changed.
+    """
+    if not known:
+        return False
+    if symbol in settled:
+        # A fill settled for this symbol during THIS cycle. The position read
+        # may not reflect it yet — the order endpoint and the position
+        # endpoint are not one view — so any shortfall we see now is far more
+        # likely to be that lag than a genuine external disposal. Wait a cycle.
+        logger.info(f"    [{symbol}] a fill settled this cycle; deferring external "
+                    f"adjustment until the next read.")
+        return False
+    if symbol_has_pending(state, symbol):
+        have = ledger_qty(state, symbol)
+        if (have - held) > DUST_QTY:
+            logger.info(f"    [{symbol}] ledger {have:.8f} > account {held:.8f}, but an order "
+                        f"is still in flight — leaving it to the order reconciler.")
+        return False
+    have = ledger_qty(state, symbol)
+    excess = have - held
+    if excess <= DUST_QTY:
+        return False
+
+    logger.warning(f"    [{symbol}] Ledger {have:.8f} > account {held:.8f}; "
+                   f"retiring {excess:.8f} from the oldest lots.")
+    book = lots_for(state, symbol)
+    idx = 0
+    while excess > DUST_QTY and idx < len(book):
+        lot = book[idx]
+        take = min(lot_qty(lot), excess)
+        lot["disposed_qty"] = float(lot.get("disposed_qty", 0.0)) + take
+        excess -= take
+        idx += 1
+    prune_empty_lots(state, symbol)
+    return True
+
+
+def prune_empty_lots(state, symbol):
+    """Drop exhausted lots — but never one whose BUY is still in flight.
+
+    An empty lot with a pending buy is load-bearing: it is the record that
+    those coins were already disposed of, and removing it would let the buy's
+    next reconciliation recreate the lot from scratch.
+    """
+    book = lots_for(state, symbol)
+    state["lots"][symbol] = [
+        lot for lot in book
+        if lot_qty(lot) > DUST_QTY or lot_has_pending_buy(state, lot["lot_id"])
+    ]
+
+
+def reconcile_pending(state):
+    """Apply confirmed fills for every in-flight order. Idempotent.
+
+    This is the ONLY path by which inventory enters or leaves the ledger.
+    Returns (changed, settled_symbols) — the symbols whose ledger moved on a
+    confirmed fill during THIS cycle. External adjustment must leave those
+    alone: a position read can lag the order endpoint, so a just-settled buy
+    can be compared against a position that does not show it yet and be
+    retired as an "external" disposal.
+    """
+    changed = False
+    settled = set()
+    for order_id in list(state["pending"].keys()):
+        p = state["pending"][order_id]
+        try:
+            order = bot.trading_client.get_order_by_id(order_id)
+        except Exception as e:
+            # Unknown, not finished. Leave it pending and stop opening more.
+            registry.log_error("crypto_grid", "reconcile_pending", e, context=order_id)
+            suspend_entries(f"cannot read in-flight order {order_id} ({e})")
+            continue
+
+        filled_qty = float(getattr(order, "filled_qty", 0) or 0)
+        filled_price = float(getattr(order, "filled_avg_price", 0) or 0)
+        status = str(getattr(getattr(order, "status", ""), "value", getattr(order, "status", ""))).lower()
+        terminal = status in {"filled", "canceled", "cancelled", "expired", "rejected", "done_for_day"}
+        symbol = p["symbol"]
+
+        if p["side"] == "buy":
+            # The lot IS the order, so its ACQUIRED side is restated from the
+            # broker's cumulative filled_qty — exact and idempotent however the
+            # fills arrive. It never touches disposed_qty, so a sell that has
+            # already happened cannot be undone by a later buy update.
+            idx, lot = find_lot(state, symbol, p["lot_id"])
+            if filled_qty > DUST_QTY and filled_price > 0:
+                if lot is None:
+                    lots_for(state, symbol).append({
+                        "lot_id": p["lot_id"], "acquired_qty": filled_qty,
+                        "disposed_qty": 0.0, "price": filled_price,
+                        "opened_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    })
+                    logger.info(f"    [LOT+] {symbol} {filled_qty:.8f} @ ${filled_price:,.2f} "
+                                f"(sells at/above ${filled_price * (1 + REQUIRED_SPREAD_PCT):,.2f})")
+                else:
+                    lot["acquired_qty"], lot["price"] = filled_qty, filled_price
+                p["applied_qty"] = filled_qty
+                settled.add(symbol)
+                changed = True
+            if terminal:
+                utils.log_confirmed_fill(order, logger, action="grid_buy",
+                                         outbox=state["outbox"])
+                if filled_qty <= DUST_QTY and lot is not None:
+                    # Rejected/canceled with nothing filled: no fabricated lot.
+                    lots_for(state, symbol).pop(idx)
+                    logger.info(f"    [LOT-] {symbol} buy {order_id} ended {status} with no fill.")
+                del state["pending"][order_id]
+                prune_empty_lots(state, symbol)
+                changed = True
+
+        else:  # sell
+            new_qty = filled_qty - p["applied_qty"]
+            if new_qty > DUST_QTY:
+                _idx, lot = find_lot(state, symbol, p["lot_id"])
+                if lot is not None:
+                    lot["disposed_qty"] = float(lot.get("disposed_qty", 0.0)) + new_qty
+                    logger.info(f"    [LOT-] {symbol} sold {new_qty:.8f} @ ${filled_price:,.2f}")
+                p["applied_qty"] = filled_qty
+                settled.add(symbol)
+                changed = True
+            if terminal:
+                utils.log_confirmed_fill(order, logger, action="grid_sell",
+                                         outbox=state["outbox"])
+                # Whatever did not fill stays in the lot, by construction: we
+                # only ever added what the broker confirmed to disposed_qty.
+                unfilled = max(0.0, p["requested_qty"] - filled_qty)
+                if unfilled > DUST_QTY:
+                    logger.info(f"    [{symbol}] sell {order_id} ended {status}; "
+                                f"{unfilled:.8f} stays in the ledger.")
+                del state["pending"][order_id]
+                prune_empty_lots(state, symbol)
+                changed = True
+    return changed, settled
+
+
+def expire_stale_sells(state):
+    """Cancel resting sells that have sat too long, so they get re-decided."""
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    changed = False
+    for order_id, p in list(state["pending"].items()):
+        if p["side"] != "sell" or not p["submitted_at"]:
+            continue
+        if (now - p["submitted_at"]) < PENDING_SELL_TTL_SECONDS:
+            continue
+        try:
+            bot.trading_client.cancel_order_by_id(order_id)
+            logger.info(f"    [CANCEL] {p['symbol']} resting sell {order_id} exceeded "
+                        f"{PENDING_SELL_TTL_SECONDS / 60:.0f}m; re-deciding next cycle.")
+            changed = True
+        except Exception as e:
+            # Already terminal, or unreachable. reconcile_pending settles it.
+            logger.info(f"    [CANCEL] {p['symbol']} sell {order_id} not cancelled: {e}")
+    return changed
+
+
+# --- MARKET DATA ----------------------------------------------------------
 def get_crypto_price(symbol):
     try:
-        req = CryptoLatestTradeRequest(symbol_or_symbols=symbol)
-        res = crypto_data_client.get_crypto_latest_trade(req)
+        from alpaca.data.requests import CryptoLatestTradeRequest
+        res = crypto_data_client.get_crypto_latest_trade(
+            CryptoLatestTradeRequest(symbol_or_symbols=symbol))
         return float(res[symbol].price)
     except Exception as e:
         logger.error(f"  [!] Price Error {symbol}: {e}")
@@ -68,35 +551,68 @@ def recalibrate_grid(symbol, current_price):
                f"Range: ${grid_bottom:,.0f} - ${grid_top:,.0f}")
 
 
-def cancel_open_orders_for_symbol(symbol, opposite_side_only=None):
-    """Cancels any open orders for a specific symbol, optionally filtering by side."""
+def cancel_my_open_orders(symbol, side=None):
+    """Cancel THIS BOT's open orders on a symbol. Never another bot's.
+
+    The old helper cancelled every open order on the symbol. crypto_grid and
+    moon_bot trade the same three coins, so it could cancel moon_bot's resting
+    breakout orders as a side effect of a grid decision.
+    """
     try:
-        req_filter = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
-        open_orders = bot.trading_client.get_orders(filter=req_filter)
-        for o in open_orders:
-            if opposite_side_only is None or o.side == opposite_side_only:
-                logger.info(f"    [CANCEL] Canceling open order {o.id} on {symbol} (Side: {o.side}) before placing new order.")
-                bot.trading_client.cancel_order_by_id(o.id)
+        open_orders = bot.trading_client.get_orders(
+            filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol]))
     except Exception as e:
-        logger.error(f"Error canceling open orders for {symbol}: {e}")
-
-
-def held_qty(symbol):
-    """Current position qty for a crypto symbol (0.0 if flat). Handles the
-    BTCUSD vs BTC/USD symbol-format mismatch."""
-    try:
-        return float(bot.trading_client.get_open_position(symbol).qty)
-    except Exception:
+        logger.error(f"Error listing open orders for {symbol}: {e}")
+        return
+    for o in open_orders:
+        if not str(getattr(o, "client_order_id", "") or "").startswith("crypto_grid-"):
+            continue  # not ours
+        if side is not None and o.side != side:
+            continue
         try:
-            alt = symbol.replace("/", "")
-            return float(bot.trading_client.get_open_position(alt).qty)
-        except Exception as e2:
-            registry.log_error("crypto_grid", "check_inventory", e2, context=symbol)
-            return 0.0
+            logger.info(f"    [CANCEL] grid order {o.id} on {symbol} (Side: {o.side}).")
+            bot.trading_client.cancel_order_by_id(o.id)
+        except Exception as e:
+            logger.error(f"Error canceling {o.id} on {symbol}: {e}")
 
 
-def grid_buy(symbol, price, current_zone):
+def per_symbol_budget():
+    """The bot's CFO budget, divided evenly across the symbols it trades.
+
+    The old check compared ONE symbol's value against the WHOLE budget, so
+    each of three symbols could independently spend all of it. Each check
+    passed; the bot ran at 3x its allocation.
+    """
+    whole = utils.get_budget_dollars("crypto_grid", bot.trading_client, equity=bot.equity)
+    return whole / len(SYMBOLS) if SYMBOLS else 0.0
+
+
+# --- TRADING --------------------------------------------------------------
+def entries_enabled():
+    """Operator lever: `bots.crypto_grid.entries_enabled` in bot_config.json.
+
+    FAIL-CLOSED — absent means disabled. The PR #22 review's shipping sequence
+    asks that grid entries stay off until the fill-driven ledger and the
+    migration of the pre-existing coins have been verified against a live
+    account, and a lever that defaults to ON would make "we haven't got to it
+    yet" indistinguishable from "we checked". Sells and reconciliation are
+    unaffected: existing inventory can always wind down.
+
+    Set it to true in bot_config.json when you are ready:
+        "bots": {"crypto_grid": {..., "entries_enabled": true}}
+    """
+    return bool(bot.bot_settings.get("entries_enabled", False))
+
+
+def grid_buy(symbol, price, current_zone, state):
     """Zone drop -> accumulate a slice, unless regime/crunch/budget says no."""
+    if not entries_enabled():
+        logger.info(f"    [SKIP] {symbol} grid entries are disabled "
+                    f"(bot_config bots.crypto_grid.entries_enabled is not true).")
+        return
+    if _entries_suspended:
+        logger.warning(f"    [SKIP] {symbol} entries suspended: {_suspend_reason}")
+        return
     if "BEAR" in bot.regime:
         logger.info(f"    [SKIP] Bear Trend Detected. Buying Paused in Zone {current_zone} for {symbol}.")
         return
@@ -104,66 +620,182 @@ def grid_buy(symbol, price, current_zone):
         logger.warning(f"    [SKIP] CAPITAL_CRUNCH active. Buy paused for {symbol}.")
         return
 
-    # Per-symbol cap at the bot's whole CFO budget (0.0 = fail-closed: no buys)
-    my_budget = utils.get_budget_dollars("crypto_grid", bot.trading_client, equity=bot.equity)
-    try:
-        current_val = float(bot.trading_client.get_open_position(symbol).market_value)
-    except Exception:
-        current_val = 0.0
+    my_budget = per_symbol_budget()
+    # Confirmed inventory + dollars already committed to unfilled buys. Both,
+    # or several in-flight orders each see the same headroom.
+    committed = ledger_value(state, symbol, price) + outstanding_buy_notional(state, symbol)
 
-    if current_val >= my_budget:
-        logger.warning(f"    [BUDGET STOP] {symbol} Current value ${current_val:.2f} >= Budget ${my_budget:.2f}. Skipping buy.")
+    if committed >= my_budget:
+        logger.warning(f"    [BUDGET STOP] {symbol} committed ${committed:.2f} >= "
+                       f"per-symbol budget ${my_budget:.2f}. Skipping buy.")
         return  # still allowed to SELL if price rises
 
-    logger.info(f"    [BUY] {symbol} Dropped to Zone {current_zone}")
-
     buying_power = float(bot.account.buying_power)
+    slice_dollars = min(BUDGET_PER_GRID, my_budget - committed)
     if not bot.budget_ok:
         logger.warning(f"    [SKIP] {symbol} Grid buy ${BUDGET_PER_GRID} > Available (budget limit)")
-    elif buying_power > BUDGET_PER_GRID:
-        cancel_open_orders_for_symbol(symbol, opposite_side_only=OrderSide.SELL)
-        qty = BUDGET_PER_GRID / price
-        bot.submit(
-            bot.market_order(symbol, qty, OrderSide.BUY, TimeInForce.GTC),
-            action="grid_buy",
-            notify=f"🟢 **GRID BUY {symbol}**\nPrice: ${price:,.2f}\nZone: {current_zone}"
-        )
-    else:
-        logger.warning(f"    [SKIP] {symbol} Low Balance: ${buying_power:.2f} (Need ${BUDGET_PER_GRID})")
+        return
+    if slice_dollars <= 0:
+        logger.warning(f"    [SKIP] {symbol} no per-symbol budget headroom left.")
+        return
+    if buying_power <= slice_dollars:
+        logger.warning(f"    [SKIP] {symbol} Low Balance: ${buying_power:.2f} (Need ${slice_dollars:.2f})")
+        return
+
+    logger.info(f"    [BUY] {symbol} Dropped to Zone {current_zone}")
+    cancel_my_open_orders(symbol, side=OrderSide.SELL)
+    qty = slice_dollars / price
+    lot_id = str(uuid.uuid4())
+
+    order = bot.submit(
+        bot.market_order(symbol, qty, OrderSide.BUY, TimeInForce.GTC),
+        action="grid_buy",
+        notify=f"🟢 **GRID BUY {symbol}**\nPrice: ${price:,.2f}\nZone: {current_zone}"
+    )
+    if order is None:
+        return  # refused before reaching the broker; nothing to track
+
+    order_id = str(getattr(order, "id", "") or "")
+    if not order_id:
+        registry.log_error("crypto_grid", "grid_buy",
+                           Exception("submitted order has no id; cannot track its fills"),
+                           context=symbol)
+        return
+    # Tracked, NOT booked. The lot appears only when a fill confirms it.
+    state["pending"][order_id] = {
+        "symbol": symbol, "side": "buy", "requested_qty": qty,
+        "applied_qty": 0.0, "lot_id": lot_id, "limit_price": price,
+        "submitted_at": datetime.datetime.now(datetime.timezone.utc).timestamp(),
+    }
 
 
-def grid_sell(symbol, price, current_zone):
-    """Zone rise -> take profit on a slice, or sweep remaining dust."""
-    logger.info(f"    [SELL] {symbol} Rose to Zone {current_zone}")
+def grid_sell(symbol, price, current_zone, state, held, known):
+    """Zone rise -> close the oldest lot, at or above its own cost floor.
 
-    qty_to_sell = BUDGET_PER_GRID / price
-    current_qty_held = held_qty(symbol)
+    A zone rise is not by itself a reason to sell. The order is a LIMIT at the
+    floor, so spread and slippage cannot push the fill below cost: a price
+    check in front of a market order checks a price the trade never uses.
+    """
+    idx, lot = sellable_lot(state, symbol, price)
+    if lot is None:
+        book = [l for l in lots_for(state, symbol) if lot_qty(l) > DUST_QTY]
+        if not book:
+            logger.info(f"    [SKIP] {symbol} Sell Signal but no open grid lots.")
+        elif lot_has_pending_sell(state, book[0]["lot_id"]):
+            logger.info(f"    [SKIP] {symbol} oldest lot already has a resting sell.")
+        else:
+            need = sell_floor(book[0])
+            logger.info(f"    [SKIP] {symbol} Zone {current_zone} rise, but the oldest lot "
+                        f"(basis ${book[0]['price']:,.2f}) needs ${need:,.2f}, price ${price:,.2f}.")
+        return
 
-    if current_qty_held >= qty_to_sell:
-        cancel_open_orders_for_symbol(symbol, opposite_side_only=OrderSide.BUY)
-        bot.submit(
-            bot.market_order(symbol, qty_to_sell, OrderSide.SELL, TimeInForce.GTC),
-            action="grid_sell",
-            notify=f"🔴 **GRID SELL {symbol}**\nPrice: ${price:,.2f}\nZone: {current_zone}"
-        )
-    elif current_qty_held > (qty_to_sell * 0.1):
-        # Partial Sell (Sweep Dust)
-        logger.info(f"    [SWEEP] {symbol} Selling remaining {current_qty_held:.6f} (Target: {qty_to_sell:.6f})")
-        cancel_open_orders_for_symbol(symbol, opposite_side_only=OrderSide.BUY)
-        bot.submit(
-            bot.market_order(symbol, current_qty_held, OrderSide.SELL, TimeInForce.GTC),
-            action="grid_sweep",
-            notify=f"🧹 **GRID SWEEP {symbol}**\nSold remaining {current_qty_held:.4f}\nPrice: ${price:,.2f}"
-        )
-    else:
-        logger.info(f"    [SKIP] {symbol} Sell Signal but Zero Inventory (Ghost Signal handled).")
+    # Never offer more than the account holds — the shared position may have
+    # been drawn down by moon_bot or by hand. An UNKNOWN read is not a zero,
+    # but it is also not a licence to sell into the dark.
+    if not known:
+        logger.warning(f"    [SKIP] {symbol} position unreadable this cycle; not selling blind.")
+        return
+    sell_qty = min(lot_qty(lot), held)
+    if sell_qty <= DUST_QTY:
+        logger.warning(f"    [SKIP] {symbol} lot {lot_qty(lot):.8f} but account holds {held:.8f}.")
+        return
+
+    floor = sell_floor(lot)
+    limit_price = max(floor, price)
+    gain_pct = (limit_price - lot["price"]) / lot["price"]
+    logger.info(f"    [SELL] {symbol} Zone {current_zone} — offering lot {sell_qty:.8f} "
+                f"at limit ${limit_price:,.2f} (basis ${lot['price']:,.2f}, +{gain_pct:.2%} gross)")
+
+    cancel_my_open_orders(symbol, side=OrderSide.BUY)
+    order = bot.submit(
+        LimitOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL,
+                          time_in_force=TimeInForce.GTC,
+                          limit_price=round(limit_price, 2),
+                          client_order_id=bot.tag(symbol)),
+        action="grid_sell",
+        notify=(f"🔴 **GRID SELL {symbol}**\nLimit: ${limit_price:,.2f}\nZone: {current_zone}\n"
+                f"Basis: ${lot['price']:,.2f} (+{gain_pct:.2%} gross, "
+                f"{gain_pct - ROUND_TRIP_COST_PCT:+.2%} net of assumed costs)")
+    )
+    if order is None:
+        return
+
+    order_id = str(getattr(order, "id", "") or "")
+    if not order_id:
+        registry.log_error("crypto_grid", "grid_sell",
+                           Exception("submitted order has no id; cannot track its fills"),
+                           context=symbol)
+        return
+    # Nothing leaves the lot until the broker confirms a fill.
+    state["pending"][order_id] = {
+        "symbol": symbol, "side": "sell", "requested_qty": sell_qty,
+        "applied_qty": 0.0, "lot_id": lot["lot_id"], "limit_price": limit_price,
+        "submitted_at": datetime.datetime.now(datetime.timezone.utc).timestamp(),
+    }
+
+
+# One-time migration notice, per symbol.
+_unledgered_reported = set()
+
+
+def report_unledgered_inventory(symbol, held, known, state):
+    """Say so, once, when the account holds coins the grid has no lot for.
+
+    On the first run after the lot-ledger migration the ledger is empty while
+    the account still holds crypto. The grid deliberately does NOT adopt that
+    inventory: attribution between crypto_grid, moon_bot and untagged history
+    is exactly what the 2026-09-11 audit could not establish, and inventing a
+    cost basis here would put a made-up number straight into the sell floor
+    this redesign exists to make trustworthy.
+
+    The consequence is real: coins with no lot are inventory the grid will
+    never sell. They are not at risk of being double-bought — `bot.budget_ok`
+    counts the actual account positions — but winding them down is a human
+    action (sell manually, or seed the ledger with the real basis).
+    """
+    if not known or symbol in _unledgered_reported:
+        return
+    unledgered = held - ledger_qty(state, symbol)
+    if unledgered <= DUST_QTY:
+        return
+    _unledgered_reported.add(symbol)
+    logger.warning(
+        f"    [{symbol}] account holds {unledgered:.8f} with no grid lot. The grid will "
+        f"not sell it (no cost basis to test against) and will not re-buy it (budget_ok "
+        f"counts real positions). Seed {STATE_FILE} or wind it down by hand.")
 
 
 def cycle(bot):
+    state = load_state()
+
+    # 0. Retry any fill rows InfluxDB refused earlier. Broker settlement and
+    #    Influx delivery are separate concerns: settlement applies once, and
+    #    delivery retries until it lands. Without this a single 503 silently
+    #    lost a trade — crypto is excluded from reconcile_fills, so nothing
+    #    would ever have backfilled it.
+    dirty = bool(utils.flush_fill_outbox(state["outbox"], logger))
+
+    # 1. Settle everything in flight BEFORE deciding anything new. Suspends
+    #    entries by itself if an order cannot be read.
+    settled_changed, settled = reconcile_pending(state)
+    if settled_changed:
+        dirty = True
+    if expire_stale_sells(state):
+        dirty = True
+
     for symbol in SYMBOLS:
         price = get_crypto_price(symbol)
         if price is None:
             continue
+
+        held, known = account_qty(symbol)
+        if not known:
+            logger.warning(f"    [{symbol}] position read failed; ledger preserved, "
+                           f"entries held off this cycle.")
+            suspend_entries(f"position read failed for {symbol}")
+        if reconcile_lots(state, symbol, held, known, settled=settled):
+            dirty = True
+        report_unledgered_inventory(symbol, held, known, state)
 
         grid = grids[symbol]
 
@@ -192,14 +824,30 @@ def cycle(bot):
         previous_zone = grid["prev_zone"]
         if current_zone != previous_zone and 0 <= current_zone <= GRID_LEVELS:
             logger.info(f"[{symbol}] Zone Change: {previous_zone} -> {current_zone} | Price: ${price:.0f}")
+            before = json.dumps(state, sort_keys=True)
             if current_zone < previous_zone:
-                grid_buy(symbol, price, current_zone)
+                grid_buy(symbol, price, current_zone, state)
             elif current_zone > previous_zone:
-                grid_sell(symbol, price, current_zone)
+                grid_sell(symbol, price, current_zone, state, held, known)
+            if json.dumps(state, sort_keys=True) != before:
+                dirty = True
 
         grid["prev_zone"] = current_zone
 
+    if dirty:
+        save_state(state)
+
+
+# Crypto data needs its own client; the runner only carries stock data.
+from alpaca.data.historical import CryptoHistoricalDataClient  # noqa: E402
+crypto_data_client = CryptoHistoricalDataClient()
+
 
 if __name__ == "__main__":
-    logger.info("--- 🕸️ CRYPTO GRID BOT V3 (fleet_bot runner) ---")
+    logger.info("--- 🕸️ CRYPTO GRID BOT V5 (fill-driven ledger, FIFO floor) ---")
+    logger.info(f"    Sells are LIMIT orders at basis +{REQUIRED_SPREAD_PCT:.2%} "
+                f"(costs {ROUND_TRIP_COST_PCT:.2%} + net {MIN_NET_PROFIT_PCT:.2%})")
+    logger.info("    New entries are FAIL-CLOSED: set bots.crypto_grid.entries_enabled "
+                "= true in bot_config.json once the ledger and migration are verified. "
+                "Sells and reconciliation run regardless.")
     bot.run(cycle)

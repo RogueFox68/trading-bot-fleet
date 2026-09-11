@@ -245,10 +245,31 @@ def _empty_realized():
     }
 
 
-def realized_metrics(fills):
-    """FIFO realized P&L supporting longs, shorts, and option premium trades."""
+def realized_metrics(fills, opening_lots=None, count_from=None):
+    """FIFO realized P&L supporting longs, shorts, and option premium trades.
+
+    `opening_lots` seeds the FIFO books with inventory already held when the
+    period opened ({(bot, symbol): [lot, ...]}, oldest first) - see
+    opening_inventory(). Without it, a sell whose opening buy predates the
+    window has nothing to close against: the old code appended it as a fresh
+    SHORT lot, so the sale booked zero realized P&L and any later buy in the
+    window was scored as covering a short that never existed. On a book that
+    turns over constantly and is never flat - crypto_grid - essentially every
+    window boundary landed mid-position.
+
+    `count_from` (a datetime) restricts which closes are BOOKED, without
+    restricting which fills are replayed. Callers that want a window's P&L
+    should pass the full fill history plus count_from, or prior inventory via
+    opening_lots; both give a window matched against real cost bases.
+
+    Returns (metrics, residual_lots): the lots still open at the end. The
+    residual is what makes window-scoped unrealized attribution possible.
+    """
     metrics = {bot: _empty_realized() for bot in fleet_registry.BOTS}
     lots = {}
+    if opening_lots:
+        for key, book in opening_lots.items():
+            lots[key] = [dict(lot) for lot in book]
     cumulative = {bot: 0.0 for bot in fleet_registry.BOTS}
     peaks = {bot: 0.0 for bot in fleet_registry.BOTS}
     hold_hours = {bot: [] for bot in fleet_registry.BOTS}
@@ -278,22 +299,25 @@ def realized_metrics(fills):
                 lot["qty"] += closed_qty
                 remaining -= closed_qty
 
-            metrics[bot]["realized_pl"] += pnl
-            metrics[bot]["closed_trades"] += 1
-            if pnl > 0:
-                metrics[bot]["winning_trades"] += 1
-            if lot.get("opened_at"):
-                hold_hours[bot].append((fill["filled_at"] - lot["opened_at"]).total_seconds() / 3600.0)
+            if count_from is None or fill["filled_at"] >= count_from:
+                metrics[bot]["realized_pl"] += pnl
+                metrics[bot]["closed_trades"] += 1
+                if pnl > 0:
+                    metrics[bot]["winning_trades"] += 1
+                if lot.get("opened_at"):
+                    hold_hours[bot].append((fill["filled_at"] - lot["opened_at"]).total_seconds() / 3600.0)
 
-            cumulative[bot] += pnl
-            peaks[bot] = max(peaks[bot], cumulative[bot])
-            metrics[bot]["max_drawdown"] = max(metrics[bot]["max_drawdown"], peaks[bot] - cumulative[bot])
+                cumulative[bot] += pnl
+                peaks[bot] = max(peaks[bot], cumulative[bot])
+                metrics[bot]["max_drawdown"] = max(metrics[bot]["max_drawdown"], peaks[bot] - cumulative[bot])
 
             if abs(lot["qty"]) <= 1e-9:
                 book.pop(0)
 
         if abs(remaining) > 1e-9:
-            book.append({"qty": remaining, "price": fill["price"], "opened_at": fill["filled_at"]})
+            book.append({"qty": remaining, "price": fill["price"],
+                         "multiplier": fill.get("multiplier", 1),
+                         "opened_at": fill["filled_at"]})
 
     for bot, data in metrics.items():
         closed = data["closed_trades"]
@@ -302,7 +326,7 @@ def realized_metrics(fills):
         data["avg_adverse_slippage_bps"] = (
             sum(slippage[bot]) / len(slippage[bot]) if slippage[bot] else None
         )
-    return metrics
+    return metrics, lots
 
 
 def risk_adjusted_score(metric, equity):
@@ -314,21 +338,130 @@ def risk_adjusted_score(metric, equity):
     return total_return - (0.50 * drawdown_penalty) + win_bonus - slippage_penalty
 
 
-def build_window_metrics(fills, unrealized_by_bot, allocation_by_bot, equity, window_days, now=None):
+def opening_inventory(fills, before):
+    """(books, incomplete_bots) as they stood at `before`.
+
+    This is the window's starting position; everything a window reports about
+    cost basis depends on it. It is only as good as the history it is built
+    from, so it also reports which bots it could NOT reconstruct.
+
+    A residual SHORT lot is the tell. Replaying the prior fills, a close with
+    no matching open cannot be paired, so it lands in the book as a negative
+    lot. For a long-only book that is impossible in reality - it means the
+    fetch window started mid-position and we are looking at the tail of a
+    trade whose entry we never saw. Treating those as genuine new shorts is
+    what made a pre-window sale book its full proceeds as profit.
+
+    Bots named in `incomplete_bots` have no establishable starting inventory,
+    so nothing derived from their cost basis in this window is trustworthy.
+    """
+    prior = [f for f in fills if f["filled_at"] < before]
+    _, residual = realized_metrics(prior)
+    incomplete = set()
+    for (bot, _symbol), book in residual.items():
+        if any(lot["qty"] < 0 for lot in book):
+            incomplete.add(bot)
+    return residual, incomplete
+
+
+def _open_notional_by_bot(lots, opened_from=None):
+    """Open exposure per bot, optionally only lots opened at/after a time."""
+    totals = {bot: 0.0 for bot in fleet_registry.BOTS}
+    for (bot, _symbol), book in (lots or {}).items():
+        if bot not in totals:
+            continue
+        for lot in book:
+            if opened_from is not None:
+                opened = lot.get("opened_at")
+                if opened is None or opened < opened_from:
+                    continue
+            # Options are priced per share against a contract quantity; without
+            # the multiplier an option lot's exposure is understated 100x.
+            multiplier = _as_float(lot.get("multiplier"), 1.0) or 1.0
+            totals[bot] += (abs(_as_float(lot.get("qty")))
+                            * abs(_as_float(lot.get("price"))) * abs(multiplier))
+    return totals
+
+
+def period_return_available(bot, opening_lots, incomplete_bots):
+    """Can this window's return actually be measured for this bot?
+
+    Only when the bot started the window FLAT. Then everything it holds now
+    was opened inside the window, so
+
+        period return = realized-in-window + current unrealized
+
+    is exact. With inventory carried in, the honest formula needs the mark at
+    the window's open, and no per-position price history is stored anywhere in
+    this fleet - so it cannot be computed, and must not be approximated.
+
+    The rejected approximation, for the record: apportion the LIFETIME
+    unrealized figure by the share of open notional each window opened. It can
+    reverse the sign. An old position up $100 and an equally sized new one
+    down $50 net to +$50 lifetime; apportioned equally, the new window is
+    credited +$25 when its actual change was -$50. Disclosing that in a notes
+    field does not make it a return: it was still called total_pl and still
+    ranked the bots for reallocation.
+    """
+    if bot in incomplete_bots:
+        return False
+    return _open_notional_by_bot(opening_lots).get(bot, 0.0) <= 0.0
+
+
+def build_window_metrics(fills, unrealized_by_bot, allocation_by_bot, equity, window_days,
+                         now=None, excluded_bots=(), history_complete=True):
     now = now or utc_now()
     cutoff = now - dt.timedelta(days=window_days)
     window_fills = [f for f in fills if f["filled_at"] >= cutoff]
-    realized = realized_metrics(window_fills)
+    # Seed with what was already held at the cutoff, so an in-window sell is
+    # matched against the basis it actually closed rather than booking its
+    # full proceeds as profit.
+    opening, incomplete = opening_inventory(fills, cutoff)
+    if not history_complete:
+        # The fetch was cut off at its old end, so EVERY bot's starting
+        # inventory is unverifiable - including the ones that happen to look
+        # flat, which is exactly the case that would otherwise be ranked.
+        incomplete = set(fleet_registry.BOTS)
+    realized, _residual = realized_metrics(window_fills, opening_lots=opening)
     out = {}
     for bot in fleet_registry.BOTS:
         r = dict(realized.get(bot, _empty_realized()))
         r["fills"] = sum(1 for f in window_fills if f["bot"] == bot)
-        r["unrealized_pl"] = round(_as_float(unrealized_by_bot.get(bot)), 2)
         r["capital_used"] = round(_as_float(allocation_by_bot.get(bot)), 2)
         r["capital_utilization"] = r["capital_used"] / equity if equity > 0 else 0.0
-        r["total_pl"] = round(r["realized_pl"] + r["unrealized_pl"], 2)
-        r["evidence_ok"] = r["closed_trades"] >= MIN_CLOSED_TRADES or r["fills"] >= MIN_FILLS
-        r["risk_adjusted_score"] = round(risk_adjusted_score(r, equity), 6) if r["evidence_ok"] else 0.0
+
+        # Lifetime, and labeled as such. It is the unrealized P&L of every
+        # position open right now, however long ago it was opened - NOT this
+        # window's contribution.
+        r["lifetime_unrealized_pl"] = round(_as_float(unrealized_by_bot.get(bot)), 2)
+        r["opening_inventory_complete"] = bot not in incomplete
+        r["started_window_flat"] = (
+            bot not in incomplete
+            and _open_notional_by_bot(opening).get(bot, 0.0) <= 0.0)
+
+        blocked = bot in excluded_bots
+        r["excluded_from_scoring"] = blocked
+        if period_return_available(bot, opening, incomplete) and not blocked:
+            r["period_return_available"] = True
+            r["unrealized_pl"] = r["lifetime_unrealized_pl"]
+            r["total_pl"] = round(r["realized_pl"] + r["unrealized_pl"], 2)
+        else:
+            # No fabricated proxy. An unmeasurable return is reported as
+            # unmeasurable, and the bot drops out of the ranking.
+            r["period_return_available"] = False
+            r["unrealized_pl"] = None
+            r["total_pl"] = None
+            r["period_return_unavailable_reason"] = (
+                "excluded_accounting_anomaly" if blocked else
+                "truncated_history_fetch" if not history_complete else
+                "incomplete_opening_history" if bot in incomplete else
+                "inventory_carried_into_window_and_no_opening_marks")
+
+        r["evidence_ok"] = (
+            r["period_return_available"]
+            and (r["closed_trades"] >= MIN_CLOSED_TRADES or r["fills"] >= MIN_FILLS))
+        r["risk_adjusted_score"] = (
+            round(risk_adjusted_score(r, equity), 6) if r["evidence_ok"] else 0.0)
         out[bot] = r
     return out
 
@@ -389,6 +522,15 @@ def recommend_allocations(metrics_by_window, config_data, context):
     eligible = {bot: s for bot, s in bot_scores.items() if s["confidence"] >= 0.35}
 
     reasons = []
+    # A bot whose period return cannot be measured is not "scoring zero" - it
+    # is unranked. Say so, so a no_change is not mistaken for a tie.
+    unmeasurable = sorted(
+        bot for bot in fleet_registry.BOTS
+        if not all(metrics_by_window.get(f"{d}d", {}).get(bot, {}).get("period_return_available")
+                   for d in WINDOW_DAYS))
+    if unmeasurable:
+        reasons.append("period_return_unavailable:" + ",".join(unmeasurable))
+
     if len(eligible) < 2:
         reasons.append("insufficient_evidence")
         action = "no_change"
@@ -415,6 +557,7 @@ def recommend_allocations(metrics_by_window, config_data, context):
         "current_allocations": current,
         "recommended_allocations": recommended,
         "bot_scores": bot_scores,
+        "unranked_bots": unmeasurable,
         "reason_codes": reasons,
         "confidence": round(max((s["confidence"] for s in bot_scores.values()), default=0.0), 3),
     }
@@ -437,7 +580,8 @@ def source_comparison(metrics_by_window, influx_realized_by_bot=None,
         }
     return {
         "window_days": {"alpaca_ledger": max(WINDOW_DAYS), "influx": influx_window_days},
-        "note": "influx side uses the accountant's avg-cost approximation",
+        "note": ("both sides are FIFO over opening inventory; a large delta means "
+                 "the two ledgers disagree about that bot and neither should pick a winner"),
         "bots": bots,
     }
 
@@ -451,9 +595,22 @@ def macro_scorecard(metrics_by_window, context):
     }
 
 
-def fetch_alpaca_fills(trading_client, lookback_days=max(WINDOW_DAYS), max_orders=10000,
+# History fetched BEYOND the longest window, purely so the window's opening
+# inventory can be reconstructed. Without it opening_inventory() has nothing
+# older than the cutoff to replay and the longest window always starts from an
+# empty book - the fix for short windows, silently absent on the one that
+# matters most. 180d covers every holding period this fleet actually runs.
+INVENTORY_LOOKBACK_DAYS = 180
+LEDGER_LOOKBACK_DAYS = max(WINDOW_DAYS) + INVENTORY_LOOKBACK_DAYS
+
+
+def fetch_alpaca_fills(trading_client, lookback_days=LEDGER_LOOKBACK_DAYS, max_orders=10000,
                        logger=None):
-    """Fetch recent closed Alpaca orders and return normalized fill rows."""
+    """Fetch closed Alpaca orders and return normalized fill rows.
+
+    The default spans the longest window PLUS the inventory lookback. Fetching
+    exactly the window means every window boundary starts mid-position.
+    """
     import utils
 
     after = utc_now() - dt.timedelta(days=lookback_days)
@@ -463,16 +620,26 @@ def fetch_alpaca_fills(trading_client, lookback_days=max(WINDOW_DAYS), max_order
         after=after,
         max_orders=max_orders,
     )
-    if logger and len(orders) >= max_orders:
+    # Truncation is a COVERAGE FACT, not a log line. Warning about it and
+    # returning the same plain list meant nothing downstream could act: a
+    # truncated history that happened to look flat was still ranked, and the
+    # claim that truncation reports unavailable was simply not implemented.
+    complete = len(orders) < max_orders
+    if not complete and logger:
         logger.warning(
             f"[StrategyAdvisor] order fetch hit max_orders={max_orders}; the "
-            f"{lookback_days}d window is truncated at its old end and the "
-            f"{max(WINDOW_DAYS)}d metrics undercount early fills.")
-    return fills_from_orders(orders)
+            f"{lookback_days}d history is truncated at its old end, so opening "
+            f"inventory cannot be established. Period returns report as "
+            f"unavailable and no allocation is recommended this run.")
+    return fills_from_orders(orders), complete
 
 
-def fetch_option_events(lookback_days=max(WINDOW_DAYS), max_pages=20):
+def fetch_option_events(lookback_days=LEDGER_LOOKBACK_DAYS, max_pages=40):
     """Fetch OPASN/OPEXC/OPEXP account activities covering the ledger window.
+
+    The horizon matches fetch_alpaca_fills deliberately: an assignment older
+    than the fill history would leave stock in the opening inventory with no
+    event explaining it.
 
     Same endpoint and paging the accountant's reconcile_option_events uses,
     kept self-contained so this paper-only layer never touches the hardened
@@ -509,11 +676,15 @@ def fetch_option_events(lookback_days=max(WINDOW_DAYS), max_pages=20):
 
 def build_strategy_report(fills, unrealized_by_bot, allocation_by_bot, equity,
                           config_data, now=None, influx_realized_by_bot=None,
-                          influx_window_days=None, option_events_included=None):
+                          influx_window_days=None, option_events_included=None,
+                          negative_basis_positions=None, excluded_bots=None,
+                          history_complete=True):
     now = now or utc_now()
+    excluded_bots = tuple(excluded_bots or ())
     metrics_by_window = {
         f"{days}d": build_window_metrics(
-            fills, unrealized_by_bot, allocation_by_bot, equity, days, now=now
+            fills, unrealized_by_bot, allocation_by_bot, equity, days, now=now,
+            excluded_bots=excluded_bots, history_complete=history_complete
         )
         for days in WINDOW_DAYS
     }
@@ -538,6 +709,28 @@ def build_strategy_report(fills, unrealized_by_bot, allocation_by_bot, equity,
                 "unrealized P&L and capital for shared coins resolve to "
                 "crypto_grid, so moon_bot vs crypto_grid scores are not "
                 "directly comparable; realized P&L is order-tag accurate"),
+            "period_return_rule": (
+                "a window's total_pl is reported ONLY when the bot started it "
+                "flat, where realized-in-window plus current unrealized is "
+                "exact. With inventory carried in, the honest figure needs the "
+                "mark at the window's open, which is not stored anywhere in "
+                "this fleet - so total_pl is null and the bot leaves the "
+                "ranking. No proxy is substituted: apportioning the lifetime "
+                "unrealized figure by open notional can reverse the sign of a "
+                "window's return"),
+            "realized_uses_opening_inventory": (
+                "window realized P&L replays inventory held before the "
+                "cutoff, so a sell whose opening buy predates the window is "
+                "matched against its real basis"),
+            "ledger_lookback_days": LEDGER_LOOKBACK_DAYS,
+            "history_complete": history_complete,
+            "excluded_from_scoring": list(excluded_bots),
+            "negative_basis_positions": negative_basis_positions or [],
+            "negative_basis_caveat": (
+                "the broker reports these positions with a NEGATIVE cost "
+                "basis, so their unrealized P&L is not a trustworthy input; "
+                "treat any score leaning on it as unestablished"
+                if negative_basis_positions else None),
         },
     }
 
@@ -549,8 +742,9 @@ def write_strategy_report(report, path=OUTPUT_FILE):
 
 def generate_and_write_report(trading_client, unrealized_by_bot, allocation_by_bot,
                               equity, config_data, logger=None, path=OUTPUT_FILE,
-                              influx_realized_by_bot=None, influx_window_days=None):
-    fills = fetch_alpaca_fills(trading_client, logger=logger)
+                              influx_realized_by_bot=None, influx_window_days=None,
+                              negative_basis_positions=None, excluded_bots=None):
+    fills, history_complete = fetch_alpaca_fills(trading_client, logger=logger)
     option_events_ok = False
     unmatched = 0
     try:
@@ -566,15 +760,28 @@ def generate_and_write_report(trading_client, unrealized_by_bot, allocation_by_b
                          f"expiry/assignment premium missing this run: {e}")
     if unmatched and logger:
         logger.warning(f"[StrategyAdvisor] {unmatched} option event(s) had no open "
-                       f"lot in the {max(WINDOW_DAYS)}d ledger (opened earlier); "
+                       f"lot in the {LEDGER_LOOKBACK_DAYS}d ledger (opened earlier); "
                        f"their premium is not counted.")
     report = build_strategy_report(fills, unrealized_by_bot, allocation_by_bot,
                                    equity, config_data,
                                    influx_realized_by_bot=influx_realized_by_bot,
                                    influx_window_days=influx_window_days,
-                                   option_events_included=option_events_ok)
+                                   option_events_included=option_events_ok,
+                                   negative_basis_positions=negative_basis_positions,
+                                   excluded_bots=excluded_bots,
+                                   history_complete=history_complete)
     write_strategy_report(report, path=path)
     if logger:
         rec = report["recommendation"]
         logger.info(f"[StrategyAdvisor] {rec['action']} | {', '.join(rec['reason_codes'])}")
+        if negative_basis_positions:
+            logger.warning(f"[StrategyAdvisor] {len(negative_basis_positions)} LONG "
+                           f"position(s) report a NEGATIVE cost basis "
+                           f"({', '.join(negative_basis_positions)}). "
+                           f"Excluded from scoring: {', '.join(excluded_bots or []) or 'none'}.")
+        withheld = [b for b, m in report["windows"].get(f"{min(WINDOW_DAYS)}d", {}).items()
+                    if not m.get("period_return_available")]
+        if withheld:
+            logger.info(f"[StrategyAdvisor] period return unavailable for "
+                        f"{', '.join(withheld)} — they are out of the ranking.")
     return report

@@ -1,4 +1,5 @@
 import config
+import re
 import time
 import datetime
 import requests
@@ -62,8 +63,23 @@ MEASUREMENT_TO_BOT = {
 # whole 2026-07-05 accountant cycle (orphan sweep + CFO realloc sit behind it).
 trading_client = utils.bound_session_timeout(TradingClient(API_KEY, SECRET_KEY, paper=PAPER))
 
+# Reporting window for realized P&L.
+PL_WINDOW_DAYS = 30
+# Extra history fetched PURELY to reconstruct what was already held when the
+# reporting window opened. Without it, a sell inside the window has no basis
+# to close against and its whole proceeds look like profit. 180d covers every
+# holding period the fleet actually runs (the wheel's longest expiries, the
+# grid's oldest un-recycled lot) without unbounded queries.
+INVENTORY_LOOKBACK_DAYS = 180
+
+
 def query_influx_trades(days=30):
-    """Fetches trade history from InfluxDB to calculate Realized P&L."""
+    """Fetches trade history from InfluxDB to calculate Realized P&L.
+
+    `days` must cover the reporting window PLUS the inventory lookback — see
+    calculate_realized_pl. Use realized_pl_for_window() rather than pairing
+    these two by hand.
+    """
     try:
         # Every active bot's measurement, straight from the registry.
         measurements = ", ".join(sorted(MEASUREMENT_TO_BOT))
@@ -101,45 +117,135 @@ def query_influx_trades(days=30):
         logger.error(f"History Fetch Error: {e}")
         return pd.DataFrame()
 
-def calculate_realized_pl(df):
-    """
-    Calculates Closed Trade P&L.
+# Actions that are position mutations with no counterparty price of their own
+# (see utils.reconcile_option_events). They must never be paired as trades:
+# an assignment is a state change, not a buy or a sell.
+LIFECYCLE_ACTIONS = {"assigned", "exercised", "expired"}
+# `grid_sweep` is a retired crypto_grid action, kept here because historical
+# rows still carry it. It was a SELL, and the old substring test matched
+# neither 'buy' nor 'sell' — so every sweep silently vanished from realized
+# P&L while its proceeds stayed in the equity curve.
+SELL_HINTS = ("sell", "sweep")
+BUY_HINTS = ("buy",)
+# OCC option symbol, e.g. PAAS260918P00015000. Anything else is an equity or
+# crypto row, whatever measurement it landed in.
+_OCC_SYMBOL = re.compile(r"^[A-Z]{1,6}\d{6}[PC]\d{8}$")
+
+
+def _row_side(action):
+    """'buy' / 'sell' / None for a trade-row action string."""
+    act = str(action or "").strip().lower()
+    if not act or act in LIFECYCLE_ACTIONS:
+        return None
+    if any(h in act for h in BUY_HINTS):
+        return "buy"
+    if any(h in act for h in SELL_HINTS):
+        return "sell"
+    return None
+
+
+def calculate_realized_pl(df, window_days=PL_WINDOW_DAYS, now=None):
+    """FIFO realized P&L per bot over the trailing `window_days`.
+
+    Replaces an average-cost approximation that could not be right on any
+    book that was not flat at both ends of the window. The old version took
+    every buy in the window, averaged them into one cost, and multiplied that
+    average by the total quantity sold — so:
+
+      * a sell whose matching buy predated the window was costed at the
+        average of UNRELATED later buys (or, with no buys in the window,
+        contributed nothing at all);
+      * inventory still held at the window's end was costed as though it had
+        been sold, because the average absorbed it;
+      * shorts were mispriced outright — the formula assumes buy-then-sell.
+
+    crypto_grid, which turns inventory over hundreds of times a month and is
+    never flat, is exactly the book that breaks worst. It is also the book the
+    dashboard was reporting several thousand dollars of "profit" on.
+
+    So: rows are replayed in time order through a per-(measurement, symbol)
+    FIFO. Rows OLDER than the window build the opening inventory and book no
+    profit; only closes that occur inside the window are counted, and each is
+    matched against the basis it actually closed. Callers must therefore pass
+    a frame covering `window_days + INVENTORY_LOOKBACK_DAYS` — a window-only
+    frame silently reintroduces the missing-basis half of the bug.
     """
     scores = {}
-    if df.empty: return scores
+    if df is None or df.empty:
+        return scores
+    if not {"action", "price", "qty", "time"}.issubset(df.columns):
+        logger.error(f"[CFO] trade frame missing columns for FIFO P&L: {list(df.columns)}")
+        return scores
 
-    # Group by Bot Measurement Name
-    for bot, group in df.groupby('bot_type'):
-        # Filter for entry/exit actions (flexible for various bot log formats)
-        buys = group[group['action'].str.contains('buy', case=False)]
-        sells = group[group['action'].str.contains('sell', case=False)]
-        
-        buy_val = (buys['price'] * buys['qty']).sum() if 'qty' in buys else 0
-        sell_val = (sells['price'] * sells['qty']).sum() if 'qty' in sells else 0
-        
-        # Simple approximation for Realized P&L
-        # (Total Sold Value - Cost Basis of Sold Units)
-        total_sold = sells['qty'].sum() if 'qty' in sells else 0
-        total_bought = buys['qty'].sum() if 'qty' in buys else 0
-        
-        realized = 0.0
-        if total_bought > 0 and total_sold > 0:
-            avg_cost = buy_val / total_bought
-            cost_of_sold = avg_cost * total_sold
-            realized = sell_val - cost_of_sold
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    cutoff = (now - datetime.timedelta(days=window_days)).timestamp()
 
-        # Options are 100 shares/contract; scale per-share premium P&L to dollars.
-        if bot in OPTION_MEASUREMENTS:
-            realized *= OPTION_CONTRACT_SIZE
-
-        # --- MAPPING: Measurement Name -> Bot Name (from fleet_registry) ---
-        bot_name = MEASUREMENT_TO_BOT.get(bot)
+    for measurement, group in df.groupby("bot_type"):
+        bot_name = MEASUREMENT_TO_BOT.get(measurement)
         if not bot_name:
-            continue # Skip any measurements we don't recognize
-            
+            continue  # Skip any measurements we don't recognize
+
+        books = {}       # symbol -> [ {qty (signed), price} ], oldest first
+        realized = 0.0
+        for row in group.sort_values("time").itertuples(index=False):
+            side = _row_side(getattr(row, "action", None))
+            if side is None:
+                continue
+            try:
+                price = float(row.price)
+                qty = abs(float(row.qty))
+                ts = float(row.time)
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0:
+                continue
+
+            in_window = ts >= cutoff
+            symbol = str(getattr(row, "symbol", "") or "")
+            # The multiplier comes from the INSTRUMENT, not the measurement.
+            # wheel_trades holds both option premium (per share, against a
+            # contract count) and the wheel's own STOCK — assigned shares, and
+            # the covered-call underlying. Scaling by measurement multiplied
+            # those share trades by 100: a 100-share PAAS buy at $48 sold at
+            # $40 reported -$80,000 instead of -$800.
+            multiplier = OPTION_CONTRACT_SIZE if _OCC_SYMBOL.match(symbol) else 1
+            book = books.setdefault(symbol, [])
+            remaining = qty if side == "buy" else -qty
+
+            # Close against opposing lots first, then keep the remainder open.
+            while abs(remaining) > 1e-12 and book and (book[0]["qty"] * remaining) < 0:
+                lot = book[0]
+                closed = min(abs(remaining), abs(lot["qty"]))
+                if lot["qty"] > 0:                      # closing a long
+                    pnl = (price - lot["price"]) * closed * multiplier
+                    lot["qty"] -= closed
+                    remaining += closed
+                else:                                   # covering a short
+                    pnl = (lot["price"] - price) * closed * multiplier
+                    lot["qty"] += closed
+                    remaining -= closed
+                if in_window:
+                    realized += pnl
+                if abs(lot["qty"]) <= 1e-12:
+                    book.pop(0)
+
+            if abs(remaining) > 1e-12:
+                book.append({"qty": remaining, "price": price})
+
         scores[bot_name] = realized
 
     return scores
+
+def realized_pl_for_window(window_days=PL_WINDOW_DAYS):
+    """Realized P&L per bot over `window_days`, with opening inventory.
+
+    The single place the reporting window and the inventory lookback are
+    paired. Both callers used to fetch exactly their window and get a book
+    that started mid-position.
+    """
+    df = query_influx_trades(days=window_days + INVENTORY_LOOKBACK_DAYS)
+    return calculate_realized_pl(df, window_days=window_days)
+
 
 def log_metric(measurement, tags, fields):
     try:
@@ -406,6 +512,33 @@ def calculate_dynamic_allocations(equity, allocation_stats, regime, vix, config_
 
 
 # Removed duplicated get_bot_owner. Accountant now uses utils.get_bot_owner directly.
+def _has_impossible_basis(position):
+    """True if a LONG position reports a negative cost basis.
+
+    Shorts legitimately carry one (selling to open is a credit), so side is
+    the whole question. Alpaca signs `qty` — negative for a short — and also
+    exposes `side`; either is enough, and both are checked because option
+    positions have been seen with one missing.
+    """
+    try:
+        basis = float(position.cost_basis)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    if basis >= 0:
+        return False
+
+    side = str(getattr(getattr(position, "side", ""), "value",
+                       getattr(position, "side", ""))).lower()
+    if side == "short":
+        return False
+    try:
+        if float(position.qty) < 0:
+            return False
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return True
+
+
 def run_accountant():
     import json
     global _last_strategy_advisor_run
@@ -440,8 +573,7 @@ def run_accountant():
                 logger.error(f"[RegimeWatch] watchdog error: {e}")
 
             # 1. FETCH REALIZED P&L (HISTORY)
-            history_df = query_influx_trades()
-            realized_scores = calculate_realized_pl(history_df)
+            realized_scores = realized_pl_for_window(PL_WINDOW_DAYS)
             
             # 2. FETCH UNREALIZED P&L (LIVE)
             positions = trading_client.get_all_positions()
@@ -460,10 +592,32 @@ def run_accountant():
             # crypto_grid in ownership.)
             unrealized_stats = {name: 0.0 for name in fleet_registry.BOTS}
             allocation_stats = unrealized_stats.copy()
+            # Positions whose cost basis is impossible for their SIDE.
+            #
+            # A negative cost basis is perfectly normal on a SHORT: selling to
+            # open is a credit, so every wheel_bot short put and every
+            # trend_bot short carries one. Flagging on sign alone therefore
+            # called routine premium selling an anomaly, which is worse than
+            # not checking — a detector that fires on normal operation trains
+            # you to ignore it (see rule 10).
+            #
+            # The real anomaly is a LONG position with a negative basis: you
+            # cannot pay a negative price for something you own. On 2026-09-11
+            # long ETH and SOL carried roughly -$1,196 and -$65, yielding
+            # ~$4,914 of "unrealized crypto profit" on ~$3,652 of market value,
+            # which is most of why the advisor wanted to move capital into the
+            # grid. The upstream cause is still unresolved — so the affected
+            # STRATEGIES are dropped from scoring, not merely annotated.
+            negative_basis_positions = []
+            anomalous_bots = set()
 
             for p in positions:
                 from utils import get_bot_owner
                 owner = get_bot_owner(p.symbol, p.asset_class, trading_client)
+                if _has_impossible_basis(p):
+                    negative_basis_positions.append(str(p.symbol))
+                    if owner:
+                        anomalous_bots.add(owner)
                 if owner in unrealized_stats:
                     unrealized_stats[owner] += float(p.unrealized_pl)
                     
@@ -533,8 +687,8 @@ def run_accountant():
                 if time.time() - _last_strategy_advisor_run > STRATEGY_ADVISOR_INTERVAL:
                     try:
                         try:
-                            advisor_influx_realized = calculate_realized_pl(
-                                query_influx_trades(days=ADVISOR_COMPARE_DAYS))
+                            advisor_influx_realized = realized_pl_for_window(
+                                ADVISOR_COMPARE_DAYS)
                         except Exception as influx_err:
                             logger.warning(f"[StrategyAdvisor] {ADVISOR_COMPARE_DAYS}d "
                                            f"influx compare unavailable: {influx_err}")
@@ -548,6 +702,8 @@ def run_accountant():
                             logger=logger,
                             influx_realized_by_bot=advisor_influx_realized,
                             influx_window_days=ADVISOR_COMPARE_DAYS,
+                            negative_basis_positions=negative_basis_positions,
+                            excluded_bots=sorted(anomalous_bots),
                         )
                         _last_strategy_advisor_run = time.time()
                     except Exception as advisor_err:
@@ -555,6 +711,19 @@ def run_accountant():
             except Exception as e:
                 logger.error(f"[CFO] Reallocation and Utilization process failed: {e}")
             
+            if negative_basis_positions:
+                logger.warning(f"[CFO] {len(negative_basis_positions)} LONG position(s) with a "
+                               f"NEGATIVE cost basis: {', '.join(negative_basis_positions)} — "
+                               f"their unrealized P&L is not trustworthy. Excluded from "
+                               f"scoring: {', '.join(sorted(anomalous_bots)) or 'none'}.")
+            # Written every cycle, zero included. A metric that only appears
+            # while something is wrong can never show that it CLEARED — the
+            # series just stops, which is indistinguishable from the writer
+            # dying.
+            log_metric("accounting_anomaly", {"kind": "negative_long_cost_basis"},
+                       {"count": len(negative_basis_positions),
+                        "affected_bots": len(anomalous_bots)})
+
             # Log Global Stats
             log_metric("account_stats", {"type": "global"}, {
                 "equity": float(account.equity),

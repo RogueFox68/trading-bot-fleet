@@ -98,12 +98,18 @@ trading-bot-fleet/
 │   ├── test_orphan_resolution.py  # Regression: ownership/entry-time resolution + root inference
 │   ├── test_fill_logging.py       # Regression: ms-floored fill stamps, wheel close ladder
 │   ├── test_strategy_advisor.py   # Regression: advisor attribution, P&L, drawdown, allocation recs
+│   ├── test_bar_freshness.py      # Regression: newest-bar selection + staleness guards
+│   ├── test_risk_exits.py         # Regression: stops/targets run AHEAD of the EOD hold branch
+│   ├── test_crypto_grid.py        # Regression: entry-linked grid spacing, lot ledger, budget split
+│   ├── test_pl_accounting.py      # Regression: FIFO period P&L, opening inventory, window scoping
+│   ├── test_safety_gates.py       # Regression: loss cap exempts closes, pending-order reservation
 │   ├── dedupe_trades.py           # One-off: delete pre-fix duplicate trade rows (dry-run default)
 │   ├── export_data.py             # Export InfluxDB trade data to CSV
 │   └── fetch_trade_history.py     # Pull raw FILL activities from Alpaca
 │
 └── (gitignored, host repo dir)  config.py, bot_config.json, active_targets.json,
-                                 effective_budgets.json, moon_bot_state.json, logs/
+                                 effective_budgets.json, moon_bot_state.json,
+                                 crypto_grid_state.json, logs/
                                  recommended_allocations.json
 ```
 
@@ -214,6 +220,201 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
 - **Crypto special case:** crypto_grid and moon_bot share BTC/ETH/SOL. Ownership resolves the
   *positions* to crypto_grid; moon_bot tracks its own coins in `moon_bot_state.json` so its
   trailing stop only sells what it bought, and its entries don't depend on the shared position.
+  **crypto_grid now keeps the same kind of ledger** (`crypto_grid_state.json`, one lot per buy
+  with its fill price). It previously read the shared account position as "its" inventory,
+  which is how it reached moon_bot's coins: an account-level FIFO reconstruction matched
+  moon-origin ETH lots against grid sells **113 times**. The account position is now only ever
+  a ceiling — `grid_sell` caps its quantity at what the account actually holds, and
+  `reconcile_lots` trims the ledger (oldest first) when it over-states reality.
+- **Both crypto ledgers move only on CONFIRMED FILLS.** `bot.submit()` returns an *order*, not
+  an outcome: pending, rejected, canceled and partially filled are all normal. A first version
+  recorded the *requested* quantity at the *submit* price whenever no fill was present, and
+  retired a whole lot whenever a sell returned any order object — so an unfilled $50 buy became
+  a real lot with a fabricated basis, and a 1-unit sell that filled 0.25 erased the other 0.75
+  from the books while the coins stayed in the account, where the other bot could reach them.
+  Orders now live in `pending` keyed by broker id and are reconciled every cycle: a **buy's lot
+  IS its order** (restated from the order's cumulative `filled_qty`/`filled_avg_price`, exact
+  and idempotent however the fills arrive), a **sell** subtracts only the newly-filled quantity
+  against an `applied_qty` watermark, a terminal zero-fill leaves nothing behind, and pending
+  orders persist across a restart. moon_bot carries the same discipline on its per-coin
+  quantity. Both save atomically (temp + `os.replace`); a failed write suspends entries rather
+  than trading on an unpersisted ledger.
+- **A lot stores cumulative acquisition and disposal, never a net quantity.** With a single
+  `qty`, a BUY update could overwrite a SELL's effect: a buy that filled 0.5 of 1 and stayed
+  pending could have that 0.5 sold and the lot emptied, and when the buy was later CANCELED
+  still reporting cumulative `filled_qty=0.5`, restating `qty` from it **resurrected** a
+  0.5-coin lot for coins already gone — on a shared symbol, a later sell would then reach
+  moon_bot's inventory to cover it. `acquired_qty` is the buy's to restate, `disposed_qty` is
+  the sells' to add to, and `lot_qty()` is the difference. An exhausted lot is kept — by
+  `prune_empty_lots` **and by `load_state`** — while its buy is still pending, because it is
+  the record of that disposal; dropping it at either point just moves the resurrection to the
+  other side of a restart. `sellable_lot` additionally refuses to sell out of an unfinished
+  acquisition.
+- **One sale is never subtracted twice.** Two reconcilers can see the same fill: the ORDER
+  read (`reconcile_pending`, attributable) and the POSITION read (`reconcile_lots`, which
+  exists to catch *external* disposals). They are separate network calls, and a fill landing
+  between them is ordinary — the position read books an "external" disposal, then the next
+  cycle's order read reports the same quantity as newly filled and books it again. A 1-coin
+  lot with a pending sell, 0.4 filling between the reads, ended up reading **0.2** in the
+  ledger while the account held **0.6**, and the untracked 0.4 invites a replacement purchase.
+  Reordering the reads does not help; they are not atomic either way. `reconcile_lots` now
+  stands down entirely while that symbol has an unsettled order (`symbol_has_pending`), so
+  attributable fills settle first and external adjustment waits for quiet. moon_bot's
+  equivalent reconcile carries the same guard.
+- **A confirmed fill outranks any position read that might predate it.** "No longer pending"
+  is not the same as "the broker's position endpoint knows". `reconcile_pending` returns the
+  set of symbols whose ledger moved on a confirmed fill **this cycle**, and external
+  adjustment skips those entirely — a just-settled buy compared against a lagging position
+  read looks exactly like an external disposal. moon_bot had the worse version of this: it
+  measured against `bot.positions`, the snapshot `FleetBot.refresh()` caches **before**
+  `cycle()` runs, so the comparison was against a list captured while the buy was still
+  unfilled. A just-confirmed 1 ETH buy left `qty=0`, no replacement-purchase guard, and — with
+  a triggered trailing stop — **zero exit submissions**. Both bots now read positions fresh,
+  per symbol, after settlement, through `utils.account_position_qty`.
+- **A triggered stop on an unreadable position is loud, not silent.** moon_bot will not sell
+  into a position it cannot see, but the old code reached that state by computing
+  `min(mine, total_held)` = 0 and simply continuing. It now routes through
+  `registry.log_error` and retries next cycle. Risk management must stay *reachable*; when it
+  cannot act, that has to be visible.
+- **Crypto fills reach InfluxDB from the bots' own reconcilers** (`utils.log_confirmed_fill`).
+  Both crypto bots are `reconciled=False` in the registry, so `reconcile_fills` never visits
+  them — survivable while every crypto order was a MARKET order, since `submit_and_log_order`
+  polls those to completion and logs the fill inline. The moment the grid's exits became LIMIT
+  orders it stopped being survivable: a resting limit order returns unlogged, so completed grid
+  **sells** had no path into `crypto_trades` while its **buys** still did, and the accountant
+  would have seen a book that only ever bought. `log_confirmed_fill` fires on TERMINAL orders
+  only (an open partial may yet fill completely and be logged at its broker `filled_at`), and
+  routes a broker-stamped fill to `_log_fill_to_influx` and a terminal partial to
+  `log_terminal_partial_fill` — both idempotent, so repeated reconciliation overwrites one point.
+- **Every terminal-partial write goes through ONE identity function.** The market branch of
+  `submit_and_log_order` used to call `_log_fill_to_influx` directly, which stamps a partial
+  with no broker `filled_at` using `time.time_ns()`, while the crypto reconciler stamped the
+  identical fill with `log_terminal_partial_fill`'s deterministic synthetic time. Two
+  timestamps means **two rows for one trade**, not an idempotent overwrite — it doubled the
+  quantity for grid market buys and moon market buys/sells. The submission poll now calls
+  `log_confirmed_fill` like everyone else. Repeatability of each helper individually was never
+  the property that mattered; agreement between them is.
+- **A refused write is a queued delivery, not a lost trade.** `_log_fill_to_influx` swallowed
+  HTTP failures, `log_confirmed_fill` reported success anyway, and the reconcilers dropped the
+  pending order regardless — so one 503 lost a crypto trade permanently, with no backfill path
+  because crypto is excluded from `reconcile_fills`. Broker **settlement** and InfluxDB
+  **delivery** are now separate: settlement applies once, delivery retries. A line that fails
+  to land is stashed in the state file's `outbox` (bounded at `FILL_OUTBOX_MAX`, loud on
+  overflow) and retried by `utils.flush_fill_outbox` at the top of every cycle until InfluxDB
+  answers 204. Every queued line carries its own deterministic timestamp, so a replay
+  overwrites the same point. The outbox persists across restarts. **It is not a lossless
+  guarantee**: at `FILL_OUTBOX_MAX` (500) the oldest queued row is dropped with a
+  `registry.log_error`. It recovers ordinary transient failures; it does not survive an
+  arbitrarily long InfluxDB outage, and crypto has no broker-side backfill (see Known Issues).
+- **Crypto symbols are compared canonically.** Alpaca reports positions as `BTCUSD` while the
+  bots' `SYMBOLS` use `BTC/USD`. moon_bot keyed its position dict on the raw broker symbol and
+  looked it up with the slash form, so `total_held` came back 0, the reconcile decided the
+  ledger over-stated reality and zeroed the coin, and the trailing-stop branch was never
+  reached — a stop that silently became a ledger wipe. `utils._same_symbol` and the canonical
+  keys in both bots settle it.
+- **A failed position read is not a flat position.** `account_qty` returns `(qty, known)`: a
+  404 is an *answer* ("no such position"), a timeout or a 500 is silence. Only a **known** read
+  may retire inventory. Before this distinction existed one timeout returned `0.0`,
+  reconciliation treated it as authoritative, and every lot in the file was retired and
+  persisted — a read failure that used to merely skip a sell became destructive the moment
+  durable state existed. An unreadable *ledger* likewise suspends entries instead of returning
+  a tradable empty book.
+- **Grid entries are fail-closed.** `bots.crypto_grid.entries_enabled` in `bot_config.json`
+  must be explicitly `true` before the grid opens anything; absent or false means no new
+  buys. Sells, reconciliation and the ledger all run regardless, so existing inventory can
+  always wind down. Default-off is deliberate: the PR #22 review asked that entries stay off
+  until the fill-driven ledger and the migration of the pre-existing coins are verified
+  against a live account, and a lever defaulting to on makes "nobody got to it" look
+  identical to "we checked".
+- **The grid sells strict FIFO, at an executable floor.** Selling the oldest *qualifying* lot
+  (skipping underwater ones) is specific-lot selection, and it disagreed with the accountant:
+  buy 1 at $200 then 1 at $90, sell at $120, and execution books +$30 against the $90 lot while
+  the books book −$80 against the $200 lot. The oldest lot is now the only candidate — if it
+  does not clear its cost, nothing is sold. And the sell is a **LIMIT at the floor**, not a
+  price check in front of a market order: spread, slippage and fees all land *after* such a
+  check, so it guarantees nothing. Resting sells are cancelled after `PENDING_SELL_TTL_SECONDS`
+  and re-decided. `cancel_my_open_orders` filters on the `crypto_grid-` tag; the old helper
+  cancelled every open order on the symbol, including moon_bot's.
+  **Migration note:** on the first run the ledger is empty while the account still holds
+  crypto. The grid deliberately does not adopt that inventory — attribution between
+  crypto_grid, moon_bot and untagged history is precisely what the audit could not establish,
+  and a made-up cost basis would go straight into the new sell guard. So those coins are
+  inventory the grid **will never sell** (logged once per symbol at startup). They are not at
+  risk of being double-bought: `bot.budget_ok` still counts the real account positions, so the
+  bot's total allocation is enforced. Winding them down is a human action — sell manually, or
+  seed `crypto_grid_state.json` with lots carrying the real basis.
+
+### Market Data Correctness (post 2026-09-11 performance follow-up)
+
+**Alpaca returns bars ascending from `start` and truncates at `limit`** — so
+`StockBarsRequest(start=<wide>, limit=<small N>)` hands back the **oldest** N bars in the
+window, not the newest. Nothing raises: the frame has the right columns, the right dtypes
+and a plausible price, it is simply weeks out of date. Three of the fleet's four fetch sites
+were in that state for months while every process reported healthy:
+
+| Site | Request | Newest bar on 2026-09-11 |
+|---|---|---|
+| survivor 15m | `start=-20d, limit=200` | Aug 27 (~2wk stale) |
+| survivor SMA200 | `start=-460d, limit=250` | Jun 5 (~14wk stale) |
+| moon donchian | `start=-60d, limit=30` | Aug 12 (~4wk stale) |
+| trend 15m | `start=-10d, limit=500` | **current** |
+
+trend was correct only by accident — a 10-day 15m window holds ~280 bars, so its
+`limit=500` never truncated. That is the whole reason this survived: the bug is invisible
+unless `limit` < bars-in-window, and one of four sites happened to sit on the right side of
+that line. moon compounded it with `df.iloc[:-1]` ("drop today's forming bar"), which on an
+already-truncated frame discards a **completed** bar and ages the Donchian levels by one
+more day.
+
+The fix is structural, not a re-tuning. **Never pass `limit` alongside `start` on a bar
+request** — size `start` to the history the indicator needs, let alpaca-py page the window,
+and take the newest rows with `utils.newest_bars`. `test_bar_freshness` enforces this by
+parsing the source: a reintroduced `limit` fails the suite, which is the only guard that
+survives a future window change.
+
+Belt and braces, `utils.bars_are_fresh` refuses to let a stale frame drive a decision and
+routes the rejection through `registry.log_error` (a `[STALE]` line + a Grafana-visible
+error) rather than skipping quietly. Daily-bar callers pass a wider `stale_factor` so a
+normal weekend or holiday close is not mistaken for an outage. `utils.drop_forming_bar`
+decides "is the last bar still forming?" from its timestamp, so it is correct on a fresh
+frame and on a stale one.
+
+`market_analyst`'s SPY fetch never carried a `limit` and was not affected, but a *successful
+fetch of stale bars* is invisible to its existing fail-safe (which only keys off fetch
+**failure**). It now publishes `spy_bar_age_hours` on the `market_regime` row and logs loudly
+past `SPY_BAR_WARN_HOURS`. It deliberately does **not** gate on that: the analyst runs 24/7,
+a Friday close plus a Monday holiday legitimately ages the newest bar past three days, and
+refusing the frame would force `CRITICAL_VOLATILITY` over a normal long weekend — a
+self-inflicted halt strictly worse than the condition it reports.
+
+`fleet_doctor` section 5b issues each bot's **own** fetcher and prints the timestamp that
+comes back, because this failure class cannot be seen from process health or error counts.
+
+**A stale frame stops entries, never exits.** The first version of this guard returned `None`
+for stale bars, the caller did `continue`, and `manage_position` was never reached — so a
+stale history feed silently suppressed stop losses, take profits, max-hold and EOD
+liquidation on every held position. That is the same defect the tiered-hold reordering
+removed, reintroduced one layer up in the caller. The fetchers now return
+`(df, indicators_ok)`: a held symbol **always** reaches `manage_position`, which runs the
+price-based exits off `utils.live_equity_price` and suppresses only the bar-derived ones (the
+RSI exit, the crossover exits, the ADX/EMA/RSI inputs to the hold score — a missing indicator
+scores *lower*, biasing toward CLOSE_EOD, which is the safe direction when blind).
+`live_equity_price` has **no fallback**: the bots used to fall back to the latest bar close,
+which is safe only while the bars are fresh, and a stop loss priced off a two-week-old close
+is worse than none because it looks like risk management. No validated price at all ⇒ the bot
+says so loudly and manages nothing that cycle.
+
+**Freshness is session-aware, and the allowance widens — it never skips.** At Monday 09:30
+the newest 15m bar is Friday's close, ~65h old, which any honest intraday bound rejects, so
+without `session_elapsed` (`FleetBot.session_elapsed`, from a hardcoded 09:30 ET open
+matching the existing EOD windows) the guard manufactures a data outage at every open. But
+the first attempt at that *exempted* the frame — returning True before inspecting the
+timestamp at all — which accepted a **two-week-old** bar during the opening 45 minutes and
+skipped the undateable-frame check with it, so both equity bots could compute entry signals
+from stale data every morning. The bound is now *widened* instead: before enough session has
+elapsed to have produced a fresh bar, the newest bar may be as old as the session is plus
+`PRIOR_SESSION_GAP_SECONDS` (4.5 days — Friday 16:00 ET to Tuesday 09:30 ET across a Monday
+holiday is ~89.5h), and no older. The timestamp is always checked.
 
 ### CFO / Budget Enforcement
 
@@ -226,6 +427,25 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
 - **Fail-closed** when `bot_config.json` is missing or the bot has no allocation.
   **Fail-open** on runtime/API errors (deliberate for paper trading — revisit before live).
 - Counts held positions (options at collateral) + pending tagged orders.
+- **A boolean budget check is not a size.** `budget_ok` says there is room, never how much.
+  moon_bot sized every breakout at a flat 10% of equity against a 4% allocation — a ~2.5x
+  overshoot on each entry — until it was clipped to `utils.get_available_budget`.
+  crypto_grid compared **one symbol's** value against the bot's **whole** budget, so all
+  three symbols could each spend it: a 3x overrun in which every individual check read as
+  compliant. It now uses `crypto_grid.per_symbol_budget()` and clips each slice to the
+  remaining per-symbol headroom.
+- **Unfilled buys reserve their capital.** The pending loop counted only equity *limit* buys
+  and short options, so equity **market** buys (no `limit_price`) and **all crypto** reserved
+  nothing — several in-flight entries each saw the same headroom and spent it.
+  `utils._pending_unit_price` prices a pending order through limit → dollar notional →
+  partial-fill average → the current mark on a held position → a live quote (equities only).
+  When **none** of those answer — a fresh quantity-based crypto MARKET buy has no limit, no
+  notional, no fill and no position, which is precisely the new-entry case — `check_budget`
+  now **fails closed** for that bot rather than warning and reserving zero. Warning and
+  continuing meant the next symbol saw the same headroom and spent it again. Entries resume
+  as soon as the order fills, prices, or terminates. crypto_grid also reserves its own
+  outstanding buy notional in its ledger (`outstanding_buy_notional`), which is the tighter
+  of the two.
 - The accountant also flips `CAPITAL_CRUNCH` in `bot_config.json` at >90% utilization
   (released <80%), and reallocates gated bots' surplus to active bots
   (`cfo_settings.reallocation_*`, `gate_idle_threshold_cycles` honored).
@@ -237,6 +457,45 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
   realizes expired-worthless premium and scores the wheel low. Its source comparison is
   window-matched (60d Alpaca ledger vs a dedicated 60d Influx read, not the CFO's 30d one).
   It never writes `effective_budgets.json`; recommendations are for review until promoted.
+- **Window P&L needs opening inventory** (2026-09-11). `build_window_metrics` used to filter
+  fills to the window and FIFO-pair only those, so a sell whose opening buy predated the
+  cutoff had no lot to close: `realized_metrics` appended it as a fresh **short** lot, the
+  sale booked **zero** realized P&L, and any later in-window buy was scored as covering a
+  short that never existed. Each window now seeds its FIFO books from
+  `opening_inventory(fills, cutoff)` — and the production fetch spans
+  `LEDGER_LOOKBACK_DAYS` (longest window + 180d), because defaulting to `max(WINDOW_DAYS)`
+  left the **60d** window with no prior fills at all: the fix worked on the short windows and
+  was silently absent on the one that matters most. `opening_inventory` also reports which
+  bots it could **not** reconstruct — a residual *short* lot means a close whose open predates
+  the fetch, so the history is incomplete and nothing derived from that bot's basis is
+  trustworthy. **Hitting the fetch cap is a coverage fact, not a log line**:
+  `fetch_alpaca_fills` returns `(fills, complete)`, and an incomplete fetch marks every bot
+  unreconstructable — including the ones that happen to look flat, which is exactly the case
+  that would otherwise be ranked on an unverifiable starting inventory.
+- **Period return is reported only when it can be measured** — no proxy. A window's return is
+  `realized-in-window + (unrealized_end − unrealized_start)`, and `unrealized_start` needs a
+  mark at the window's open that this fleet stores nowhere. So `total_pl` is populated **only**
+  when the bot started the window flat (then everything it holds now was opened inside the
+  window and the sum is exact); otherwise it is `null`, `period_return_available` is false,
+  and the bot leaves the ranking with a stated reason. The rejected approximation —
+  apportioning the lifetime unrealized figure by the open notional each window opened — can
+  **reverse the sign**: an old position up $100 and an equally sized new one down $50 net to
+  +$50 lifetime, and an equal split credits the new window +$25 when its actual change was
+  −$50. Disclosing that in a notes field did not stop it being called `total_pl` and ranking
+  the bots for reallocation. `lifetime_unrealized_pl` carries the raw figure, labeled.
+- **An impossible cost basis excludes the strategy from scoring.** A negative cost basis is
+  *normal* on a short — selling to open is a credit, so every wheel_bot short put carries one.
+  Checking the sign alone called routine premium selling an anomaly, which is worse than not
+  checking (rule 10: a detector that fires on normal operation trains you to ignore it). The
+  real anomaly is a **long** with a negative basis: `accountant._has_impossible_basis` keys on
+  side (and on signed `qty`, since some option positions arrive without a usable `side`).
+  On 2026-09-11 long ETH and SOL carried roughly -$1,196 and -$65, yielding ~$4,914 of
+  "unrealized crypto profit" on ~$3,652 of market value — most of why the advisor wanted to
+  move another 2% out of trend_bot and into crypto_grid. Flagging alone did not stop that:
+  the affected **owning bots** are now passed to the advisor as `excluded_bots`, which voids
+  their period return and drops them from the ranking until the basis is reconciled. The
+  `accounting_anomaly` metric is written **every cycle, zero included**, because a series that
+  only exists while something is wrong can never show that it cleared.
 
 ### Safety Gates (in `utils.submit_and_log_order`)
 
@@ -251,7 +510,16 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
   Deliberate host-side work sets `FLEET_ALLOW_UNCONTAINED_ORDERS=1`, which warns once
   (not per order) and proceeds. `fleet_doctor` reports the guard's verdict in section 1,
   so a misfire is visible before it bites.
-- Daily loss cap: `MAX_DAILY_LOSS` (-$5,000) blocks all orders.
+- Daily loss cap: `MAX_DAILY_LOSS` (-$5,000) blocks orders that **open or increase**
+  exposure. It used to block *every* order, before looking at what the order did — so a fleet
+  down $5,000 could no longer sell a losing long, cover a short, or buy back a short option.
+  A circuit breaker that traps you inside the position is the opposite of a risk control, and
+  no amount of exit reordering in the bots could fix it, because the block was below them in
+  the shared submit path. `utils.exposure_increasing_qty` is the shared classifier (signed
+  position quantity, crypto's BTCUSD/BTC-slash-USD spelling normalised); the loss cap and the
+  notional/exposure caps both use it, so the two cannot disagree about what "closing" means.
+  A partial close is fully exempt; an over-sell is blocked only on the part that flips the
+  position into a new short.
 - Notional cap ($20k) + symbol exposure cap ($5k) on any **equity order that opens or increases
   exposure** — long entries AND short entries. Risk-reducing orders (closes, covers) are exempt.
   Options rely on the bots' own collateral/BP checks; crypto is exempt. The gate's price lookup
@@ -331,8 +599,27 @@ been written in > 30 min — catching a wedged/dead analyst its own in-process f
 `tiered_hold.py` scores positions (P&L, signal validity, confidence, duration, regime/VIX
 penalties) into CLOSE_EOD / HOLD_OVERNIGHT / HOLD_SWING at the 15:30 ET window; 15:45+ ET
 liquidates CLOSE_EOD. `max_hold_days_for_tier` is the hard backstop exit (3d/7d).
-*Partially wired:* `OVERNIGHT_STOPS` stop/trailing percentages and `premarket_check()` are
-defined but not yet enforced anywhere — only `max_hold_days` is live.
+
+**A hold decision governs the EOD sweep, never risk management** (fixed 2026-09-11). Both
+equity bots evaluated the tiered-hold branch *first* and returned early on a
+HOLD_OVERNIGHT/HOLD_SWING tier — so from 15:30 ET a position scoring "hold" had **no stop
+loss, no take profit and no signal exit**, for the rest of the session and straight through
+the overnight gap, which is the one window where a gap can actually happen. The tier meaning
+"worth carrying overnight" was the tier that removed its protection. Stops/targets/crossovers
+now run ahead of the hold branch in both `survivor_bot.manage_position` and
+`trend_bot.manage_position`; the hold override itself is unchanged and still suppresses the
+EOD sweep when no risk exit fires. `test_risk_exits` pins the ordering (it fails 7 ways
+against the pre-fix code).
+
+The same failure then reappeared one layer up, in the callers: a stale-bar guard returned
+`None` and `cycle()` skipped the held symbol entirely, so `manage_position` was never reached.
+See **Market Data Correctness** — indicator eligibility and risk management are now separate
+questions, and `test_risk_exits` drives `cycle()` rather than `manage_position`, because the
+bug lived in the caller both times.
+
+*Still partially wired:* `OVERNIGHT_STOPS` stop/trailing percentages and `premarket_check()`
+are defined but not enforced anywhere — the bots' own stop percentages are what close the
+gap above. `max_hold_days` remains the only tiered_hold backstop that is live.
 
 ## Key Conventions
 
@@ -346,7 +633,7 @@ defined but not yet enforced anywhere — only `max_hold_days` is live.
 
 ## Testing
 
-`python -m unittest test_orphan_resolution test_fill_logging test_market_analyst test_strategy_advisor test_commander test_containment -v` —
+`python -m unittest test_orphan_resolution test_fill_logging test_market_analyst test_strategy_advisor test_commander test_containment test_bar_freshness test_risk_exits test_crypto_grid test_pl_accounting test_safety_gates -v` —
 regression suites for the ownership/entry-time paging fix (+ option-root inference and the
 no-default-owner rule), fill-row stamping / wheel close-ladder pricing, and the market-regime
 pipeline (SPY-df normalization, VIX>28 kill-switch, loud-failure + stale fail-safe), plus the
@@ -355,16 +642,36 @@ first two after touching `utils.py` ownership/order/logging code or wheel close 
 `test_market_analyst` after touching `market_analyst.py` (it covers each VIX source's parsing
 and the chain's fall-through/rejection rules), and `test_commander` after touching the watchdog's
 alerting. Run `test_containment` after touching anything in the order-submission path —
-its load-bearing assertion is that an uncontained fleet never reaches the broker at all. Strategy/advisor changes are still validated through paper trading; there is no
-backtest harness.
+its load-bearing assertion is that an uncontained fleet never reaches the broker at all.
+
+Run **`test_bar_freshness` after touching ANY bar request.** Its load-bearing assertion is
+source-level: it parses every fetch site and fails if a `StockBarsRequest`/`CryptoBarsRequest`
+pairs `start` with `limit`. That is the only check that survives someone widening a window
+later, because the bug it catches produces a plausible frame rather than an error.
+Run `test_risk_exits` after touching either equity bot's `manage_position` — it asserts a
+stop loss fires inside the 15:30+ hold window, the case that was silently disabled.
+Run `test_crypto_grid` after touching grid entry/exit or either crypto ledger — it covers the
+whole order lifecycle (delayed fill, zero-fill rejection, partial-then-canceled, repeated
+reconciliation, restart while pending) because every one of those was a way to invent or
+destroy inventory. Run `test_pl_accounting` after touching `accountant.calculate_realized_pl`
+or the advisor's window metrics, and `test_safety_gates` after touching the order-submission
+path or `check_budget_details` — its load-bearing assertion is that a breached daily loss cap
+still lets a long exit, a short cover and an option buy-to-close through.
+
+Strategy/advisor changes are still validated through paper trading; there is no
+backtest harness. Two dependencies are not installable everywhere: `ta` is sdist-only and
+fails to build on some toolchains (`test_risk_exits` stubs it when absent), and the suites
+need a `config.py` — copy `config.example.py` for a local run.
 
 **`fleet_doctor.py`** is the diagnostic entry point — run it *in the container* against the code
 the fleet actually runs:
 `docker exec -w /app/code trading-fleet python3 fleet_doctor.py`. It verifies location, syntax +
 uncommitted drift, config completeness, that **every PM2 process survives import** (the one
-failure class a bot's own main-loop `try/except` cannot catch), Alpaca, each VIX source
-separately, an InfluxDB round-trip, **how many commanders are writing telemetry**, the
-`market_regime` heartbeat, and pm2 state. Read-only; never orders.
+failure class a bot's own main-loop `try/except` cannot catch), Alpaca, **the age of the bars
+each bot actually trades on** (section 5b — it calls the bots' own fetchers, since a stale
+frame is a *successful* fetch and shows up nowhere else), each VIX source separately, an
+InfluxDB round-trip, **how many commanders are writing telemetry**, the `market_regime`
+heartbeat, and pm2 state. Read-only; never orders.
 
 Two of its checks are deliberately *not* file-mtime based, because mtime lies here:
 `bot_config.json` is only rewritten when a published value moves (a closed weekend with a
@@ -375,7 +682,47 @@ judged against that schedule rather than a flat 24h.
 ## Known Issues / Tech Debt
 
 - **tiered_hold overnight stops unwired** (see above) — `max_hold_days` is the only enforced
-  backstop.
+  tiered_hold backstop. The bots enforce their own stop/target percentages around the clock
+  now, so a held-overnight position is no longer unprotected, but `OVERNIGHT_STOPS`'
+  per-tier trailing stops and `premarket_check()` still do nothing.
+- **Negative cost bases on crypto positions are unexplained.** The broker reported long ETH
+  and SOL at roughly -$1,196 and -$65 of cost basis on 2026-09-11, producing ~$4,914 of
+  "unrealized profit" on ~$3,652 of market value. Those positions' owning bots are now
+  excluded from advisor scoring (`accounting_anomaly` metric written every cycle,
+  `assumptions.negative_basis_positions` + `excluded_from_scoring` in the report) rather than
+  silently ranked, but **the upstream cause is not established** — it needs a
+  reconciliation against actual fills and coin fees. An independent reconstruction of all
+  BTC/ETH/SOL cash flows from inception put combined crypto P&L near **+$123**, against a
+  dashboard reading several thousand; that reconstruction itself leaves a $5.49 cash
+  discrepancy and small BTC/SOL quantity discrepancies, so it is provisional too.
+- **Per-bot historical attribution depends on an attribution policy.** A complete-history
+  FIFO reconstruction finds cross-owner lot matches among the equity bots and untagged
+  orders, not only in crypto. Opening-owner allocation is a reasonable default but is not a
+  fact about which strategy earned what — treat pre-2026-09 per-bot dollar totals as
+  indicative.
+- **The scout's last run lands after entries stop.** The documented schedule starts its final
+  run at 15:00 CT (16:00 ET) while trend_bot and survivor_bot stop new entries at 14:00 ET
+  (`FleetBot.is_eod_skip_entry`), so that run's targets cannot be acted on until the next
+  session. Sequential shadow-advisor analysis delays publication further. No historical
+  target archive or per-candidate timing log exists yet, so how much return this costs is
+  unquantified — it is a reason to instrument the timing, not yet a measured loss.
+- **Coin-denominated fees are not modelled.** `ROUND_TRIP_COST_PCT` (0.5%) is an assumption,
+  deliberately an over-estimate, not a reading of the fees Alpaca actually charged. Crypto
+  fees paid in coin reduce the position quantity rather than cash, so the grid's reconcile
+  absorbs them as a ledger shortfall instead of attributing them to the trade that incurred
+  them. Realized crypto P&L is therefore approximate by a small, unmeasured amount.
+- **The fill outbox is bounded, so a long InfluxDB outage still loses rows.** Failed crypto
+  fill writes queue in the bot state files and retry until a 204, but at `FILL_OUTBOX_MAX`
+  (500) the oldest is dropped with a loud `registry.log_error`. That covers a restart or a
+  transient 503; it does not cover a multi-day outage. Closing it properly needs either
+  durable spill storage or a broker-side backfill for crypto — `reconcile_fills` deliberately
+  skips both crypto bots because their `grid_buy`/`grid_sell` action vocabulary cannot be
+  rebuilt from an order alone. Until then, treat an `[Outbox] FULL` alert as data loss that
+  has already happened, not a warning that it might.
+- **`max_orders` truncation is reported, not recovered.** If the advisor's history fetch hits
+  its cap, `fetch_alpaca_fills` returns `complete=False`, every bot's period return reports
+  `truncated_history_fetch` and no allocation is recommended. Correct, but blunt: a long
+  enough order history costs you the ranking rather than triggering a deeper page walk.
 - **commander bare `except: pass`** remains on best-effort Discord sends.
 - **`bot_monitor.memory` / `.cpu` in Grafana were flat 0 until 2026-09.** `pm2 jlist` reports
   live resource usage under `monit`, not `pm2_env`; commander read the wrong key, so the fleet's
@@ -390,7 +737,8 @@ judged against that schedule rather than a flat 24h.
 - **`ta` is an sdist-only, effectively unmaintained dependency** (trend_bot's EMA/ADX,
   survivor_bot's RSI). It builds and computes correctly under the pinned pandas 3.x / numpy 2.x
   set, but it is the one package here that can fail a container rebuild outright on a toolchain
-  change. `market_analyst.TechnicalMath` and `market_scanner.TechnicalMath` already implement the
+  change — and on 2026-09-11 it did exactly that on a clean Python 3.11 box (`pip install ta`
+  failed to build a wheel), which is the failure mode described below arriving in practice. `market_analyst.TechnicalMath` and `market_scanner.TechnicalMath` already implement the
   same indicators natively, so replacing it is a contained job if it breaks — the reason it hasn't
   been done pre-emptively is that it would change live indicator math with no backtest to validate
   against.
@@ -441,3 +789,49 @@ judged against that schedule rather than a flat 24h.
    pings per cycle. Anything that alerts on a *persistent* condition needs a throttle, and its
    wording must distinguish the conditions it covers (see `commander._alert_down`).
 11. **Run the orphan regression suite** after touching ownership/order-history code.
+12. **Never pass `limit` alongside `start` on a bar request.** It returns the OLDEST bars in
+   the window. Size the window to the history the indicator needs and slice the newest rows
+   with `utils.newest_bars`. `test_bar_freshness` fails the build if this returns.
+13. **Risk exits come before hold/EOD policy.** A tier, a regime, or a time-of-day branch may
+   decide whether to *sweep* a position; none of them may decide whether its stop loss
+   applies. If a new exit path is added, put it ahead of the tiered-hold block.
+14. **A boolean budget check is not a size.** `budget_ok` says there is room, not how much.
+   Size entries against `utils.get_available_budget` (or a per-symbol share of it), and clip
+   the order rather than trusting a percentage-of-equity target.
+15. **Don't promote an allocation on an unexplained number.** The advisor is paper-only and
+   advisory for exactly this reason; check `assumptions.negative_basis_positions` and the
+   `source_comparison` deltas before acting on a recommendation.
+16. **A submitted order is not a filled one.** `bot.submit()` returns an order object for a
+   pending, rejected, canceled or partially-filled order alike. Never write inventory,
+   quantity or cost basis from a submission — reconcile it from the broker's cumulative
+   `filled_qty`/`filled_avg_price` against an applied watermark, so the update is idempotent
+   and a partial keeps its remainder.
+17. **A failed read is not a zero.** Distinguish "the broker said none" (a 404) from "the
+   broker did not answer" (timeout, 500). Only an answer may retire durable state. This is
+   the same rule as `OrderFetchError` in the ownership map, one layer down.
+17a. **Compare symbols canonically.** Alpaca spells crypto positions `BTCUSD` and orders
+   `BTC/USD`. A raw-string comparison between the two silently reads as "no position", which
+   downstream becomes a ledger wipe or a phantom short. Use `utils._same_symbol`.
+17b. **A widened bound is not a skipped check.** When a guard must be relaxed for a known
+   legitimate case, raise the threshold — never return early before validating. The early
+   return also skips every *other* check on that path, which is how a session-open allowance
+   came to accept two-week-old bars and undateable frames alike.
+18. **A risk control must not trap you inside the position.** Anything that blocks orders
+   has to ask what the order *does* first: exposure-increasing orders can be refused,
+   risk-reducing ones must have a path through. Classify with
+   `utils.exposure_increasing_qty` so every gate agrees on what "closing" means.
+19. **Idempotence is a property of the SYSTEM, not of a helper.** Two functions that each
+   overwrite their own row still produce two rows if they stamp the same event differently.
+   When more than one path can write the same fact, they must share one identity function —
+   and the test must assert the resulting quantity, not that each helper repeats itself.
+20. **Settlement and delivery are different jobs.** Applying a fill to trading state must
+   happen exactly once; getting it into the reporting database must retry until it lands.
+   Never let a failed write silently finish a state transition — queue the delivery.
+21. **A log line is not a control.** If a condition should change behavior, it has to be
+   returned and acted on, not warned about. "Hitting max_orders will make returns
+   unavailable" was logged while the same plain fill list went downstream and got ranked
+   anyway.
+22. **Report an unmeasurable number as unmeasurable.** If a metric needs data the fleet does
+   not store, publish it as unavailable and withhold whatever depends on it. Do not
+   substitute a proxy and disclose the substitution in a notes field — the number still gets
+   used, and a proxy that can invert the sign of a return is worse than a gap.

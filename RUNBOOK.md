@@ -121,6 +121,69 @@ Safety is centralized in `utils.py`:
     market reading. `fleet_doctor.py` tests each source separately and tells you whether
     it is one provider or container egress.
 
+*   **A bot is running but its trades make no sense:** suspect the *data*, not the logic.
+    A truncated bar request returns a perfectly well-formed frame of stale prices — it
+    cannot be seen from `pm2 ls`, error counts, or Grafana process panels, and three of the
+    fleet's four fetch sites were in that state for months. Check the bar ages first:
+    ```bash
+    docker exec -w /app/code trading-fleet python3 fleet_doctor.py   # section 5b
+    docker exec trading-fleet pm2 logs <name> --lines 60 --nostream | grep STALE
+    ```
+    A `[STALE]` line names the symbol and the age; the bot stands down on that symbol
+    rather than trading on it. In Grafana, `market_regime.spy_bar_age_hours` is the same
+    signal for the regime feed — the analyst's heartbeat proves the *process* is alive,
+    that field proves the *data* is.
+*   **crypto_grid holds coins it won't sell:** expected immediately after the lot-ledger
+    migration. The grid only sells lots it recorded buying, and the pre-migration inventory
+    has none — the log says so once per symbol at startup. It cannot over-buy on top of them
+    (`budget_ok` counts real positions), but it will not wind them down either. Either close
+    those coins by hand on the Alpaca dashboard, or seed `crypto_grid_state.json` with the
+    real basis:
+    ```json
+    {"BTC/USD": [], "ETH/USD": [{"qty": 0.5, "price": 2800.0, "opened_at": "2026-08-01T00:00:00+00:00"}], "SOL/USD": []}
+    ```
+    Only put a basis in that file if you know it. A guessed number defeats the profit guard
+    the ledger exists to enforce.
+*   **crypto_grid never buys:** expected. Entries are fail-closed — set
+    `bots.crypto_grid.entries_enabled` to `true` in `bot_config.json` (host repo dir, then
+    `docker exec trading-fleet pm2 restart crypto_grid`) once you have verified the lot ledger
+    against a live account and decided what to do with the pre-existing coins. Sells and
+    reconciliation run either way, so held inventory is never stranded by this lever.
+*   **crypto_grid logs `[SUSPEND] New grid entries halted`:** the bot is managing what it can
+    but opening nothing new, deliberately. Three causes, all in the log line: the lot ledger
+    could not be read or written (`crypto_grid_state.json` — repair or remove it), an
+    in-flight order could not be read from Alpaca, or a position read failed. It resumes by
+    itself once the underlying read succeeds. Do NOT delete the ledger to clear it without
+    reading it first: an empty ledger is a grid that will never sell what it holds.
+*   **A crypto bot logs `[Outbox] delivered N queued fill row(s)`:** InfluxDB refused some
+    trade writes earlier and they have now landed. Normal recovery, no action. A *growing*
+    outbox means InfluxDB has been unreachable for a while — check the `influxdb` container and
+    `fleet_doctor.py` section 7. The queued rows live in `crypto_grid_state.json` /
+    `moon_bot_state.json` and survive restarts.
+    **`[Outbox] FULL` is data loss that has already happened**, not a warning that it might:
+    at 500 queued rows the oldest is dropped. Crypto has no broker-side backfill, so those
+    trades are gone from `crypto_trades` — the ledgers and the broker are still correct, but
+    Grafana and the accountant's Influx-side P&L will under-count for that period. Note the
+    window and treat those numbers as incomplete.
+*   **The CFO logs `FAIL-CLOSED — N pending order(s) cannot be priced`:** a bot has an unfilled
+    market buy with no limit price, no dollar notional, no partial fill and no existing
+    position, so its capital cannot be reserved. New entries for that bot are blocked until the
+    order fills, prices or terminates — which for a crypto market order is usually seconds.
+    A *persistent* one means an order is stuck open: check it on the Alpaca dashboard and
+    cancel it if it will never fill.
+*   **The advisor says `period_return_unavailable` / `unranked_bots`:** working as intended,
+    not a fault. A window's return can only be measured when the bot started that window flat;
+    with inventory carried in, the honest figure needs a mark at the window's open that is not
+    stored anywhere. Those bots are dropped from the ranking rather than scored on a proxy.
+    `realized_pl` and `lifetime_unrealized_pl` are still reported for them.
+*   **The advisor recommends moving capital into crypto:** check
+    `recommended_allocations.json` → `assumptions.negative_basis_positions` before acting.
+    A non-empty list means the broker is reporting a negative cost basis on those symbols,
+    so their unrealized P&L — which feeds the scores — is not trustworthy. Also compare
+    `source_comparison`: a large Alpaca-vs-Influx delta on one bot means the two ledgers
+    disagree about that strategy and neither should pick a winner. The advisor never
+    writes `effective_budgets.json`; promotion is always a human step.
+
 ## Target File Contract
 The Corsair scout must emit the v1.1 dictionary schema:
 ```json

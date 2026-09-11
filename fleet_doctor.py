@@ -54,6 +54,13 @@ def _emit(status, section, msg, detail=""):
     _results.append((status, section, msg))
 
 
+# Diagnostic symbols for the bar-freshness probe. SPY and BTC/USD are chosen
+# because they always have bars — a gap here is the feed, never the ticker.
+# Neither implies the bot trades that symbol.
+BAR_PROBE_SYMBOL = "SPY"
+BAR_PROBE_CRYPTO = "BTC/USD"
+
+
 def ok(section, msg, detail=""):   _emit("PASS", section, msg, detail)
 def bad(section, msg, detail=""):  _emit("FAIL", section, msg, detail)
 def warn(section, msg, detail=""): _emit("WARN", section, msg, detail)
@@ -337,6 +344,92 @@ def check_alpaca(config):
     except Exception as e:
         bad("alpaca", f"SPY bars failed: {type(e).__name__}: {e}",
             "The regime half of market_analyst is down, not just VIX.")
+
+
+# --- 5b. BAR FRESHNESS ---------------------------------------------------
+def check_bar_freshness(config):
+    """Issue each bot's OWN bar request and report the newest bar it receives.
+
+    This check exists because the failure it catches is invisible everywhere
+    else. Alpaca returns bars ascending from `start` and truncates at `limit`,
+    so `start=<wide>, limit=<small>` hands back the OLDEST bars in the window.
+    Nothing errors. The frame has the right columns, the right dtypes and a
+    plausible price - it is simply weeks out of date, and the indicator built
+    on it is confidently wrong. Three of the fleet's four fetch sites were in
+    that state for months (survivor 15m ~2wk, survivor SMA200 ~14wk, moon
+    donchian ~4wk) while every process reported healthy.
+
+    So: no synthetic probe. Call the bots' own fetchers, the ones the fleet
+    actually trades on, and print the timestamp that comes back.
+    """
+    header("5b. BAR FRESHNESS — how old is the data each bot trades on?")
+    print("          (a stale frame is a SUCCESSFUL fetch of old bars — it")
+    print("           cannot be seen from process health or error counts)")
+    if config is None:
+        warn("bars", "Skipped: no usable config.")
+        return
+
+    try:
+        import utils
+    except Exception as e:
+        bad("bars", f"utils will not import: {e}")
+        return
+
+    # (label, callable -> DataFrame|None, bar seconds, stale factor)
+    probes = []
+    try:
+        import survivor_bot
+        probes.append(("survivor_bot 15m", lambda: survivor_bot.get_data_alpaca(BAR_PROBE_SYMBOL),
+                       survivor_bot.BAR_SECONDS, utils.BAR_STALE_FACTOR))
+    except Exception as e:
+        warn("bars", f"survivor_bot probe unavailable: {type(e).__name__}: {e}")
+    try:
+        import trend_bot
+        probes.append(("trend_bot 15m", lambda: trend_bot.get_data_alpaca(BAR_PROBE_SYMBOL),
+                       trend_bot.BAR_SECONDS, utils.BAR_STALE_FACTOR))
+    except Exception as e:
+        warn("bars", f"trend_bot probe unavailable: {type(e).__name__}: {e}")
+
+    for label, fetch, bar_seconds, factor in probes:
+        try:
+            df = fetch()
+        except Exception as e:
+            bad("bars", f"{label}: fetch raised {type(e).__name__}: {e}")
+            continue
+        if df is None or len(df) == 0:
+            # The bot's own freshness guard returns None on a stale frame, so
+            # this is either "no data" or "data too old to trade" — both mean
+            # the bot is standing down on this symbol.
+            bad("bars", f"{label} ({BAR_PROBE_SYMBOL}): no usable frame — "
+                        f"empty response, or the freshness guard rejected it.",
+                "Check the bot log for a [STALE] line naming the age.")
+            continue
+        age = utils.bar_age_seconds(df)
+        if age is None:
+            bad("bars", f"{label} ({BAR_PROBE_SYMBOL}): {len(df)} bars, but no usable timestamp.")
+            continue
+        newest = df.index[-1]
+        limit_h = (bar_seconds * factor) / 3600.0
+        msg = (f"{label} ({BAR_PROBE_SYMBOL}): {len(df)} bars, newest {newest} "
+               f"({age / 3600.0:.1f}h old, limit {limit_h:.1f}h).")
+        if age > bar_seconds * factor:
+            bad("bars", msg, "The bot refuses to trade on this; the feed or the request window is wrong.")
+        else:
+            ok("bars", msg)
+
+    # moon_bot's Donchian levels come off crypto daily bars (its own client).
+    try:
+        import crypto_breakout
+        high, low, price = crypto_breakout.get_donchian_levels(BAR_PROBE_CRYPTO)
+        if price is None:
+            bad("bars", f"moon_bot donchian ({BAR_PROBE_CRYPTO}): no usable levels — "
+                        "empty response, too few completed bars, or stale.")
+        else:
+            ok("bars", f"moon_bot donchian ({BAR_PROBE_CRYPTO}): "
+                       f"{crypto_breakout.LOOKBACK_ENTRY}d high ${high:,.2f}, "
+                       f"{crypto_breakout.LOOKBACK_EXIT}d low ${low:,.2f}, last ${price:,.2f}.")
+    except Exception as e:
+        warn("bars", f"moon_bot probe unavailable: {type(e).__name__}: {e}")
 
 
 # --- 6. VIX SOURCES ------------------------------------------------------
@@ -667,6 +760,7 @@ def main():
         print("\n(network checks skipped)")
     else:
         check_alpaca(cfg)
+        check_bar_freshness(cfg)
         check_vix()
         check_influx(cfg)
         check_duplicate_fleet(cfg)

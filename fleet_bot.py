@@ -42,6 +42,10 @@ TARGET_FILE = "active_targets.json"
 CONFIG_FILE = "bot_config.json"
 FAILED_SYMBOL_COOLDOWN = 3600  # seconds to skip a symbol after an order error
 EASTERN = pytz.timezone('America/New_York')
+# Regular US equity session open, ET. Hardcoded to match the EOD windows below
+# ("14:00", "15:30", "15:45"), which are hardcoded for the same reason: Alpaca's
+# clock reports next_open/next_close, not the current session's open.
+MARKET_OPEN_ET = (9, 30)
 
 
 class FleetBot:
@@ -87,6 +91,7 @@ class FleetBot:
         self.is_eod_eval = False        # 15:30-15:45 ET: tiered-hold scoring window
         self.is_eod_close = False       # 15:45+ ET: liquidation window
         self.is_eod_skip_entry = False  # 14:00+ ET: no new entries
+        self.session_elapsed = None     # seconds since today's open (None off-session)
 
     # ---- Discord -------------------------------------------------------
     def notify(self, msg):
@@ -196,6 +201,17 @@ class FleetBot:
         self.is_eod_eval = "15:30" <= self.time_str < "15:45"
         self.is_eod_close = self.time_str >= "15:45"
         self.is_eod_skip_entry = self.time_str >= "14:00"
+
+        # How long today's session has been open. Bar-freshness checks need it:
+        # at 09:30 the newest intraday bar is the PREVIOUS session's, which any
+        # honest staleness bound rejects, so without this every session open
+        # looks like a data outage. None for 24/7 bots, which have no session.
+        if self.market_hours:
+            session_open = now_et.replace(hour=MARKET_OPEN_ET[0], minute=MARKET_OPEN_ET[1],
+                                          second=0, microsecond=0)
+            self.session_elapsed = max(0.0, (now_et - session_open).total_seconds())
+        else:
+            self.session_elapsed = None
 
         # Batch budget check once per cycle to prevent log spam
         self.budget_ok = utils.check_budget(self.name, self.trading_client)

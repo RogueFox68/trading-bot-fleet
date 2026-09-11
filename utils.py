@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 import time
@@ -20,7 +21,64 @@ MEASUREMENT_BY_BOT = {
 }
 MEASUREMENT_BY_BOT.update(fleet_registry.RETIRED_BOT_MEASUREMENTS)
 
-def _log_fill_to_influx(order, logger, reason="", action=None):
+# A fill row that InfluxDB refused is a trade the books will never show. The
+# write is a DELIVERY, separate from broker settlement: settlement must apply
+# once, delivery must retry. Callers pass an `outbox` list; a line that fails
+# to land is appended to it and retried by flush_fill_outbox until InfluxDB
+# answers 204. Crypto is excluded from reconcile_fills, so without this there
+# is no backfill path at all for a dropped crypto row.
+FILL_OUTBOX_MAX = 500
+
+
+def _post_influx_line(line, logger, context=""):
+    """Write one line-protocol row. True only on a real 204."""
+    try:
+        url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
+        r = requests.post(url, data=line, timeout=2)
+        if r.status_code == 204:
+            return True
+        logger.warning(f"InfluxDB trade write failed{context}: {r.status_code} {r.text}")
+    except Exception as e:
+        logger.warning(f"InfluxDB trade write error{context}: {e}")
+    return False
+
+
+def _stash(outbox, line, logger):
+    """Queue a failed delivery for retry. Bounded, and loud when it overflows."""
+    if outbox is None:
+        return
+    if len(outbox) >= FILL_OUTBOX_MAX:
+        dropped = outbox.pop(0)
+        registry.log_error("utils", "fill_outbox_overflow",
+                           Exception(f"outbox full at {FILL_OUTBOX_MAX}; dropped a fill row"),
+                           context=dropped[:80])
+        logger.error(f"  [Outbox] FULL ({FILL_OUTBOX_MAX}) — dropped the oldest undelivered "
+                     f"fill row. InfluxDB has been unreachable for a long time.")
+    outbox.append(line)
+
+
+def flush_fill_outbox(outbox, logger):
+    """Retry queued fill rows. Returns how many landed; leaves the rest queued.
+
+    Every row carries its own deterministic timestamp, so a replay overwrites
+    the same point rather than duplicating it.
+    """
+    if not outbox:
+        return 0
+    delivered = 0
+    for line in list(outbox):
+        if _post_influx_line(line, logger, context=" (outbox retry)"):
+            outbox.remove(line)
+            delivered += 1
+        else:
+            break  # InfluxDB is down; stop hammering it this cycle
+    if delivered:
+        logger.info(f"  [Outbox] delivered {delivered} queued fill row(s); "
+                    f"{len(outbox)} still waiting.")
+    return delivered
+
+
+def _log_fill_to_influx(order, logger, reason="", action=None, outbox=None):
     """Write a trade row to InfluxDB from a CONFIRMED Alpaca fill.
 
     Measurement is derived from the bot tag in client_order_id
@@ -29,7 +87,7 @@ def _log_fill_to_influx(order, logger, reason="", action=None):
     """
     try:
         if order is None or getattr(order, "filled_avg_price", None) is None:
-            return  # not filled -> do not log
+            return 0  # not filled -> do not log
         c_id = order.client_order_id or ""
         bot = next((b for b in MEASUREMENT_BY_BOT if c_id.startswith(f"{b}-")), None)
         measurement = MEASUREMENT_BY_BOT.get(bot, "trades")
@@ -48,12 +106,13 @@ def _log_fill_to_influx(order, logger, reason="", action=None):
         line = (f'{measurement},symbol={order.symbol} '
                 f'price={float(order.filled_avg_price)},action="{act}",'
                 f'qty={float(order.filled_qty)}{reason_field} {ns}')
-        url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
-        r = requests.post(url, data=line, timeout=2)
-        if r.status_code != 204:
-            logger.warning(f"InfluxDB trade write failed: {r.status_code} {r.text}")
+        if _post_influx_line(line, logger):
+            return 1
+        _stash(outbox, line, logger)
+        return 0
     except Exception as e:
         logger.warning(f"InfluxDB trade write error: {e}")
+    return 0
 
 # --- SAFETY LIMITS ---
 MAX_DAILY_LOSS = -5000.0
@@ -588,6 +647,53 @@ def get_budget_dollars(bot_name, trading_client, equity=None):
         equity = float(trading_client.get_account().equity)
     return equity * allocation_pct
 
+def _pending_unit_price(order, positions=None):
+    """Best available per-unit price for an unfilled order, or 0.0.
+
+    Tried in order of authority: the order's own limit, its dollar notional,
+    the average price of whatever has already filled, then the current mark on
+    a held position in the same symbol. Returns 0.0 when none of those exist,
+    so the caller can say the capital is unreserved instead of reserving zero
+    and calling it compliant.
+    """
+    try:
+        if getattr(order, "limit_price", None):
+            return float(order.limit_price)
+    except (TypeError, ValueError):
+        pass
+    try:
+        notional = getattr(order, "notional", None)
+        qty = float(getattr(order, "qty", 0) or 0)
+        if notional and qty > 0:
+            return float(notional) / qty
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    try:
+        if getattr(order, "filled_avg_price", None):
+            return float(order.filled_avg_price)
+    except (TypeError, ValueError):
+        pass
+    for p in positions or []:
+        if _same_symbol(getattr(p, "symbol", ""), getattr(order, "symbol", "")):
+            try:
+                return abs(float(p.current_price))
+            except (TypeError, ValueError, AttributeError):
+                continue
+
+    # Last resort for equities: ask for a quote. Crypto has no price client
+    # here, so those fall through to 0.0 and the caller fails closed.
+    symbol = getattr(order, "symbol", "") or ""
+    if symbol and "/" not in symbol and not re.match(r"^[A-Z]{1,6}\d{6}[PC]\d{8}$", symbol):
+        try:
+            from alpaca.data.requests import StockLatestTradeRequest
+            res = _safety_price_client().get_stock_latest_trade(
+                StockLatestTradeRequest(symbol_or_symbols=symbol))
+            return abs(float(res[symbol].price))
+        except Exception as e:
+            logger.warning(f"  [CFO] quote lookup failed pricing pending {symbol}: {e}")
+    return 0.0
+
+
 def check_budget_details(bot_name, trading_client):
     """
     Returns (is_ok, budget_dollars, total_used)
@@ -623,6 +729,7 @@ def check_budget_details(bot_name, trading_client):
         # 5. Calculate Pending Order Usage
         open_orders = trading_client.get_orders(filter=GetOrdersRequest(status="open"))
         pending_used = 0.0
+        unpriceable = []
         
         for o in open_orders:
             # Check if this order originated from this specific bot
@@ -634,11 +741,31 @@ def check_budget_details(bot_name, trading_client):
             if is_my_order:
                 unfilled_qty = float(o.qty) - float(o.filled_qty)
                 if unfilled_qty <= 0: continue
-                
-                # Equities (Buy Orders)
-                if o.asset_class == AssetClass.US_EQUITY and o.side == OrderSide.BUY:
-                    if o.limit_price:
-                        pending_used += unfilled_qty * float(o.limit_price)
+
+                # Equities and CRYPTO (Buy Orders).
+                #
+                # Crypto was missing entirely, and equity MARKET buys slipped
+                # through too (no limit_price, so the old branch priced them at
+                # nothing). Several not-yet-filled entries could therefore each
+                # see the same headroom and spend it. `_pending_unit_price`
+                # falls back through limit -> notional -> partial fill -> live
+                # mark, and says so out loud when it cannot price an order at
+                # all rather than silently reserving zero.
+                if o.side == OrderSide.BUY and o.asset_class in (
+                        AssetClass.US_EQUITY, AssetClass.CRYPTO):
+                    unit = _pending_unit_price(o, positions)
+                    if unit > 0:
+                        pending_used += unfilled_qty * unit
+                    else:
+                        # A fresh quantity-based MARKET buy has no limit, no
+                        # notional, no partial fill and no existing position -
+                        # precisely the new-entry case - so every fallback
+                        # returns nothing. Warning and continuing reserved
+                        # ZERO, and the next symbol saw the same headroom.
+                        # Refuse further exposure instead: the bot keeps
+                        # managing, and resumes entries as soon as the order
+                        # fills, prices, or terminates.
+                        unpriceable.append(str(getattr(o, "symbol", o.id)))
                         
                 # Options (Sell to Open / CSPs / CCs)
                 elif o.asset_class == AssetClass.US_OPTION and o.side == OrderSide.SELL:
@@ -653,6 +780,15 @@ def check_budget_details(bot_name, trading_client):
                     except Exception as e:
                         registry.log_error("utils", "parse_strike", e, context=o.symbol)
                         logger.error(f"  [CFO] Error parsing strike from {o.symbol}: {e}")
+
+        if unpriceable:
+            logger.warning(
+                f"  [CFO] {bot_name}: FAIL-CLOSED — {len(unpriceable)} pending order(s) "
+                f"cannot be priced ({', '.join(unpriceable)}), so their capital cannot be "
+                f"reserved. Blocking new entries until they fill or terminate.")
+            registry.log_error("utils", "unpriceable_pending",
+                               Exception(f"{bot_name}: {', '.join(unpriceable)}"))
+            return False, budget_dollars, budget_dollars
 
         total_used = current_used + pending_used
         available = budget_dollars - total_used
@@ -785,6 +921,47 @@ def assert_order_allowed_here():
         f"set {UNCONTAINED_OVERRIDE_ENV}=1.")
 
 
+def _same_symbol(position_symbol, order_symbol):
+    """Alpaca reports crypto positions as BTCUSD while orders use BTC/USD."""
+    return (position_symbol or "").replace("/", "") == (order_symbol or "").replace("/", "")
+
+
+def exposure_increasing_qty(order_data, positions):
+    """How much of this order OPENS or INCREASES exposure, in units.
+
+    0.0 means the order is purely risk-reducing: a sell against a long, a buy
+    against a short, a buy-to-close on a short option. A partial close is also
+    0.0; an over-sell that flips the position returns only the flipping part.
+
+    Shared by the daily loss cap and the notional/exposure caps so the two
+    cannot disagree about what "closing" means. Works for every asset class:
+    positions carry a signed quantity, and crypto's BTCUSD/BTC-slash-USD
+    spelling is normalised.
+    """
+    symbol = getattr(order_data, "symbol", None)
+    qty_attr = getattr(order_data, "qty", None)
+    if not symbol or qty_attr is None:
+        return 0.0
+    try:
+        qty = abs(float(qty_attr))
+    except (TypeError, ValueError):
+        return 0.0
+
+    held_qty = 0.0   # signed: long > 0, short < 0
+    for p in positions or []:
+        if _same_symbol(getattr(p, "symbol", ""), symbol):
+            try:
+                held_qty += float(p.qty)
+            except (TypeError, ValueError):
+                continue
+
+    if getattr(order_data, "side", None) == OrderSide.BUY:
+        # Buying while short covers up to |held_qty| before opening long
+        return qty if held_qty >= 0 else max(0.0, qty + held_qty)
+    # Selling while long closes up to held_qty before opening short
+    return qty if held_qty <= 0 else max(0.0, qty - held_qty)
+
+
 def submit_and_log_order(trading_client, order_data, logger, reason="", log_action=None):
     """
     Submits an order and polls for a few seconds to log fill-confirmation.
@@ -803,12 +980,33 @@ def submit_and_log_order(trading_client, order_data, logger, reason="", log_acti
             assert_order_allowed_here()
 
             account = trading_client.get_account()
-            
+
+            # Positions are needed by both the loss cap (only once it trips)
+            # and the exposure caps. Fetch at most once, and only if asked.
+            _positions_cache = []
+
+            def _positions():
+                if not _positions_cache:
+                    _positions_cache.append(trading_client.get_all_positions())
+                return _positions_cache[0]
+
             # 1. Daily Loss Cap Check
+            #
+            # Applies ONLY to orders that open or increase exposure. The cap
+            # used to reject every order outright, including the closes that
+            # would have stopped the bleeding: a fleet down $5,000 could no
+            # longer exit a losing long, cover a short, or buy back a short
+            # option. A circuit breaker that traps you inside the position is
+            # the opposite of a risk control.
             if account.last_equity and account.equity:
                 today_pnl = float(account.equity) - float(account.last_equity)
                 if today_pnl < MAX_DAILY_LOSS:
-                    raise Exception(f"Daily Loss Cap Exceeded! PnL: ${today_pnl:.2f} < Limit: ${MAX_DAILY_LOSS:.2f}")
+                    if exposure_increasing_qty(order_data, _positions()) > 0:
+                        raise Exception(f"Daily Loss Cap Exceeded! PnL: ${today_pnl:.2f} < Limit: ${MAX_DAILY_LOSS:.2f}")
+                    logger.warning(
+                        f"  [SAFETY] Daily loss cap is active (PnL ${today_pnl:.2f}), but this "
+                        f"order only REDUCES exposure in {getattr(order_data, 'symbol', '?')} "
+                        f"— allowing it through.")
 
             # 2+3. Notional & Symbol Exposure Caps — applied to any EQUITY
             # order that OPENS or INCREASES exposure: buys beyond a held short
@@ -839,15 +1037,8 @@ def submit_and_log_order(trading_client, order_data, logger, reason="", log_acti
                     except Exception as e:
                         logger.warning(f"  [SAFETY] price lookup failed for {symbol}: {e}")
 
-                positions = trading_client.get_all_positions()
-                held_qty = sum(float(p.qty) for p in positions if p.symbol == symbol)  # signed: long > 0, short < 0
-
-                if order_data.side == OrderSide.BUY:
-                    # Buying while short covers up to |held_qty| before opening long
-                    opening_qty = qty if held_qty >= 0 else max(0.0, qty + held_qty)
-                else:
-                    # Selling while long closes up to held_qty before opening short
-                    opening_qty = qty if held_qty <= 0 else max(0.0, qty - held_qty)
+                positions = _positions()
+                opening_qty = exposure_increasing_qty(order_data, positions)
 
                 if opening_qty > 0 and est_price > 0:
                     notional = opening_qty * est_price
@@ -897,11 +1088,15 @@ def submit_and_log_order(trading_client, order_data, logger, reason="", log_acti
                     return updated_order
                 elif status in ["canceled", "expired", "rejected"]:
                     logger.warning(f"  [ORDER FAILED] ID: {updated_order.id} | Status: {status} | Filled: {updated_order.filled_qty}")
-                    # Terminal with a partial fill: log it here. These never reach a
-                    # 'filled' status, so reconcile_fills() skips them (no filled_at)
-                    # and this is the only capture. The helper no-ops when nothing
-                    # filled, so a zero-fill cancel writes no row.
-                    _log_fill_to_influx(updated_order, logger, reason=reason, action=log_action)
+                    # Terminal with a partial fill. Routed through the SAME
+                    # canonical path the crypto reconcilers use: calling
+                    # _log_fill_to_influx directly stamped a no-filled_at
+                    # partial with time.time_ns(), while the reconciler stamped
+                    # the identical fill with log_terminal_partial_fill's
+                    # deterministic synthetic time — two timestamps, so two
+                    # rows for one trade instead of an idempotent overwrite.
+                    # One identity function, every caller.
+                    log_confirmed_fill(updated_order, logger, action=log_action, reason=reason)
                     return updated_order
                 # 'partially_filled' / 'new' / 'accepted' / 'pending_new' -> keep polling
 
@@ -1024,7 +1219,7 @@ def _fill_action(order):
         return "sell_put" if is_option.group(1) == "P" else "sell_call"
     return "sell"
 
-def log_terminal_partial_fill(order, logger):
+def log_terminal_partial_fill(order, logger, action=None, outbox=None):
     """Log a TERMINAL order's partial fill as a first-class trade row.
 
     A close-ladder rung (wheel_bot.close_option_position) can partially fill and
@@ -1074,14 +1269,12 @@ def log_terminal_partial_fill(order, logger):
         oid = str(getattr(order, "id", "") or c_id)
         ns = (base_ms + zlib.crc32(oid.encode()) % 1000) * 1_000_000
 
-        action = _fill_action(order)
+        action = action or _fill_action(order)
         line = (f'{measurement},symbol={order.symbol} '
                 f'price={float(price)},action="{action}",qty={filled_qty},'
                 f'fill_source="terminal_partial",source_order_id="{oid}" {ns}')
-        url = f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/write?db={config.INFLUX_DB_NAME}"
-        r = requests.post(url, data=line, timeout=2)
-        if r.status_code != 204:
-            logger.warning(f"  [TerminalPartial] InfluxDB write failed: {r.status_code} {r.text}")
+        if not _post_influx_line(line, logger, context=" [TerminalPartial]"):
+            _stash(outbox, line, logger)
             return 0
         logger.info(f"  [TerminalPartial] {order.symbol} {action} qty={filled_qty} "
                     f"(order {oid}, {status})")
@@ -1090,6 +1283,84 @@ def log_terminal_partial_fill(order, logger):
         registry.log_error("utils", "log_terminal_partial_fill", e,
                            context=getattr(order, "symbol", None))
         return 0
+
+def _http_status(exc):
+    """HTTP status behind an exception, or None.
+
+    Deliberately duck-typed rather than keyed on alpaca's APIError class: the
+    SDK wraps and re-raises through several layers, and the only thing that
+    matters is whether the broker gave us a status at all.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def account_position_qty(trading_client, symbol, bot_name="utils"):
+    """(qty, known) for an account position, read FRESH from the broker.
+
+    `known=False` means the broker did not answer — not that the position is
+    flat. A 404 IS an answer: Alpaca says the position does not exist. Only an
+    answer may retire durable state.
+
+    Shared by both crypto bots so they cannot drift. moon_bot previously read
+    `bot.positions`, the snapshot `FleetBot.refresh()` takes BEFORE cycle()
+    runs — so it predated the cycle's own fill reconciliation, and a buy that
+    settled during the cycle was compared against a position list captured
+    while that buy was still unfilled. Position-dependent decisions need a
+    read taken AFTER settlement, not the one the runner happened to cache.
+    """
+    missing = 0
+    for candidate in (symbol, symbol.replace("/", "")):
+        try:
+            return float(trading_client.get_open_position(candidate).qty), True
+        except Exception as e:
+            if _http_status(e) == 404:
+                missing += 1          # the broker ANSWERED: no such position
+                continue
+            registry.log_error(bot_name, "check_inventory", e, context=candidate)
+            return 0.0, False         # no answer at all
+    return (0.0, True) if missing else (0.0, False)
+
+
+def log_confirmed_fill(order, logger, action=None, reason="", outbox=None):
+    """Write a TERMINAL crypto order's fill to InfluxDB. Idempotent; 1 or 0.
+
+    The crypto bots reconcile their own ledgers from broker orders, and their
+    registry entries set `reconciled=False` (their grid_buy/grid_sell action
+    vocabulary cannot be rebuilt from an order alone), so `reconcile_fills`
+    never visits them. That was survivable while every crypto order was a
+    MARKET order: submit_and_log_order polls those to completion and logs the
+    fill inline. The moment the grid's exits became LIMIT orders it stopped
+    being survivable - submit_and_log_order returns a resting limit order
+    without logging anything, so completed grid SELLS had no path into
+    `crypto_trades` at all while its BUYS still did. The accountant would have
+    seen a book that only ever bought.
+
+    TERMINAL only, matching log_terminal_partial_fill's guardrails: an order
+    that is still open may yet fill completely and be logged at its broker
+    `filled_at`, and writing an in-flight partial first would double-count it.
+    """
+    if order is None:
+        return 0
+    raw_status = getattr(order, "status", None)
+    status = str(getattr(raw_status, "value", raw_status) or "").lower()
+    if status not in ("filled", "canceled", "cancelled", "expired", "rejected"):
+        return 0
+    if float(getattr(order, "filled_qty", 0) or 0) <= 0:
+        return 0
+
+    if getattr(order, "filled_at", None) is not None:
+        # Broker stamped the fill: the full-fill path owns the row and keys it
+        # on filled_at, so repeated reconciles overwrite one point.
+        return _log_fill_to_influx(order, logger, reason=reason, action=action, outbox=outbox)
+    # No broker stamp (a terminal partial): deterministic synthetic stamp.
+    return log_terminal_partial_fill(order, logger, action=action, outbox=outbox)
+
 
 def reconcile_fills(trading_client, logger, lookback_days=30):
     """Reconcile bot trade logs against Alpaca's authoritative fills.
@@ -1183,6 +1454,210 @@ def bound_session_timeout(client, timeout=30):
     session.request = _bounded
     session._fleet_timeout = timeout
     return client
+
+# --- BAR SELECTION & FRESHNESS -------------------------------------------
+# Alpaca returns bars ASCENDING from `start`, and `limit` truncates the
+# response at THAT end - so `StockBarsRequest(start=<wide>, limit=N)` yields
+# the OLDEST N bars in the window, never the newest. Every fetch site that
+# paired a wide `start` with a `limit` smaller than the window was therefore
+# computing indicators on a frozen historical slice and calling it "latest".
+#
+# Measured on 2026-09-11 (the performance follow-up), against live requests
+# issued with the deployed SDK from inside the fleet container:
+#
+#   survivor 15m   start=-20d  limit=200  -> newest bar Aug 27  (~2wk stale)
+#   survivor SMA200 start=-460d limit=250  -> newest bar Jun 5   (~14wk stale)
+#   moon daily     start=-60d  limit=30   -> newest bar Aug 12  (~4wk stale)
+#   trend 15m      start=-10d  limit=500  -> current (the ONLY site whose
+#                                            limit exceeded its window)
+#
+# That is why trend's data was fine and nobody noticed for months: the bug is
+# invisible unless limit < bars-in-window, and it fails by returning plausible
+# numbers rather than an error.
+#
+# The fix is structural, not a tuning change: size `start` to the history the
+# indicator actually needs and DO NOT pass `limit` (alpaca-py paginates the
+# window for you), then take the newest rows with `newest_bars`. `limit` is
+# only ever safe as an over-cap that the window cannot reach, and encoding
+# that distinction in every call site is exactly how this regressed - so the
+# rule here is simply: no `limit` alongside `start`.
+#
+# Belt and braces, `bars_are_fresh` refuses to let a stale frame drive a
+# decision even if some future feed change reintroduces the truncation. A
+# silently stale indicator is the same failure class as the 2026-06-24 frozen
+# VIX: the number is present, confident, and wrong.
+
+# A frame is stale once its newest bar is older than this many bar-widths.
+# 3 absorbs a normal gap (a halted symbol, a thin crypto minute, the first
+# bar after an outage) without absorbing a two-week hole.
+BAR_STALE_FACTOR = 3.0
+
+# The longest legitimate gap between one session's last bar and the next
+# session's open: Friday 16:00 ET to Tuesday 09:30 ET across a Monday holiday
+# is ~89.5h. 4.5 days carries that with margin and still rejects a frame that
+# has missed a whole week. Used only to widen the bound at the open, never to
+# skip a check - see bars_are_fresh.
+PRIOR_SESSION_GAP_SECONDS = 4.5 * 24 * 3600
+
+
+def _bar_timestamp(df, position=-1):
+    """Timezone-aware UTC datetime of one bar, or None if undeterminable."""
+    try:
+        if df is None or len(df) == 0:
+            return None
+        ts = df.index[position]
+        to_pydatetime = getattr(ts, "to_pydatetime", None)
+        if to_pydatetime is not None:
+            ts = to_pydatetime()
+        if not isinstance(ts, datetime.datetime):
+            return None
+        if ts.tzinfo is None:
+            return ts.replace(tzinfo=datetime.timezone.utc)
+        return ts.astimezone(datetime.timezone.utc)
+    except Exception:
+        return None
+
+
+def newest_bars(df, count):
+    """The newest `count` rows, ascending. Use INSTEAD of a request `limit`.
+
+    Bars come back oldest-first, so the newest rows are the tail. Callers that
+    need exactly N periods (an SMA window, a Donchian lookback) must slice
+    here, after the fetch, rather than asking the API for N bars.
+    """
+    if df is None or count is None or count <= 0:
+        return df
+    return df.tail(int(count))
+
+
+def bar_age_seconds(df, now=None):
+    """Age in seconds of the newest bar, or None if undeterminable."""
+    ts = _bar_timestamp(df)
+    if ts is None:
+        return None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    return (now - ts).total_seconds()
+
+
+def bars_are_fresh(df, bar_seconds, bot_name, symbol, context="",
+                   stale_factor=BAR_STALE_FACTOR, now=None, session_elapsed=None):
+    """True if the newest bar is recent enough to compute indicators on.
+
+    Stale or undateable frames are a LOUD failure (registry.log_error, so they
+    surface in Grafana like any other), never a silent skip - the whole point
+    is that the previous behavior looked exactly like success.
+
+    `session_elapsed` (seconds the current trading session has been open)
+    WIDENS the allowance near the open; it never skips the check. Without any
+    allowance, every Monday 09:30 reading is "stale": the newest 15m bar is
+    Friday's close, ~65 hours old, and an intraday bound of 3 x 15min rejects
+    it - a false outage manufactured by the guard itself. But exempting the
+    frame outright (the first attempt at this) accepted ANY bar in the opening
+    45 minutes, including a two-week-old one, and skipped the undateable-frame
+    check with it. So before enough session has elapsed to have produced a
+    fresh bar, the newest bar may be as old as the session is, plus one
+    legitimate market close - and no older.
+
+    A False answer means "do not compute indicators from this frame". It must
+    NOT be read as "do not manage the position": risk exits run off a live
+    quote and the entry price, neither of which comes from here. See the
+    bots' manage_position(indicators_ok=...).
+    """
+    max_age = float(bar_seconds) * float(stale_factor)
+    if session_elapsed is not None and session_elapsed < max_age:
+        # Too little session has passed to expect a fresh bar: the newest one
+        # should be the PREVIOUS session's, not any bar at all.
+        max_age = float(session_elapsed) + PRIOR_SESSION_GAP_SECONDS
+
+    age = bar_age_seconds(df, now=now)
+    if age is None:
+        registry.log_error(bot_name, "bar_freshness",
+                           Exception("bars carry no usable timestamp index"),
+                           context=f"{symbol} {context}".strip())
+        logger.error(f"  [STALE] {bot_name} {symbol} {context}: bars have no usable timestamp")
+        return False
+
+    if age > max_age:
+        registry.log_error(
+            bot_name, "bar_freshness",
+            Exception(f"newest bar is {age / 3600.0:.1f}h old (limit {max_age / 3600.0:.1f}h)"),
+            context=f"{symbol} {context}".strip())
+        logger.error(f"  [STALE] {bot_name} {symbol} {context}: newest bar "
+                     f"{age / 3600.0:.1f}h old > {max_age / 3600.0:.1f}h limit - refusing to trade on it")
+        return False
+    return True
+
+
+# A trade older than this is not a price you may run a stop loss against.
+LIVE_QUOTE_MAX_AGE = 15 * 60
+
+
+def live_equity_price(data_client, symbol, bot_name, max_age_seconds=LIVE_QUOTE_MAX_AGE,
+                      now=None):
+    """Current trade price for a RISK decision, or None if it can't be validated.
+
+    Deliberately has no fallback. The bots used to fall back to the latest bar
+    close when this fetch failed, which is safe only while the bars are fresh -
+    and the whole reason this function exists is the case where they are not.
+    Running a stop loss off a two-week-old close is worse than not running one,
+    because it looks like risk management. A None here means "no price", and
+    the caller must say so rather than substitute one.
+    """
+    try:
+        from alpaca.data.requests import StockLatestTradeRequest
+        trade = data_client.get_stock_latest_trade(
+            StockLatestTradeRequest(symbol_or_symbols=[symbol]))[symbol]
+    except Exception as e:
+        registry.log_error(bot_name, "live_quote", e, context=symbol)
+        logger.error(f"    [!] {bot_name} {symbol}: live quote unavailable: {e}")
+        return None
+
+    price = float(getattr(trade, "price", 0) or 0)
+    if price <= 0:
+        registry.log_error(bot_name, "live_quote",
+                           Exception(f"non-positive price {price!r}"), context=symbol)
+        return None
+
+    stamp = getattr(trade, "timestamp", None)
+    if stamp is not None:
+        to_py = getattr(stamp, "to_pydatetime", None)
+        if to_py is not None:
+            stamp = to_py()
+        if isinstance(stamp, datetime.datetime):
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=datetime.timezone.utc)
+            now = now or datetime.datetime.now(datetime.timezone.utc)
+            age = (now - stamp).total_seconds()
+            if age > max_age_seconds:
+                registry.log_error(
+                    bot_name, "live_quote",
+                    Exception(f"last trade is {age / 60.0:.0f}m old (limit "
+                              f"{max_age_seconds / 60.0:.0f}m)"), context=symbol)
+                logger.error(f"    [!] {bot_name} {symbol}: last trade {age / 60.0:.0f}m "
+                             f"old - not a price to risk-manage against")
+                return None
+    return price
+
+
+def drop_forming_bar(df, bar_seconds, now=None):
+    """Drop the final bar only if it is still forming.
+
+    `df.iloc[:-1]` was the old idiom for "exclude the current incomplete
+    candle". It is only correct when the frame actually ends at now: on a
+    truncated (stale) frame it silently discards a COMPLETED bar, which is how
+    moon_bot's 30-day-old Donchian levels became 31-day-old ones. Deciding
+    from the timestamp works on both fresh and stale frames.
+    """
+    if df is None or len(df) == 0:
+        return df
+    ts = _bar_timestamp(df)
+    if ts is None:
+        return df.iloc[:-1]  # can't date it; keep the old conservative behavior
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if (ts + datetime.timedelta(seconds=float(bar_seconds))) > now:
+        return df.iloc[:-1]
+    return df
+
 
 # --- OPTION LIFECYCLE EVENTS (assignment / exercise / expiration) ---
 # These are position mutations with NO order behind them, so submit_and_log_order
