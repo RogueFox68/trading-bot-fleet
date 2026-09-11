@@ -103,6 +103,7 @@ trading-bot-fleet/
 │   ├── test_crypto_grid.py        # Regression: entry-linked grid spacing, lot ledger, budget split
 │   ├── test_pl_accounting.py      # Regression: FIFO period P&L, opening inventory, window scoping
 │   ├── test_safety_gates.py       # Regression: loss cap exempts closes, pending-order reservation
+│   ├── test_config_audit.py       # Regression: bot_config completeness, fail-safe bootstrap
 │   ├── dedupe_trades.py           # One-off: delete pre-fix duplicate trade rows (dry-run default)
 │   ├── export_data.py             # Export InfluxDB trade data to CSV
 │   └── fetch_trade_history.py     # Pull raw FILL activities from Alpaca
@@ -140,8 +141,9 @@ Beelink → the live mount makes it visible in-container → bots trade against 
 Two files make a new strategy cheap to add:
 
 - **`fleet_registry.py`** — one entry per bot: script, InfluxDB measurement, webhook config key,
-  static symbols, reconciliation flag, gating rule, manual-state flag. Ownership tags,
-  accountant queries/reporting, analyst pause behavior, and fill reconciliation ALL derive from
+  static symbols, reconciliation flag, gating rule, manual-state flag, and the `bot_config.json`
+  keys that bot reads (`config_keys`). Ownership tags, accountant queries/reporting, analyst
+  pause behavior, fill reconciliation and the **bot_config completeness check** ALL derive from
   it. **Never re-introduce a per-bot list anywhere else.**
 - **`fleet_bot.py`** — the shared runner. Provides clients, Discord, market-hours gate,
   regime/VIX, targets loading, ownership priming, pending-order tracking, budget gate, EOD
@@ -416,6 +418,44 @@ elapsed to have produced a fresh bar, the newest bar may be as old as the sessio
 `PRIOR_SESSION_GAP_SECONDS` (4.5 days — Friday 16:00 ET to Tuesday 09:30 ET across a Monday
 holiday is ~89.5h), and no older. The timestamp is always checked.
 
+### The bot_config.json Contract
+
+`bot_config.json` is gitignored and lives on the host, so **no config change ever arrives by
+deploy**. Anything a release adds to `bot_config.template.json` is a manual step on the
+Beelink, every time. The live file also accumulates runtime state the template never had —
+`vix`, `vix_source`, `data_stale`, `regime_updated`, `CAPITAL_CRUNCH`, commander's paused
+`status` values, the wheel's per-ticker levers. **Drift in that direction is expected and
+healthy; never `cp bot_config.template.json bot_config.json` on a running fleet** — it resets
+`market_condition` to a tradeable regime (un-gating wheel_bot and crypto_grid), clears a
+latched `emergency_stop`, and discards every allocation you tuned.
+
+Drift in the *other* direction was invisible until 2026-09-11: every read is a
+`.get(key, default)`, so a missing key is silent, and two of those defaults are not
+conservative.
+
+| Missing key | Silent default | Consequence |
+|---|---|---|
+| `global_settings.vix` | `15.0` | **Below every gate** — the VIX kill-switch reads a calm market |
+| `cfo_settings.unallocated_reserve` | `0.0` | No reserve; every budget computes on full equity |
+| `global_settings.market_condition` | `"SIDEWAYS"` | Tradeable — un-gates wheel_bot and crypto_grid |
+| `bots.crypto_grid.entries_enabled` | `False` | Grid opens nothing (safe, but silent) |
+
+`fleet_registry.missing_config_keys()` declares the whole expected shape —
+`GLOBAL_SETTINGS_KEYS`, `CFO_SETTINGS_KEYS`, `REQUIRED_BOT_KEYS`, and each bot's own
+`config_keys` — and `fleet_doctor` section 8 reports what the live file lacks, failing on the
+unsafe defaults and warning on the rest. It lives in the registry rather than in fleet_doctor
+because the registry already owns this contract (see "Adding a new bot", steps 2–3), so a
+newly registered bot is covered the moment it is registered. `unregistered_config_bots()`
+separately reports `bots{}` entries with no registry entry — harmless, but dead.
+
+**The template itself was missing `vix`**, which the check found on its first run: a fresh
+install traded as though the market were calm until market_analyst's first successful fetch,
+up to 15 minutes of a disabled kill-switch that looked exactly like a working one. The
+template now seeds the analyst's **own blind-state values** — `CRITICAL_VOLATILITY`, VIX 25,
+`data_stale: true` — because a config that has never had a successful fetch *is* the stale
+case, and `STALE_VIX_SENTINEL` is what the analyst writes when it is blind. A fresh install
+therefore boots gated and un-gates itself once the regime is real.
+
 ### CFO / Budget Enforcement
 
 `utils.check_budget(bot_name, client)` before every entry:
@@ -633,7 +673,7 @@ gap above. `max_hold_days` remains the only tiered_hold backstop that is live.
 
 ## Testing
 
-`python -m unittest test_orphan_resolution test_fill_logging test_market_analyst test_strategy_advisor test_commander test_containment test_bar_freshness test_risk_exits test_crypto_grid test_pl_accounting test_safety_gates -v` —
+`python -m unittest test_orphan_resolution test_fill_logging test_market_analyst test_strategy_advisor test_commander test_containment test_bar_freshness test_risk_exits test_crypto_grid test_pl_accounting test_safety_gates test_config_audit -v` —
 regression suites for the ownership/entry-time paging fix (+ option-root inference and the
 no-default-owner rule), fill-row stamping / wheel close-ladder pricing, and the market-regime
 pipeline (SPY-df normalization, VIX>28 kill-switch, loud-failure + stale fail-safe), plus the
@@ -653,7 +693,10 @@ stop loss fires inside the 15:30+ hold window, the case that was silently disabl
 Run `test_crypto_grid` after touching grid entry/exit or either crypto ledger — it covers the
 whole order lifecycle (delayed fill, zero-fill rejection, partial-then-canceled, repeated
 reconciliation, restart while pending) because every one of those was a way to invent or
-destroy inventory. Run `test_pl_accounting` after touching `accountant.calculate_realized_pl`
+destroy inventory. Run `test_config_audit` after adding any `bot_config.json` key or registering a bot — it
+asserts the shipped template defines everything the code reads, and that a fresh config boots
+into the fail-safe rather than a calm market. Run `test_pl_accounting` after touching
+`accountant.calculate_realized_pl`
 or the advisor's window metrics, and `test_safety_gates` after touching the order-submission
 path or `check_budget_details` — its load-bearing assertion is that a breached daily loss cap
 still lets a long exit, a short cover and an option buy-to-close through.
@@ -700,6 +743,10 @@ judged against that schedule rather than a flat 24h.
   orders, not only in crypto. Opening-owner allocation is a reasonable default but is not a
   fact about which strategy earned what — treat pre-2026-09 per-bot dollar totals as
   indicative.
+- **Config keys are checked, but config *values* are not.** `missing_config_keys` reports an
+  absent key; it does not know that `allocation: 0.9` is wrong or that `base_allocations` no
+  longer sums sensibly (rule 4 is still a human check). It also cannot see a key that is
+  present but stale — a hand-edited `vix` nobody updated reads as live.
 - **The scout's last run lands after entries stop.** The documented schedule starts its final
   run at 15:00 CT (16:00 ET) while trend_bot and survivor_bot stop new entries at 14:00 ET
   (`FleetBot.is_eod_skip_entry`), so that run's targets cannot be acted on until the next
@@ -831,7 +878,15 @@ judged against that schedule rather than a flat 24h.
    returned and acted on, not warned about. "Hitting max_orders will make returns
    unavailable" was logged while the same plain fill list went downstream and got ranked
    anyway.
-22. **Report an unmeasurable number as unmeasurable.** If a metric needs data the fleet does
+22. **A key the code reads belongs in `fleet_registry`'s config contract.** Adding a
+   `bot_config.json` read means adding it to `GLOBAL_SETTINGS_KEYS`, `CFO_SETTINGS_KEYS` or
+   the bot's own `config_keys`, with its silent default and why that default matters. The
+   live file is gitignored, so a new key never arrives by deploy — if it is not declared,
+   nothing will ever tell the operator it is absent.
+23. **A bootstrap default must fail safe.** A fresh `bot_config.json` has had no successful
+   market fetch, so it must seed the same values the analyst publishes when blind, not a
+   calm market it never measured.
+24. **Report an unmeasurable number as unmeasurable.** If a metric needs data the fleet does
    not store, publish it as unavailable and withhold whatever depends on it. Do not
    substitute a proxy and disclose the substitution in a notes field — the number still gets
    used, and a proxy that can invert the sign of a return is worse than a gap.

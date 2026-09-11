@@ -184,6 +184,14 @@ Safety is centralized in `utils.py`:
     disagree about that strategy and neither should pick a winner. The advisor never
     writes `effective_budgets.json`; promotion is always a human step.
 
+*   **`fleet_doctor` says bot_config.json is missing keys:** the live config on the host has
+    drifted behind the code. Each listed key shows the value the code silently falls back to;
+    `!!` marks one where that fallback is unsafe (an absent `vix` reads 15.0, below every gate).
+    Add the named keys to `~/bots/repo/bot_config.json` and restart the affected process.
+    **Do not** `cp bot_config.template.json bot_config.json` to fix it — that resets the regime
+    to a tradeable one, clears a latched `/panic`, and discards your allocation tuning. Add the
+    keys; keep the file.
+
 ## Target File Contract
 The Corsair scout must emit the v1.1 dictionary schema:
 ```json
