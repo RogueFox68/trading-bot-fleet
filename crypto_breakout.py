@@ -63,6 +63,10 @@ STATE_VERSION = 2
 DUST_QTY = 1e-8
 
 
+# In-memory only: flags load_state sets for cycle(), never written to disk.
+_TRANSIENT_KEYS = frozenset({"unreadable", "migrated"})
+
+
 def _empty_state():
     return {"version": STATE_VERSION, "qty": {}, "pending": {}, "outbox": []}
 
@@ -86,14 +90,31 @@ def load_state():
         return state
 
     # v1 was a flat {symbol: qty} map; carry it forward.
+    #
+    # Build it from _empty_state() rather than a dict literal. The literal
+    # listed the keys v2 had ON THE DAY IT WAS WRITTEN, so when the outbox
+    # arrived every OTHER path gained the key and this one silently did not:
+    # `state["outbox"]` at the top of cycle() raised KeyError before any work
+    # ran, the runner caught it, and moon_bot logged one error a minute for
+    # four days while PM2 showed it online and the doctor's import check
+    # passed. Nothing was saved either — save_state only runs at the END of a
+    # cycle that never got there — so the file stayed v1 and the crash
+    # repeated forever. An empty `{}` file reached the same branch and broke
+    # the same way. Seeding from _empty_state() means a key added to v2 is
+    # carried by every loader by construction, not by remembering to.
     if "qty" not in raw and "pending" not in raw:
         try:
-            return {"version": STATE_VERSION, "pending": {},
-                    "qty": {k: float(v) for k, v in raw.items()}}
+            migrated = {str(k): float(v) for k, v in raw.items()}
         except (TypeError, ValueError):
             state = _empty_state()
             state["unreadable"] = True
             return state
+        state = _empty_state()
+        state["qty"] = migrated
+        # Convert the file on disk once, so the migration is not re-run (and
+        # not re-risked) on every restart. cycle() acts on this.
+        state["migrated"] = True
+        return state
 
     state = _empty_state()
     for k, v in (raw.get("qty") or {}).items():
@@ -118,7 +139,7 @@ def save_state(state):
     """Write atomically — a half-written ledger is lost inventory tracking."""
     tmp = f"{STATE_FILE}.tmp"
     try:
-        payload = {k: v for k, v in state.items() if k != "unreadable"}
+        payload = {k: v for k, v in state.items() if k not in _TRANSIENT_KEYS}
         with open(tmp, "w") as f:
             json.dump(payload, f, indent=2)
             f.flush()
@@ -257,6 +278,13 @@ def cycle(bot):
     buying_power = float(bot.account.buying_power)
 
     state = load_state()
+    # A migrated v1 ledger is written back immediately, not left to the
+    # end-of-cycle `if dirty` save: anything that raises in between would
+    # leave the file in the old shape and migrate it again next cycle.
+    if state.pop("migrated", False):
+        logger.info(f"    [LEDGER] migrated v1 ledger to v{STATE_VERSION}; "
+                    f"rewriting {STATE_FILE}.")
+        save_state(state)
     # Retry any fill rows InfluxDB refused earlier, then settle everything in
     # flight. Settlement applies once; delivery retries until it lands.
     dirty = bool(utils.flush_fill_outbox(state["outbox"], logger))
