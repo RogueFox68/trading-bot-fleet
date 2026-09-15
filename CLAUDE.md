@@ -634,14 +634,25 @@ existing positions.
 postmortems):** SPY (which drives the regime) comes from **Alpaca `get_stock_bars`** — reliable,
 already authenticated. VIX cannot: alpaca-py exposes no index feed and this account 403s on the
 index endpoints. So VIX runs a **multi-source fallback chain** (`market_analyst.VIX_SOURCES`):
-CBOE delayed-quote JSON → stooq CSV → yfinance, first sane reading wins. That order
+CBOE delayed-quote JSON → yfinance, first sane reading wins. That order
 is measured, not assumed: from the fleet container on 2026-09-06 CBOE answered in 0.2s,
 stooq returned HTTP 404, and yfinance timed out after 130s (so yfinance carries its own
-short `VIX_YF_TIMEOUT`, since three chain attempts at 130s would stall the loop for
-minutes). Every source returns
+short `VIX_YF_TIMEOUT`, since chain attempts at 130s would stall the loop for
+minutes). **stooq was removed 2026-09-15** after 404ing continuously for nine days — the
+percent-encoded-caret fix shipped 2026-09-07 and the 404 outlived it by eight days, so the
+endpoint is gone for `^vix`, not mis-addressed. It is deliberately **not replaced**: the bar is
+free, unauthenticated, *intraday*, true index points, and nothing free clears it. Every source
+returns
 **true index points**, so the 22/28 gates need no recalibration whichever answers; a dollar-priced
 proxy (VIXY/VXX) is deliberately excluded, since a mis-scaled number feeding a kill-switch is
-worse than no number (the stale fail-safe already covers "no number"). Readings outside
+worse than no number (the stale fail-safe already covers "no number"). A **daily-close** series
+(FRED's `VIXCLS`) is excluded for a subtler version of the same reason: it would only ever be
+reached when both intraday sources are down, and a market-wide event is exactly when a CDN and
+Yahoo fail together *and* when VIX spikes — so a successful fetch of yesterday's calm close would
+publish as a **live** reading and suppress the stale fail-safe that would otherwise have gated the
+fleet. That trades a loud, safe degradation for a quiet, wrong one on the worst day of the year.
+The chain is therefore two deep, and `fleet_doctor` **warns when only one source is left**, since
+with two there is no longer a spare to lose quietly. Readings outside
 `[VIX_MIN, VIX_MAX]` = [5, 150] are rejected as garbage rather than published. yfinance is **last
 and imported lazily** — it broke the fleet twice (2026-06 rate-limiting, 2026-09 outright), and a
 broken install of an optional fallback must not kill the regime process at import. The winning
@@ -804,15 +815,19 @@ judged against that schedule rather than a flat 24h.
   only per-process memory series never carried data. Fixed — but every `bot_monitor` point
   written before that fix has memory=0 and cpu=0, so historical panels are empty by construction.
 - **VIX depends on free public providers.** alpaca-py has no index feed, so VIX can't move to
-  Alpaca like SPY did. The 2026-09 chain (stooq → CBOE → yfinance) removes the *single*-provider
+  Alpaca like SPY did. The chain (CBOE → yfinance) removes the *single*-provider
   SPOF, and the stale fail-safe + accountant freshness watchdog still bound the blast radius, but
-  all three are unauthenticated endpoints that can rate-limit or change shape without notice. A
-  paid index feed remains the only way to actually own this input. `fleet_doctor.py` reports each
-  source's health individually — and a dead source is a **warning** while any source is still
-  live, a failure only when the last one dies. stooq has 404'd since 2026-09-06; reporting a
-  condition the chain is designed to absorb as `[ FAIL ]` on every run put a permanent red line
-  in the summary and, through the exit code, made a healthy fleet look broken forever (rule 10,
-  in the one section whose header already said "a red line here is not an outage by itself").
+  both are unauthenticated endpoints that can rate-limit or change shape without notice. A
+  paid index feed remains the only way to actually own this input, and it is now the **only** way
+  to get back to three sources — stooq was removed 2026-09-15 and no free intraday replacement
+  exists (see Market Regime & Gating for why a daily-close series is not one). `fleet_doctor.py`
+  reports each source's health individually — a dead source is a **warning** while any source is
+  still live, a failure only when the last one dies, and a **warning that there is no spare left**
+  once the chain is down to one. Reporting a condition the chain is designed to absorb as
+  `[ FAIL ]` on every run put a permanent red line in the summary and, through the exit code,
+  made a healthy fleet look broken forever (rule 10, in the one section whose header already said
+  "a red line here is not an outage by itself"). **The chain is now two deep, so that tolerance
+  has one step left in it.**
 - **`ta` is an sdist-only, effectively unmaintained dependency** (trend_bot's EMA/ADX,
   survivor_bot's RSI). It builds and computes correctly under the pinned pandas 3.x / numpy 2.x
   set, but it is the one package here that can fail a container rebuild outright on a toolchain

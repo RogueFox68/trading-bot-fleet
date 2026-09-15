@@ -587,3 +587,60 @@ class AccountingAnomalyCheckTest(unittest.TestCase):
         statuses, out = self._run(None, None)
         self.assertEqual(statuses, ["WARN"])
         self.assertIn("not running", out)
+
+
+class VixChainDepthTest(unittest.TestCase):
+    """With stooq removed the chain is two deep, so one loss is the last spare.
+
+    The old grading said "the chain has a spare" for any live < total, which
+    on a two-source chain is exactly wrong: one dead source means the NEXT
+    failure drops the fleet onto the stale fail-safe. Rule 27 tolerates a
+    covered failure, but the tolerance has to end where the cover does.
+    """
+
+    def setUp(self):
+        import market_analyst
+        self.fd = fleet_doctor
+        self.ma = market_analyst
+        self._saved = market_analyst.VIX_SOURCES
+        self.fd._results = []
+
+    def tearDown(self):
+        self.ma.VIX_SOURCES = self._saved
+        self.fd._results = []
+
+    def _run(self, sources):
+        self.ma.VIX_SOURCES = sources
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.fd.check_vix()
+        return [r for r in self.fd._results if r[1] == "vix"], buf.getvalue()
+
+    @staticmethod
+    def _dead():
+        def f():
+            raise RuntimeError("HTTP 404")
+        return f
+
+    def test_the_shipped_chain_is_intraday_only(self):
+        self.assertEqual([n for n, _ in self.ma.VIX_SOURCES], ["cboe", "yfinance"])
+
+    def test_one_of_two_live_warns_that_there_is_no_spare(self):
+        results, out = self._run([("cboe", lambda: 15.84),
+                                  ("yfinance", self._dead())])
+        self.assertFalse([r for r in results if r[0] == "FAIL"],
+                         "a covered source must not fail the run (rule 27)")
+        self.assertTrue([r for r in results if r[0] == "WARN"
+                         and "NO spare" in r[2]],
+                        f"losing the last spare was reported as fine: {results}")
+
+    def test_both_live_is_clean(self):
+        results, _ = self._run([("cboe", lambda: 15.84),
+                                ("yfinance", lambda: 15.9)])
+        self.assertFalse([r for r in results if r[0] in ("FAIL", "WARN")], results)
+
+    def test_all_dead_still_fails(self):
+        results, _ = self._run([("cboe", self._dead()),
+                                ("yfinance", self._dead())])
+        self.assertTrue([r for r in results if r[0] == "FAIL"],
+                        "an entirely dead chain must fail")

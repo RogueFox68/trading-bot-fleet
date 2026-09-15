@@ -226,29 +226,6 @@ def check_spy_bar_age(spy_df):
 # answer. Raising is fine too — the chain catches, logs, and moves on. None of
 # them may raise out of get_vix_value(): its contract is `float | None`.
 
-def _vix_from_stooq():
-    """stooq.com delayed CSV quote. No key, no cookie, plain requests.
-
-    The symbol goes through `params` so requests percent-encodes the caret
-    (^vix -> %5Evix). Hand-building the URL with a literal '^' returned HTTP 404
-    from the container on 2026-09-06 — an unencoded caret is not a legal URI
-    character and intermediaries are free to mangle it."""
-    r = requests.get("https://stooq.com/q/l/",
-                     params={"s": "^vix", "f": "sd2t2ohlc", "h": "", "e": "csv"},
-                     timeout=VIX_HTTP_TIMEOUT,
-                     headers={"User-Agent": VIX_USER_AGENT})
-    if r.status_code != 200 or not r.text:
-        raise RuntimeError(f"HTTP {r.status_code}")
-    # Symbol,Date,Time,Open,High,Low,Close  -> Close is the VIX level.
-    lines = [ln for ln in r.text.strip().splitlines() if ln.strip()]
-    if len(lines) < 2:
-        raise ValueError(f"short CSV: {r.text[:80]!r}")
-    close = lines[-1].split(",")[-1].strip()
-    if not close or close.upper() == "N/D":
-        raise ValueError(f"no quote: {r.text[:80]!r}")
-    return float(close)
-
-
 def _vix_from_cboe():
     """CBOE's own delayed-quote JSON — the index's home exchange."""
     r = requests.get(
@@ -330,13 +307,37 @@ def _vix_from_yfinance():
 # CBOE is first on evidence, not preference: measured from the fleet container
 # on 2026-09-06, CBOE answered in 0.2s while stooq returned HTTP 404 and
 # yfinance timed out after 130s. It is also the index's home exchange, which
-# makes it the most defensible source to be carrying a kill-switch.
-# stooq stays as the independent second opinion (different operator, different
-# network path), and yfinance stays last because it is the one that has already
-# failed this fleet twice.
+# makes it the most defensible source to be carrying a kill-switch. yfinance
+# is last because it is the one that has already failed this fleet twice
+# (2026-06 rate-limiting, 2026-09 outright).
+#
+# stooq was REMOVED on 2026-09-15 after 404ing continuously since 2026-09-06.
+# The percent-encoded-caret theory was already tried — that is what the
+# `params={"s": "^vix"}` form was for, shipped 2026-09-07 — and the 404
+# persisted for the eight days after it, so the endpoint is gone for ^vix,
+# not mis-addressed.
+#
+# It is deliberately NOT replaced. The bar is a free, unauthenticated,
+# INTRADAY source of true index points, and nothing free clears it: the
+# remaining candidates are daily-close series (FRED's VIXCLS is the obvious
+# one) or dollar-priced proxies (VIXY/VXX), and both are the same mistake in
+# different clothes — a number that is not what the gate believes it is.
+#
+# A daily close is specifically dangerous HERE, more than it looks. It would
+# only ever be consulted when both intraday sources are down, and a
+# market-wide event is exactly when a CDN and Yahoo are most likely to fail
+# together AND when VIX is most likely to be spiking. In that window a
+# successful FRED fetch publishes yesterday's calm close as a LIVE reading,
+# which suppresses the stale fail-safe (CRITICAL_VOLATILITY + VIX 25) that
+# would otherwise have gated the fleet. Adding it would trade a loud, safe
+# degradation for a quiet, wrong one on the worst day of the year.
+#
+# So the chain is two sources plus the fail-safe, and the thinness is
+# reported rather than papered over: fleet_doctor warns when only one source
+# is left, because with two there is no longer a spare to lose quietly.
+# Closing this properly needs a paid index feed (see CLAUDE.md Known Issues).
 VIX_SOURCES = (
     ("cboe", _vix_from_cboe),
-    ("stooq", _vix_from_stooq),
     ("yfinance", _vix_from_yfinance),
 )
 

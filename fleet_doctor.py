@@ -496,6 +496,16 @@ def check_vix():
             "The fleet will run on the stale fail-safe: CRITICAL_VOLATILITY +\n"
             "VIX 25 + data_stale=true after 45 min. That is SAFE (entries gated)\n"
             "but it is not a market reading. Check egress from the container.")
+    elif live == 1:
+        # With stooq removed the chain is two sources deep, so one dead
+        # source is the LAST spare, not a covered failure. Rule 27 says a
+        # tolerated failure is a warning — but "tolerated" ends here: the
+        # next one takes the kill-switch down to the stale fail-safe.
+        warn("vix", f"Only 1 of {len(sources)} VIX sources is live — the chain "
+                    f"has NO spare left.",
+             "The next failure drops the fleet onto the stale fail-safe\n"
+             "(CRITICAL_VOLATILITY + VIX 25 + data_stale after 45 min): safe,\n"
+             "but not a market reading. Fix the dead source or add one.")
     elif live < len(sources):
         ok("vix", f"{live}/{len(sources)} sources live — the chain has a spare.")
     else:
