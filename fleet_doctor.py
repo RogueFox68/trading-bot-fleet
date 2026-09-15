@@ -541,6 +541,194 @@ def check_influx(config):
         bad("influx", f"Write failed: {e}")
 
 
+# --- 7c. ERROR RATE ------------------------------------------------------
+#
+# Thresholds. Baseline before 2026-09-11 was 1-15 errors a DAY across the
+# whole fleet, so 50 is already well outside normal and 200 is not a busy
+# day — it is a loop.
+ERROR_WARN_24H = 50        # any one bot, summed across its groups
+ERROR_FAIL_24H = 200       # any one (bot_id, component, error_type) group
+ERROR_FAIL_PER_HOUR = 30   # >= every 2 min in the last hour: loop cadence
+#
+# Detection latency is the deliberate cost of not firing on every short
+# burst. At moon_bot's 60s error cadence the per-hour rule fires after 30
+# minutes; the 24h rule alone would have needed over three hours. A slower
+# loop (the accountant's 300s cycle is 12/h) falls under the per-hour bar and
+# is caught by the 24h rule within a day instead. Both are far better than
+# the four days this actually took.
+ERROR_TOP_N = 5
+
+
+def classify_error_rates(groups_24h, groups_1h):
+    """Grade grouped error counts. Pure, so it is testable without InfluxDB.
+
+    groups_*: {(bot_id, component, error_type): count}
+    Returns (findings, offenders) where findings is [(status, msg, detail)]
+    ordered worst-first and offenders is the top groups by 24h count.
+
+    This exists because the doctor could not see the failure it most needed
+    to: moon_bot raised KeyError on the first statement of every cycle for
+    four days — ~5,500 errors, one a minute — while PM2 reported `online`
+    (the runner catches it) and the import check passed (the module imports
+    fine). Neither process health nor import health can see a bot that
+    catches its own exception, so the error series is the only witness.
+    """
+    findings = []
+    offenders = sorted(groups_24h.items(), key=lambda kv: kv[1], reverse=True)
+
+    looping = {k: c for k, c in groups_1h.items() if c >= ERROR_FAIL_PER_HOUR}
+    heavy = {k: c for k, c in groups_24h.items() if c > ERROR_FAIL_24H}
+
+    for key in sorted(set(heavy) | set(looping),
+                      key=lambda k: groups_24h.get(k, 0), reverse=True):
+        bot_id, component, error_type = key
+        day, hour = groups_24h.get(key, 0), groups_1h.get(key, 0)
+        why = []
+        if key in heavy:
+            why.append(f"{day} in 24h (> {ERROR_FAIL_24H})")
+        if key in looping:
+            why.append(f"{hour} in the last hour — about one per "
+                       f"{3600 / hour:.0f}s, i.e. loop cadence")
+        findings.append((
+            "FAIL",
+            f"{bot_id}/{component} is failing every cycle: {error_type} — "
+            + "; ".join(why),
+            "PM2 will still report this process `online` and the import check "
+            "will still\npass: the runner catches it. Read the bot's log for "
+            "the traceback."))
+
+    per_bot = {}
+    for (bot_id, _, _), count in groups_24h.items():
+        per_bot[bot_id] = per_bot.get(bot_id, 0) + count
+    for bot_id, count in sorted(per_bot.items(), key=lambda kv: -kv[1]):
+        if count > ERROR_WARN_24H and not any(
+                k[0] == bot_id for k in set(heavy) | set(looping)):
+            findings.append((
+                "WARN",
+                f"{bot_id} logged {count} errors in 24h "
+                f"(> {ERROR_WARN_24H}; baseline is 1-15 a day, fleet-wide).",
+                ""))
+    return findings, offenders[:ERROR_TOP_N]
+
+
+def _influx_groups(config, requests, window):
+    """{(bot_id, component, error_type): count} over `window` (e.g. '24h')."""
+    r = requests.get(
+        f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/query",
+        params={"db": config.INFLUX_DB_NAME,
+                "q": f"SELECT count(value) FROM bot_error_events "
+                     f"WHERE time > now() - {window} "
+                     f"GROUP BY bot_id, component, error_type"},
+        timeout=10)
+    groups = {}
+    for s in (r.json().get("results", [{}])[0].get("series") or []):
+        t = s.get("tags") or {}
+        key = (t.get("bot_id") or "?", t.get("component") or "?",
+               t.get("error_type") or "?")
+        groups[key] = int(s["values"][0][1] or 0)
+    return groups
+
+
+def _influx_last_messages(config, requests):
+    """{(bot_id, component, error_type): sample message} over 24h."""
+    try:
+        r = requests.get(
+            f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/query",
+            params={"db": config.INFLUX_DB_NAME,
+                    "q": "SELECT last(message) FROM bot_error_events "
+                         "WHERE time > now() - 24h "
+                         "GROUP BY bot_id, component, error_type"},
+            timeout=10)
+        out = {}
+        for s in (r.json().get("results", [{}])[0].get("series") or []):
+            t = s.get("tags") or {}
+            out[(t.get("bot_id") or "?", t.get("component") or "?",
+                 t.get("error_type") or "?")] = s["values"][0][1]
+        return out
+    except Exception:
+        return {}
+
+
+def _check_accounting_anomaly(config, requests):
+    """The accountant writes this EVERY cycle, zero included — so the signal
+    is count > 0, not the presence of a row. A row with count 0 is the series
+    telling you it checked and found nothing, which is the whole point of
+    writing it unconditionally."""
+    try:
+        r = requests.get(
+            f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/query",
+            params={"db": config.INFLUX_DB_NAME,
+                    "q": "SELECT * FROM accounting_anomaly "
+                         "WHERE time > now() - 1h ORDER BY time DESC LIMIT 1"},
+            timeout=10)
+        series = (r.json().get("results", [{}])[0].get("series") or [])
+    except Exception as e:
+        warn("errors", f"Could not read accounting_anomaly: {e}")
+        return
+    if not series:
+        warn("errors", "No accounting_anomaly rows in the last hour — the "
+                       "accountant writes one EVERY cycle, so this means it is "
+                       "not running, not that the books are clean.")
+        return
+    row = dict(zip(series[0]["columns"], series[0]["values"][0]))
+    count = int(row.get("count") or 0)
+    if not count:
+        ok("errors", "accounting_anomaly: 0 impossible cost bases.")
+        return
+    detail = f"kind: {row.get('kind') or 'negative_long_cost_basis'}"
+    if row.get("symbols"):
+        detail += f"\npositions: {row['symbols']}"
+    if row.get("bots"):
+        detail += f"\nbots withheld from scoring and from bot_performance: {row['bots']}"
+    warn("errors", f"accounting_anomaly: {count} position(s) with an impossible "
+                   f"cost basis, affecting {int(row.get('affected_bots') or 0)} bot(s).",
+         detail + "\nTheir unrealized/total P&L is withheld from bot_performance "
+                  "and\nthey are dropped from advisor scoring until the basis is "
+                  "reconciled.")
+
+
+def check_error_rate(config):
+    header("7c. ERROR RATE — is any bot failing every cycle?")
+    print("          (a bot that catches its own exception looks healthy to")
+    print("           both PM2 and the import check — only this can see it)")
+    if config is None:
+        warn("errors", "Skipped: no usable config.")
+        return
+    try:
+        import requests
+    except Exception as e:
+        bad("errors", f"requests will not import: {e}")
+        return
+    try:
+        groups_24h = _influx_groups(config, requests, "24h")
+        groups_1h = _influx_groups(config, requests, "1h")
+    except Exception as e:
+        warn("errors", f"Could not read bot_error_events: {type(e).__name__}: {e}")
+        _check_accounting_anomaly(config, requests)
+        return
+
+    findings, offenders = classify_error_rates(groups_24h, groups_1h)
+    total = sum(groups_24h.values())
+
+    if not findings:
+        ok("errors", f"{total} error(s) in 24h across {len(groups_24h)} group(s) "
+                     f"— within the 1-15/day baseline band." if total <= ERROR_WARN_24H
+           else f"{total} error(s) in 24h across {len(groups_24h)} group(s).")
+    else:
+        messages = _influx_last_messages(config, requests)
+        for status, msg, detail in findings:
+            (bad if status == "FAIL" else warn)("errors", msg, detail)
+        print("\n          Top offenders (24h):")
+        for (bot_id, component, error_type), count in offenders:
+            sample = messages.get((bot_id, component, error_type)) or ""
+            line = f"   {count:>6}  {bot_id}/{component}  {error_type}"
+            if sample:
+                line += f"  — {str(sample)[:70]}"
+            print(f"       {line}")
+
+    _check_accounting_anomaly(config, requests)
+
+
 # --- 7b. DUPLICATE FLEET -------------------------------------------------
 def check_duplicate_fleet(config):
     header("7b. DUPLICATE FLEET — is more than one commander alerting?")
@@ -835,6 +1023,7 @@ def main():
         check_bar_freshness(cfg)
         check_vix()
         check_influx(cfg)
+        check_error_rate(cfg)
         check_duplicate_fleet(cfg)
     check_state()
 

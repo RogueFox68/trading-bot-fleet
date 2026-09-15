@@ -539,6 +539,20 @@ def _has_impossible_basis(position):
     return True
 
 
+def _metric_list(values, limit=20):
+    """Comma-joined string field for a metric: bounded and quote-safe.
+
+    log_metric writes string fields as k="v" with no escaping, so a stray
+    quote would corrupt the line protocol for the whole point.
+    """
+    cleaned = [str(v).replace('"', "").replace(",", " ").replace("\\", "")
+               for v in values]
+    shown = cleaned[:limit]
+    if len(cleaned) > limit:
+        shown.append(f"+{len(cleaned) - limit} more")
+    return ",".join(shown)
+
+
 def build_bot_performance_point(bot, realized_pl, unrealized_pl, allocation, suspect):
     """The bot_performance tags+fields for one bot. Pure, so it can be tested.
 
@@ -747,9 +761,16 @@ def run_accountant():
             # while something is wrong can never show that it CLEARED — the
             # series just stops, which is indistinguishable from the writer
             # dying.
+            # `affected_bots` is a COUNT, and `kind` is a constant tag, so
+            # neither answers "which ones?" — fleet_doctor had nothing to
+            # print but a number. The names ride along as fields so the
+            # diagnostic can name the strategy and the position without
+            # anyone having to open the accountant log.
             log_metric("accounting_anomaly", {"kind": "negative_long_cost_basis"},
                        {"count": len(negative_basis_positions),
-                        "affected_bots": len(anomalous_bots)})
+                        "affected_bots": len(anomalous_bots),
+                        "symbols": _metric_list(negative_basis_positions),
+                        "bots": _metric_list(sorted(anomalous_bots))})
 
             # Log Global Stats
             log_metric("account_stats", {"type": "global"}, {
