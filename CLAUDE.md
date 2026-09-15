@@ -112,6 +112,7 @@ trading-bot-fleet/
                                  effective_budgets.json, moon_bot_state.json,
                                  crypto_grid_state.json, logs/
                                  recommended_allocations.json
+                                 logs/order_reasons.jsonl  (trade-reason sidecar)
 ```
 
 Retired: `condor_bot.py` (2026-07, Alpaca multi-leg unreliability — in git history if ever
@@ -560,7 +561,23 @@ therefore boots gated and un-gates itself once the regime is real.
   the affected **owning bots** are now passed to the advisor as `excluded_bots`, which voids
   their period return and drops them from the ranking until the basis is reconciled. The
   `accounting_anomaly` metric is written **every cycle, zero included**, because a series that
-  only exists while something is wrong can never show that it cleared.
+  only exists while something is wrong can never show that it cleared. It also carries
+  `symbols` and `bots` as fields — `affected_bots` is a *count* and `kind` is a constant tag,
+  so neither could answer "which ones?" for `fleet_doctor`.
+- **A flagged basis is withheld from `bot_performance`, not just annotated** (2026-09-15).
+  Flagging alone left the dashboard reporting crypto_grid at unrealized **+$5,027.81** /
+  total **+$5,038.94** while `accounting_anomaly` fired beside it every cycle — whoever reads
+  the panel reads the number, not the flag (rule 21). A bot owning any negative-basis long now
+  publishes **no** `unrealized_pl` and **no** `total_pl`. The whole bot is withheld rather than
+  the bad position's share: netting the suspect leg out and publishing the rest under the same
+  field name is exactly the proxy rule 24 forbids. `realized_pl` (FIFO over confirmed fills)
+  and `allocation` (|market value|) never read `avg_entry_price`, so both survive and are
+  always written. Every row carries a `pl_suspect` tag, **true and false alike**, so "clean" is
+  visible rather than implied by absence — rows written before 2026-09-15 lack the tag and so
+  form a separate series. `bot_performance` is **write-only in the fleet** (only
+  `export_data.py` reads it) and `calculate_dynamic_allocations` takes `allocation_stats` and
+  gating only, so a bad basis could never move a budget — pinned by a test, because weighting
+  the allocator by performance later would silently make it possible.
 
 ### Safety Gates (in `utils.submit_and_log_order`)
 
@@ -599,6 +616,21 @@ therefore boots gated and un-gates itself once the regime is real.
   Rows are stamped at the fill time **floored to the millisecond** so the submit-time and
   reconciled writes land on one point (Alpaca's two order endpoints serialize `filled_at` with
   sub-µs differences; raw-ns stamps duplicated an unpredictable subset of fills).
+- **The trade `reason` outlives the submit poll** (2026-09-15). `submit_and_log_order` only
+  logs a MARKET order that reaches `filled` inside its 5s poll; when the poll elapses it
+  deliberately writes nothing (a `now()`-stamped partial would double-count against the
+  reconciled row) and `reconcile_fills` creates the row later — in the **accountant** process,
+  which has no idea why the bot traded. It passed no `reason`, and the field is omitted from
+  line protocol when empty, so those rows read back as `reason=None`. The rows missing a
+  reason were therefore **exactly the orders that took longer than 5s to fill**: 2026-09-15's
+  were stamped 13:32Z, two minutes after the open. Nothing was "dropped" and no commit caused
+  it — it had been true since equity reconciliation landed 2026-07-01. The reason is known in
+  one process and needed in another, so it is written down: `logs/order_reasons.jsonl`,
+  append-only (five bot processes share it; a read-modify-write map would clobber), bounded by
+  age (35d, past the 30d reconcile window) and line count, compacted by the accountant as its
+  only reader, and recorded only for `RECONCILED_BOTS`. It is **best-effort by construction** —
+  a failed write logs and returns, and the worst case is the `reason=None` row we already had.
+  **Nothing that decides a trade may ever read this file.**
 
 ### Wheel Expiry Safety (post PAAS assignment postmortem)
 
@@ -732,7 +764,14 @@ stop loss fires inside the 15:30+ hold window, the case that was silently disabl
 Run `test_crypto_grid` after touching grid entry/exit or either crypto ledger — it covers the
 whole order lifecycle (delayed fill, zero-fill rejection, partial-then-canceled, repeated
 reconciliation, restart while pending) because every one of those was a way to invent or
-destroy inventory. Run `test_config_audit` after adding any `bot_config.json` key or registering a bot — it
+destroy inventory. Run `test_crypto_grid.MoonBotLedgerMigrationTest` after touching **either crypto bot's
+`load_state`/`save_state`** — it drives the real loader against a real file for every shape
+that can be on disk (v1, current, empty, absent, corrupt, non-object), because the defect it
+pins survived 331 passing tests that all patched `load_state` out and injected
+`_empty_state()` (rule 30). Run `test_fill_logging.ReasonSurvivesLateFillTest` after touching
+the reason sidecar or `reconcile_fills`, and `test_pl_accounting.SuspectPerformanceWriteTest`
+after touching `bot_performance` or the negative-basis detector.
+Run `test_config_audit` after adding any `bot_config.json` key or registering a bot — it
 asserts the shipped template defines everything the code reads, and that a fresh config boots
 into the fail-safe rather than a calm market. Run `test_pl_accounting` after touching
 `accountant.calculate_realized_pl`
@@ -752,8 +791,24 @@ uncommitted drift, config completeness, that **every PM2 process survives import
 failure class a bot's own main-loop `try/except` cannot catch), Alpaca, **the age of the bars
 each bot actually trades on** (section 5b — it calls the bots' own fetchers, since a stale
 frame is a *successful* fetch and shows up nowhere else), each VIX source separately, an
-InfluxDB round-trip, **how many commanders are writing telemetry**, the `market_regime`
-heartbeat, and pm2 state. Read-only; never orders.
+InfluxDB round-trip, **whether any bot is failing every cycle** (section 7c), **how many
+commanders are writing telemetry**, the `market_regime` heartbeat, and pm2 state. Read-only;
+never orders.
+
+**Section 7c exists because import health and process health are both blind to a caught
+exception.** moon_bot raised `KeyError` on the first statement of every cycle for four days —
+~5,500 errors, one a minute — while PM2 reported `online` (the runner catches it and sleeps
+60s) and the import check passed (the module imports fine; only its data path was broken).
+The doctor reported 34 passed / 0 failed throughout. The error series was the only witness and
+nothing read it. 7c groups `bot_error_events` by `(bot_id, component, error_type)` — `bot_id`
+being the populated tag; there is **no `bot` tag** on that measurement — and FAILs a group
+over 200 in 24h or running at loop cadence (≥30 in the last hour), WARNs a bot over 50 in 24h,
+and prints the top offenders with a sample message. Thresholds sit above the documented
+**1–15/day** fleet-wide baseline so it stays silent on a healthy fleet (rule 10). The per-hour
+rule is for latency: at a 60s cadence it fires in 30 minutes where the 24h rule alone takes
+over three hours. `accounting_anomaly` is graded on **count > 0, not row presence** — the
+accountant writes it every cycle with zero included, so "warn if it has rows" would warn
+forever; **no rows at all** is its own warning, meaning the accountant is not running.
 
 Two of its checks are deliberately *not* file-mtime based, because mtime lies here:
 `bot_config.json` is only rewritten when a published value moves (a closed weekend with a
@@ -809,6 +864,11 @@ judged against that schedule rather than a flat 24h.
   its cap, `fetch_alpaca_fills` returns `complete=False`, every bot's period return reports
   `truncated_history_fetch` and no allocation is recommended. Correct, but blunt: a long
   enough order history costs you the ranking rather than triggering a deeper page walk.
+- **The trade-reason sidecar is best-effort, and deliberately so.** `logs/order_reasons.jsonl`
+  restores `reason` on fills reconciled after the 5s submit poll, but a lost write (disk full,
+  a compaction racing a concurrent append) silently costs one annotation. That is acceptable
+  only because nothing downstream reads `reason` programmatically — it is a Grafana/human
+  label. **If anything ever starts deciding on it, this file is not a sound input.**
 - **commander bare `except: pass`** remains on best-effort Discord sends.
 - **`bot_monitor.memory` / `.cpu` in Grafana were flat 0 until 2026-09.** `pm2 jlist` reports
   live resource usage under `monit`, not `pm2_env`; commander read the wrong key, so the fleet's
@@ -956,3 +1016,23 @@ judged against that schedule rather than a flat 24h.
    a failure of the system, and reporting it as one every run burns the summary and the exit
    code that a real failure needs. Judge it after all the alternatives are known: dead **and
    uncovered** is the failure.
+28. **A migration must produce the CURRENT shape, not the shape it was written against.**
+   Build a migrated record from the same constructor every other load path uses
+   (`_empty_state()`), never a dict literal listing today's keys. A literal freezes the
+   schema at the moment it was typed, so the next field added reaches every path except
+   that one — and the gap only fires for whoever still has the old file, which is nobody
+   in testing and one live bot in production. moon_bot's v1 branch cost four days of
+   trailing stops this way. Then persist the migration immediately, so the conversion is
+   not re-risked on every restart.
+29. **A caught exception is invisible to process health.** PM2 `online` and a passing
+   import check both mean the module loaded, not that it works — a bot whose runner
+   catches its own exception every cycle looks identical to a healthy one. Anything that
+   can fail in a loop must be observable from the error series, and something has to
+   actually read that series (`fleet_doctor` section 7c). ~5,500 identical errors sat
+   under a clean bill of health for four days.
+30. **Test the loader, not a hand-built state.** A test that patches `load_state` out and
+   injects `_empty_state()` exercises the one shape that is guaranteed correct and skips
+   the parsing, migration and corruption paths entirely. Drive the real loader against a
+   real file for every shape that can be on disk — v1, current, empty, absent, corrupt.
+   331 passing tests did not see a bot that had been crashing every 60 seconds for four
+   days, because they all entered through the mock.
