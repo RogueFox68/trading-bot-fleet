@@ -226,29 +226,6 @@ def check_spy_bar_age(spy_df):
 # answer. Raising is fine too — the chain catches, logs, and moves on. None of
 # them may raise out of get_vix_value(): its contract is `float | None`.
 
-def _vix_from_stooq():
-    """stooq.com delayed CSV quote. No key, no cookie, plain requests.
-
-    The symbol goes through `params` so requests percent-encodes the caret
-    (^vix -> %5Evix). Hand-building the URL with a literal '^' returned HTTP 404
-    from the container on 2026-09-06 — an unencoded caret is not a legal URI
-    character and intermediaries are free to mangle it."""
-    r = requests.get("https://stooq.com/q/l/",
-                     params={"s": "^vix", "f": "sd2t2ohlc", "h": "", "e": "csv"},
-                     timeout=VIX_HTTP_TIMEOUT,
-                     headers={"User-Agent": VIX_USER_AGENT})
-    if r.status_code != 200 or not r.text:
-        raise RuntimeError(f"HTTP {r.status_code}")
-    # Symbol,Date,Time,Open,High,Low,Close  -> Close is the VIX level.
-    lines = [ln for ln in r.text.strip().splitlines() if ln.strip()]
-    if len(lines) < 2:
-        raise ValueError(f"short CSV: {r.text[:80]!r}")
-    close = lines[-1].split(",")[-1].strip()
-    if not close or close.upper() == "N/D":
-        raise ValueError(f"no quote: {r.text[:80]!r}")
-    return float(close)
-
-
 def _vix_from_cboe():
     """CBOE's own delayed-quote JSON — the index's home exchange."""
     r = requests.get(
@@ -330,13 +307,37 @@ def _vix_from_yfinance():
 # CBOE is first on evidence, not preference: measured from the fleet container
 # on 2026-09-06, CBOE answered in 0.2s while stooq returned HTTP 404 and
 # yfinance timed out after 130s. It is also the index's home exchange, which
-# makes it the most defensible source to be carrying a kill-switch.
-# stooq stays as the independent second opinion (different operator, different
-# network path), and yfinance stays last because it is the one that has already
-# failed this fleet twice.
+# makes it the most defensible source to be carrying a kill-switch. yfinance
+# is last because it is the one that has already failed this fleet twice
+# (2026-06 rate-limiting, 2026-09 outright).
+#
+# stooq was REMOVED on 2026-09-15 after 404ing continuously since 2026-09-06.
+# The percent-encoded-caret theory was already tried — that is what the
+# `params={"s": "^vix"}` form was for, shipped 2026-09-07 — and the 404
+# persisted for the eight days after it, so the endpoint is gone for ^vix,
+# not mis-addressed.
+#
+# It is deliberately NOT replaced. The bar is a free, unauthenticated,
+# INTRADAY source of true index points, and nothing free clears it: the
+# remaining candidates are daily-close series (FRED's VIXCLS is the obvious
+# one) or dollar-priced proxies (VIXY/VXX), and both are the same mistake in
+# different clothes — a number that is not what the gate believes it is.
+#
+# A daily close is specifically dangerous HERE, more than it looks. It would
+# only ever be consulted when both intraday sources are down, and a
+# market-wide event is exactly when a CDN and Yahoo are most likely to fail
+# together AND when VIX is most likely to be spiking. In that window a
+# successful FRED fetch publishes yesterday's calm close as a LIVE reading,
+# which suppresses the stale fail-safe (CRITICAL_VOLATILITY + VIX 25) that
+# would otherwise have gated the fleet. Adding it would trade a loud, safe
+# degradation for a quiet, wrong one on the worst day of the year.
+#
+# So the chain is two sources plus the fail-safe, and the thinness is
+# reported rather than papered over: fleet_doctor warns when only one source
+# is left, because with two there is no longer a spare to lose quietly.
+# Closing this properly needs a paid index feed (see CLAUDE.md Known Issues).
 VIX_SOURCES = (
     ("cboe", _vix_from_cboe),
-    ("stooq", _vix_from_stooq),
     ("yfinance", _vix_from_yfinance),
 )
 
@@ -355,17 +356,36 @@ def get_vix_value():
     fail-safe) only when every source failed on every attempt. Contract is
     unchanged from the yfinance-only version: no args, `float | None`."""
     global last_vix_source
+    # A COVERED source failure is not an error event (rule 27).
+    #
+    # This used to registry.log_error per failed source, before knowing whether
+    # the chain went on to answer. The chain exists precisely so one provider
+    # can die without touching the kill-switch, so a covered death was being
+    # filed as a fleet failure: ~96 rows a day on a 900s cycle with the VIX
+    # perfectly live, and more when a source needs a retry (3 attempts x 2
+    # sources is up to 6 rows for ONE cycle that succeeded). fleet_doctor
+    # section 7c reads that series, so a working fallback could push the
+    # analyst past the error thresholds and fail the run — while section 6,
+    # looking at the same condition on the live chain, correctly called it a
+    # warning. That is the stooq permanent-red-line lesson arriving through a
+    # different door, and two halves of one diagnostic disagreeing (rule 26).
+    #
+    # Nothing is lost. Every attempt still writes logger.error with the source
+    # and reason, the whole list rides on the total-failure error below, and
+    # WHICH provider is carrying the kill-switch is already a first-class
+    # indexed series: the vix_source tag on every market_regime row.
+    failures = []
     for attempt in range(FETCH_RETRIES):
         for name, fetch in VIX_SOURCES:
             try:
                 val = fetch()
             except Exception as e:
-                registry.log_error("market_analyst", "get_vix_value", e,
-                                   context=f"{name} attempt {attempt + 1}")
+                failures.append(f"{name} a{attempt + 1}: {type(e).__name__}: {e}")
                 logger.error(f"[Analyst] VIX({name}) failed "
                              f"(attempt {attempt + 1}): {e}")
                 continue
             if val is None:
+                failures.append(f"{name} a{attempt + 1}: no data")
                 logger.error(f"[Analyst] VIX({name}) returned no data "
                              f"(attempt {attempt + 1}).")
                 continue
@@ -373,10 +393,8 @@ def get_vix_value():
                 # Out-of-band means the source is serving garbage (a rate-limit
                 # page, a zeroed row). Rejecting is the point: a bad number here
                 # silently mis-sets the 22/28 gates.
-                registry.log_error(
-                    "market_analyst", "get_vix_value",
-                    ValueError(f"VIX {val} outside [{VIX_MIN}, {VIX_MAX}]"),
-                    context=f"{name} attempt {attempt + 1}")
+                failures.append(f"{name} a{attempt + 1}: {val} outside "
+                                f"[{VIX_MIN}, {VIX_MAX}]")
                 logger.error(f"[Analyst] VIX({name}) out of band: {val}")
                 continue
             if name != last_vix_source:
@@ -386,6 +404,13 @@ def get_vix_value():
             return float(val)
         if attempt < FETCH_RETRIES - 1:
             time.sleep(FETCH_BACKOFF * (2 ** attempt))
+    # EVERY source failed on EVERY attempt. The kill-switch has no reading, so
+    # now it is an error event — this is the 2026-06-24 silent-freeze case, and
+    # it stays as loud as it has always been.
+    registry.log_error(
+        "market_analyst", "get_vix_value",
+        RuntimeError("every VIX source failed: " + "; ".join(failures)),
+        context=f"{len(VIX_SOURCES)} source(s) x {FETCH_RETRIES} attempts")
     last_vix_source = None
     return None
 

@@ -31,9 +31,11 @@ import datetime as dt_mod
 import io
 import sys
 import unittest
+from unittest import mock
 
 import pandas as pd
 
+import fleet_doctor
 import utils
 
 UTC = dt_mod.timezone.utc
@@ -415,3 +417,401 @@ class VixSourceClassificationTest(unittest.TestCase):
         results = self._run([("cboe", lambda: 900.0), ("stooq", self._dead())])
         fails = [r for r in results if r[0] == "FAIL"]
         self.assertTrue(any("NO VIX source" in r[2] for r in fails), results)
+
+
+class ErrorRateClassificationTest(unittest.TestCase):
+    """fleet_doctor section 7c: a bot that catches its own exception.
+
+    --- The defect this pins ----------------------------------------------
+
+    moon_bot raised KeyError('outbox') on the FIRST statement of every cycle
+    from 2026-09-11 16:57Z, about one a minute, ~5,500 errors over four days.
+    The doctor reported 34 passed / 0 failed / 2 warnings throughout, because
+    every check it had was blind to it:
+
+      * PM2 said `online` — fleet_bot.run catches the exception and sleeps 60s.
+      * The import check passed — crypto_breakout imports fine; only its data
+        path was broken.
+
+    Neither process health nor import health can see a caught exception. The
+    error series is the only witness, and nothing read it. Four days.
+
+    These drive the classifier directly, so the thresholds are exercised
+    without a live InfluxDB (rule 25: the interesting half is the check's own
+    logic, and "it needs a live database" is why these ship untested).
+    """
+
+    # The live shape on 2026-09-15, before Task 1 was deployed.
+    MOON = ("moon_bot", "main_loop", "KeyError")
+
+    def test_the_live_moon_bot_data_fails(self):
+        findings, offenders = fleet_doctor.classify_error_rates(
+            {self.MOON: 5500}, {self.MOON: 60})
+        self.assertTrue(findings, "the four-day outage produced no finding")
+        status, msg, _ = findings[0]
+        self.assertEqual(status, "FAIL")
+        self.assertIn("moon_bot", msg)
+        self.assertIn("main_loop", msg)
+        self.assertIn("KeyError", msg)
+        self.assertEqual(offenders[0][0], self.MOON)
+
+    def test_the_cadence_is_named_in_seconds(self):
+        findings, _ = fleet_doctor.classify_error_rates(
+            {self.MOON: 5500}, {self.MOON: 60})
+        self.assertIn("60s", findings[0][1],
+                      "one error a minute should be reported as a 60s cadence")
+
+    def test_a_quiet_fleet_produces_no_findings(self):
+        # The documented baseline: 1-15 errors a day, fleet-wide.
+        groups = {("trend_bot", "main_loop", "APIError"): 7,
+                  ("wheel_bot", "close_option", "TimeoutError"): 3}
+        findings, _ = fleet_doctor.classify_error_rates(groups, {})
+        self.assertEqual(findings, [], "normal traffic must stay silent (rule 10)")
+
+    def test_a_fast_loop_fails_before_it_reaches_the_24h_threshold(self):
+        """A crash 45 minutes old must not wait a day to show.
+
+        At moon_bot's 60s error cadence the 24h rule needs 200 errors — over
+        three hours. The per-hour rule catches the same bot in 30 minutes.
+        """
+        key = ("survivor_bot", "main_loop", "ValueError")
+        findings, _ = fleet_doctor.classify_error_rates({key: 45}, {key: 45})
+        self.assertTrue(findings)
+        self.assertEqual(findings[0][0], "FAIL")
+        self.assertIn("loop cadence", findings[0][1])
+
+    def test_a_short_burst_that_already_stopped_is_not_a_loop(self):
+        """20 errors an hour ago and nothing since is not a per-cycle failure.
+
+        Detection latency is the deliberate cost: at a 60s cadence the
+        per-hour rule fires after 30 minutes, and a slower loop (the
+        accountant's 300s cycle is 12/h) is caught by the 24h rule instead.
+        Firing on any short burst would make the section unreadable.
+        """
+        key = ("trend_bot", "main_loop", "APIError")
+        findings, _ = fleet_doctor.classify_error_rates({key: 20}, {key: 0})
+        self.assertEqual(findings, [])
+
+    def test_elevated_but_not_looping_is_a_warning(self):
+        key = ("wheel_bot", "close_option", "TimeoutError")
+        findings, _ = fleet_doctor.classify_error_rates({key: 80}, {key: 2})
+        self.assertEqual([f[0] for f in findings], ["WARN"])
+        self.assertIn("wheel_bot", findings[0][1])
+
+    def test_a_bots_errors_are_summed_across_groups_for_the_warning(self):
+        groups = {("wheel_bot", "close_option", "TimeoutError"): 30,
+                  ("wheel_bot", "main_loop", "APIError"): 30}
+        findings, _ = fleet_doctor.classify_error_rates(groups, {})
+        self.assertEqual([f[0] for f in findings], ["WARN"])
+        self.assertIn("60 errors", findings[0][1])
+
+    def test_a_failing_bot_is_not_also_warned_about(self):
+        """One condition, one alert — a duplicate ping is rule 10 noise."""
+        groups = {self.MOON: 5500, ("moon_bot", "reconcile_pending", "APIError"): 60}
+        findings, _ = fleet_doctor.classify_error_rates(groups, {self.MOON: 60})
+        self.assertEqual([f[0] for f in findings], ["FAIL"],
+                         "moon_bot should FAIL once, not FAIL and WARN")
+
+    def test_offenders_are_ranked_worst_first_and_capped(self):
+        groups = {(f"bot{i}", "main_loop", "E"): i for i in range(1, 12)}
+        _, offenders = fleet_doctor.classify_error_rates(groups, {})
+        self.assertEqual(len(offenders), fleet_doctor.ERROR_TOP_N)
+        self.assertEqual([c for _, c in offenders], [11, 10, 9, 8, 7])
+
+    def test_thresholds_sit_above_the_documented_baseline(self):
+        # 1-15 a day was normal; a threshold inside that band would fire on
+        # healthy operation, which trains you to ignore the report (rule 10).
+        self.assertGreater(fleet_doctor.ERROR_WARN_24H, 15)
+        self.assertGreater(fleet_doctor.ERROR_FAIL_24H, fleet_doctor.ERROR_WARN_24H)
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+class _FakeRequests:
+    def __init__(self, payload):
+        self._payload = payload
+        self.queries = []
+
+    def get(self, url, params=None, timeout=None):
+        self.queries.append((params or {}).get("q", ""))
+        return _FakeResponse(self._payload)
+
+
+class AccountingAnomalyCheckTest(unittest.TestCase):
+    """A metric written EVERY cycle cannot be graded on row presence.
+
+    accountant writes accounting_anomaly unconditionally, zero included —
+    precisely so a cleared condition is visible rather than the series just
+    stopping. So "warn if it has rows in the last hour" would warn forever on
+    a healthy fleet. The signal is count > 0.
+    """
+
+    class _Cfg:
+        INFLUX_HOST, INFLUX_PORT, INFLUX_DB_NAME = "influxdb", 8086, "trading_bots"
+
+    def _run(self, columns, values):
+        payload = {"results": [{"series": [{"columns": columns,
+                                            "values": [values]}]}]} if columns \
+            else {"results": [{}]}
+        req = _FakeRequests(payload)
+        fleet_doctor._results.clear()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fleet_doctor._check_accounting_anomaly(self._Cfg(), req)
+        statuses = [r[0] for r in fleet_doctor._results]
+        fleet_doctor._results.clear()
+        return statuses, buf.getvalue()
+
+    def test_a_zero_count_row_is_a_pass(self):
+        statuses, _ = self._run(
+            ["time", "kind", "count", "affected_bots", "symbols", "bots"],
+            [0, "negative_long_cost_basis", 0, 0, "", ""])
+        self.assertEqual(statuses, ["PASS"],
+                         "a clean row must not warn — it is written every cycle")
+
+    def test_the_observed_anomaly_warns_and_names_the_positions(self):
+        statuses, out = self._run(
+            ["time", "kind", "count", "affected_bots", "symbols", "bots"],
+            [0, "negative_long_cost_basis", 2, 1, "ETHUSD,SOLUSD", "crypto_grid"])
+        self.assertEqual(statuses, ["WARN"])
+        self.assertIn("ETHUSD", out)
+        self.assertIn("SOLUSD", out)
+        self.assertIn("crypto_grid", out)
+
+    def test_no_rows_at_all_means_the_accountant_is_not_running(self):
+        statuses, out = self._run(None, None)
+        self.assertEqual(statuses, ["WARN"])
+        self.assertIn("not running", out)
+
+
+class VixChainDepthTest(unittest.TestCase):
+    """With stooq removed the chain is two deep, so one loss is the last spare.
+
+    The old grading said "the chain has a spare" for any live < total, which
+    on a two-source chain is exactly wrong: one dead source means the NEXT
+    failure drops the fleet onto the stale fail-safe. Rule 27 tolerates a
+    covered failure, but the tolerance has to end where the cover does.
+    """
+
+    def setUp(self):
+        import market_analyst
+        self.fd = fleet_doctor
+        self.ma = market_analyst
+        self._saved = market_analyst.VIX_SOURCES
+        self.fd._results = []
+
+    def tearDown(self):
+        self.ma.VIX_SOURCES = self._saved
+        self.fd._results = []
+
+    def _run(self, sources):
+        self.ma.VIX_SOURCES = sources
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.fd.check_vix()
+        return [r for r in self.fd._results if r[1] == "vix"], buf.getvalue()
+
+    @staticmethod
+    def _dead():
+        def f():
+            raise RuntimeError("HTTP 404")
+        return f
+
+    def test_the_shipped_chain_is_intraday_only(self):
+        self.assertEqual([n for n, _ in self.ma.VIX_SOURCES], ["cboe", "yfinance"])
+
+    def test_one_of_two_live_warns_that_there_is_no_spare(self):
+        results, out = self._run([("cboe", lambda: 15.84),
+                                  ("yfinance", self._dead())])
+        self.assertFalse([r for r in results if r[0] == "FAIL"],
+                         "a covered source must not fail the run (rule 27)")
+        self.assertTrue([r for r in results if r[0] == "WARN"
+                         and "NO spare" in r[2]],
+                        f"losing the last spare was reported as fine: {results}")
+
+    def test_both_live_is_clean(self):
+        results, _ = self._run([("cboe", lambda: 15.84),
+                                ("yfinance", lambda: 15.9)])
+        self.assertFalse([r for r in results if r[0] in ("FAIL", "WARN")], results)
+
+    def test_all_dead_still_fails(self):
+        results, _ = self._run([("cboe", self._dead()),
+                                ("yfinance", self._dead())])
+        self.assertTrue([r for r in results if r[0] == "FAIL"],
+                        "an entirely dead chain must fail")
+
+
+class _StubResponse:
+    def __init__(self, status_code=200, payload=None, raises=False):
+        self.status_code = status_code
+        self._payload = payload
+        self._raises = raises
+        self.text = str(payload)
+
+    def json(self):
+        if self._raises:
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+        return self._payload
+
+
+class _StubRequests:
+    def __init__(self, response):
+        self._response = response
+
+    def get(self, url, params=None, timeout=None):
+        return self._response
+
+
+class UnreadableErrorSeriesTest(unittest.TestCase):
+    """An unreadable database must never read as a healthy fleet.
+
+    --- The defect this pins ----------------------------------------------
+
+    Section 7c's reader went straight to
+
+        r.json().get("results", [{}])[0].get("series") or []
+
+    which turns EVERY failure shape into an empty list, and an empty list into
+    "0 errors". With requests stubbed to return HTTP 401 and
+    {"error": "authorization failed"}, or HTTP 200 carrying
+    {"results": [{"error": "query timeout exceeded"}]}, check_error_rate
+    printed:
+
+        [  ok  ] 0 error(s) in 24h across 0 group(s) — within the 1-15/day
+                 baseline band.
+
+    So the one check built to notice a bot failing every cycle reported a
+    clean fleet precisely when it could not see. That is rule 25 turned on
+    7c itself: it answered with the same confident formatting whether or not
+    it had looked — the same shape as section 5b's "2 bars".
+
+    Absence of rows and inability to READ rows are different facts. Only a
+    query that succeeded and came back empty may say the fleet is quiet.
+    """
+
+    class _Cfg:
+        INFLUX_HOST, INFLUX_PORT, INFLUX_DB_NAME = "influxdb", 8086, "trading_bots"
+
+    def _run(self, response):
+        req = _StubRequests(response)
+        fleet_doctor._results.clear()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with mock.patch.dict(sys.modules, {"requests": req}):
+                fleet_doctor.check_error_rate(self._Cfg())
+        results = list(fleet_doctor._results)
+        fleet_doctor._results.clear()
+        return results, buf.getvalue()
+
+    def _assert_blind_not_healthy(self, response, label):
+        results, out = self._run(response)
+        self.assertFalse([r for r in results if r[0] == "PASS"],
+                         f"{label}: an unreadable query reported a healthy fleet")
+        self.assertTrue([r for r in results if r[0] == "WARN"
+                         and "Could not read bot_error_events" in r[2]],
+                        f"{label}: no monitoring-unavailable warning — got {results}")
+        self.assertNotIn("0 error(s) in 24h", out,
+                         f"{label}: still printed a count it never obtained")
+
+    def test_http_401_with_a_top_level_error(self):
+        self._assert_blind_not_healthy(
+            _StubResponse(401, {"error": "authorization failed"}), "HTTP 401")
+
+    def test_http_200_with_a_per_result_error(self):
+        # InfluxDB 1.x reports query errors per result, under HTTP 200.
+        self._assert_blind_not_healthy(
+            _StubResponse(200, {"results": [{"error": "query timeout exceeded"}]}),
+            "per-result error")
+
+    def test_http_500_with_no_body(self):
+        self._assert_blind_not_healthy(_StubResponse(500, {}), "HTTP 500")
+
+    def test_a_non_json_response(self):
+        self._assert_blind_not_healthy(
+            _StubResponse(200, None, raises=True), "non-JSON")
+
+    def test_a_response_with_no_results_key(self):
+        self._assert_blind_not_healthy(_StubResponse(200, {}), "no results key")
+
+    def test_a_genuinely_empty_result_still_passes(self):
+        """The whole point of the distinction: quiet is not the same as blind."""
+        results, out = self._run(_StubResponse(200, {"results": [{}]}))
+        self.assertTrue([r for r in results if r[0] == "PASS"],
+                        f"a successful empty query must still report a quiet fleet: {results}")
+        self.assertIn("0 error(s) in 24h", out)
+
+    def test_the_anomaly_check_does_not_blame_the_accountant_for_a_bad_query(self):
+        """'No rows' means the accountant is dead — but only if the query worked."""
+        _, out = self._run(_StubResponse(401, {"error": "authorization failed"}))
+        self.assertNotIn("not running", out,
+                         "a failed query was reported as the accountant being down")
+        self.assertIn("Could not read accounting_anomaly", out)
+
+
+class CoveredVixFailureIsNotAFleetErrorTest(unittest.TestCase):
+    """Sections 6 and 7c must not disagree about a covered VIX source.
+
+    --- The defect this pins ----------------------------------------------
+
+    get_vix_value logged registry.log_error for EACH failed source before
+    knowing whether the chain went on to answer. Section 6 grades that same
+    condition a warning ("covered — the chain has a live source"), so the two
+    halves of one diagnostic reached opposite verdicts on one fact (rule 26),
+    and the error-series half could fail the run's exit code for a fallback
+    that was working exactly as designed (rule 27).
+
+    On the analyst's 900s cycle a covered failure is ~96 rows a day — already
+    past 7c's 50/24h warning bar — and a cycle needing retries can file up to
+    FETCH_RETRIES x len(VIX_SOURCES) rows while still succeeding, which
+    reaches the 200/24h FAIL bar.
+    """
+
+    def setUp(self):
+        import market_analyst
+        self.ma = market_analyst
+
+    @staticmethod
+    def _chain(*pairs):
+        def make(v):
+            def fetch():
+                if isinstance(v, Exception):
+                    raise v
+                return v
+            return fetch
+        return tuple((name, make(v)) for name, v in pairs)
+
+    def test_a_covered_failure_writes_no_error_row(self):
+        with mock.patch.object(self.ma, "VIX_SOURCES",
+                               self._chain(("cboe", RuntimeError("HTTP 503")),
+                                           ("yfinance", 15.4))), \
+             mock.patch.object(self.ma.registry, "log_error") as le:
+            self.assertAlmostEqual(self.ma.get_vix_value(), 15.4)
+        self.assertFalse(le.called)
+
+    def test_the_rate_that_used_to_be_produced_would_have_failed_the_run(self):
+        """Why this mattered: the old cadence crossed 7c's thresholds."""
+        key = ("market_analyst", "get_vix_value", "RuntimeError")
+        per_cycle = self.ma.FETCH_RETRIES * len(self.ma.VIX_SOURCES)
+        cycles_per_day = 86400 // self.ma.CHECK_INTERVAL
+
+        # One covered failure per cycle: past the WARN bar, permanently.
+        findings, _ = fleet_doctor.classify_error_rates(
+            {key: cycles_per_day}, {key: cycles_per_day // 24})
+        self.assertTrue(findings,
+                        "a permanently-warning healthy fleet is the condition "
+                        "this fix removes")
+
+        # A retrying-but-succeeding cycle: past the FAIL bar.
+        heavy = cycles_per_day * per_cycle
+        findings, _ = fleet_doctor.classify_error_rates(
+            {key: heavy}, {key: heavy // 24})
+        self.assertEqual(findings[0][0], "FAIL")
+
+        # And with the fix there are no rows at all, so neither fires.
+        self.assertEqual(fleet_doctor.classify_error_rates({}, {})[0], [])

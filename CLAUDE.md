@@ -112,6 +112,7 @@ trading-bot-fleet/
                                  effective_budgets.json, moon_bot_state.json,
                                  crypto_grid_state.json, logs/
                                  recommended_allocations.json
+                                 logs/order_reasons.jsonl  (trade-reason sidecar)
 ```
 
 Retired: `condor_bot.py` (2026-07, Alpaca multi-leg unreliability — in git history if ever
@@ -560,7 +561,23 @@ therefore boots gated and un-gates itself once the regime is real.
   the affected **owning bots** are now passed to the advisor as `excluded_bots`, which voids
   their period return and drops them from the ranking until the basis is reconciled. The
   `accounting_anomaly` metric is written **every cycle, zero included**, because a series that
-  only exists while something is wrong can never show that it cleared.
+  only exists while something is wrong can never show that it cleared. It also carries
+  `symbols` and `bots` as fields — `affected_bots` is a *count* and `kind` is a constant tag,
+  so neither could answer "which ones?" for `fleet_doctor`.
+- **A flagged basis is withheld from `bot_performance`, not just annotated** (2026-09-15).
+  Flagging alone left the dashboard reporting crypto_grid at unrealized **+$5,027.81** /
+  total **+$5,038.94** while `accounting_anomaly` fired beside it every cycle — whoever reads
+  the panel reads the number, not the flag (rule 21). A bot owning any negative-basis long now
+  publishes **no** `unrealized_pl` and **no** `total_pl`. The whole bot is withheld rather than
+  the bad position's share: netting the suspect leg out and publishing the rest under the same
+  field name is exactly the proxy rule 24 forbids. `realized_pl` (FIFO over confirmed fills)
+  and `allocation` (|market value|) never read `avg_entry_price`, so both survive and are
+  always written. Every row carries a `pl_suspect` tag, **true and false alike**, so "clean" is
+  visible rather than implied by absence — rows written before 2026-09-15 lack the tag and so
+  form a separate series. `bot_performance` is **write-only in the fleet** (only
+  `export_data.py` reads it) and `calculate_dynamic_allocations` takes `allocation_stats` and
+  gating only, so a bad basis could never move a budget — pinned by a test, because weighting
+  the allocator by performance later would silently make it possible.
 
 ### Safety Gates (in `utils.submit_and_log_order`)
 
@@ -599,6 +616,21 @@ therefore boots gated and un-gates itself once the regime is real.
   Rows are stamped at the fill time **floored to the millisecond** so the submit-time and
   reconciled writes land on one point (Alpaca's two order endpoints serialize `filled_at` with
   sub-µs differences; raw-ns stamps duplicated an unpredictable subset of fills).
+- **The trade `reason` outlives the submit poll** (2026-09-15). `submit_and_log_order` only
+  logs a MARKET order that reaches `filled` inside its 5s poll; when the poll elapses it
+  deliberately writes nothing (a `now()`-stamped partial would double-count against the
+  reconciled row) and `reconcile_fills` creates the row later — in the **accountant** process,
+  which has no idea why the bot traded. It passed no `reason`, and the field is omitted from
+  line protocol when empty, so those rows read back as `reason=None`. The rows missing a
+  reason were therefore **exactly the orders that took longer than 5s to fill**: 2026-09-15's
+  were stamped 13:32Z, two minutes after the open. Nothing was "dropped" and no commit caused
+  it — it had been true since equity reconciliation landed 2026-07-01. The reason is known in
+  one process and needed in another, so it is written down: `logs/order_reasons.jsonl`,
+  append-only (five bot processes share it; a read-modify-write map would clobber), bounded by
+  age (35d, past the 30d reconcile window) and line count, compacted by the accountant as its
+  only reader, and recorded only for `RECONCILED_BOTS`. It is **best-effort by construction** —
+  a failed write logs and returns, and the worst case is the `reason=None` row we already had.
+  **Nothing that decides a trade may ever read this file.**
 
 ### Wheel Expiry Safety (post PAAS assignment postmortem)
 
@@ -634,14 +666,25 @@ existing positions.
 postmortems):** SPY (which drives the regime) comes from **Alpaca `get_stock_bars`** — reliable,
 already authenticated. VIX cannot: alpaca-py exposes no index feed and this account 403s on the
 index endpoints. So VIX runs a **multi-source fallback chain** (`market_analyst.VIX_SOURCES`):
-CBOE delayed-quote JSON → stooq CSV → yfinance, first sane reading wins. That order
+CBOE delayed-quote JSON → yfinance, first sane reading wins. That order
 is measured, not assumed: from the fleet container on 2026-09-06 CBOE answered in 0.2s,
 stooq returned HTTP 404, and yfinance timed out after 130s (so yfinance carries its own
-short `VIX_YF_TIMEOUT`, since three chain attempts at 130s would stall the loop for
-minutes). Every source returns
+short `VIX_YF_TIMEOUT`, since chain attempts at 130s would stall the loop for
+minutes). **stooq was removed 2026-09-15** after 404ing continuously for nine days — the
+percent-encoded-caret fix shipped 2026-09-07 and the 404 outlived it by eight days, so the
+endpoint is gone for `^vix`, not mis-addressed. It is deliberately **not replaced**: the bar is
+free, unauthenticated, *intraday*, true index points, and nothing free clears it. Every source
+returns
 **true index points**, so the 22/28 gates need no recalibration whichever answers; a dollar-priced
 proxy (VIXY/VXX) is deliberately excluded, since a mis-scaled number feeding a kill-switch is
-worse than no number (the stale fail-safe already covers "no number"). Readings outside
+worse than no number (the stale fail-safe already covers "no number"). A **daily-close** series
+(FRED's `VIXCLS`) is excluded for a subtler version of the same reason: it would only ever be
+reached when both intraday sources are down, and a market-wide event is exactly when a CDN and
+Yahoo fail together *and* when VIX spikes — so a successful fetch of yesterday's calm close would
+publish as a **live** reading and suppress the stale fail-safe that would otherwise have gated the
+fleet. That trades a loud, safe degradation for a quiet, wrong one on the worst day of the year.
+The chain is therefore two deep, and `fleet_doctor` **warns when only one source is left**, since
+with two there is no longer a spare to lose quietly. Readings outside
 `[VIX_MIN, VIX_MAX]` = [5, 150] are rejected as garbage rather than published. yfinance is **last
 and imported lazily** — it broke the fleet twice (2026-06 rate-limiting, 2026-09 outright), and a
 broken install of an optional fallback must not kill the regime process at import. The winning
@@ -650,7 +693,19 @@ and shown by `/status` — so which provider carries the kill-switch is never a 
 Failures are **loud**: an empty/failed fetch logs `registry.log_error` + a throttled Discord
 ping and **never silently skips** (the original bug: a two-ticker `yf.download` returned an
 empty frame, the publish block skipped with no `else`, and VIX froze — disabling the kill-switch
-for ~12 days). A fresh `market_regime` InfluxDB row is written **only on a fully-successful
+for ~12 days). **"Loud" means the whole chain failing, not one covered source** (fixed
+2026-09-16). `get_vix_value` used to `registry.log_error` per failed source *before* knowing
+whether the chain went on to answer, so a working fallback was filed as a fleet failure: ~96
+rows a day on the 900s cycle with the VIX perfectly live, and up to
+`FETCH_RETRIES × len(VIX_SOURCES)` rows for a **single successful** cycle once retries were
+involved. `fleet_doctor` section 7c reads that series, so a healthy fallback could push the
+analyst past the error thresholds and fail the run — while section 6, judging the same
+condition on the live chain, correctly called it a warning. Two halves of one diagnostic
+disagreeing about one fact (rule 26), and the stooq permanent-red-line lesson (rule 27)
+arriving through a different door. Per-source detail is **not** lost: every attempt still
+writes `logger.error`, the full list of source/reason pairs rides on the single total-failure
+error, and which provider is carrying the kill-switch is already a first-class indexed series
+(the `vix_source` tag on every `market_regime` row). A fresh `market_regime` InfluxDB row is written **only on a fully-successful
 fetch**, so its recency is the fleet's "regime is live" heartbeat. If no good fetch lands for
 `STALE_REGIME_SECONDS` (45 min), the analyst **fails safe**: it degrades to `CRITICAL_VOLATILITY`
 + an elevated sentinel VIX (25, above the wheel/crypto gates but below the 28 full-kill so a data
@@ -721,7 +776,14 @@ stop loss fires inside the 15:30+ hold window, the case that was silently disabl
 Run `test_crypto_grid` after touching grid entry/exit or either crypto ledger — it covers the
 whole order lifecycle (delayed fill, zero-fill rejection, partial-then-canceled, repeated
 reconciliation, restart while pending) because every one of those was a way to invent or
-destroy inventory. Run `test_config_audit` after adding any `bot_config.json` key or registering a bot — it
+destroy inventory. Run `test_crypto_grid.MoonBotLedgerMigrationTest` after touching **either crypto bot's
+`load_state`/`save_state`** — it drives the real loader against a real file for every shape
+that can be on disk (v1, current, empty, absent, corrupt, non-object), because the defect it
+pins survived 331 passing tests that all patched `load_state` out and injected
+`_empty_state()` (rule 30). Run `test_fill_logging.ReasonSurvivesLateFillTest` after touching
+the reason sidecar or `reconcile_fills`, and `test_pl_accounting.SuspectPerformanceWriteTest`
+after touching `bot_performance` or the negative-basis detector.
+Run `test_config_audit` after adding any `bot_config.json` key or registering a bot — it
 asserts the shipped template defines everything the code reads, and that a fresh config boots
 into the fail-safe rather than a calm market. Run `test_pl_accounting` after touching
 `accountant.calculate_realized_pl`
@@ -741,8 +803,37 @@ uncommitted drift, config completeness, that **every PM2 process survives import
 failure class a bot's own main-loop `try/except` cannot catch), Alpaca, **the age of the bars
 each bot actually trades on** (section 5b — it calls the bots' own fetchers, since a stale
 frame is a *successful* fetch and shows up nowhere else), each VIX source separately, an
-InfluxDB round-trip, **how many commanders are writing telemetry**, the `market_regime`
-heartbeat, and pm2 state. Read-only; never orders.
+InfluxDB round-trip, **whether any bot is failing every cycle** (section 7c), **how many
+commanders are writing telemetry**, the `market_regime` heartbeat, and pm2 state. Read-only;
+never orders.
+
+**Section 7c exists because import health and process health are both blind to a caught
+exception.** moon_bot raised `KeyError` on the first statement of every cycle for four days —
+~5,500 errors, one a minute — while PM2 reported `online` (the runner catches it and sleeps
+60s) and the import check passed (the module imports fine; only its data path was broken).
+The doctor reported 34 passed / 0 failed throughout. The error series was the only witness and
+nothing read it. 7c groups `bot_error_events` by `(bot_id, component, error_type)` — `bot_id`
+being the populated tag; there is **no `bot` tag** on that measurement — and FAILs a group
+over 200 in 24h or running at loop cadence (≥30 in the last hour), WARNs a bot over 50 in 24h,
+and prints the top offenders with a sample message. Thresholds sit above the documented
+**1–15/day** fleet-wide baseline so it stays silent on a healthy fleet (rule 10). The per-hour
+rule is for latency: at a 60s cadence it fires in 30 minutes where the 24h rule alone takes
+over three hours. `accounting_anomaly` is graded on **count > 0, not row presence** — the
+accountant writes it every cycle with zero included, so "warn if it has rows" would warn
+forever; **no rows at all** is its own warning, meaning the accountant is not running.
+
+**An unreadable database is not a healthy fleet** (fixed 2026-09-16). The readers went
+straight to `.get("results", [{}])[0].get("series")`, which turns every failure shape into an
+empty list and an empty list into "0 errors": an HTTP 401 with `{"error": …}`, an HTTP **200**
+carrying `{"results": [{"error": "query timeout exceeded"}]}` (InfluxDB 1.x reports query
+errors per result, under 200), a 500 with no body — all printed
+`[ ok ] 0 error(s) in 24h across 0 group(s)`. The one check built to notice a bot failing every
+cycle reported a clean fleet precisely when it could not see: rule 25 turned on 7c itself, the
+same shape as section 5b's "2 bars". Every reader now goes through one `_influx_series` helper
+that validates HTTP status and both error fields (rule 19 — they cannot drift on what counts
+as a usable answer), and a failure routes to the monitoring-unavailable warning, which says
+the section is **blind** rather than quiet. "No rows" may only mean the accountant is dead
+when the query actually succeeded.
 
 Two of its checks are deliberately *not* file-mtime based, because mtime lies here:
 `bot_config.json` is only rewritten when a published value moves (a closed weekend with a
@@ -798,21 +889,30 @@ judged against that schedule rather than a flat 24h.
   its cap, `fetch_alpaca_fills` returns `complete=False`, every bot's period return reports
   `truncated_history_fetch` and no allocation is recommended. Correct, but blunt: a long
   enough order history costs you the ranking rather than triggering a deeper page walk.
+- **The trade-reason sidecar is best-effort, and deliberately so.** `logs/order_reasons.jsonl`
+  restores `reason` on fills reconciled after the 5s submit poll, but a lost write (disk full,
+  a compaction racing a concurrent append) silently costs one annotation. That is acceptable
+  only because nothing downstream reads `reason` programmatically — it is a Grafana/human
+  label. **If anything ever starts deciding on it, this file is not a sound input.**
 - **commander bare `except: pass`** remains on best-effort Discord sends.
 - **`bot_monitor.memory` / `.cpu` in Grafana were flat 0 until 2026-09.** `pm2 jlist` reports
   live resource usage under `monit`, not `pm2_env`; commander read the wrong key, so the fleet's
   only per-process memory series never carried data. Fixed — but every `bot_monitor` point
   written before that fix has memory=0 and cpu=0, so historical panels are empty by construction.
 - **VIX depends on free public providers.** alpaca-py has no index feed, so VIX can't move to
-  Alpaca like SPY did. The 2026-09 chain (stooq → CBOE → yfinance) removes the *single*-provider
+  Alpaca like SPY did. The chain (CBOE → yfinance) removes the *single*-provider
   SPOF, and the stale fail-safe + accountant freshness watchdog still bound the blast radius, but
-  all three are unauthenticated endpoints that can rate-limit or change shape without notice. A
-  paid index feed remains the only way to actually own this input. `fleet_doctor.py` reports each
-  source's health individually — and a dead source is a **warning** while any source is still
-  live, a failure only when the last one dies. stooq has 404'd since 2026-09-06; reporting a
-  condition the chain is designed to absorb as `[ FAIL ]` on every run put a permanent red line
-  in the summary and, through the exit code, made a healthy fleet look broken forever (rule 10,
-  in the one section whose header already said "a red line here is not an outage by itself").
+  both are unauthenticated endpoints that can rate-limit or change shape without notice. A
+  paid index feed remains the only way to actually own this input, and it is now the **only** way
+  to get back to three sources — stooq was removed 2026-09-15 and no free intraday replacement
+  exists (see Market Regime & Gating for why a daily-close series is not one). `fleet_doctor.py`
+  reports each source's health individually — a dead source is a **warning** while any source is
+  still live, a failure only when the last one dies, and a **warning that there is no spare left**
+  once the chain is down to one. Reporting a condition the chain is designed to absorb as
+  `[ FAIL ]` on every run put a permanent red line in the summary and, through the exit code,
+  made a healthy fleet look broken forever (rule 10, in the one section whose header already said
+  "a red line here is not an outage by itself"). **The chain is now two deep, so that tolerance
+  has one step left in it.**
 - **`ta` is an sdist-only, effectively unmaintained dependency** (trend_bot's EMA/ADX,
   survivor_bot's RSI). It builds and computes correctly under the pinned pandas 3.x / numpy 2.x
   set, but it is the one package here that can fail a container rebuild outright on a toolchain
@@ -941,3 +1041,23 @@ judged against that schedule rather than a flat 24h.
    a failure of the system, and reporting it as one every run burns the summary and the exit
    code that a real failure needs. Judge it after all the alternatives are known: dead **and
    uncovered** is the failure.
+28. **A migration must produce the CURRENT shape, not the shape it was written against.**
+   Build a migrated record from the same constructor every other load path uses
+   (`_empty_state()`), never a dict literal listing today's keys. A literal freezes the
+   schema at the moment it was typed, so the next field added reaches every path except
+   that one — and the gap only fires for whoever still has the old file, which is nobody
+   in testing and one live bot in production. moon_bot's v1 branch cost four days of
+   trailing stops this way. Then persist the migration immediately, so the conversion is
+   not re-risked on every restart.
+29. **A caught exception is invisible to process health.** PM2 `online` and a passing
+   import check both mean the module loaded, not that it works — a bot whose runner
+   catches its own exception every cycle looks identical to a healthy one. Anything that
+   can fail in a loop must be observable from the error series, and something has to
+   actually read that series (`fleet_doctor` section 7c). ~5,500 identical errors sat
+   under a clean bill of health for four days.
+30. **Test the loader, not a hand-built state.** A test that patches `load_state` out and
+   injects `_empty_state()` exercises the one shape that is guaranteed correct and skips
+   the parsing, migration and corruption paths entirely. Drive the real loader against a
+   real file for every shape that can be on disk — v1, current, empty, absent, corrupt.
+   331 passing tests did not see a bot that had been crashing every 60 seconds for four
+   days, because they all entered through the mock.

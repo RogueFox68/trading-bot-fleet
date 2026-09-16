@@ -539,6 +539,52 @@ def _has_impossible_basis(position):
     return True
 
 
+def _metric_list(values, limit=20):
+    """Comma-joined string field for a metric: bounded and quote-safe.
+
+    log_metric writes string fields as k="v" with no escaping, so a stray
+    quote would corrupt the line protocol for the whole point.
+    """
+    cleaned = [str(v).replace('"', "").replace(",", " ").replace("\\", "")
+               for v in values]
+    shown = cleaned[:limit]
+    if len(cleaned) > limit:
+        shown.append(f"+{len(cleaned) - limit} more")
+    return ",".join(shown)
+
+
+def build_bot_performance_point(bot, realized_pl, unrealized_pl, allocation, suspect):
+    """The bot_performance tags+fields for one bot. Pure, so it can be tested.
+
+    An unrealized figure derived from an impossible cost basis is not
+    published, because it is not a measurement (rule 24).
+
+    Flagging it was not enough: the accounting_anomaly row said something was
+    wrong while bot_performance went on reporting crypto_grid at +$5,027.81
+    unrealized / +$5,038.94 total off a -$1,495 cost basis on 1.4156 ETH.
+    Whoever reads the dashboard reads the number, not the flag beside it.
+
+    The whole bot is withheld, not just the bad position's share: netting the
+    suspect leg out and publishing the rest under the same field name is the
+    proxy rule 24 forbids — a partial sum that still reads as this bot's P&L.
+
+    realized_pl and allocation SURVIVE and are always written. Realized is
+    FIFO over confirmed fills (calculate_realized_pl); allocation is
+    |market_value|. Neither reads avg_entry_price, so the bad basis cannot
+    reach them.
+
+    pl_suspect is written on EVERY row, true and false alike, so a panel can
+    filter on it and so "clean" is visible rather than merely implied by
+    absence — the same reason accounting_anomaly is written with a zero count.
+    """
+    fields = {"allocation": allocation, "realized_pl": realized_pl}
+    if not suspect:
+        fields["unrealized_pl"] = unrealized_pl
+        fields["total_pl"] = realized_pl + unrealized_pl
+    tags = {"bot": bot, "pl_suspect": "true" if suspect else "false"}
+    return tags, fields
+
+
 def run_accountant():
     import json
     global _last_strategy_advisor_run
@@ -638,21 +684,16 @@ def run_accountant():
             for bot in unrealized_stats.keys():
                 r_pl = realized_scores.get(bot, 0.0)
                 u_pl = unrealized_stats[bot]
-                total_pl = r_pl + u_pl
-                
-                # print(f"  {bot:<15} | Real: ${r_pl:>7.2f} | Paper: ${u_pl:>7.2f} | TOTAL: ${total_pl:>7.2f}")
-                
-                log_metric(
-                    measurement="bot_performance",
-                    tags={"bot": bot},
-                    fields={
-                        "allocation": allocation_stats[bot],
-                        "unrealized_pl": u_pl,
-                        "realized_pl": r_pl,
-                        "total_pl": total_pl
-                    }
-                )
-            
+                suspect = bot in anomalous_bots
+                if suspect:
+                    logger.warning(f"[CFO] {bot}: unrealized/total P&L WITHHELD from "
+                                   f"bot_performance — it owns a long position with a "
+                                   f"negative cost basis. realized_pl and allocation "
+                                   f"are unaffected.")
+                tags, fields = build_bot_performance_point(
+                    bot, r_pl, u_pl, allocation_stats[bot], suspect)
+                log_metric(measurement="bot_performance", tags=tags, fields=fields)
+
             # --- PHASE 23C: CFO DYNAMIC REALLOCATION ---
             try:
                 with open("bot_config.json", "r") as f:
@@ -720,9 +761,16 @@ def run_accountant():
             # while something is wrong can never show that it CLEARED — the
             # series just stops, which is indistinguishable from the writer
             # dying.
+            # `affected_bots` is a COUNT, and `kind` is a constant tag, so
+            # neither answers "which ones?" — fleet_doctor had nothing to
+            # print but a number. The names ride along as fields so the
+            # diagnostic can name the strategy and the position without
+            # anyone having to open the accountant log.
             log_metric("accounting_anomaly", {"kind": "negative_long_cost_basis"},
                        {"count": len(negative_basis_positions),
-                        "affected_bots": len(anomalous_bots)})
+                        "affected_bots": len(anomalous_bots),
+                        "symbols": _metric_list(negative_basis_positions),
+                        "bots": _metric_list(sorted(anomalous_bots))})
 
             # Log Global Stats
             log_metric("account_stats", {"type": "global"}, {

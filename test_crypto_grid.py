@@ -1069,3 +1069,143 @@ class MoonLifecycleTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MoonBotLedgerMigrationTest(unittest.TestCase):
+    """Every load path returns a COMPLETE v2 state, whatever is on disk.
+
+    The defect this pins (live 2026-09-11 -> 2026-09-15): load_state's v1
+    migration branch returned a dict literal — {"version", "pending", "qty"} —
+    that predated the outbox. Every other path built on _empty_state() and so
+    gained the key; this one did not. cycle() opens with
+
+        utils.flush_fill_outbox(state["outbox"], logger)
+
+    so the KeyError fired on the FIRST statement, before reconcile_pending and
+    before the symbol loop: no Donchian scan, no fill settlement, and — the
+    part that matters — no trailing-stop exit for four days, on a bot holding
+    coins. The runner caught it, PM2 reported `online`, and the doctor's
+    import check passed, because the module imports fine; only the data path
+    was broken.
+
+    It could not self-heal: save_state runs at the END of a cycle that never
+    reached it, so the file stayed v1 and the crash repeated every 60s
+    (fleet_bot.run's error sleep) — ~5,500 identical errors.
+
+    Why 331 passing tests missed it: every other moon_bot test here builds
+    state with `moon._empty_state()` and then patches `load_state` out
+    entirely, so the migration branch was the one path never executed. These
+    tests call the REAL load_state against a REAL file for each shape on disk.
+    """
+
+    def setUp(self):
+        try:
+            import crypto_breakout
+        except Exception as e:  # pragma: no cover
+            self.skipTest(f"crypto_breakout unavailable: {e}")
+        self.moon = crypto_breakout
+
+    def _load(self, raw_text):
+        """Real load_state against a real file containing `raw_text`."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "moon_bot_state.json")
+            if raw_text is not None:
+                with open(path, "w") as f:
+                    f.write(raw_text)
+            with mock.patch.object(self.moon, "STATE_FILE", path):
+                return self.moon.load_state()
+
+    def _assert_complete(self, state, label):
+        """It must satisfy _empty_state's contract, not a hand-listed subset."""
+        for key in self.moon._empty_state():
+            self.assertIn(key, state, f"{label}: v2 key {key!r} missing from load_state()")
+        # The actual crash, driven rather than asserted about.
+        try:
+            state["outbox"]
+        except KeyError:  # pragma: no cover
+            self.fail(f"{label}: KeyError 'outbox' — this is the 2026-09-11 defect")
+
+    def test_v1_flat_file_migrates_complete(self):
+        # The exact shape found on the Beelink: {"ETH/USD": 0.0}
+        state = self._load('{"ETH/USD": 0.0}')
+        self._assert_complete(state, "v1 flat")
+        self.assertEqual(state["qty"], {"ETH/USD": 0.0})
+        self.assertTrue(state.get("migrated"), "migration must ask cycle() to rewrite the file")
+
+    def test_v1_file_with_a_real_holding_keeps_the_quantity(self):
+        state = self._load('{"ETH/USD": 1.25, "BTC/USD": 0.5}')
+        self._assert_complete(state, "v1 holdings")
+        self.assertAlmostEqual(state["qty"]["ETH/USD"], 1.25)
+        self.assertAlmostEqual(state["qty"]["BTC/USD"], 0.5)
+
+    def test_empty_object_file_is_complete(self):
+        # `{}` has neither "qty" nor "pending", so it takes the SAME branch.
+        state = self._load("{}")
+        self._assert_complete(state, "empty {}")
+        self.assertEqual(state["qty"], {})
+
+    def test_v2_file_is_complete(self):
+        state = self._load('{"version": 2, "qty": {"ETH/USD": 2.0},'
+                           ' "pending": {}, "outbox": ["line"]}')
+        self._assert_complete(state, "v2")
+        self.assertAlmostEqual(state["qty"]["ETH/USD"], 2.0)
+        self.assertEqual(state["outbox"], ["line"])
+        self.assertFalse(state.get("migrated"), "a v2 file needs no migration rewrite")
+
+    def test_missing_file_is_complete(self):
+        state = self._load(None)
+        self._assert_complete(state, "missing file")
+        self.assertEqual(state["qty"], {})
+
+    def test_corrupt_file_is_complete_and_suspends_entries(self):
+        state = self._load('{"ETH/USD": 1.0')  # truncated JSON
+        self._assert_complete(state, "corrupt")
+        self.assertTrue(state.get("unreadable"),
+                        "an unreadable ledger must suspend entries, not trade on a blank one")
+
+    def test_non_numeric_v1_values_are_complete_and_suspend_entries(self):
+        state = self._load('{"ETH/USD": "not-a-number"}')
+        self._assert_complete(state, "bad v1 values")
+        self.assertTrue(state.get("unreadable"))
+
+    def test_a_non_object_file_is_complete(self):
+        state = self._load('["not", "an", "object"]')
+        self._assert_complete(state, "json array")
+        self.assertTrue(state.get("unreadable"))
+
+    def test_transient_flags_never_reach_disk(self):
+        """`migrated`/`unreadable` are in-memory signals, not ledger fields."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "moon_bot_state.json")
+            with open(path, "w") as f:
+                f.write('{"ETH/USD": 1.0}')
+            with mock.patch.object(self.moon, "STATE_FILE", path):
+                state = self.moon.load_state()
+                self.assertTrue(state.get("migrated"))
+                self.moon.save_state(state)
+                with open(path) as f:
+                    on_disk = json.load(f)
+        self.assertNotIn("migrated", on_disk)
+        self.assertNotIn("unreadable", on_disk)
+        self.assertIn("outbox", on_disk)
+        self.assertEqual(on_disk["version"], self.moon.STATE_VERSION)
+
+    def test_a_v1_file_is_converted_on_disk_by_one_cycle(self):
+        """The file must stop being v1 — otherwise the bug just recurs."""
+        moon = self.moon
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "moon_bot_state.json")
+            with open(path, "w") as f:
+                f.write('{"ETH/USD": 0.0}')
+            with mock.patch.object(moon, "STATE_FILE", path), \
+                 mock.patch.object(moon, "get_donchian_levels",
+                                   return_value=(None, None, None)), \
+                 mock.patch.object(utils, "_post_influx_line", return_value=True), \
+                 mock.patch.object(moon.bot, "equity", 100000.0), \
+                 mock.patch.object(moon.bot, "account",
+                                   mock.Mock(buying_power="500000")):
+                moon.cycle(moon.bot)          # must not raise KeyError
+            with open(path) as f:
+                on_disk = json.load(f)
+        self.assertIn("outbox", on_disk, "the file is still v1; the crash would recur")
+        self.assertEqual(on_disk["version"], moon.STATE_VERSION)
