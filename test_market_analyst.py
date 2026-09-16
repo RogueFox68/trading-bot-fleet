@@ -2,7 +2,7 @@
 
 Covers the fix for the 2026-06-24 silent-outage postmortem:
   - SPY moved to Alpaca get_stock_bars (df normalization, empty -> None).
-  - VIX on a multi-source fallback chain (stooq -> cboe -> yfinance; first
+  - VIX on a multi-source fallback chain (cboe -> yfinance; first
     sane reading wins, all-down -> None). Added 2026-09 after Yahoo broke
     for good and a single provider proved to be a SPOF for the kill-switch.
   - VIX>28 emergency pause fires on a simulated high-VIX reading (the headline
@@ -194,13 +194,13 @@ class UpdateBotConfigTests(unittest.TestCase):
 
     def test_identical_values_skip_rewrite(self):
         """Churn guard: when nothing published changed, don't rewrite the file."""
-        ma.last_vix_source = "stooq"
+        ma.last_vix_source = "srcA"
         self.addCleanup(setattr, ma, "last_vix_source", None)
         seeded = json.loads(json.dumps(BASE_CONFIG))
         seeded["global_settings"].update(
             {"market_condition": "SIDEWAYS", "vix": 16.45,
              "macro_climate": "MACRO_BULL", "data_stale": False,
-             "vix_source": "stooq"})
+             "vix_source": "srcA"})
         self._write(seeded)
 
         with mock.patch.object(ma.json, "dump") as dump:
@@ -210,7 +210,7 @@ class UpdateBotConfigTests(unittest.TestCase):
     def test_source_change_alone_persists(self):
         """The chain falling through to a different provider is a published
         change: bot_config is how a human sees which source is carrying VIX."""
-        ma.last_vix_source = "stooq"
+        ma.last_vix_source = "srcA"
         self.addCleanup(setattr, ma, "last_vix_source", None)
         seeded = json.loads(json.dumps(BASE_CONFIG))
         seeded["global_settings"].update(
@@ -220,10 +220,10 @@ class UpdateBotConfigTests(unittest.TestCase):
         self._write(seeded)
 
         ma.update_bot_config("SIDEWAYS", 16.45, "MACRO_BULL")
-        self.assertEqual(self._read()["global_settings"]["vix_source"], "stooq")
+        self.assertEqual(self._read()["global_settings"]["vix_source"], "srcA")
 
     def test_stale_failsafe_records_no_live_source(self):
-        ma.last_vix_source = "stooq"
+        ma.last_vix_source = "srcA"
         self.addCleanup(setattr, ma, "last_vix_source", None)
         self._write(BASE_CONFIG)
 
@@ -286,28 +286,35 @@ class _Resp:
         return self._payload
 
 
-STOOQ_OK = "Symbol,Date,Time,Open,High,Low,Close\n^VIX,2026-09-05,21:14:00,14.9,15.2,14.4,14.53\n"
 
 
 class VixSourceTests(unittest.TestCase):
     """Each source parses its own provider's shape and nothing else."""
 
-    def test_stooq_parses_close_column(self):
-        with mock.patch.object(ma.requests, "get",
-                               return_value=_Resp(text=STOOQ_OK)):
-            self.assertAlmostEqual(ma._vix_from_stooq(), 14.53)
+    def test_stooq_is_gone_and_stays_gone(self):
+        """Removed 2026-09-15 after 404ing continuously since 2026-09-06.
 
-    def test_stooq_no_quote_raises(self):
-        body = "Symbol,Date,Time,Open,High,Low,Close\n^VIX,N/D,N/D,N/D,N/D,N/D,N/D\n"
-        with mock.patch.object(ma.requests, "get", return_value=_Resp(text=body)):
-            with self.assertRaises(ValueError):
-                ma._vix_from_stooq()
+        The percent-encoded-caret fix shipped 2026-09-07 and the 404 survived
+        the eight days after it, so the endpoint is gone for ^vix rather than
+        mis-addressed — re-adding it would re-add a permanent red line.
+        """
+        self.assertNotIn("srcA", [n for n, _ in ma.VIX_SOURCES])
+        self.assertFalse(hasattr(ma, "_vix_from_stooq"))
 
-    def test_stooq_non_200_raises(self):
-        with mock.patch.object(ma.requests, "get",
-                               return_value=_Resp(status_code=429, text="slow down")):
-            with self.assertRaises(RuntimeError):
-                ma._vix_from_stooq()
+    def test_every_source_is_intraday_and_unit_priced(self):
+        """No daily-close series, no dollar-priced proxy.
+
+        Both are the same mistake in different clothes: a number that is not
+        what the 22/28 gates believe it is. A daily close is the subtler one —
+        it would only be reached when both intraday sources are down, which
+        correlates with exactly the market-wide event that spikes VIX, and a
+        successful fetch of yesterday's calm close SUPPRESSES the stale
+        fail-safe that would otherwise have gated the fleet.
+        """
+        names = [n for n, _ in ma.VIX_SOURCES]
+        for banned in ("fred", "vixcls", "vixy", "vxx", "proxy", "daily"):
+            self.assertNotIn(banned, [n.lower() for n in names])
+        self.assertTrue(names, "the chain must never be empty")
 
     def test_cboe_parses_current_price(self):
         payload = {"data": {"current_price": 15.75, "close": 15.1}}
@@ -377,17 +384,60 @@ class GetVixValueTests(unittest.TestCase):
 
     def test_first_source_wins(self):
         with mock.patch.object(ma, "VIX_SOURCES",
-                               self._chain(("stooq", 14.5), ("cboe", 99.0))):
+                               self._chain(("srcA", 14.5), ("cboe", 99.0))):
             self.assertAlmostEqual(ma.get_vix_value(), 14.5)
-            self.assertEqual(ma.last_vix_source, "stooq")
+            self.assertEqual(ma.last_vix_source, "srcA")
 
     def test_falls_through_to_next_source(self):
-        chain = self._chain(("stooq", RuntimeError("HTTP 403")), ("cboe", 15.25))
+        """A COVERED source failure is not an error event (rule 27).
+
+        This previously asserted the opposite — "the dead source is still
+        LOUD" — which filed a working fallback as a fleet failure. On a 900s
+        cycle that is ~96 error rows a day with the VIX perfectly live, and up
+        to 6 rows for a SINGLE successful cycle once retries are involved.
+        fleet_doctor section 7c reads that series, so a healthy fallback could
+        push the analyst past the error thresholds and fail the run, while
+        section 6 — looking at the same condition on the live chain — called
+        it a warning. Two halves of one diagnostic disagreeing (rule 26), and
+        the stooq permanent-red-line lesson arriving through another door.
+
+        The detail is NOT lost: every attempt still writes logger.error, the
+        full list rides on the total-failure error, and which provider is
+        carrying the kill-switch is already an indexed series (the vix_source
+        tag on every market_regime row).
+        """
+        chain = self._chain(("srcA", RuntimeError("HTTP 403")), ("cboe", 15.25))
         with mock.patch.object(ma, "VIX_SOURCES", chain), \
              mock.patch.object(ma.registry, "log_error") as le:
             self.assertAlmostEqual(ma.get_vix_value(), 15.25)
             self.assertEqual(ma.last_vix_source, "cboe")
-            self.assertTrue(le.called)   # the dead source is still LOUD
+            self.assertFalse(le.called,
+                             "a covered source failure was filed as a fleet error")
+
+    def test_a_covered_failure_still_reaches_the_log(self):
+        """Not an error EVENT, still a logged fact."""
+        chain = self._chain(("srcA", RuntimeError("HTTP 403")), ("cboe", 15.25))
+        with mock.patch.object(ma, "VIX_SOURCES", chain), \
+             mock.patch.object(ma.logger, "error") as log:
+            ma.get_vix_value()
+        self.assertTrue(any("srcA" in str(c) for c in log.call_args_list),
+                        "the failing source vanished from the log entirely")
+
+    def test_a_retry_that_succeeds_logs_no_error_event(self):
+        """3 attempts x 2 sources could file 6 rows for one good cycle."""
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise RuntimeError("transient")
+            return 13.0
+
+        with mock.patch.object(ma, "VIX_SOURCES",
+                               (("srcA", flaky), ("cboe", flaky))), \
+             mock.patch.object(ma.registry, "log_error") as le:
+            self.assertAlmostEqual(ma.get_vix_value(), 13.0)
+            self.assertFalse(le.called)
 
     def test_none_from_a_source_is_skipped(self):
         chain = self._chain(("yfinance", None), ("cboe", 16.0))
@@ -396,24 +446,53 @@ class GetVixValueTests(unittest.TestCase):
 
     def test_out_of_band_value_is_rejected_not_published(self):
         """A rate-limit page parsing to 0.0 must never reach the 22/28 gates."""
-        chain = self._chain(("stooq", 0.0), ("cboe", 17.5))
+        chain = self._chain(("srcA", 0.0), ("cboe", 17.5))
         with mock.patch.object(ma, "VIX_SOURCES", chain), \
              mock.patch.object(ma.registry, "log_error") as le:
             self.assertAlmostEqual(ma.get_vix_value(), 17.5)
-            self.assertTrue(le.called)
+            # Rejected and skipped, but COVERED by the next source, so it is
+            # not a fleet error either — same rule as the fall-through above.
+            self.assertFalse(le.called)
 
     def test_absurdly_high_value_is_rejected(self):
-        chain = self._chain(("stooq", 1453.0))
+        chain = self._chain(("srcA", 1453.0))
         with mock.patch.object(ma, "VIX_SOURCES", chain):
             self.assertIsNone(ma.get_vix_value())
 
     def test_all_sources_down_returns_none(self):
-        chain = self._chain(("stooq", RuntimeError("boom")),
+        chain = self._chain(("srcA", RuntimeError("boom")),
                             ("cboe", RuntimeError("boom")),
                             ("yfinance", None))
         with mock.patch.object(ma, "VIX_SOURCES", chain):
             self.assertIsNone(ma.get_vix_value())
             self.assertIsNone(ma.last_vix_source)
+
+    def test_a_total_chain_failure_is_still_a_loud_error_event(self):
+        """The 2026-06-24 silent-freeze case keeps its error row.
+
+        Quietening the covered case must not quieten this one: with no source
+        answering, the kill-switch has no reading at all.
+        """
+        chain = self._chain(("srcA", RuntimeError("boom")),
+                            ("cboe", None))
+        with mock.patch.object(ma, "VIX_SOURCES", chain), \
+             mock.patch.object(ma.registry, "log_error") as le:
+            self.assertIsNone(ma.get_vix_value())
+        self.assertEqual(le.call_count, 1,
+                         "a total VIX outage must log exactly one error event")
+
+    def test_the_total_failure_error_names_every_source_and_reason(self):
+        """One row replaces the per-source rows, so it has to carry them."""
+        chain = self._chain(("srcA", RuntimeError("HTTP 403")),
+                            ("cboe", None),
+                            ("yfinance", 0.0))
+        with mock.patch.object(ma, "VIX_SOURCES", chain), \
+             mock.patch.object(ma.registry, "log_error") as le:
+            ma.get_vix_value()
+        message = str(le.call_args[0][2])
+        for expected in ("srcA", "HTTP 403", "cboe", "no data", "yfinance"):
+            self.assertIn(expected, message,
+                          f"{expected!r} missing from the total-failure error")
 
     def test_whole_chain_is_retried(self):
         calls = {"n": 0}
@@ -424,7 +503,7 @@ class GetVixValueTests(unittest.TestCase):
                 raise RuntimeError("transient")
             return 13.0
 
-        with mock.patch.object(ma, "VIX_SOURCES", (("stooq", flaky),)):
+        with mock.patch.object(ma, "VIX_SOURCES", (("srcA", flaky),)):
             self.assertAlmostEqual(ma.get_vix_value(), 13.0)
         self.assertEqual(calls["n"], 3)
 

@@ -558,3 +558,121 @@ class NegativeBasisFlagTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SuspectPerformanceWriteTest(unittest.TestCase):
+    """A flagged basis must not still be published as this bot's P&L.
+
+    The 2026-09-15 live check: accounting_anomaly was being written every
+    cycle with kind=negative_long_cost_basis, and bot_performance STILL
+    reported crypto_grid at unrealized +5027.81 / total +5038.94 — derived
+    from Alpaca's ETHUSD (qty 1.4156, avg_entry_price -1056.36, cost_basis
+    -1495.40, unrealized_pl +4959.59) and a dust SOLUSD with the same defect.
+    Account equity was correct; only per-bot attribution was wrong.
+
+    A detector whose finding does not reach the number it invalidates is a
+    log line, not a control (rule 21).
+    """
+
+    def point(self, bot="crypto_grid", realized=11.13, unrealized=5027.81,
+              allocation=3464.19, suspect=True):
+        return accountant.build_bot_performance_point(
+            bot, realized, unrealized, allocation, suspect)
+
+    def test_a_suspect_bot_publishes_no_unrealized_or_total(self):
+        _, fields = self.point()
+        self.assertNotIn("unrealized_pl", fields,
+                         "the inflated unrealized figure is still being published")
+        self.assertNotIn("total_pl", fields,
+                         "total_pl carries the same bad basis through addition")
+
+    def test_a_suspect_bot_still_publishes_realized_and_allocation(self):
+        # Realized is FIFO over confirmed fills and allocation is
+        # |market_value|; neither reads avg_entry_price, so both survive.
+        _, fields = self.point()
+        self.assertAlmostEqual(fields["realized_pl"], 11.13)
+        self.assertAlmostEqual(fields["allocation"], 3464.19)
+
+    def test_the_suspect_bot_is_tagged(self):
+        tags, _ = self.point()
+        self.assertEqual(tags["pl_suspect"], "true")
+        self.assertEqual(tags["bot"], "crypto_grid")
+
+    def test_a_clean_bot_is_unchanged_and_tagged_false(self):
+        tags, fields = self.point(bot="trend_bot", realized=100.0,
+                                  unrealized=25.0, allocation=9000.0,
+                                  suspect=False)
+        self.assertEqual(tags["pl_suspect"], "false",
+                         "clean must be visible, not implied by absence")
+        self.assertAlmostEqual(fields["unrealized_pl"], 25.0)
+        self.assertAlmostEqual(fields["total_pl"], 125.0)
+        self.assertAlmostEqual(fields["realized_pl"], 100.0)
+
+    def test_the_withheld_bot_is_not_netted_down_to_a_partial_sum(self):
+        """Netting the bad leg out and publishing the rest is rule 24's proxy."""
+        _, fields = self.point(unrealized=68.22)   # as if ETH/SOL were removed
+        self.assertNotIn("unrealized_pl", fields,
+                         "a partial sum under the same field name still reads as P&L")
+
+    def test_no_field_is_silently_renamed(self):
+        """A clean row keeps exactly the four fields Grafana already plots."""
+        _, fields = self.point(suspect=False)
+        self.assertEqual(set(fields),
+                         {"allocation", "realized_pl", "unrealized_pl", "total_pl"})
+
+
+class SuspectWriteIsDrivenEndToEndTest(unittest.TestCase):
+    """The flag reaches the write through the accountant's own plumbing.
+
+    ImpossibleBasisTest pins the detector and SuspectPerformanceWriteTest pins
+    the point builder; this drives detector -> anomalous_bots -> builder, so a
+    future refactor cannot pass both while leaving them unconnected (rule 19:
+    idempotence/agreement is a property of the system, not of a helper).
+    """
+
+    def test_the_observed_positions_withhold_their_owner(self):
+        eth = ImpossibleBasisTest.position("ETHUSD", 1.4156, -1495.40)
+        sol = ImpossibleBasisTest.position("SOLUSD", 0.0113, -65.0)
+        clean = ImpossibleBasisTest.position("AAPL", 10, 2000.0)
+
+        owners = {"ETHUSD": "crypto_grid", "SOLUSD": "crypto_grid",
+                  "AAPL": "trend_bot"}
+        anomalous = {owners[p.symbol] for p in (eth, sol, clean)
+                     if accountant._has_impossible_basis(p)}
+
+        self.assertEqual(anomalous, {"crypto_grid"})
+
+        _, grid = accountant.build_bot_performance_point(
+            "crypto_grid", 11.13, 5027.81, 3464.19, "crypto_grid" in anomalous)
+        _, trend = accountant.build_bot_performance_point(
+            "trend_bot", 100.0, 25.0, 9000.0, "trend_bot" in anomalous)
+
+        self.assertNotIn("total_pl", grid, "crypto_grid's phantom total was published")
+        self.assertAlmostEqual(trend["total_pl"], 125.0,
+                               msg="an unaffected bot must not lose its P&L")
+
+
+class AllocationsIgnorePerformanceTest(unittest.TestCase):
+    """Phantom P&L must not be able to move real capital.
+
+    bot_performance is currently WRITE-ONLY inside the fleet: the accountant
+    writes it and only export_data.py (a manual CSV dump) reads it back. The
+    CFO reallocator takes `allocation_stats`, which is built from
+    abs(market_value) and never touches cost basis or P&L — so a negative
+    basis could inflate the dashboard but not a budget.
+
+    That is worth PINNING rather than re-deriving: it is the difference
+    between a reporting bug and a capital-at-risk one, and it would be an
+    easy thing to undo by "improving" the allocator to weight by performance.
+    """
+
+    def test_the_reallocator_takes_no_pl_input(self):
+        import inspect
+        params = set(inspect.signature(
+            accountant.calculate_dynamic_allocations).parameters)
+        self.assertEqual(
+            params, {"equity", "allocation_stats", "regime", "vix", "config_data"},
+            "calculate_dynamic_allocations grew a new input — if it is P&L "
+            "derived, a negative cost basis can now move real allocations")
+        for banned in ("realized", "unrealized", "performance", "pl", "total_pl"):
+            self.assertNotIn(banned, params)

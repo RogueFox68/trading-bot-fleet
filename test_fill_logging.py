@@ -13,6 +13,11 @@ and the PAAS put rode DTE-0 into assignment.
 Run: python -m unittest test_fill_logging -v
 """
 import datetime
+import json
+import os
+import shutil
+import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -177,7 +182,7 @@ class ReconcileFillsPagingTest(unittest.TestCase):
                 side_effect=lambda o, lg, action=None, reason="": full_path.append(o.symbol)), \
              mock.patch.object(
                 utils, "log_terminal_partial_fill",
-                side_effect=lambda o, lg: (partial_path.append(o.symbol), 1)[1]):
+                side_effect=lambda o, lg, reason="": (partial_path.append(o.symbol), 1)[1]):
             n = utils.reconcile_fills(client, utils.logger)
 
         self.assertEqual(full_path, ["AAA260731P00045000"])      # full-fill path
@@ -352,3 +357,208 @@ class TerminalPartialFillTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReasonSurvivesLateFillTest(unittest.TestCase):
+    """A trade row keeps its reason even when the submit poll misses the fill.
+
+    --- The defect this pins ----------------------------------------------
+
+    On 2026-09-15 the day's entries logged reason=None: MSTR (trades, 13:32Z)
+    and USFD (survivor_trades, 13:32Z). Every row on 9/14 had one ("Entry
+    (Crossover)", "Bought Dip", "EOD Liquidation").
+
+    It was NOT a dropped argument, and no commit caused it — HEAD was
+    2026-09-11 and nothing landed on 9/14 or 9/15. `reason` propagates
+    correctly on every submit-time path.
+
+    The real cause: submit_and_log_order only logs a MARKET order that
+    reaches `filled` inside its 5s poll. When the poll elapses it deliberately
+    writes NOTHING (a now()-stamped partial would double-count against the
+    reconciled row), so the row is created later by reconcile_fills — running
+    in the ACCOUNTANT process, which called _log_fill_to_influx with no
+    reason=. _log_fill_to_influx omits the field entirely when empty, so the
+    row reads back as reason=None.
+
+    The rows without a reason are therefore exactly the orders that took
+    longer than 5s to fill. 13:32Z is 09:32 ET — two minutes after the open,
+    when fill latency is worst. 9/14's orders simply filled inside the poll.
+    This had been true since equity reconciliation landed on 2026-07-01.
+
+    The reason is known in the BOT process and needed in the ACCOUNTANT
+    process, so it has to be written down. These tests drive that handoff.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "order_reasons.jsonl")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_a_remembered_reason_comes_back(self):
+        utils.remember_order_reason("ord-1", "Entry (Crossover)", file_path=self.path)
+        self.assertEqual(utils.load_order_reasons(self.path)["ord-1"],
+                         "Entry (Crossover)")
+
+    def test_a_missing_file_is_an_empty_map_not_an_error(self):
+        self.assertEqual(utils.load_order_reasons(self.path + ".nope"), {})
+
+    def test_a_corrupt_line_does_not_lose_the_others(self):
+        utils.remember_order_reason("ord-1", "Bought Dip", file_path=self.path)
+        with open(self.path, "a") as f:
+            f.write("{not json\n\n")
+        utils.remember_order_reason("ord-2", "EOD Liquidation", file_path=self.path)
+        reasons = utils.load_order_reasons(self.path)
+        self.assertEqual(reasons["ord-1"], "Bought Dip")
+        self.assertEqual(reasons["ord-2"], "EOD Liquidation")
+
+    def test_entries_past_the_reconcile_window_are_dropped(self):
+        utils.remember_order_reason("old", "Entry (Crossover)", file_path=self.path)
+        with open(self.path) as f:
+            rec = json.loads(f.read().strip())
+        rec["ts"] = time.time() - 40 * 86400
+        with open(self.path, "w") as f:
+            f.write(json.dumps(rec) + "\n")
+        self.assertNotIn("old", utils.load_order_reasons(self.path))
+
+    def test_an_empty_reason_is_not_recorded(self):
+        self.assertFalse(utils.remember_order_reason("ord-1", "", file_path=self.path))
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_concurrent_writers_do_not_clobber_each_other(self):
+        # Five bot processes share this file; append-only is why that is safe.
+        for i in range(5):
+            utils.remember_order_reason(f"ord-{i}", f"Entry ({i})", file_path=self.path)
+        reasons = utils.load_order_reasons(self.path)
+        self.assertEqual(len(reasons), 5)
+        self.assertEqual(reasons["ord-3"], "Entry (3)")
+
+    def test_the_file_is_compacted_once_it_grows_past_the_cap(self):
+        over = utils.ORDER_REASON_MAX_LINES + 50
+        now = time.time()
+        with open(self.path, "w") as f:
+            for i in range(over):
+                f.write(json.dumps({"id": f"o{i}", "reason": "r", "ts": now}) + "\n")
+        utils.load_order_reasons(self.path)
+        with open(self.path) as f:
+            remaining = [ln for ln in f if ln.strip()]
+        self.assertLessEqual(len(remaining), utils.ORDER_REASON_MAX_LINES)
+        # Newest are the ones kept — they are the ones still reconcilable.
+        self.assertIn(f'"o{over - 1}"', remaining[-1])
+
+    def test_reconcile_writes_the_remembered_reason(self):
+        """The end-to-end case: a fill the submit poll never saw."""
+        now = datetime.datetime.now(UTC)
+        late = _ReconcileOrder(
+            "MSTR", "trend_bot-MSTR-1",
+            now - datetime.timedelta(minutes=30), now - datetime.timedelta(minutes=29),
+            utils.OrderSide.SELL, status="filled")
+        late.id = "late-order-1"
+        client = _ReconcileClient([late])
+
+        utils.remember_order_reason("late-order-1", "Entry (Crossover)",
+                                    file_path=self.path)
+        seen = {}
+        with mock.patch.object(utils, "ORDER_REASON_FILE", self.path), \
+             mock.patch.object(
+                utils, "_log_fill_to_influx",
+                side_effect=lambda o, lg, action=None, reason="", outbox=None:
+                    seen.update({"reason": reason}) or 1):
+            utils.reconcile_fills(client, utils.logger)
+
+        self.assertEqual(seen.get("reason"), "Entry (Crossover)",
+                         "the reconciled row lost the reason again")
+
+    def test_an_unknown_order_reconciles_with_no_reason_rather_than_failing(self):
+        now = datetime.datetime.now(UTC)
+        o = _ReconcileOrder("USFD", "survivor_bot-USFD-1",
+                            now - datetime.timedelta(minutes=30),
+                            now - datetime.timedelta(minutes=29),
+                            utils.OrderSide.BUY, status="filled")
+        o.id = "never-recorded"
+        seen = {}
+        with mock.patch.object(utils, "ORDER_REASON_FILE", self.path), \
+             mock.patch.object(
+                utils, "_log_fill_to_influx",
+                side_effect=lambda ord_, lg, action=None, reason="", outbox=None:
+                    seen.update({"reason": reason}) or 1):
+            utils.reconcile_fills(_ReconcileClient([o]), utils.logger)
+        self.assertEqual(seen.get("reason"), "",
+                         "an unknown order must degrade to today's behaviour, not raise")
+
+    def test_the_submit_path_records_the_reason_before_polling(self):
+        """It must be written even when the poll then elapses unfilled.
+
+        This is THE case that needed it: the order never reaches `filled`
+        inside the 5s poll, so submit_and_log_order writes no row at all and
+        reconcile_fills creates it later, in another process.
+        """
+        from alpaca.trading.requests import MarketOrderRequest
+
+        recorded = []
+        pending = mock.Mock(
+            id="sub-1", symbol="MSTR", side=utils.OrderSide.SELL, qty="10",
+            status=mock.Mock(value="accepted"), type=mock.Mock(value="market"),
+            filled_qty="0", filled_avg_price=None,
+            client_order_id="trend_bot-MSTR-1")
+        client = mock.Mock()
+        client.get_account.return_value = mock.Mock(equity="100000",
+                                                    last_equity="100000")
+        client.get_all_positions.return_value = []
+        client.submit_order.return_value = pending
+        client.get_order_by_id.return_value = pending   # never fills
+
+        with mock.patch.object(utils, "remember_order_reason",
+                               side_effect=lambda oid, r, file_path=None:
+                                   recorded.append((oid, r))), \
+             mock.patch.object(utils, "assert_order_allowed_here"), \
+             mock.patch.object(utils, "_log_fill_to_influx"), \
+             mock.patch.object(utils, "_safety_price_client",
+                               return_value=mock.Mock(**{
+                                   "get_stock_latest_trade.return_value": {
+                                       "MSTR": mock.Mock(price=100.0)}})), \
+             mock.patch("time.sleep"):
+            utils.submit_and_log_order(
+                client,
+                MarketOrderRequest(symbol="MSTR", qty=10,
+                                   side=utils.OrderSide.SELL, time_in_force="day"),
+                utils.logger, reason="Entry (Crossover)")
+
+        self.assertEqual(recorded, [("sub-1", "Entry (Crossover)")],
+                         "the reason was not recorded at submit time, so a late "
+                         "fill can never recover it")
+
+
+class ReasonIsNotRecordedForUnreconciledBotsTest(unittest.TestCase):
+    """Crypto bots log their own fills; their reasons would never be read."""
+
+    def test_a_crypto_order_records_nothing(self):
+        from alpaca.trading.requests import MarketOrderRequest
+        recorded = []
+        pending = mock.Mock(
+            id="c-1", symbol="BTC/USD", side=utils.OrderSide.BUY, qty="1",
+            status=mock.Mock(value="accepted"), type=mock.Mock(value="market"),
+            filled_qty="0", filled_avg_price=None,
+            client_order_id="crypto_grid-BTCUSD-1")
+        client = mock.Mock()
+        client.get_account.return_value = mock.Mock(equity="100000",
+                                                    last_equity="100000")
+        client.get_all_positions.return_value = []
+        client.submit_order.return_value = pending
+        client.get_order_by_id.return_value = pending
+
+        with mock.patch.object(utils, "remember_order_reason",
+                               side_effect=lambda oid, r, file_path=None:
+                                   recorded.append((oid, r))), \
+             mock.patch.object(utils, "assert_order_allowed_here"), \
+             mock.patch.object(utils, "_log_fill_to_influx"), \
+             mock.patch("time.sleep"):
+            utils.submit_and_log_order(
+                client,
+                MarketOrderRequest(symbol="BTC/USD", qty=1,
+                                   side=utils.OrderSide.BUY, time_in_force="gtc"),
+                utils.logger, reason="grid entry")
+
+        self.assertEqual(recorded, [],
+                         "crypto is reconciled=False — nothing would ever read this")

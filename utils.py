@@ -1068,6 +1068,18 @@ def submit_and_log_order(trading_client, order_data, logger, reason="", log_acti
         # --- SUBMIT ORDER ---
         order = trading_client.submit_order(order_data)
         logger.info(f"  [ORDER SUBMITTED] ID: {order.id} | Symbol: {order.symbol} | Side: {order.side} | Qty: {order.qty} | Status: {order.status.value} | Type: {order.type.value}")
+        # Recorded BEFORE the poll, because the case that needs it is the one
+        # where the poll elapses and this function never logs the fill at all:
+        # reconcile_fills creates the row later, in another process, and can
+        # only carry the reason across if it was written down here.
+        #
+        # Only for bots reconcile_fills actually visits. The crypto bots are
+        # reconciled=False and log their own fills, where the meaning is
+        # already in the action vocabulary (grid_buy / buy_breakout / ...),
+        # so recording theirs would be writes nothing ever reads.
+        _c_id = getattr(order, "client_order_id", "") or ""
+        if any(_c_id.startswith(f"{b}-") for b in RECONCILED_BOTS):
+            remember_order_reason(getattr(order, "id", ""), reason)
         
         # Check if market order, poll for fill
         is_market = isinstance(order_data, MarketOrderRequest)
@@ -1205,6 +1217,109 @@ RECONCILED_BOTS = tuple(
 # logged loudly (coverage may be incomplete that cycle).
 RECONCILE_MAX_ORDERS = 10000
 
+# --- TRADE REASON SIDECAR ------------------------------------------------
+#
+# Why this file exists.
+#
+# `reason` ("Entry (Crossover)", "Bought Dip", "EOD Liquidation") is written
+# by the bot and reaches _log_fill_to_influx correctly on every submit-time
+# path. But submit_and_log_order only logs a MARKET order that reaches
+# `filled` inside its 5s poll. When the poll elapses, it deliberately writes
+# nothing — a now()-stamped partial would double-count against the reconciled
+# row — and the row is created later by reconcile_fills instead, which runs
+# in the ACCOUNTANT process and has no idea why the bot traded. It called
+# _log_fill_to_influx with no `reason=`, and since the field is omitted from
+# line protocol when empty, the row read back as reason=None.
+#
+# So the rows missing a reason are exactly the orders that took longer than
+# 5s to fill. That is why 2026-09-14 looked fine and 2026-09-15 did not: the
+# 13:32Z fills were two minutes after the open, when latency is worst. No
+# commit dropped anything; this has been true since equity reconciliation
+# landed on 2026-07-01.
+#
+# The reason is known in one process and needed in another, so it has to be
+# durable. Append-only JSONL, one small line per order: concurrent appends
+# from several bot processes do not clobber each other the way a
+# read-modify-write JSON map would.
+ORDER_REASON_FILE = os.path.join("logs", "order_reasons.jsonl")
+# Comfortably past reconcile_fills' 30-day lookback.
+ORDER_REASON_MAX_AGE_DAYS = 35
+ORDER_REASON_MAX_LINES = 20000
+
+
+def remember_order_reason(order_id, reason, file_path=None):
+    """Record why an order was placed, for whoever logs its fill later.
+
+    Best-effort by design: this is a display annotation, never trading state.
+    A failure here must not stop an order, so it is logged and swallowed —
+    the worst case is the reason=None row we already had.
+    """
+    order_id, reason = str(order_id or ""), str(reason or "")
+    if not order_id or not reason:
+        return False
+    path = file_path or ORDER_REASON_FILE
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        line = json.dumps({"id": order_id, "reason": reason, "ts": time.time()})
+        with open(path, "a") as f:
+            f.write(line + "\n")
+        return True
+    except Exception as e:
+        registry.log_error("utils", "remember_order_reason", e, context=order_id)
+        return False
+
+
+def load_order_reasons(file_path=None, max_age_days=ORDER_REASON_MAX_AGE_DAYS):
+    """{order_id: reason} for orders still inside the reconcile window.
+
+    Also compacts the file once it passes ORDER_REASON_MAX_LINES. The
+    accountant is the only reader, so it does the compaction; an append
+    landing between the read and the os.replace is lost, which costs one
+    annotation and nothing else. That is why this file may never hold
+    anything a trading decision depends on.
+    """
+    path = file_path or ORDER_REASON_FILE
+    cutoff = time.time() - max_age_days * 86400
+    reasons, kept, total = {}, [], 0
+    try:
+        with open(path) as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                total += 1
+                try:
+                    rec = json.loads(raw)
+                    if float(rec.get("ts", 0)) < cutoff:
+                        continue
+                    oid = str(rec["id"])
+                except (ValueError, TypeError, KeyError):
+                    continue
+                reasons[oid] = str(rec.get("reason", ""))
+                kept.append(raw)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        registry.log_error("utils", "load_order_reasons", e, context=path)
+        return {}
+
+    if total > ORDER_REASON_MAX_LINES:
+        tmp = f"{path}.tmp"
+        try:
+            with open(tmp, "w") as f:
+                f.write("\n".join(kept[-ORDER_REASON_MAX_LINES:]))
+                if kept:
+                    f.write("\n")
+            os.replace(tmp, path)
+        except Exception as e:
+            registry.log_error("utils", "compact_order_reasons", e, context=path)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    return reasons
+
+
 def _fill_action(order):
     """Best-effort trade action for a reconciled fill, from the order side/symbol.
 
@@ -1219,7 +1334,7 @@ def _fill_action(order):
         return "sell_put" if is_option.group(1) == "P" else "sell_call"
     return "sell"
 
-def log_terminal_partial_fill(order, logger, action=None, outbox=None):
+def log_terminal_partial_fill(order, logger, action=None, outbox=None, reason=""):
     """Log a TERMINAL order's partial fill as a first-class trade row.
 
     A close-ladder rung (wheel_bot.close_option_position) can partially fill and
@@ -1270,8 +1385,12 @@ def log_terminal_partial_fill(order, logger, action=None, outbox=None):
         ns = (base_ms + zlib.crc32(oid.encode()) % 1000) * 1_000_000
 
         action = action or _fill_action(order)
+        # Same convention as _log_fill_to_influx: omitted entirely when empty,
+        # so a row without one reads back as reason=None rather than "".
+        reason_field = f',reason="{reason}"' if reason else ""
         line = (f'{measurement},symbol={order.symbol} '
-                f'price={float(price)},action="{action}",qty={filled_qty},'
+                f'price={float(price)},action="{action}",qty={filled_qty}'
+                f'{reason_field},'
                 f'fill_source="terminal_partial",source_order_id="{oid}" {ns}')
         if not _post_influx_line(line, logger, context=" [TerminalPartial]"):
             _stash(outbox, line, logger)
@@ -1359,7 +1478,11 @@ def log_confirmed_fill(order, logger, action=None, reason="", outbox=None):
         # on filled_at, so repeated reconciles overwrite one point.
         return _log_fill_to_influx(order, logger, reason=reason, action=action, outbox=outbox)
     # No broker stamp (a terminal partial): deterministic synthetic stamp.
-    return log_terminal_partial_fill(order, logger, action=action, outbox=outbox)
+    # The reason rides along here too — it was being dropped on this branch
+    # while the full-fill branch above carried it, so an order that ended
+    # canceled-after-a-partial lost the annotation its twin kept.
+    return log_terminal_partial_fill(order, logger, action=action, outbox=outbox,
+                                     reason=reason)
 
 
 def reconcile_fills(trading_client, logger, lookback_days=30):
@@ -1408,13 +1531,19 @@ def reconcile_fills(trading_client, logger, lookback_days=30):
                        f"cap; fills older than the covered window may be missed "
                        f"this cycle.")
 
+    # Why the bot placed each order, recorded at submit time by another
+    # process. Without it every fill that took longer than the 5s submit poll
+    # landed with no reason at all.
+    reasons = load_order_reasons()
+
     for o in orders:
         c_id = getattr(o, "client_order_id", "") or ""
         if not any(c_id.startswith(f"{b}-") for b in RECONCILED_BOTS):
             continue
+        reason = reasons.get(str(getattr(o, "id", "")), "")
         # Fully-filled orders carry a stable broker filled_at -> stamp there.
         if getattr(o, "filled_at", None) is not None:
-            _log_fill_to_influx(o, logger, action=_fill_action(o))
+            _log_fill_to_influx(o, logger, action=_fill_action(o), reason=reason)
             written += 1
         else:
             # No filled_at: a terminal order (canceled/expired/rejected) that only
@@ -1422,7 +1551,7 @@ def reconcile_fills(trading_client, logger, lookback_days=30):
             # recover the partial here (idempotent, synthetic stamp). No-op unless
             # terminal with filled_qty>0 — still-open partials and zero-fill
             # terminations write nothing, so no full-fill row can be double-counted.
-            written += log_terminal_partial_fill(o, logger)
+            written += log_terminal_partial_fill(o, logger, reason=reason)
 
     if written:
         logger.info(f"  [Reconcile] wrote/updated {written} fill row(s) from Alpaca.")
