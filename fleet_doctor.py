@@ -621,17 +621,63 @@ def classify_error_rates(groups_24h, groups_1h):
     return findings, offenders[:ERROR_TOP_N]
 
 
+def _influx_series(config, requests, q, timeout=10):
+    """The series list for one query, or raise. The ONE place a response is judged.
+
+    An unreadable database must never read as a healthy fleet. This used to
+    go straight to `.get("results", [{}])[0].get("series")`, which turns every
+    failure shape into an empty list and therefore into "0 errors": an HTTP
+    401 with {"error": "authorization failed"}, an HTTP 200 carrying
+    {"results": [{"error": "query timeout exceeded"}]}, a 500 with no body —
+    all three printed PASS: 0 error(s) in 24h across 0 group(s).
+
+    That is the section's own failure mode (rule 25): it answered with the
+    same confident formatting whether or not it had looked. Absence of rows
+    and inability to read rows are different facts, and only the caller's
+    monitoring-unavailable warning may speak for the second.
+
+    Every reader in this section goes through here so they cannot drift on
+    what counts as a usable answer (rule 19).
+    """
+    r = requests.get(f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/query",
+                     params={"db": config.INFLUX_DB_NAME, "q": q},
+                     timeout=timeout)
+    status = getattr(r, "status_code", None)
+    if status is not None and not (200 <= int(status) < 300):
+        detail = ""
+        try:
+            detail = str(r.json().get("error") or "")[:160]
+        except Exception:
+            detail = str(getattr(r, "text", ""))[:160]
+        raise RuntimeError(f"HTTP {status}" + (f": {detail}" if detail else ""))
+    try:
+        payload = r.json()
+    except Exception as e:
+        raise RuntimeError(f"response was not JSON: {e}")
+    if not isinstance(payload, dict):
+        raise RuntimeError("response was not a JSON object")
+    # InfluxDB 1.x reports query errors at the top level AND per result, both
+    # under HTTP 200.
+    if payload.get("error"):
+        raise RuntimeError(str(payload["error"])[:200])
+    results = payload.get("results")
+    if not isinstance(results, list) or not results:
+        raise RuntimeError("response carried no results")
+    first = results[0] if isinstance(results[0], dict) else {}
+    if first.get("error"):
+        raise RuntimeError(str(first["error"])[:200])
+    return first.get("series") or []
+
+
 def _influx_groups(config, requests, window):
     """{(bot_id, component, error_type): count} over `window` (e.g. '24h')."""
-    r = requests.get(
-        f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/query",
-        params={"db": config.INFLUX_DB_NAME,
-                "q": f"SELECT count(value) FROM bot_error_events "
-                     f"WHERE time > now() - {window} "
-                     f"GROUP BY bot_id, component, error_type"},
-        timeout=10)
+    series = _influx_series(
+        config, requests,
+        f"SELECT count(value) FROM bot_error_events "
+        f"WHERE time > now() - {window} "
+        f"GROUP BY bot_id, component, error_type")
     groups = {}
-    for s in (r.json().get("results", [{}])[0].get("series") or []):
+    for s in series:
         t = s.get("tags") or {}
         key = (t.get("bot_id") or "?", t.get("component") or "?",
                t.get("error_type") or "?")
@@ -642,20 +688,19 @@ def _influx_groups(config, requests, window):
 def _influx_last_messages(config, requests):
     """{(bot_id, component, error_type): sample message} over 24h."""
     try:
-        r = requests.get(
-            f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/query",
-            params={"db": config.INFLUX_DB_NAME,
-                    "q": "SELECT last(message) FROM bot_error_events "
-                         "WHERE time > now() - 24h "
-                         "GROUP BY bot_id, component, error_type"},
-            timeout=10)
+        series = _influx_series(
+            config, requests,
+            "SELECT last(message) FROM bot_error_events "
+            "WHERE time > now() - 24h "
+            "GROUP BY bot_id, component, error_type")
         out = {}
-        for s in (r.json().get("results", [{}])[0].get("series") or []):
+        for s in series:
             t = s.get("tags") or {}
             out[(t.get("bot_id") or "?", t.get("component") or "?",
                  t.get("error_type") or "?")] = s["values"][0][1]
         return out
     except Exception:
+        # Sample messages are decoration on a finding that already stands.
         return {}
 
 
@@ -665,14 +710,13 @@ def _check_accounting_anomaly(config, requests):
     telling you it checked and found nothing, which is the whole point of
     writing it unconditionally."""
     try:
-        r = requests.get(
-            f"http://{config.INFLUX_HOST}:{config.INFLUX_PORT}/query",
-            params={"db": config.INFLUX_DB_NAME,
-                    "q": "SELECT * FROM accounting_anomaly "
-                         "WHERE time > now() - 1h ORDER BY time DESC LIMIT 1"},
-            timeout=10)
-        series = (r.json().get("results", [{}])[0].get("series") or [])
+        series = _influx_series(
+            config, requests,
+            "SELECT * FROM accounting_anomaly "
+            "WHERE time > now() - 1h ORDER BY time DESC LIMIT 1")
     except Exception as e:
+        # NOT "the accountant is not running" — that diagnosis belongs only to
+        # a query that actually succeeded and came back empty.
         warn("errors", f"Could not read accounting_anomaly: {e}")
         return
     if not series:
@@ -713,7 +757,10 @@ def check_error_rate(config):
         groups_24h = _influx_groups(config, requests, "24h")
         groups_1h = _influx_groups(config, requests, "1h")
     except Exception as e:
-        warn("errors", f"Could not read bot_error_events: {type(e).__name__}: {e}")
+        warn("errors", f"Could not read bot_error_events: {type(e).__name__}: {e}",
+             "This section is BLIND, which is not the same as a quiet fleet —\n"
+             "a bot could be failing every cycle right now and this run would\n"
+             "not know. Check InfluxDB auth and the database name.")
         _check_accounting_anomaly(config, requests)
         return
 

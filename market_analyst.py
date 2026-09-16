@@ -356,17 +356,36 @@ def get_vix_value():
     fail-safe) only when every source failed on every attempt. Contract is
     unchanged from the yfinance-only version: no args, `float | None`."""
     global last_vix_source
+    # A COVERED source failure is not an error event (rule 27).
+    #
+    # This used to registry.log_error per failed source, before knowing whether
+    # the chain went on to answer. The chain exists precisely so one provider
+    # can die without touching the kill-switch, so a covered death was being
+    # filed as a fleet failure: ~96 rows a day on a 900s cycle with the VIX
+    # perfectly live, and more when a source needs a retry (3 attempts x 2
+    # sources is up to 6 rows for ONE cycle that succeeded). fleet_doctor
+    # section 7c reads that series, so a working fallback could push the
+    # analyst past the error thresholds and fail the run — while section 6,
+    # looking at the same condition on the live chain, correctly called it a
+    # warning. That is the stooq permanent-red-line lesson arriving through a
+    # different door, and two halves of one diagnostic disagreeing (rule 26).
+    #
+    # Nothing is lost. Every attempt still writes logger.error with the source
+    # and reason, the whole list rides on the total-failure error below, and
+    # WHICH provider is carrying the kill-switch is already a first-class
+    # indexed series: the vix_source tag on every market_regime row.
+    failures = []
     for attempt in range(FETCH_RETRIES):
         for name, fetch in VIX_SOURCES:
             try:
                 val = fetch()
             except Exception as e:
-                registry.log_error("market_analyst", "get_vix_value", e,
-                                   context=f"{name} attempt {attempt + 1}")
+                failures.append(f"{name} a{attempt + 1}: {type(e).__name__}: {e}")
                 logger.error(f"[Analyst] VIX({name}) failed "
                              f"(attempt {attempt + 1}): {e}")
                 continue
             if val is None:
+                failures.append(f"{name} a{attempt + 1}: no data")
                 logger.error(f"[Analyst] VIX({name}) returned no data "
                              f"(attempt {attempt + 1}).")
                 continue
@@ -374,10 +393,8 @@ def get_vix_value():
                 # Out-of-band means the source is serving garbage (a rate-limit
                 # page, a zeroed row). Rejecting is the point: a bad number here
                 # silently mis-sets the 22/28 gates.
-                registry.log_error(
-                    "market_analyst", "get_vix_value",
-                    ValueError(f"VIX {val} outside [{VIX_MIN}, {VIX_MAX}]"),
-                    context=f"{name} attempt {attempt + 1}")
+                failures.append(f"{name} a{attempt + 1}: {val} outside "
+                                f"[{VIX_MIN}, {VIX_MAX}]")
                 logger.error(f"[Analyst] VIX({name}) out of band: {val}")
                 continue
             if name != last_vix_source:
@@ -387,6 +404,13 @@ def get_vix_value():
             return float(val)
         if attempt < FETCH_RETRIES - 1:
             time.sleep(FETCH_BACKOFF * (2 ** attempt))
+    # EVERY source failed on EVERY attempt. The kill-switch has no reading, so
+    # now it is an error event — this is the 2026-06-24 silent-freeze case, and
+    # it stays as loud as it has always been.
+    registry.log_error(
+        "market_analyst", "get_vix_value",
+        RuntimeError("every VIX source failed: " + "; ".join(failures)),
+        context=f"{len(VIX_SOURCES)} source(s) x {FETCH_RETRIES} attempts")
     last_vix_source = None
     return None
 

@@ -693,7 +693,19 @@ and shown by `/status` — so which provider carries the kill-switch is never a 
 Failures are **loud**: an empty/failed fetch logs `registry.log_error` + a throttled Discord
 ping and **never silently skips** (the original bug: a two-ticker `yf.download` returned an
 empty frame, the publish block skipped with no `else`, and VIX froze — disabling the kill-switch
-for ~12 days). A fresh `market_regime` InfluxDB row is written **only on a fully-successful
+for ~12 days). **"Loud" means the whole chain failing, not one covered source** (fixed
+2026-09-16). `get_vix_value` used to `registry.log_error` per failed source *before* knowing
+whether the chain went on to answer, so a working fallback was filed as a fleet failure: ~96
+rows a day on the 900s cycle with the VIX perfectly live, and up to
+`FETCH_RETRIES × len(VIX_SOURCES)` rows for a **single successful** cycle once retries were
+involved. `fleet_doctor` section 7c reads that series, so a healthy fallback could push the
+analyst past the error thresholds and fail the run — while section 6, judging the same
+condition on the live chain, correctly called it a warning. Two halves of one diagnostic
+disagreeing about one fact (rule 26), and the stooq permanent-red-line lesson (rule 27)
+arriving through a different door. Per-source detail is **not** lost: every attempt still
+writes `logger.error`, the full list of source/reason pairs rides on the single total-failure
+error, and which provider is carrying the kill-switch is already a first-class indexed series
+(the `vix_source` tag on every `market_regime` row). A fresh `market_regime` InfluxDB row is written **only on a fully-successful
 fetch**, so its recency is the fleet's "regime is live" heartbeat. If no good fetch lands for
 `STALE_REGIME_SECONDS` (45 min), the analyst **fails safe**: it degrades to `CRITICAL_VOLATILITY`
 + an elevated sentinel VIX (25, above the wheel/crypto gates but below the 28 full-kill so a data
@@ -809,6 +821,19 @@ rule is for latency: at a 60s cadence it fires in 30 minutes where the 24h rule 
 over three hours. `accounting_anomaly` is graded on **count > 0, not row presence** — the
 accountant writes it every cycle with zero included, so "warn if it has rows" would warn
 forever; **no rows at all** is its own warning, meaning the accountant is not running.
+
+**An unreadable database is not a healthy fleet** (fixed 2026-09-16). The readers went
+straight to `.get("results", [{}])[0].get("series")`, which turns every failure shape into an
+empty list and an empty list into "0 errors": an HTTP 401 with `{"error": …}`, an HTTP **200**
+carrying `{"results": [{"error": "query timeout exceeded"}]}` (InfluxDB 1.x reports query
+errors per result, under 200), a 500 with no body — all printed
+`[ ok ] 0 error(s) in 24h across 0 group(s)`. The one check built to notice a bot failing every
+cycle reported a clean fleet precisely when it could not see: rule 25 turned on 7c itself, the
+same shape as section 5b's "2 bars". Every reader now goes through one `_influx_series` helper
+that validates HTTP status and both error fields (rule 19 — they cannot drift on what counts
+as a usable answer), and a failure routes to the monitoring-unavailable warning, which says
+the section is **blind** rather than quiet. "No rows" may only mean the accountant is dead
+when the query actually succeeded.
 
 Two of its checks are deliberately *not* file-mtime based, because mtime lies here:
 `bot_config.json` is only rewritten when a published value moves (a closed weekend with a

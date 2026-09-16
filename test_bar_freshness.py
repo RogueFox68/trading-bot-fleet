@@ -31,6 +31,7 @@ import datetime as dt_mod
 import io
 import sys
 import unittest
+from unittest import mock
 
 import pandas as pd
 
@@ -644,3 +645,173 @@ class VixChainDepthTest(unittest.TestCase):
                                 ("yfinance", self._dead())])
         self.assertTrue([r for r in results if r[0] == "FAIL"],
                         "an entirely dead chain must fail")
+
+
+class _StubResponse:
+    def __init__(self, status_code=200, payload=None, raises=False):
+        self.status_code = status_code
+        self._payload = payload
+        self._raises = raises
+        self.text = str(payload)
+
+    def json(self):
+        if self._raises:
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+        return self._payload
+
+
+class _StubRequests:
+    def __init__(self, response):
+        self._response = response
+
+    def get(self, url, params=None, timeout=None):
+        return self._response
+
+
+class UnreadableErrorSeriesTest(unittest.TestCase):
+    """An unreadable database must never read as a healthy fleet.
+
+    --- The defect this pins ----------------------------------------------
+
+    Section 7c's reader went straight to
+
+        r.json().get("results", [{}])[0].get("series") or []
+
+    which turns EVERY failure shape into an empty list, and an empty list into
+    "0 errors". With requests stubbed to return HTTP 401 and
+    {"error": "authorization failed"}, or HTTP 200 carrying
+    {"results": [{"error": "query timeout exceeded"}]}, check_error_rate
+    printed:
+
+        [  ok  ] 0 error(s) in 24h across 0 group(s) — within the 1-15/day
+                 baseline band.
+
+    So the one check built to notice a bot failing every cycle reported a
+    clean fleet precisely when it could not see. That is rule 25 turned on
+    7c itself: it answered with the same confident formatting whether or not
+    it had looked — the same shape as section 5b's "2 bars".
+
+    Absence of rows and inability to READ rows are different facts. Only a
+    query that succeeded and came back empty may say the fleet is quiet.
+    """
+
+    class _Cfg:
+        INFLUX_HOST, INFLUX_PORT, INFLUX_DB_NAME = "influxdb", 8086, "trading_bots"
+
+    def _run(self, response):
+        req = _StubRequests(response)
+        fleet_doctor._results.clear()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with mock.patch.dict(sys.modules, {"requests": req}):
+                fleet_doctor.check_error_rate(self._Cfg())
+        results = list(fleet_doctor._results)
+        fleet_doctor._results.clear()
+        return results, buf.getvalue()
+
+    def _assert_blind_not_healthy(self, response, label):
+        results, out = self._run(response)
+        self.assertFalse([r for r in results if r[0] == "PASS"],
+                         f"{label}: an unreadable query reported a healthy fleet")
+        self.assertTrue([r for r in results if r[0] == "WARN"
+                         and "Could not read bot_error_events" in r[2]],
+                        f"{label}: no monitoring-unavailable warning — got {results}")
+        self.assertNotIn("0 error(s) in 24h", out,
+                         f"{label}: still printed a count it never obtained")
+
+    def test_http_401_with_a_top_level_error(self):
+        self._assert_blind_not_healthy(
+            _StubResponse(401, {"error": "authorization failed"}), "HTTP 401")
+
+    def test_http_200_with_a_per_result_error(self):
+        # InfluxDB 1.x reports query errors per result, under HTTP 200.
+        self._assert_blind_not_healthy(
+            _StubResponse(200, {"results": [{"error": "query timeout exceeded"}]}),
+            "per-result error")
+
+    def test_http_500_with_no_body(self):
+        self._assert_blind_not_healthy(_StubResponse(500, {}), "HTTP 500")
+
+    def test_a_non_json_response(self):
+        self._assert_blind_not_healthy(
+            _StubResponse(200, None, raises=True), "non-JSON")
+
+    def test_a_response_with_no_results_key(self):
+        self._assert_blind_not_healthy(_StubResponse(200, {}), "no results key")
+
+    def test_a_genuinely_empty_result_still_passes(self):
+        """The whole point of the distinction: quiet is not the same as blind."""
+        results, out = self._run(_StubResponse(200, {"results": [{}]}))
+        self.assertTrue([r for r in results if r[0] == "PASS"],
+                        f"a successful empty query must still report a quiet fleet: {results}")
+        self.assertIn("0 error(s) in 24h", out)
+
+    def test_the_anomaly_check_does_not_blame_the_accountant_for_a_bad_query(self):
+        """'No rows' means the accountant is dead — but only if the query worked."""
+        _, out = self._run(_StubResponse(401, {"error": "authorization failed"}))
+        self.assertNotIn("not running", out,
+                         "a failed query was reported as the accountant being down")
+        self.assertIn("Could not read accounting_anomaly", out)
+
+
+class CoveredVixFailureIsNotAFleetErrorTest(unittest.TestCase):
+    """Sections 6 and 7c must not disagree about a covered VIX source.
+
+    --- The defect this pins ----------------------------------------------
+
+    get_vix_value logged registry.log_error for EACH failed source before
+    knowing whether the chain went on to answer. Section 6 grades that same
+    condition a warning ("covered — the chain has a live source"), so the two
+    halves of one diagnostic reached opposite verdicts on one fact (rule 26),
+    and the error-series half could fail the run's exit code for a fallback
+    that was working exactly as designed (rule 27).
+
+    On the analyst's 900s cycle a covered failure is ~96 rows a day — already
+    past 7c's 50/24h warning bar — and a cycle needing retries can file up to
+    FETCH_RETRIES x len(VIX_SOURCES) rows while still succeeding, which
+    reaches the 200/24h FAIL bar.
+    """
+
+    def setUp(self):
+        import market_analyst
+        self.ma = market_analyst
+
+    @staticmethod
+    def _chain(*pairs):
+        def make(v):
+            def fetch():
+                if isinstance(v, Exception):
+                    raise v
+                return v
+            return fetch
+        return tuple((name, make(v)) for name, v in pairs)
+
+    def test_a_covered_failure_writes_no_error_row(self):
+        with mock.patch.object(self.ma, "VIX_SOURCES",
+                               self._chain(("cboe", RuntimeError("HTTP 503")),
+                                           ("yfinance", 15.4))), \
+             mock.patch.object(self.ma.registry, "log_error") as le:
+            self.assertAlmostEqual(self.ma.get_vix_value(), 15.4)
+        self.assertFalse(le.called)
+
+    def test_the_rate_that_used_to_be_produced_would_have_failed_the_run(self):
+        """Why this mattered: the old cadence crossed 7c's thresholds."""
+        key = ("market_analyst", "get_vix_value", "RuntimeError")
+        per_cycle = self.ma.FETCH_RETRIES * len(self.ma.VIX_SOURCES)
+        cycles_per_day = 86400 // self.ma.CHECK_INTERVAL
+
+        # One covered failure per cycle: past the WARN bar, permanently.
+        findings, _ = fleet_doctor.classify_error_rates(
+            {key: cycles_per_day}, {key: cycles_per_day // 24})
+        self.assertTrue(findings,
+                        "a permanently-warning healthy fleet is the condition "
+                        "this fix removes")
+
+        # A retrying-but-succeeding cycle: past the FAIL bar.
+        heavy = cycles_per_day * per_cycle
+        findings, _ = fleet_doctor.classify_error_rates(
+            {key: heavy}, {key: heavy // 24})
+        self.assertEqual(findings[0][0], "FAIL")
+
+        # And with the fix there are no rows at all, so neither fires.
+        self.assertEqual(fleet_doctor.classify_error_rates({}, {})[0], [])

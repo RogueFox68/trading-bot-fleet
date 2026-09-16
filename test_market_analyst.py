@@ -389,12 +389,55 @@ class GetVixValueTests(unittest.TestCase):
             self.assertEqual(ma.last_vix_source, "srcA")
 
     def test_falls_through_to_next_source(self):
+        """A COVERED source failure is not an error event (rule 27).
+
+        This previously asserted the opposite — "the dead source is still
+        LOUD" — which filed a working fallback as a fleet failure. On a 900s
+        cycle that is ~96 error rows a day with the VIX perfectly live, and up
+        to 6 rows for a SINGLE successful cycle once retries are involved.
+        fleet_doctor section 7c reads that series, so a healthy fallback could
+        push the analyst past the error thresholds and fail the run, while
+        section 6 — looking at the same condition on the live chain — called
+        it a warning. Two halves of one diagnostic disagreeing (rule 26), and
+        the stooq permanent-red-line lesson arriving through another door.
+
+        The detail is NOT lost: every attempt still writes logger.error, the
+        full list rides on the total-failure error, and which provider is
+        carrying the kill-switch is already an indexed series (the vix_source
+        tag on every market_regime row).
+        """
         chain = self._chain(("srcA", RuntimeError("HTTP 403")), ("cboe", 15.25))
         with mock.patch.object(ma, "VIX_SOURCES", chain), \
              mock.patch.object(ma.registry, "log_error") as le:
             self.assertAlmostEqual(ma.get_vix_value(), 15.25)
             self.assertEqual(ma.last_vix_source, "cboe")
-            self.assertTrue(le.called)   # the dead source is still LOUD
+            self.assertFalse(le.called,
+                             "a covered source failure was filed as a fleet error")
+
+    def test_a_covered_failure_still_reaches_the_log(self):
+        """Not an error EVENT, still a logged fact."""
+        chain = self._chain(("srcA", RuntimeError("HTTP 403")), ("cboe", 15.25))
+        with mock.patch.object(ma, "VIX_SOURCES", chain), \
+             mock.patch.object(ma.logger, "error") as log:
+            ma.get_vix_value()
+        self.assertTrue(any("srcA" in str(c) for c in log.call_args_list),
+                        "the failing source vanished from the log entirely")
+
+    def test_a_retry_that_succeeds_logs_no_error_event(self):
+        """3 attempts x 2 sources could file 6 rows for one good cycle."""
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise RuntimeError("transient")
+            return 13.0
+
+        with mock.patch.object(ma, "VIX_SOURCES",
+                               (("srcA", flaky), ("cboe", flaky))), \
+             mock.patch.object(ma.registry, "log_error") as le:
+            self.assertAlmostEqual(ma.get_vix_value(), 13.0)
+            self.assertFalse(le.called)
 
     def test_none_from_a_source_is_skipped(self):
         chain = self._chain(("yfinance", None), ("cboe", 16.0))
@@ -407,7 +450,9 @@ class GetVixValueTests(unittest.TestCase):
         with mock.patch.object(ma, "VIX_SOURCES", chain), \
              mock.patch.object(ma.registry, "log_error") as le:
             self.assertAlmostEqual(ma.get_vix_value(), 17.5)
-            self.assertTrue(le.called)
+            # Rejected and skipped, but COVERED by the next source, so it is
+            # not a fleet error either — same rule as the fall-through above.
+            self.assertFalse(le.called)
 
     def test_absurdly_high_value_is_rejected(self):
         chain = self._chain(("srcA", 1453.0))
@@ -421,6 +466,33 @@ class GetVixValueTests(unittest.TestCase):
         with mock.patch.object(ma, "VIX_SOURCES", chain):
             self.assertIsNone(ma.get_vix_value())
             self.assertIsNone(ma.last_vix_source)
+
+    def test_a_total_chain_failure_is_still_a_loud_error_event(self):
+        """The 2026-06-24 silent-freeze case keeps its error row.
+
+        Quietening the covered case must not quieten this one: with no source
+        answering, the kill-switch has no reading at all.
+        """
+        chain = self._chain(("srcA", RuntimeError("boom")),
+                            ("cboe", None))
+        with mock.patch.object(ma, "VIX_SOURCES", chain), \
+             mock.patch.object(ma.registry, "log_error") as le:
+            self.assertIsNone(ma.get_vix_value())
+        self.assertEqual(le.call_count, 1,
+                         "a total VIX outage must log exactly one error event")
+
+    def test_the_total_failure_error_names_every_source_and_reason(self):
+        """One row replaces the per-source rows, so it has to carry them."""
+        chain = self._chain(("srcA", RuntimeError("HTTP 403")),
+                            ("cboe", None),
+                            ("yfinance", 0.0))
+        with mock.patch.object(ma, "VIX_SOURCES", chain), \
+             mock.patch.object(ma.registry, "log_error") as le:
+            ma.get_vix_value()
+        message = str(le.call_args[0][2])
+        for expected in ("srcA", "HTTP 403", "cboe", "no data", "yfinance"):
+            self.assertIn(expected, message,
+                          f"{expected!r} missing from the total-failure error")
 
     def test_whole_chain_is_retried(self):
         calls = {"n": 0}
