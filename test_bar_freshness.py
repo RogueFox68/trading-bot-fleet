@@ -815,3 +815,139 @@ class CoveredVixFailureIsNotAFleetErrorTest(unittest.TestCase):
 
         # And with the fix there are no rows at all, so neither fires.
         self.assertEqual(fleet_doctor.classify_error_rates({}, {})[0], [])
+
+
+class RunningCodeCurrencyTest(unittest.TestCase):
+    """fleet_doctor section 9b: a process running code older than the file.
+
+    The gap this pins is the one that turned a fixed bug into a six-day
+    outage. moon_bot's KeyError('outbox') crash loop was fixed and merged on
+    2026-09-16, and on 2026-09-17 the Beelink was still logging it every 60s,
+    because the container had not been restarted. Every other check agreed
+    with the FILE and so reported health: section 2b saw a clean working tree,
+    the import check imported the fixed module, and pm2 said `online` (the
+    runner catches the exception). The one fact nobody held was that the
+    process predated the fix.
+
+    `stale_processes` takes an injected `mtime_of` so the comparison logic is
+    driven without a container or a live pm2 (rule 25 — "it needs the real
+    box" is why these ship untested, and the interesting half is the logic).
+    """
+
+    NOW = 1_800_000_000.0
+    HOUR = 3600.0
+
+    def _proc(self, name, script, started, status="online"):
+        return {"name": name,
+                "pm2_env": {"status": status,
+                            "pm_uptime": started * 1000.0,   # pm2 reports ms
+                            "pm_exec_path": f"/app/code/{script}"}}
+
+    def _mtimes(self, **files):
+        return lambda f: files.get(f)
+
+    def test_a_process_older_than_its_own_script_is_stale(self):
+        procs = [self._proc("moon_bot", "crypto_breakout.py",
+                            self.NOW - 6 * 24 * self.HOUR)]
+        stale = fleet_doctor.stale_processes(
+            procs, self._mtimes(**{"crypto_breakout.py": self.NOW - self.HOUR}))
+        self.assertEqual(len(stale), 1)
+        name, script, secs = stale[0]
+        self.assertEqual((name, script), ("moon_bot", "crypto_breakout.py"))
+        self.assertAlmostEqual(secs / self.HOUR, 6 * 24 - 1, places=3)
+
+    def test_a_process_started_after_the_change_is_current(self):
+        procs = [self._proc("moon_bot", "crypto_breakout.py", self.NOW - self.HOUR)]
+        self.assertEqual(
+            fleet_doctor.stale_processes(
+                procs,
+                self._mtimes(**{"crypto_breakout.py": self.NOW - 6 * 24 * self.HOUR})),
+            [])
+
+    def test_a_shared_module_change_makes_every_process_stale(self):
+        """utils.py is imported by all of them, so it counts against all."""
+        procs = [self._proc("moon_bot", "crypto_breakout.py", self.NOW - 2 * self.HOUR),
+                 self._proc("wheel_bot", "wheel_bot.py", self.NOW - 2 * self.HOUR)]
+        stale = fleet_doctor.stale_processes(
+            procs, self._mtimes(**{"utils.py": self.NOW - self.HOUR}))
+        self.assertEqual(sorted(s[0] for s in stale), ["moon_bot", "wheel_bot"])
+
+    def test_a_stopped_process_is_not_reported_here(self):
+        """check_state already FAILs on it; two alerts for one fact is rule 10."""
+        procs = [self._proc("moon_bot", "crypto_breakout.py",
+                            self.NOW - 6 * 24 * self.HOUR, status="stopped")]
+        self.assertEqual(
+            fleet_doctor.stale_processes(
+                procs, self._mtimes(**{"crypto_breakout.py": self.NOW})),
+            [])
+
+    def test_an_unreadable_mtime_is_not_a_verdict(self):
+        """Rule 17: a failed read is not an answer. No mtime -> no finding."""
+        procs = [self._proc("moon_bot", "crypto_breakout.py", self.NOW - self.HOUR)]
+        self.assertEqual(
+            fleet_doctor.stale_processes(procs, lambda f: None), [])
+
+    def test_a_missing_uptime_is_not_a_verdict(self):
+        procs = [{"name": "moon_bot",
+                  "pm2_env": {"status": "online",
+                              "pm_exec_path": "/app/code/crypto_breakout.py"}}]
+        self.assertEqual(
+            fleet_doctor.stale_processes(
+                procs, self._mtimes(**{"crypto_breakout.py": self.NOW})),
+            [])
+
+    def test_an_infra_process_falls_back_to_its_own_name(self):
+        procs = [{"name": "commander",
+                  "pm2_env": {"status": "online",
+                              "pm_uptime": (self.NOW - 2 * self.HOUR) * 1000.0}}]
+        stale = fleet_doctor.stale_processes(
+            procs, self._mtimes(**{"commander.py": self.NOW - self.HOUR}))
+        self.assertEqual([s[1] for s in stale], ["commander.py"])
+
+    def test_the_registry_resolves_a_name_that_is_not_its_script(self):
+        """moon_bot's script is crypto_breakout.py — "<name>.py" is a miss.
+
+        Only reached when pm2 omits pm_exec_path, but guessing there would
+        compare against a file that does not exist and quietly report the
+        process as current (rule 2: the registry is the only bot list).
+        """
+        self.assertEqual(fleet_doctor._script_for_process("moon_bot"),
+                         "crypto_breakout.py")
+        procs = [{"name": "moon_bot",
+                  "pm2_env": {"status": "online",
+                              "pm_uptime": (self.NOW - 8 * 24 * self.HOUR) * 1000.0}}]
+        stale = fleet_doctor.stale_processes(
+            procs, self._mtimes(**{"crypto_breakout.py": self.NOW - self.HOUR}))
+        self.assertEqual([s[1] for s in stale], ["crypto_breakout.py"])
+
+    def test_pm2s_own_exec_path_wins_over_the_registry(self):
+        procs = [self._proc("moon_bot", "crypto_breakout.py", self.NOW - 2 * self.HOUR)]
+        stale = fleet_doctor.stale_processes(
+            procs, self._mtimes(**{"crypto_breakout.py": self.NOW - self.HOUR}))
+        self.assertEqual([s[1] for s in stale], ["crypto_breakout.py"])
+
+    def test_the_september_17_beelink_state_is_reported(self):
+        """The exact incident: PR #25 merged yesterday, fleet never restarted.
+
+        That merge touched crypto_breakout.py AND utils.py, so the fleet-wide
+        answer is the right one: the bot carrying the fixed crash and every
+        process sharing the changed util are all running yesterday's code.
+        """
+        merged = self.NOW - 26 * self.HOUR
+        procs = [self._proc("moon_bot", "crypto_breakout.py", self.NOW - 8 * 24 * self.HOUR),
+                 self._proc("commander", "commander.py", self.NOW - 8 * 24 * self.HOUR)]
+        stale = fleet_doctor.stale_processes(
+            procs, self._mtimes(**{"crypto_breakout.py": merged, "utils.py": merged}))
+        self.assertEqual(sorted(s[0] for s in stale), ["commander", "moon_bot"],
+                         "a shared change makes every process stale, not just the bot")
+        # The reported figure is the GAP: how long after each process started
+        # its code changed. Started 8d ago, code changed 26h ago -> ~166h.
+        self.assertTrue(all(abs(s[2] - 166 * self.HOUR) < 1.0 for s in stale),
+                        [s[2] / self.HOUR for s in stale])
+
+    def test_only_the_bot_is_flagged_when_only_its_own_script_changed(self):
+        procs = [self._proc("moon_bot", "crypto_breakout.py", self.NOW - 8 * 24 * self.HOUR),
+                 self._proc("commander", "commander.py", self.NOW - 8 * 24 * self.HOUR)]
+        stale = fleet_doctor.stale_processes(
+            procs, self._mtimes(**{"crypto_breakout.py": self.NOW - self.HOUR}))
+        self.assertEqual([s[0] for s in stale], ["moon_bot"])

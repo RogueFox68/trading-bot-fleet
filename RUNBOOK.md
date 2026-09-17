@@ -152,11 +152,20 @@ Safety is centralized in `utils.py`:
     ```
     Only put a basis in that file if you know it. A guessed number defeats the profit guard
     the ledger exists to enforce.
-*   **crypto_grid never buys:** expected. Entries are fail-closed — set
-    `bots.crypto_grid.entries_enabled` to `true` in `bot_config.json` (host repo dir, then
-    `docker exec trading-fleet pm2 restart crypto_grid`) once you have verified the lot ledger
-    against a live account and decided what to do with the pre-existing coins. Sells and
-    reconciliation run either way, so held inventory is never stranded by this lever.
+*   **A bug you know was fixed is still happening:** check that the fix is actually
+    *running*, not merely present. The repo is volume-mounted, so `git pull` updates the files
+    under a live process without changing what it executes — the file says fixed and the
+    process is still broken. `fleet_doctor.py` section 9b compares each process's start time
+    against the code on disk and says which are stale. The fix is
+    `docker exec trading-fleet pm2 restart all` (rebuild first if `requirements.txt` or
+    `deploy/` moved). This cost six days on moon_bot's `KeyError('outbox')` loop.
+
+*   **crypto_grid never buys:** there is no on/off lever any more (the `entries_enabled` flag
+    was removed 2026-09-17; a stale copy in a live `bot_config.json` is ignored). Four real
+    gates can stop an entry and each names itself in the log: `[SUSPEND]` (ledger unreadable
+    — see below), `Bear Trend Detected` (the registry's regime gate), `CAPITAL_CRUNCH active`,
+    and `[BUDGET STOP]` / `no per-symbol budget headroom`. Read the `[SKIP]` line to see which.
+    Sells and reconciliation run under all of them, so held inventory is never stranded.
 *   **crypto_grid logs `[SUSPEND] New grid entries halted`:** the bot is managing what it can
     but opening nothing new, deliberately. Three causes, all in the log line: the lot ledger
     could not be read or written (`crypto_grid_state.json` — repair or remove it), an
