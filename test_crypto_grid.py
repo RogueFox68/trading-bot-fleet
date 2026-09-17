@@ -817,8 +817,7 @@ class LedgerPersistenceTest(unittest.TestCase):
         submitted = []
         crypto_grid.suspend_entries("test")
         try:
-            with mock.patch.object(crypto_grid.bot, "bot_settings", {"entries_enabled": True}), \
-                 mock.patch.object(crypto_grid.bot, "submit",
+            with mock.patch.object(crypto_grid.bot, "submit",
                                    side_effect=lambda *a, **k: submitted.append(a)):
                 crypto_grid.grid_buy("BTC/USD", 100.0, 3, st)
         finally:
@@ -826,17 +825,26 @@ class LedgerPersistenceTest(unittest.TestCase):
         self.assertEqual(submitted, [])
 
 
-class EntriesLeverTest(unittest.TestCase):
-    """New entries are fail-closed until an operator turns them on."""
+class EntryGatesTest(unittest.TestCase):
+    """The grid's entry gates are its trading conditions — nothing else.
 
-    def _buy_with_settings(self, settings):
+    A `bots.crypto_grid.entries_enabled` flag used to sit in front of all of
+    them, fail-closed, so an operator who had not set it saw the same "[SKIP]"
+    shape as a bear regime or an exhausted budget. It was removed deliberately;
+    these tests fail if a bot_config on/off lever is reintroduced in front of
+    grid_buy, and pin that each REAL gate still stops an entry on its own.
+    """
+
+    def _buy_with_settings(self, settings, **overrides):
         st = state_with()
         submitted = []
+        env = dict(regime="SIDEWAYS", capital_crunch=False, budget_ok=True)
+        env.update(overrides)
         with mock.patch.object(crypto_grid.bot, "bot_settings", settings), \
              mock.patch.object(crypto_grid, "per_symbol_budget", return_value=1000.0), \
-             mock.patch.object(crypto_grid.bot, "regime", "SIDEWAYS"), \
-             mock.patch.object(crypto_grid.bot, "capital_crunch", False), \
-             mock.patch.object(crypto_grid.bot, "budget_ok", True), \
+             mock.patch.object(crypto_grid.bot, "regime", env["regime"]), \
+             mock.patch.object(crypto_grid.bot, "capital_crunch", env["capital_crunch"]), \
+             mock.patch.object(crypto_grid.bot, "budget_ok", env["budget_ok"]), \
              mock.patch.object(crypto_grid.bot, "account", mock.Mock(buying_power="100000")), \
              mock.patch.object(crypto_grid, "cancel_my_open_orders"), \
              mock.patch.object(crypto_grid.bot, "market_order", return_value=object()), \
@@ -845,16 +853,25 @@ class EntriesLeverTest(unittest.TestCase):
             crypto_grid.grid_buy("BTC/USD", 100.0, 3, st)
         return submitted
 
-    def test_absent_key_means_disabled(self):
-        self.assertEqual(self._buy_with_settings({}), [])
+    def test_an_empty_bot_config_entry_does_not_block_a_buy(self):
+        # The removed lever's fail-closed default lived exactly here.
+        self.assertEqual(len(self._buy_with_settings({})), 1)
 
-    def test_explicit_false_means_disabled(self):
-        self.assertEqual(self._buy_with_settings({"entries_enabled": False}), [])
+    def test_a_stale_entries_enabled_false_is_inert(self):
+        # A live bot_config.json on the Beelink may still carry the old key.
+        # It is gitignored, so nothing removes it by deploy; it must do nothing.
+        self.assertEqual(len(self._buy_with_settings({"entries_enabled": False})), 1)
 
-    def test_explicit_true_enables_entries(self):
-        self.assertEqual(len(self._buy_with_settings({"entries_enabled": True})), 1)
+    def test_a_bear_regime_still_blocks_a_buy(self):
+        self.assertEqual(self._buy_with_settings({}, regime="BEAR_TREND"), [])
 
-    def test_selling_is_unaffected_by_the_lever(self):
+    def test_capital_crunch_still_blocks_a_buy(self):
+        self.assertEqual(self._buy_with_settings({}, capital_crunch=True), [])
+
+    def test_a_failed_budget_check_still_blocks_a_buy(self):
+        self.assertEqual(self._buy_with_settings({}, budget_ok=False), [])
+
+    def test_selling_is_unaffected(self):
         # Existing inventory must always be able to wind down.
         st = state_with(lots={"BTC/USD": [lot("L1", 1.0, 100.0)]})
         submitted = []
@@ -863,7 +880,7 @@ class EntriesLeverTest(unittest.TestCase):
              mock.patch.object(crypto_grid.bot, "submit",
                                side_effect=lambda *a, **k: submitted.append(a) or FakeOrder("o2")):
             crypto_grid.grid_sell("BTC/USD", 120.0, 5, st, held=1.0, known=True)
-        self.assertEqual(len(submitted), 1, "the entries lever blocked an exit")
+        self.assertEqual(len(submitted), 1, "an entry gate blocked an exit")
 
 
 class BudgetTest(unittest.TestCase):
@@ -888,8 +905,7 @@ class BudgetTest(unittest.TestCase):
     def test_a_pending_buy_blocks_a_second_one_over_budget(self):
         st = state_with(pending={"o1": pending_buy(qty=10.0, price=100.0)})
         submitted = []
-        with mock.patch.object(crypto_grid.bot, "bot_settings", {"entries_enabled": True}), \
-             mock.patch.object(crypto_grid, "per_symbol_budget", return_value=1000.0), \
+        with mock.patch.object(crypto_grid, "per_symbol_budget", return_value=1000.0), \
              mock.patch.object(crypto_grid.bot, "regime", "SIDEWAYS"), \
              mock.patch.object(crypto_grid.bot, "capital_crunch", False), \
              mock.patch.object(crypto_grid.bot, "submit",
@@ -900,8 +916,7 @@ class BudgetTest(unittest.TestCase):
     def test_a_slice_never_overshoots_the_remaining_share(self):
         st = state_with(lots={"BTC/USD": [lot("L1", 9.6, 100.0)]})
         captured = {}
-        with mock.patch.object(crypto_grid.bot, "bot_settings", {"entries_enabled": True}), \
-             mock.patch.object(crypto_grid, "per_symbol_budget", return_value=1000.0), \
+        with mock.patch.object(crypto_grid, "per_symbol_budget", return_value=1000.0), \
              mock.patch.object(crypto_grid.bot, "regime", "SIDEWAYS"), \
              mock.patch.object(crypto_grid.bot, "capital_crunch", False), \
              mock.patch.object(crypto_grid.bot, "budget_ok", True), \

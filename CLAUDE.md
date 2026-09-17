@@ -322,13 +322,15 @@ Prevents "bot fratricide" — multiple bots fighting over one position:
   persisted — a read failure that used to merely skip a sell became destructive the moment
   durable state existed. An unreadable *ledger* likewise suspends entries instead of returning
   a tradable empty book.
-- **Grid entries are fail-closed.** `bots.crypto_grid.entries_enabled` in `bot_config.json`
-  must be explicitly `true` before the grid opens anything; absent or false means no new
-  buys. Sells, reconciliation and the ledger all run regardless, so existing inventory can
-  always wind down. Default-off is deliberate: the PR #22 review asked that entries stay off
-  until the fill-driven ledger and the migration of the pre-existing coins are verified
-  against a live account, and a lever defaulting to on makes "nobody got to it" look
-  identical to "we checked".
+- **The grid's entry gates are its trading conditions, and nothing else** (2026-09-17). A
+  `bots.crypto_grid.entries_enabled` flag briefly sat in front of all of them, fail-closed,
+  as PR #22's shipping sequence. It was removed: the grid already has four real gates
+  (ledger-unreadable suspension, the registry's bear-regime rule, `CAPITAL_CRUNCH`, and the
+  per-symbol budget), each of which says in the log why it stopped, and a fifth that meant
+  "an operator has not flipped a bit in a gitignored file" was indistinguishable from them
+  at a glance. `bot_config.json` is gitignored, so a live file may still carry the key —
+  nothing reads it now, and `test_crypto_grid.EntryGatesTest` pins both that a stale
+  `entries_enabled: false` is inert and that each real gate still stops an entry alone.
 - **The grid sells strict FIFO, at an executable floor.** Selling the oldest *qualifying* lot
   (skipping underwater ones) is specific-lot selection, and it disagreed with the accountant:
   buy 1 at $200 then 1 at $90, sell at $120, and execution books +$30 against the $90 lot while
@@ -464,7 +466,6 @@ conservative.
 | `global_settings.vix` | `15.0` | **Below every gate** — the VIX kill-switch reads a calm market |
 | `cfo_settings.unallocated_reserve` | `0.0` | No reserve; every budget computes on full equity |
 | `global_settings.market_condition` | `"SIDEWAYS"` | Tradeable — un-gates wheel_bot and crypto_grid |
-| `bots.crypto_grid.entries_enabled` | `False` | Grid opens nothing (safe, but silent) |
 
 `fleet_registry.missing_config_keys()` declares the whole expected shape —
 `GLOBAL_SETTINGS_KEYS`, `CFO_SETTINGS_KEYS`, `REQUIRED_BOT_KEYS`, and each bot's own
@@ -768,8 +769,9 @@ Run **`test_bar_freshness` after touching ANY bar request.** Its load-bearing as
 source-level: it parses every fetch site and fails if a `StockBarsRequest`/`CryptoBarsRequest`
 pairs `start` with `limit`. That is the only check that survives someone widening a window
 later, because the bug it catches produces a plausible frame rather than an error.
-It also drives `fleet_doctor`'s own section 5b and section 6 (`BarProbeContractTest`,
-`VixSourceClassificationTest`), because both shipped broken: **run it after touching
+It also drives `fleet_doctor`'s own section 5b, section 6, section 7c and section 9b
+(`BarProbeContractTest`, `VixSourceClassificationTest`, `ErrorRateClassificationTest`,
+`RunningCodeCurrencyTest`), because the first two shipped broken: **run it after touching
 `fleet_doctor` too**, not just after touching a bar request.
 Run `test_risk_exits` after touching either equity bot's `manage_position` — it asserts a
 stop loss fires inside the 15:30+ hold window, the case that was silently disabled.
@@ -804,8 +806,22 @@ failure class a bot's own main-loop `try/except` cannot catch), Alpaca, **the ag
 each bot actually trades on** (section 5b — it calls the bots' own fetchers, since a stale
 frame is a *successful* fetch and shows up nowhere else), each VIX source separately, an
 InfluxDB round-trip, **whether any bot is failing every cycle** (section 7c), **how many
-commanders are writing telemetry**, the `market_regime` heartbeat, and pm2 state. Read-only;
-never orders.
+commanders are writing telemetry**, the `market_regime` heartbeat, pm2 state, and **whether
+each process is actually running the code on disk** (section 9b). Read-only; never orders.
+
+**Section 9b exists because every other check in this file agrees with the FILE, and the
+fleet runs a PROCESS.** The repo is volume-mounted, so `git pull` changes the code inside the
+container instantly — but a running process keeps the module it imported at start, until
+`pm2 restart`. moon_bot's `KeyError('outbox')` crash loop was fixed and merged 2026-09-16 and
+was still logging once a minute on the Beelink on 2026-09-17, because nothing had restarted:
+section 2b reported a clean working tree, the import check imported the *fixed* module, and
+pm2 said `online`. Three checks, all correct, all about the file. `stale_processes` compares
+each process's `pm_uptime` against the newest mtime among its own script and the modules
+everything imports (`utils.py`, `fleet_bot.py`, `fleet_registry.py`, `logger.py`,
+`tiered_hold.py`), so a change to a shared module flags the whole fleet. It is a **warning,
+not a failure** (rule 27): it is briefly and legitimately true between a `git pull` and the
+restart that follows it. An unreadable mtime or a missing `pm_uptime` yields no finding
+rather than a guess (rule 17), and a stopped process is left to the check above it (rule 10).
 
 **Section 7c exists because import health and process health are both blind to a caught
 exception.** moon_bot raised `KeyError` on the first statement of every cycle for four days —

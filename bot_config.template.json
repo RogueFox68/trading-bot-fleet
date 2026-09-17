@@ -24,8 +24,7 @@
             "script": "crypto_grid.py",
             "status": "active",
             "strategy": "neutral",
-            "allocation": 0.05,
-            "entries_enabled": false
+            "allocation": 0.05
         },
         "moon_bot": {
             "script": "crypto_breakout.py",

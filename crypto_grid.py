@@ -588,28 +588,15 @@ def per_symbol_budget():
 
 
 # --- TRADING --------------------------------------------------------------
-def entries_enabled():
-    """Operator lever: `bots.crypto_grid.entries_enabled` in bot_config.json.
-
-    FAIL-CLOSED — absent means disabled. The PR #22 review's shipping sequence
-    asks that grid entries stay off until the fill-driven ledger and the
-    migration of the pre-existing coins have been verified against a live
-    account, and a lever that defaults to ON would make "we haven't got to it
-    yet" indistinguishable from "we checked". Sells and reconciliation are
-    unaffected: existing inventory can always wind down.
-
-    Set it to true in bot_config.json when you are ready:
-        "bots": {"crypto_grid": {..., "entries_enabled": true}}
-    """
-    return bool(bot.bot_settings.get("entries_enabled", False))
-
-
 def grid_buy(symbol, price, current_zone, state):
-    """Zone drop -> accumulate a slice, unless regime/crunch/budget says no."""
-    if not entries_enabled():
-        logger.info(f"    [SKIP] {symbol} grid entries are disabled "
-                    f"(bot_config bots.crypto_grid.entries_enabled is not true).")
-        return
+    """Zone drop -> accumulate a slice, unless regime/crunch/budget says no.
+
+    There is no separate operator on/off lever. The grid's entry conditions
+    ARE the gate: suspension on an unreadable ledger, the bear-regime rule in
+    the registry, CAPITAL_CRUNCH, and the per-symbol budget. A `bot_config`
+    flag on top of those was a fourth way to be stopped that read, in the log,
+    exactly like the other three.
+    """
     if _entries_suspended:
         logger.warning(f"    [SKIP] {symbol} entries suspended: {_suspend_reason}")
         return
@@ -847,7 +834,6 @@ if __name__ == "__main__":
     logger.info("--- 🕸️ CRYPTO GRID BOT V5 (fill-driven ledger, FIFO floor) ---")
     logger.info(f"    Sells are LIMIT orders at basis +{REQUIRED_SPREAD_PCT:.2%} "
                 f"(costs {ROUND_TRIP_COST_PCT:.2%} + net {MIN_NET_PROFIT_PCT:.2%})")
-    logger.info("    New entries are FAIL-CLOSED: set bots.crypto_grid.entries_enabled "
-                "= true in bot_config.json once the ledger and migration are verified. "
-                "Sells and reconciliation run regardless.")
+    logger.info("    Pre-migration coins carry no lot and are never sold by the grid; "
+                "seed crypto_grid_state.json with a real basis or wind them down by hand.")
     bot.run(cycle)

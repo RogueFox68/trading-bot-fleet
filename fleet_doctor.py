@@ -874,6 +874,93 @@ def _age(path):
     return None if not os.path.exists(path) else time.time() - os.path.getmtime(path)
 
 
+# Modules every PM2 process imports. A change to one of these is a change to
+# every bot, so it counts against all of them for staleness.
+SHARED_MODULES = ("utils.py", "fleet_bot.py", "fleet_registry.py", "logger.py",
+                  "tiered_hold.py")
+
+
+def _script_for_process(name):
+    """PM2 name -> script filename, from the registry (rule 2: one bot list).
+
+    Only reached when pm2 omits `pm_exec_path`. It matters because the two
+    disagree for moon_bot, whose script is crypto_breakout.py — guessing
+    "<name>.py" would silently compare against a file that does not exist.
+    """
+    try:
+        import fleet_registry
+        cfg = fleet_registry.BOTS.get(name) or {}
+        if cfg.get("script"):
+            return cfg["script"]
+    except Exception:
+        pass
+    return f"{name}.py"
+
+
+def stale_processes(procs, mtime_of, script_of=None):
+    """PM2 processes still running code older than the files on disk.
+
+    The repo is volume-mounted, so `git pull` changes the code inside the
+    container INSTANTLY — but a running process keeps the module it imported
+    at start. Until `pm2 restart`, the file says fixed and the process is
+    still broken, and every other check here agrees with the file: section 2b
+    reports a clean working tree, the import check imports the NEW module, and
+    pm2 says `online`. That gap cost six days on moon_bot's KeyError('outbox')
+    crash loop (fixed 2026-09-16, still looping on the Beelink 2026-09-17)
+    because nothing compared the two.
+
+    A process is stale if it started before the newest mtime among its own
+    script and SHARED_MODULES. Returns [(name, script, gap_seconds)], where
+    the gap is how long AFTER the process started its code last changed.
+    `mtime_of(filename) -> float | None` and `script_of(pm2_name) -> str` are
+    injected so this is testable without a container or a live pm2 (rule 25).
+    """
+    script_of = script_of or _script_for_process
+    shared = [m for m in (mtime_of(f) for f in SHARED_MODULES) if m]
+    stale = []
+    for p in procs:
+        env = p.get("pm2_env", {}) or {}
+        if env.get("status") != "online":
+            continue  # a stopped process is check_state's problem, not this one
+        try:
+            started = float(env.get("pm_uptime") or 0) / 1000.0
+        except (TypeError, ValueError):
+            continue
+        if started <= 0:
+            continue
+        script = os.path.basename(env.get("pm_exec_path") or "") or script_of(p.get("name"))
+        own = mtime_of(script)
+        newest = max(shared + ([own] if own else []), default=None)
+        if newest is None:
+            continue  # nothing readable to compare against; not a verdict
+        if newest > started:
+            stale.append((p.get("name", "?"), script, newest - started))
+    return stale
+
+
+def _check_running_code_is_current(procs):
+    """Section 9b: is each process running the code that is on disk?"""
+    stale = stale_processes(procs, lambda f: (os.path.getmtime(os.path.join(REPO, f))
+                                              if os.path.exists(os.path.join(REPO, f))
+                                              else None))
+    if not stale:
+        ok("state", "Every process started after its code was last changed.")
+        return
+    lines = "\n".join(
+        f"  {name:<18} {script:<22} code changed {secs / 3600:.1f}h after "
+        f"this process started"
+        for name, script, secs in sorted(stale, key=lambda s: -s[2]))
+    warn("state",
+         f"{len(stale)} process(es) are running code older than the repo.",
+         lines +
+         "\n-> The repo is volume-mounted, so a `git pull` updates the files\n"
+         "   under a running process without changing what it executes.\n"
+         "   Expected for a few seconds mid-deploy; anything else means the\n"
+         "   restart was missed and a shipped fix is NOT live:\n"
+         "     docker exec trading-fleet pm2 restart all\n"
+         "   (rebuild first if requirements.txt or deploy/ moved.)")
+
+
 def _check_regime_heartbeat():
     """market_regime's newest row IS the fleet's 'regime is live' signal: the
     analyst writes one only on a fully-successful fetch. Unlike bot_config's
@@ -1055,6 +1142,8 @@ def check_state():
             "  docker exec trading-fleet pm2 logs <name> --err --lines 40 --nostream")
     else:
         ok("state", f"All {len(procs)} PM2 processes online with sane restart counts.")
+
+    _check_running_code_is_current(procs)
 
 
 def main():
