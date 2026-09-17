@@ -71,11 +71,6 @@ BOTS = {
         reconciled=False,
         manual_state=False,
         gated_when=dict(regimes=("BEAR_TREND", "CRITICAL_VOLATILITY")),
-        config_keys={
-            "entries_enabled": (
-                False, "warn",
-                "the grid opens NO new positions until this is explicitly true"),
-        },
     ),
     "moon_bot": dict(
         script="crypto_breakout.py",

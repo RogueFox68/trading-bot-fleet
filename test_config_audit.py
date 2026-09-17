@@ -94,21 +94,28 @@ class MissingKeyDetectionTest(unittest.TestCase):
                      if f[0] == "bots.crypto_grid")
         self.assertEqual(entry[2], "critical")
 
-    def test_absent_entries_enabled_is_reported(self):
-        # The live case: the grid silently opens nothing.
+    def test_absent_per_ticker_lever_is_reported(self):
         cfg = full_config()
-        del cfg["bots"]["crypto_grid"]["entries_enabled"]
+        del cfg["bots"]["wheel_bot"]["force_close_symbols"]
         entry = next(f for f in fleet_registry.missing_config_keys(cfg)
-                     if f[0] == "bots.crypto_grid.entries_enabled")
-        self.assertEqual((entry[1], entry[2]), (False, "warn"))
+                     if f[0] == "bots.wheel_bot.force_close_symbols")
+        self.assertEqual((entry[1], entry[2]), ([], "warn"))
 
     def test_per_bot_keys_come_from_the_registry(self):
         # Rule 2: no per-bot list outside fleet_registry. A bot declaring a
         # config key gets checked without touching the checker.
-        self.assertIn("entries_enabled",
-                      fleet_registry.BOTS["crypto_grid"]["config_keys"])
         self.assertIn("force_close_symbols",
                       fleet_registry.BOTS["wheel_bot"]["config_keys"])
+
+    def test_a_bot_declaring_no_config_keys_is_not_a_finding(self):
+        # crypto_grid's only declared key was the removed entries_enabled
+        # lever. A bot with no config_keys at all must still audit cleanly —
+        # `missing_config_keys` reads the registry, so dropping the block is
+        # the whole removal (rule 2, and rule 22 in reverse).
+        cfg = full_config()
+        paths = [f[0] for f in fleet_registry.missing_config_keys(cfg)]
+        self.assertEqual(paths, [], f"a complete config reported findings: {paths}")
+        self.assertFalse(fleet_registry.BOTS["crypto_grid"].get("config_keys"))
 
     def test_critical_findings_sort_first(self):
         cfg = full_config()
