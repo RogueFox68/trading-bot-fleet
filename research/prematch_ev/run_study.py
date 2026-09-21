@@ -25,10 +25,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from analysis.scoring import Eligibility, Observation, build_report  # noqa: E402
+from analysis.scoring import (                                     # noqa: E402
+    DEFAULT_MAX_MINUTES_TO_START, Eligibility, EntryPolicy, Observation,
+    build_report,
+)
 from collect import (                                              # noqa: E402
-    Ledger, decision_cutoffs, in_study_window, join_markets,
-    market_start_time, observation_at_cutoff, snapshots_per_day_for,
+    BASELINE_LEAD_MINUTES, MAX_SOURCE_LAG, Checkpoint, CheckpointMatrix, Ledger,
+    STATUS_NOT_YET_LISTED, STATUS_OBSERVED, checkpoint_targets,
+    decision_cutoffs, default_lead_grid, grid_reach, in_study_window,
+    join_markets, listing_status, market_start_time, observation_with_status,
+    parse_lead_grid, snapshots_per_day_for,
 )
 from core import fees
 from core.matcher import EVENT_BODY_TIMEZONE                                              # noqa: E402
@@ -37,9 +43,11 @@ from data.kalshi_history import (                                  # noqa: E402
     Coverage, enumerate_settled_markets, fetch_candlesticks,
     fetch_historical_cutoff, uses_archive,
 )
-from data.cache import CreditCapReached, ResponseCache             # noqa: E402
+from data.cache import (                                           # noqa: E402
+    CreditCapReached, ResponseCache, key_for,
+)
 from data.odds_history import (                                    # noqa: E402
-    CreditLedger, MAX_QUOTE_AGE_SECONDS, RETRIES, SPORT_KEYS,
+    CreditLedger, DEFAULT_BOOKMAKERS, MAX_QUOTE_AGE_SECONDS, RETRIES, SPORT_KEYS,
     estimate_credits, fetch_snapshot, probe_earliest_snapshot,
 )
 
@@ -52,8 +60,27 @@ def parse_args(argv=None):
                    help="Kalshi series ticker for game markets")
     p.add_argument("--from", dest="start", help="YYYY-MM-DD")
     p.add_argument("--to", dest="end", help="YYYY-MM-DD")
-    p.add_argument("--lead-minutes", type=int, default=60,
-                   help="observe both predictors this many minutes before start")
+    p.add_argument("--lead-grid", default=None,
+                   help="comma-separated lead times, e.g. '72h,48h,24h,12h,6h,3h'. "
+                        "The 60-minute baseline is always kept and labelled "
+                        "separately. Default: the multi-day exploratory grid.")
+    p.add_argument("--entry-delay-minutes", type=float, default=0.0,
+                   help="reaction delay: a signal seen at t enters at the first "
+                        "quote at/after t+delay. 0 is the INSTANTANEOUS bound, "
+                        "not a neutral default.")
+    p.add_argument("--max-entries-per-game", type=int, default=1,
+                   help="entry policy: repeated checkpoints on one game are "
+                        "repeated looks at one outcome, not independent bets")
+    p.add_argument("--max-lead-minutes", type=float, default=None,
+                   help="eligibility ceiling. Derived from the lead grid when "
+                        "unset; a ceiling below the grid is refused, not "
+                        "silently applied.")
+    p.add_argument("--overwrite", action="store_true",
+                   help="allow writing into a non-empty --out directory")
+    p.add_argument("--lead-minutes", type=float, default=None,
+                   help="SINGLE-checkpoint mode, overriding --lead-grid: "
+                        "observe both predictors this many minutes before "
+                        "start. Retained for the late pre-game baseline.")
     p.add_argument("--devig", choices=("shin", "multiplicative"), default="shin")
     p.add_argument("--max-quote-age", type=float, default=MAX_QUOTE_AGE_SECONDS,
                    help="reject a sharp quote older than this at the cutoff")
@@ -86,6 +113,59 @@ def parse_args(argv=None):
 
 def _date(value: str) -> datetime:
     return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+
+# How much slack the eligibility ceiling carries above the earliest
+# checkpoint. A cutoff floored to the 5-minute snapshot grid can sit slightly
+# further out than its nominal lead, and a ceiling exactly at the nominal lead
+# would drop those rows for being one minute early.
+LEAD_CEILING_SLACK = 60.0
+
+
+def lead_grid_for(args) -> tuple[Checkpoint, ...]:
+    """The checkpoints this run observes, earliest lead first.
+
+    `--lead-minutes` still means ONE checkpoint, because the late pre-game
+    baseline has to stay runnable exactly as it was -- its results have been
+    inspected and must remain comparable. Everything else gets the grid.
+    """
+    if args.lead_minutes is not None:
+        return (Checkpoint(float(args.lead_minutes),
+                           baseline=float(args.lead_minutes) == BASELINE_LEAD_MINUTES),)
+    if args.lead_grid:
+        return parse_lead_grid(args.lead_grid)
+    return default_lead_grid()
+
+
+def eligibility_for(args, grid) -> Eligibility:
+    """The frozen screen, with a ceiling that actually covers the grid.
+
+    Raises when the ceiling would exclude a checkpoint being collected. That
+    combination is not a stricter study -- it is a study that pays to fetch
+    72-hour observations and then drops them for being 72 hours out, and it
+    reads in the diagnostics as absent opportunity rather than as a
+    misconfiguration.
+    """
+    reach = max((c.minutes for c in grid), default=0.0)
+    ceiling = (float(args.max_lead_minutes) if args.max_lead_minutes is not None
+               else max(DEFAULT_MAX_MINUTES_TO_START, reach + LEAD_CEILING_SLACK))
+    if ceiling < reach:
+        raise ValueError(
+            f"eligibility ceiling {ceiling:g} min is below the earliest "
+            f"checkpoint in the grid ({reach:g} min). Every observation at that "
+            "checkpoint would be fetched and then discarded as 'too far from "
+            "start'. Raise --max-lead-minutes or shorten --lead-grid."
+        )
+    return Eligibility(min_net_ev=args.min_net_ev, max_spread=args.max_spread,
+                       max_minutes_to_start=ceiling)
+
+
+def entry_policy_for(args) -> EntryPolicy:
+    return EntryPolicy(max_entries_per_game=args.max_entries_per_game)
+
+
+def grid_describe(grid) -> str:
+    return ", ".join(c.label for c in grid)
 
 
 def fee_provenance(args) -> list[str]:
@@ -245,35 +325,68 @@ def survey(args):
     # boundary: a 00:30 UTC game at a 60-minute lead needs the PREVIOUS day's
     # 23:30 snapshot. Widening --from instead would change the study universe,
     # which is a different thing from fetching the inputs that universe needs.
+    grid = lead_grid_for(args)
     starts = [market_start_time(m) for m in markets.values()]
-    cutoffs = decision_cutoffs([s for s in starts if s], args.lead_minutes)
+    cutoffs = decision_cutoffs([s for s in starts if s], grid)
+
+    # RETRIEVAL reaches back further than the STUDY WINDOW, deliberately. A
+    # 72-hour checkpoint on a Sept 1 game needs an Aug 29 snapshot. Fetching
+    # that input is not the same as widening the universe: Aug 29's own games
+    # were already excluded above, on their start times, and nothing here adds
+    # them back.
     outside_window = sum(1 for c in cutoffs if not (start <= c < end_exclusive))
+    reach = grid_reach(grid)
     if outside_window:
-        print(f"          {outside_window:,} cutoff(s) fall outside the game "
-              "window and are fetched anyway -- eligible games need them")
+        print(f"          {outside_window:,} cutoff(s) precede the game window "
+              f"by up to {reach.total_seconds() / 3600:.0f}h and are fetched "
+              "anyway -- eligible games need them")
+        print(f"          those snapshots are INPUTS ONLY; games starting "
+              "before the window stay out of the universe")
     print(f"          {len(cutoffs):,} distinct decision cutoffs from "
-          f"{len(markets):,} contracts")
+          f"{len(markets):,} contracts x {len(grid)} checkpoints "
+          f"({grid_describe(grid)})")
+
+    targets = checkpoint_targets(markets, grid, ledger)
+    matrix = CheckpointMatrix()
+    matrix.expect(targets)
+    ledger.count("checkpoint_cells", len(targets), unit="game-checkpoints")
 
     if not cutoffs and markets:
         coverage.fail(
             f"{len(markets):,} contracts are in the window but no decision "
-            f"cutoff falls inside it at a {args.lead_minutes:.0f}-minute lead; "
-            "widen --from or reduce --lead-minutes"
+            f"cutoff was derived at leads {grid_describe(grid)}; "
+            "widen --from or shorten --lead-grid"
         )
 
-    return markets, cutoffs, cutoff, coverage, ledger
+    return markets, cutoffs, cutoff, coverage, ledger, grid, matrix
 
 
 def preflight(args) -> int:
     """Enumerate the real work before any paid call. Costs nothing."""
-    markets, cutoffs, cutoff, coverage, ledger = survey(args)
+    markets, cutoffs, cutoff, coverage, ledger, grid, matrix = survey(args)
     per_call = estimate_credits(1, 1)
+
+    # WHAT IS ACTUALLY MISSING, not what a run would request. The cache already
+    # holds the snapshots an earlier run paid for, and a cost that ignored them
+    # would quote a price nobody is going to be charged.
+    cache = ResponseCache(Path(args.cache_dir) if args.cache_dir else None)
+    missing = [at for at in cutoffs
+               if not cache.has(key_for(args.sport, at, DEFAULT_BOOKMAKERS, "h2h"))]
+    cached = len(cutoffs) - len(missing)
+
     print()
     print("PREFLIGHT (no paid requests made)")
     print(f"  eligible contracts   {len(markets):,}")
+    print(f"  lead grid            {grid_describe(grid)}  ({len(grid)} checkpoints)")
+    print(f"  checkpoint cells     {len(matrix.statuses):,}  "
+          "(contracts x checkpoints -- the coverage denominator)")
     print(f"  distinct cutoffs     {len(cutoffs):,}")
-    base = len(cutoffs) * per_call
-    print(f"  base credit cost     {base:,} ({per_call} per call)")
+    print(f"  already cached       {cached:,}  (free)")
+    print(f"  unique missing       {len(missing):,}  <-- what this run would buy")
+    base = len(missing) * per_call
+    gross = len(cutoffs) * per_call
+    print(f"  base credit cost     {base:,} ({per_call} per call; "
+          f"{gross:,} without the cache)")
     print(f"  worst case w/ retries {base * RETRIES:,} ({RETRIES} attempts each)")
     print("                        a provider can charge a request whose response")
     print("                        is lost, so retries are budgeted, not free")
@@ -285,6 +398,16 @@ def preflight(args) -> int:
         print("  configured cap       none  <-- set --max-credits before a paid run")
     print(f"  coverage             {coverage}")
     print()
+    try:
+        eligibility_for(args, grid)
+    except ValueError as exc:
+        print(f"  !! CONFIGURATION: {exc}")
+        print()
+        return 2
+    print(matrix.render())
+    print("    (every cell reads 'unreported' before a run -- this is the")
+    print("     expected universe, established without fetching anything)")
+    print()
     print(ledger.render())
     if not coverage.complete:
         print()
@@ -295,7 +418,7 @@ def preflight(args) -> int:
 
 def collect(args, key: str):
     """Pull both sides, join on identity, and build observations at one cutoff."""
-    markets, cutoffs, cutoff, coverage, ledger = survey(args)
+    markets, cutoffs, cutoff, coverage, ledger, grid, matrix = survey(args)
     credits = CreditLedger(cap=args.max_credits)
     cache = ResponseCache(Path(args.cache_dir) if args.cache_dir else None)
 
@@ -341,35 +464,69 @@ def collect(args, key: str):
     joined = join_markets(markets, quotes_by_event, args.sport, ledger)
     print(f"  joined: {len(joined):,} contracts matched to a sharp event")
 
-    # --- one decision timestamp per game -------------------------------------
-    # THE STUDY'S OWN DENOMINATOR: one target contract per joined market, each
-    # needing a usable quote at its required cutoff. Independently enumerated
-    # from the exchange side, never derived from how many observations
-    # succeeded -- a denominator defined by its successes always reads 100%.
+    # --- every (contract, checkpoint) cell -----------------------------------
+    # THE STUDY'S OWN DENOMINATOR is the enumerated cell count, not the rows
+    # that succeeded: a denominator defined by its successes always reads 100%.
+    # Each cell resolves to exactly one status, and the three benign ones are
+    # kept apart from the one that threatens the sample.
     observations: list[Observation] = []
+    entry_delay = timedelta(minutes=args.entry_delay_minutes)
     ledger.count("target_contracts", len(joined), unit="contracts")
     for jm in joined:
-        decision_at = jm.start - timedelta(minutes=args.lead_minutes)
+        market = markets[jm.market_ticker]
+        # ONE candle fetch per contract, spanning the WHOLE grid. Fetching per
+        # checkpoint would re-request the same series seven times; the archive
+        # is free but not instant, and the window is contiguous anyway.
+        earliest = min(c.decision_at(jm.start) for c in grid)
         candles, cand_cov = fetch_candlesticks(
             jm.market_ticker, args.series,
-            decision_at - timedelta(minutes=args.lead_minutes),
-            decision_at,
-            use_archive=uses_archive(markets[jm.market_ticker], cutoff),
+            earliest - MAX_SOURCE_LAG, jm.start,
+            use_archive=uses_archive(market, cutoff),
         )
         coverage.merge(cand_cov)
-        obs = observation_at_cutoff(
-            jm, quotes_by_event.get(jm.provider_event_id, []), candles,
-            decision_at, args.sport, ledger, method=args.devig,
-            max_quote_age=args.max_quote_age, reject_stage="target_contracts",
-        )
-        if obs is not None:
-            observations.append(obs)
+
+        for checkpoint in grid:
+            decision_at = checkpoint.decision_at(jm.start)
+
+            # DID THE CONTRACT EXIST? A 72-hour checkpoint often predates the
+            # listing. That is a feasibility RESULT -- there was no
+            # opportunity to miss -- and it is counted as an eligibility
+            # exclusion, never as a coverage failure.
+            listing = listing_status(market, decision_at)
+            if listing == STATUS_NOT_YET_LISTED:
+                matrix.record(jm.market_ticker, checkpoint, listing)
+                ledger.exclude("contract_not_yet_listed", stage="checkpoint_cells")
+                continue
+            if listing is not None:
+                matrix.record(jm.market_ticker, checkpoint, listing)
+                ledger.reject("listing_time_unreadable", jm.market_ticker,
+                              stage="checkpoint_cells")
+                continue
+
+            if not candles:
+                matrix.record(jm.market_ticker, checkpoint, "candles_unavailable")
+                ledger.reject("candles_unavailable", jm.market_ticker,
+                              stage="checkpoint_cells")
+                continue
+
+            obs, status = observation_with_status(
+                jm, quotes_by_event.get(jm.provider_event_id, []), candles,
+                decision_at, args.sport, ledger, method=args.devig,
+                max_quote_age=args.max_quote_age,
+                reject_stage="checkpoint_cells",
+                checkpoint=checkpoint, entry_delay=entry_delay,
+            )
+            matrix.record(jm.market_ticker, checkpoint, status)
+            if obs is not None:
+                observations.append(obs)
 
     ledger.count("observations", len(observations), unit="contracts")
     ledger.apply_to(coverage)
-    print(f"  built:  {len(observations):,} observations "
-          f"({ledger.total_rejected:,} records dropped, see ledger)")
-    return observations, coverage, credits, ledger
+    print(f"  built:  {len(observations):,} observations across "
+          f"{len(matrix.statuses):,} cells "
+          f"({matrix.source_failures():,} source failures, "
+          f"{matrix.unreported():,} unreported)")
+    return observations, coverage, credits, ledger, grid, matrix
 
 
 def main(argv=None) -> int:
@@ -395,8 +552,23 @@ def main(argv=None) -> int:
         return 2
 
     print(f"collecting {args.sport} {args.start}..{args.end}")
-    observations, coverage, credits, ledger = collect(args, key)
     out = Path(args.out)
+    # A NEW DESIGN MUST NOT OVERWRITE THE OLD RESULTS. The baseline run's
+    # artifacts are the only record of what the late pre-game window looked
+    # like, and a multi-day run writing over them would destroy the comparison
+    # it exists to make.
+    if out.exists() and any(out.iterdir()) and not args.overwrite:
+        print(f"{out} already holds artifacts. Use a separate --out directory "
+              "for this run, or pass --overwrite to replace them.", file=sys.stderr)
+        return 2
+
+    try:
+        eligibility = eligibility_for(args, lead_grid_for(args))
+    except ValueError as exc:
+        print(f"CONFIGURATION: {exc}", file=sys.stderr)
+        return 2
+
+    observations, coverage, credits, ledger, grid, matrix = collect(args, key)
     out.mkdir(parents=True, exist_ok=True)
 
     def write_coverage():
@@ -415,7 +587,17 @@ def main(argv=None) -> int:
             "run": {
                 "sport": args.sport, "series": args.series,
                 "from": args.start, "to": args.end,
-                "lead_minutes": args.lead_minutes,
+                "lead_grid": [c.label for c in grid],
+                "lead_grid_minutes": [c.minutes for c in grid],
+                "baseline_lead_minutes": BASELINE_LEAD_MINUTES,
+                "entry_delay_minutes": args.entry_delay_minutes,
+                "max_entries_per_game": args.max_entries_per_game,
+                "max_minutes_to_start": eligibility.max_minutes_to_start,
+                "design_status": "EXPLORATORY -- multi-day grid chosen after "
+                                 "inspecting the late pre-game baseline; not a "
+                                 "preregistered test",
+                "checkpoint_coverage": matrix.by_checkpoint(),
+                "checkpoint_detail": matrix.detail_by_checkpoint(),
                 "devig": args.devig,
                 "max_quote_age_seconds": args.max_quote_age,
                 "min_net_ev": args.min_net_ev,
@@ -450,11 +632,13 @@ def main(argv=None) -> int:
         print(f"!! {warning}")
     report = build_report(
         observations, coverage, fee_provenance(args),
-        eligibility=Eligibility(min_net_ev=args.min_net_ev,
-                                max_spread=args.max_spread),
+        eligibility=eligibility,
         series=args.series,
         ledger_text=ledger.render(),
         route=args.fee_route,
+        policy=entry_policy_for(args),
+        baseline_minutes=BASELINE_LEAD_MINUTES,
+        checkpoint_coverage=matrix.render(),
     )
     print()
     print(report.render())
@@ -472,6 +656,13 @@ def main(argv=None) -> int:
             "p_sharp": o.p_sharp, "p_exchange": o.p_exchange,
             "outcome": o.outcome, "bid": o.exchange_bid, "ask": o.exchange_ask,
             "devig_method": o.devig_method,
+            # The checkpoint and the entry are separate facts from the
+            # observation: with a reaction delay, bid/ask above are the ENTRY
+            # book, while p_exchange is the price that was observed.
+            "checkpoint_minutes": o.checkpoint_minutes,
+            "checkpoint": o.checkpoint_label,
+            "entry_at": o.entry_at.isoformat() if o.entry_at else None,
+            "entry_delay_minutes": o.entry_delay_minutes,
         } for o in observations], indent=2), encoding="utf-8")
     print(f"\nwrote {out}/report.txt, observations.json and coverage.json ({credits})")
     return 0 if coverage.complete else 1

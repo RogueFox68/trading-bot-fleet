@@ -16,7 +16,7 @@ import run_study
 from analysis.scoring import (
     Eligibility, Observation, screen_diagnostics,
 )
-from collect import Ledger
+from collect import CheckpointMatrix, Ledger, default_lead_grid
 from data.cache import CreditCapReached, ResponseCache, key_for, redact
 from data.kalshi_history import Coverage
 from data.odds_history import CreditLedger
@@ -56,7 +56,8 @@ class ArtifactPersistenceTest(unittest.TestCase):
             out = Path(d) / "study"
             with mock.patch.object(
                 run_study, "collect",
-                return_value=(observations, Coverage(), CreditLedger(), ledger)
+                return_value=(observations, Coverage(), CreditLedger(), ledger,
+                              default_lead_grid(), CheckpointMatrix())
             ):
                 code = run_study.main(args_for(out))
             return code, out
@@ -74,7 +75,8 @@ class ArtifactPersistenceTest(unittest.TestCase):
             out = Path(d) / "study"
             with mock.patch.object(
                 run_study, "collect",
-                return_value=([], Coverage(), CreditLedger(), ledger)
+                return_value=([], Coverage(), CreditLedger(), ledger,
+                              default_lead_grid(), CheckpointMatrix())
             ):
                 run_study.main(args_for(out))
             payload = json.loads((out / "coverage.json").read_text())
@@ -88,7 +90,8 @@ class ArtifactPersistenceTest(unittest.TestCase):
             with mock.patch.object(
                 run_study, "collect",
                 return_value=([fake_observation(i) for i in range(40)],
-                              Coverage(), CreditLedger(), Ledger())
+                              Coverage(), CreditLedger(), Ledger(),
+                              default_lead_grid(), CheckpointMatrix())
             ):
                 code = run_study.main(args_for(out))
             self.assertEqual(code, 0)
@@ -102,7 +105,8 @@ class ArtifactPersistenceTest(unittest.TestCase):
             out = Path(d) / "study"
             with mock.patch.object(
                 run_study, "collect",
-                return_value=([fake_observation()], Coverage(), CreditLedger(), Ledger())
+                return_value=([fake_observation()], Coverage(), CreditLedger(), Ledger(),
+                              default_lead_grid(), CheckpointMatrix())
             ):
                 run_study.main(args_for(out))
             for name in ("report.txt", "coverage.json", "observations.json"):
@@ -124,7 +128,8 @@ class FeeRouteCliTest(unittest.TestCase):
             with mock.patch.object(
                 run_study, "collect",
                 return_value=([fake_observation(i) for i in range(40)],
-                              Coverage(), CreditLedger(), Ledger())
+                              Coverage(), CreditLedger(), Ledger(),
+                              default_lead_grid(), CheckpointMatrix())
             ):
                 code = run_study.main(args_for(out, **over))
             return (code,
@@ -199,7 +204,8 @@ class PreflightTest(unittest.TestCase):
 
     def test_preflight_uses_the_shared_survey(self):
         with mock.patch.object(run_study, "survey",
-                               return_value=({}, [], None, Coverage(), Ledger())) as sv:
+                               return_value=({}, [], None, Coverage(), Ledger(),
+                                             default_lead_grid(), CheckpointMatrix())) as sv:
             run_study.main(["--preflight", "--sport", "MLB", "--series", "KXMLBGAME",
                             "--from", "2026-09-14", "--to", "2026-09-15",
                             "--api-key", "K"])
@@ -210,7 +216,9 @@ class PreflightTest(unittest.TestCase):
                    datetime(2026, 9, 15, 1, 0, tzinfo=UTC)]
         with mock.patch.object(run_study, "survey",
                                return_value=({"a": {}}, cutoffs, None,
-                                             Coverage(), Ledger())):
+                                             Coverage(), Ledger(),
+                                             default_lead_grid(),
+                                             CheckpointMatrix())):
             with mock.patch("builtins.print") as printed:
                 code = run_study.main(
                     ["--preflight", "--sport", "MLB", "--series", "KXMLBGAME",
@@ -226,7 +234,8 @@ class PreflightTest(unittest.TestCase):
     def test_preflight_fails_on_incomplete_coverage_before_spending(self):
         bad = Coverage().fail("enumeration truncated")
         with mock.patch.object(run_study, "survey",
-                               return_value=({}, [], None, bad, Ledger())):
+                               return_value=({}, [], None, bad, Ledger(),
+                                             default_lead_grid(), CheckpointMatrix())):
             code = run_study.main(
                 ["--preflight", "--sport", "MLB", "--series", "KXMLBGAME",
                  "--from", "2026-09-14", "--to", "2026-09-15", "--api-key", "K"])

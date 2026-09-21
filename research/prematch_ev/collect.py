@@ -50,7 +50,7 @@ from core.matcher import (
     unknown_exchange_codes,
 )
 from data.kalshi_history import (
-    Coverage, settlement_outcome, settlement_time,
+    Coverage, market_open_time, settlement_outcome, settlement_time,
 )
 from data.odds_history import MAX_QUOTE_AGE_SECONDS, SharpQuote
 
@@ -66,6 +66,12 @@ MAX_SOURCE_LAG = timedelta(minutes=20)
 # Above this share of unexplained loss the surviving sample cannot be assumed
 # representative, and coverage fails rather than certifying it.
 MAX_UNEXPLAINED_LOSS = 0.20
+
+# How far past the intended entry instant a candle may sit and still count as
+# that entry. Beyond this the quote is a DIFFERENT moment, not a late version
+# of the same one, and the run records a missing entry rather than reaching for
+# whatever came next.
+ENTRY_TOLERANCE = timedelta(minutes=15)
 
 
 # The archive's snapshot resolution. Requesting a time between snapshots
@@ -97,9 +103,99 @@ def snapshots_per_day_for(max_quote_age: float) -> int:
     return max(1, math.ceil(24 * 3600 / max_quote_age))
 
 
+# --- the lead-time grid -----------------------------------------------------
+#
+# The study began with ONE checkpoint 60 minutes before start. That measures
+# the late pre-game market and nothing else, and the thesis it was built to
+# test -- that injuries, scratches and suspensions reprice a game over DAYS --
+# lives almost entirely outside it. A single late snapshot cannot reject that
+# thesis; it was never looking at the window where it would show up.
+#
+# These checkpoints are EXPLORATORY DESIGN, chosen now and recorded as such.
+# They are not a preregistered test, and the 60-minute point is kept as a
+# separately labelled baseline rather than quietly folded in with the rest --
+# it is the only one with data already inspected, so pooling it would mix a
+# fresh grid with a window that has been looked at.
+DEFAULT_LEAD_GRID_MINUTES: tuple[float, ...] = (4320, 2880, 1440, 720, 360, 180)
+BASELINE_LEAD_MINUTES = 60.0
+
+
+@dataclass(frozen=True)
+class Checkpoint:
+    """One lead time, carrying its own label and whether it is the baseline."""
+
+    minutes: float
+    baseline: bool = False
+
+    @property
+    def label(self) -> str:
+        if self.minutes >= 60 and self.minutes % 60 == 0:
+            base = f"{int(self.minutes // 60)}h"
+        else:
+            base = f"{self.minutes:g}m"
+        return f"{base} (baseline)" if self.baseline else base
+
+    @property
+    def key(self) -> str:
+        return f"{self.minutes:g}"
+
+    def decision_at(self, start: datetime) -> datetime:
+        return start - timedelta(minutes=self.minutes)
+
+
+def default_lead_grid(include_baseline: bool = True) -> tuple[Checkpoint, ...]:
+    grid = [Checkpoint(m) for m in DEFAULT_LEAD_GRID_MINUTES]
+    if include_baseline:
+        grid.append(Checkpoint(BASELINE_LEAD_MINUTES, baseline=True))
+    return tuple(sorted(grid, key=lambda c: -c.minutes))
+
+
+def parse_lead_grid(spec: str, baseline_minutes: float | None = BASELINE_LEAD_MINUTES
+                    ) -> tuple[Checkpoint, ...]:
+    """Parse `72h,48h,180` into checkpoints, earliest lead first.
+
+    Accepts an `h` or `m` suffix, or bare minutes. Sorted descending by lead so
+    that "earliest qualifying checkpoint" is simply the first match -- the
+    selection rule depends on that order, so it is established once here rather
+    than re-sorted by each caller.
+    """
+    minutes: list[float] = []
+    for raw in spec.split(","):
+        token = raw.strip().lower()
+        if not token:
+            continue
+        try:
+            if token.endswith("h"):
+                value = float(token[:-1]) * 60.0
+            elif token.endswith("m"):
+                value = float(token[:-1])
+            else:
+                value = float(token)
+        except ValueError:
+            raise ValueError(f"unparseable lead time {raw!r} in {spec!r}") from None
+        if value <= 0:
+            raise ValueError(f"lead time must be positive, got {raw!r}")
+        minutes.append(value)
+    if not minutes:
+        raise ValueError(f"no lead times in {spec!r}")
+
+    out = {m: Checkpoint(m) for m in minutes}
+    if baseline_minutes is not None:
+        # The baseline rides along even when not named, and keeps its label
+        # even when it IS named -- a run that silently dropped it would have
+        # no comparison against the window already studied.
+        out[baseline_minutes] = Checkpoint(baseline_minutes, baseline=True)
+    return tuple(sorted(out.values(), key=lambda c: -c.minutes))
+
+
+def grid_reach(grid: Iterable[Checkpoint]) -> timedelta:
+    """How far before the earliest game an input fetch must reach."""
+    return timedelta(minutes=max((c.minutes for c in grid), default=0.0))
+
+
 def decision_cutoffs(
     commence_times: Iterable[datetime],
-    lead_minutes: float,
+    lead_grid: "float | Iterable[Checkpoint]",
     resolution: timedelta = SNAPSHOT_RESOLUTION,
 ) -> list[datetime]:
     """The distinct instants a targeted fetch actually needs.
@@ -108,12 +204,23 @@ def decision_cutoffs(
     needs a handful of fetches rather than fifteen: each cutoff is floored to
     the archive's snapshot grid and then deduplicated. This is what makes
     targeting cheaper than a grid fine enough to satisfy the freshness bound.
+
+    With a GRID, the same deduplication does more work, not less: every game
+    in a slate shares its 72h/48h/24h cutoffs with the others just as it shared
+    the 60-minute one, so N checkpoints cost far less than N times one.
+
+    A bare number is still accepted so a single-checkpoint run reads the same
+    as it always did.
     """
+    grid = ([Checkpoint(float(lead_grid))]
+            if isinstance(lead_grid, (int, float))
+            else list(lead_grid))
     step = resolution.total_seconds()
     seen: set[float] = set()
     for start in commence_times:
-        cutoff = start - timedelta(minutes=lead_minutes)
-        seen.add(math.floor(cutoff.timestamp() / step) * step)
+        for checkpoint in grid:
+            cutoff = checkpoint.decision_at(start)
+            seen.add(math.floor(cutoff.timestamp() / step) * step)
     return [datetime.fromtimestamp(ts, tz=timezone.utc) for ts in sorted(seen)]
 
 
@@ -285,6 +392,188 @@ class Ledger:
         lines.append(f"  lossy stages:       {[n for n, _ in self.lossy_stages()] or 'none'}")
         lines.append(f"  UNACCOUNTED stages: "
                      f"{[n for n, _ in self.unaccounted_stages()] or 'none'}")
+        return "\n".join(lines)
+
+
+# --- game x checkpoint coverage ---------------------------------------------
+#
+# The expected universe is every (contract, checkpoint) pair the enumeration
+# says should exist -- established BEFORE any quote is fetched, so it cannot be
+# defined by its own successes. A denominator derived from what succeeded
+# always reads 100%.
+#
+# Three outcomes are deliberately kept apart, because they mean opposite things
+# for feasibility:
+#
+#   NOT LISTED     the contract did not exist yet. There was no opportunity to
+#                  miss. This is a RESULT -- "you cannot trade this game three
+#                  days out" is exactly what a multi-day study is asking -- and
+#                  it is an eligibility exclusion, never a coverage failure.
+#   NO QUOTE       the contract existed and nobody had quoted it, or the quote
+#                  was unusable. Also a result: listed but untradeable.
+#   SOURCE FAILURE the archive, the parser or the provider let us down. This is
+#                  the only group that threatens whether the sample is
+#                  representative.
+#
+# An UNREADABLE listing time is none of the three and gets its own bucket. It
+# is not evidence the market was listed (rule 17).
+STATUS_OBSERVED = "observed"
+STATUS_NOT_YET_LISTED = "not_yet_listed"
+STATUS_LISTING_UNKNOWN = "listing_time_unknown"
+
+STATUS_GROUPS: dict[str, str] = {
+    STATUS_OBSERVED: "observed",
+    STATUS_NOT_YET_LISTED: "not_listed",
+    STATUS_LISTING_UNKNOWN: "listing_unknown",
+    "no_exchange_quote_at_cutoff": "no_quote",
+    "exchange_quote_too_old_at_cutoff": "no_quote",
+    "no_entry_quote_after_delay": "no_quote",
+    "no_sharp_quote_available_at_cutoff": "no_sharp",
+    "sharp_quote_too_old_at_cutoff": "no_sharp",
+    "exchange_quote_malformed": "source_failure",
+    "candles_unavailable": "source_failure",
+    "yes_side_unresolvable": "source_failure",
+    "cutoff_at_or_after_start": "not_listed",
+}
+# Groups that do NOT indicate a gap in what the study could see.
+#
+# "unreported" is deliberately NOT a source failure. A cell nobody has resolved
+# yet is not a cell the source failed on -- before a run EVERY cell is
+# unreported, and folding the two together would make the preflight's failure
+# count equal to the whole universe. It is counted separately, and after a run
+# a non-zero count means the collector skipped cells, which is its own bug.
+BENIGN_GROUPS = frozenset({"observed", "not_listed", "no_quote", "unreported"})
+
+
+@dataclass(frozen=True)
+class CheckpointTarget:
+    """One cell of the expected universe: this contract, at this lead time."""
+
+    market_ticker: str
+    event_ticker: str
+    checkpoint: Checkpoint
+    start: datetime
+    decision_at: datetime
+
+
+def checkpoint_targets(
+    markets: dict[str, dict],
+    lead_grid: Iterable[Checkpoint],
+    ledger: "Ledger | None" = None,
+) -> list[CheckpointTarget]:
+    """Every (contract, checkpoint) the enumeration says should exist.
+
+    Derived from exchange enumeration ALONE -- no quote, no join, no fetch.
+    That is what makes it a denominator rather than a tally.
+
+    A contract with no readable start cannot have checkpoints at all. The
+    caller is expected to have filtered those already, so reaching one here
+    means that filter changed -- which is exactly the kind of silent shrinkage
+    of a DENOMINATOR that makes coverage measure itself. It is counted, not
+    skipped quietly.
+    """
+    grid = list(lead_grid)
+    out: list[CheckpointTarget] = []
+    undatable = 0
+    for ticker, market in markets.items():
+        start = market_start_time(market)
+        if start is None:
+            undatable += 1
+            continue
+        event = kalshi_event_ticker(market) or ticker
+        for checkpoint in grid:
+            out.append(CheckpointTarget(ticker, event, checkpoint, start,
+                                        checkpoint.decision_at(start)))
+    if undatable and ledger is not None:
+        ledger.reject("no_readable_start_time_at_targeting",
+                      f"{undatable} contracts", count=undatable,
+                      stage="contracts")
+    return out
+
+
+def listing_status(market: dict, decision_at: datetime) -> str | None:
+    """`not_yet_listed`, `listing_time_unknown`, or None when it was listed."""
+    opened = market_open_time(market)
+    if opened is None:
+        return STATUS_LISTING_UNKNOWN
+    return STATUS_NOT_YET_LISTED if decision_at < opened else None
+
+
+@dataclass
+class CheckpointMatrix:
+    """What happened at each (contract, checkpoint) cell.
+
+    Every target is recorded, including the ones that never became an
+    observation -- a matrix that only holds successes cannot answer "how early
+    could this have been traded?", which is the whole question.
+    """
+
+    statuses: dict[tuple[str, str], str] = field(default_factory=dict)
+    checkpoints: list[Checkpoint] = field(default_factory=list)
+
+    def expect(self, targets: Iterable[CheckpointTarget]) -> None:
+        seen: dict[str, Checkpoint] = {}
+        for t in targets:
+            self.statuses.setdefault((t.market_ticker, t.checkpoint.key), "")
+            seen.setdefault(t.checkpoint.key, t.checkpoint)
+        self.checkpoints = sorted(seen.values(), key=lambda c: -c.minutes)
+
+    def record(self, market_ticker: str, checkpoint: Checkpoint, status: str) -> None:
+        self.statuses[(market_ticker, checkpoint.key)] = status
+
+    def group_of(self, status: str) -> str:
+        if not status:
+            return "unreported"
+        return STATUS_GROUPS.get(status, "source_failure")
+
+    def by_checkpoint(self) -> dict[str, dict[str, int]]:
+        """Per checkpoint, a count of each outcome GROUP."""
+        out: dict[str, dict[str, int]] = {}
+        for (_, key), status in self.statuses.items():
+            out.setdefault(key, {})
+            group = self.group_of(status)
+            out[key][group] = out[key].get(group, 0) + 1
+        return out
+
+    def detail_by_checkpoint(self) -> dict[str, dict[str, int]]:
+        """Per checkpoint, a count of each raw status -- what to debug from."""
+        out: dict[str, dict[str, int]] = {}
+        for (_, key), status in self.statuses.items():
+            out.setdefault(key, {})
+            name = status or "unreported"
+            out[key][name] = out[key].get(name, 0) + 1
+        return out
+
+    def source_failures(self) -> int:
+        """Cells where the archive, parser or provider let us down.
+
+        The only group that threatens whether the sample is representative.
+        An unrecognised status counts here rather than being ignored: a new
+        failure mode must not land in a benign bucket by default.
+        """
+        return sum(1 for s in self.statuses.values()
+                   if self.group_of(s) not in BENIGN_GROUPS)
+
+    def unreported(self) -> int:
+        """Cells no run has resolved. Expected before a run, a bug after one."""
+        return sum(1 for s in self.statuses.values() if not s)
+
+    def observed(self) -> int:
+        return sum(1 for s in self.statuses.values() if s == STATUS_OBSERVED)
+
+    def render(self) -> str:
+        cols = ["observed", "not_listed", "no_quote", "no_sharp",
+                "listing_unknown", "source_failure", "unreported"]
+        grouped = self.by_checkpoint()
+        lines = ["GAME x CHECKPOINT COVERAGE",
+                 "    the denominator is the ENUMERATED universe, not the rows that",
+                 "    succeeded. 'not_listed' is a RESULT (no contract existed that",
+                 "    early), not a gap; only 'source_failure' threatens the sample.",
+                 "    " + f"{'lead':<14}" + "".join(f"{c:>16}" for c in cols)]
+        for checkpoint in self.checkpoints:
+            counts = grouped.get(checkpoint.key, {})
+            lines.append("    " + f"{checkpoint.label:<14}"
+                         + "".join(f"{counts.get(c, 0):>16,}" for c in cols))
         return "\n".join(lines)
 
 
@@ -573,7 +862,7 @@ def join_markets(
     return joined
 
 
-def observation_at_cutoff(
+def observation_with_status(
     joined: JoinedMarket,
     quotes: list[SharpQuote],
     candles: list,
@@ -584,8 +873,19 @@ def observation_at_cutoff(
     max_lag: timedelta = MAX_SOURCE_LAG,
     max_quote_age: float = MAX_QUOTE_AGE_SECONDS,
     reject_stage: str = "observation_build",
-) -> Observation | None:
-    """Build one observation from the newest record on EACH side at the cutoff.
+    checkpoint: "Checkpoint | None" = None,
+    entry_delay: timedelta = timedelta(0),
+    entry_tolerance: timedelta = ENTRY_TOLERANCE,
+) -> tuple[Observation | None, str]:
+    """Build one observation, and say what happened either way.
+
+    Returns `(observation, status)`. The status is `STATUS_OBSERVED` or the
+    exact reason this cell failed, which is what the game x checkpoint matrix
+    records -- a matrix that only knows "no row here" cannot tell a contract
+    nobody quoted from one the archive lost.
+
+    `observation_at_cutoff` is the same function viewed as just the
+    observation, so the two can never disagree about why a cell is empty.
 
     Both sides take the latest record published at or before `decision_at`, and
     both must be within `max_lag` of it. That is what makes the comparison a
@@ -606,7 +906,7 @@ def observation_at_cutoff(
     ]
     if not usable_quotes:
         ledger.reject("no_sharp_quote_available_at_cutoff", joined.market_ticker, stage=reject_stage)
-        return None
+        return None, "no_sharp_quote_available_at_cutoff"
 
     quote = max(usable_quotes, key=lambda q: q.last_update)
 
@@ -617,29 +917,56 @@ def observation_at_cutoff(
     if age_at_decision > max_quote_age:
         ledger.reject("sharp_quote_too_old_at_cutoff",
                       f"{joined.market_ticker} {age_at_decision:.0f}s", stage=reject_stage)
-        return None
+        return None, "sharp_quote_too_old_at_cutoff"
 
     usable_candles = [c for c in candles if c.mid is not None and c.ts <= decision_at]
     if not usable_candles:
         ledger.reject("no_exchange_quote_at_cutoff", joined.market_ticker, stage=reject_stage)
-        return None
+        return None, "no_exchange_quote_at_cutoff"
     candle = max(usable_candles, key=lambda c: c.ts)
     if decision_at - candle.ts > max_lag:
         ledger.reject("exchange_quote_too_old_at_cutoff", joined.market_ticker, stage=reject_stage)
-        return None
+        return None, "exchange_quote_too_old_at_cutoff"
     if candle.has_malformed_price:
         ledger.reject("exchange_quote_malformed", joined.market_ticker, stage=reject_stage)
-        return None
+        return None, "exchange_quote_malformed"
 
     p_sharp = orient_probability(quote, joined.yes_participant, league, method)
     if p_sharp is None:
         ledger.reject("yes_side_unresolvable", f"{joined.market_ticker} YES={joined.yes_participant}", stage=reject_stage)
-        return None
+        return None, "yes_side_unresolvable"
 
     lead_minutes = (joined.start - decision_at).total_seconds() / 60.0
     if lead_minutes <= 0:
         ledger.reject("cutoff_at_or_after_start", joined.market_ticker, stage=reject_stage)
-        return None
+        return None, "cutoff_at_or_after_start"
+
+    # THE ENTRY IS NOT THE OBSERVATION. Acting on a signal takes time, and the
+    # price you get is the one available once you have acted -- which on a
+    # delayed retail feed is exactly where the measured edge can go.
+    #
+    # At ZERO delay the entry IS the observation candle, preserving the
+    # existing baseline bit for bit. That is the instantaneous bound and it is
+    # labelled as one, not as a neutral default: it assumes you trade at the
+    # last price you saw, the moment you saw it.
+    entry_candle = candle
+    entry_at = candle.ts
+    if entry_delay > timedelta(0):
+        target = decision_at + entry_delay
+        available = [c for c in candles
+                     if c.mid is not None and not c.has_malformed_price
+                     and target <= c.ts < joined.start
+                     and c.ts - target <= entry_tolerance]
+        if not available:
+            # A missing delayed quote is NOT a fill at the observation price.
+            # Substituting the price you saw for the price you could have got
+            # is the whole error this parameter exists to measure.
+            ledger.reject("no_entry_quote_after_delay",
+                          f"{joined.market_ticker} +{entry_delay.total_seconds() / 60:.0f}m",
+                          stage=reject_stage)
+            return None, "no_entry_quote_after_delay"
+        entry_candle = min(available, key=lambda c: c.ts)
+        entry_at = entry_candle.ts
 
     return Observation(
         game_id=joined.event_ticker,
@@ -650,10 +977,24 @@ def observation_at_cutoff(
         p_exchange=candle.mid,
         outcome=joined.outcome,
         yes_participant=joined.yes_participant,
-        exchange_bid=candle.bid_close,
-        exchange_ask=candle.ask_close,
+        exchange_bid=entry_candle.bid_close,
+        exchange_ask=entry_candle.ask_close,
         sharp_at=quote.last_update,
         sharp_snapshot_at=quote.snapshot,
         exchange_at=candle.ts,
         devig_method=method,
-    )
+        checkpoint_minutes=checkpoint.minutes if checkpoint else None,
+        entry_at=entry_at,
+        entry_delay_minutes=entry_delay.total_seconds() / 60.0,
+    ), STATUS_OBSERVED
+
+
+def observation_at_cutoff(*args, **kwargs) -> Observation | None:
+    """`observation_with_status`, keeping only the observation.
+
+    One implementation, two views. A second copy of this logic that returned
+    the status its own way would eventually disagree with the one that built
+    the row, in exactly the run where the matrix was the thing you were
+    reading (rule 26).
+    """
+    return observation_with_status(*args, **kwargs)[0]

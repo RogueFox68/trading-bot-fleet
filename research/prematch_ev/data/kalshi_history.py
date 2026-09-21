@@ -488,6 +488,40 @@ def settlement_time(market: dict) -> datetime | None:
     return None
 
 
+# WHEN THE CONTRACT BECAME TRADEABLE. Multi-day lead times reach back before
+# some markets existed: a 72h checkpoint on a Tuesday game lands on Saturday,
+# and a contract listed Monday was simply not there. That is a SUBSTANTIVE
+# feasibility result -- "the opportunity could not have been taken this early"
+# -- and it is a different fact from "the archive failed" or "nobody quoted".
+#
+# An ABSENT open time is neither. It is not evidence the market was listed, so
+# it gets its own status rather than being folded into either side (rule 17: a
+# failed read is not a zero).
+LISTING_KEYS_ISO = ("open_time", "open_ts_iso")
+LISTING_KEYS_NUMERIC = ("open_ts",)
+
+
+def market_open_time(market: dict) -> datetime | None:
+    """When the contract opened for trading, or None when unreadable.
+
+    This is the listing time, NOT the scheduled start (see
+    `collect.market_start_time`) and NOT settlement. It answers exactly one
+    question: at this checkpoint, did this contract yet exist?
+    """
+    for key in LISTING_KEYS_ISO:
+        value = market.get(key)
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+    for key in LISTING_KEYS_NUMERIC:
+        value = market.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+    return None
+
+
 def uses_archive(market: dict, cutoff: datetime | None) -> bool | None:
     """Which candlestick partition holds this market's data.
 

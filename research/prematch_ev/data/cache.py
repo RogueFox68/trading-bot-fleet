@@ -67,6 +67,15 @@ class ResponseCache:
     def _path(self, key: str) -> Path:
         return self.root / f"{key}.json"
 
+    def has(self, key: str) -> bool:
+        """Is this response already on disk? Does NOT count a hit or a miss.
+
+        The preflight asks this to cost a run, and a preflight that moved the
+        cache statistics would make the run it predicts look different from the
+        run that happens.
+        """
+        return bool(self.enabled and self._path(key).exists())
+
     def get(self, key: str) -> Any | None:
         if not self.enabled:
             return None

@@ -63,6 +63,10 @@ MIN_GAMES = 200
 MIN_TRADED_GAMES = 200
 EPSILON = 1e-6
 DEFAULT_BOOTSTRAP = 2000
+# 72 hours plus an hour of slack, matching `collect.DEFAULT_LEAD_GRID_MINUTES`.
+# Deliberately a named constant rather than `24 * 60` inline: the old ceiling
+# was a literal, and a literal is what made widening the grid a silent filter.
+DEFAULT_MAX_MINUTES_TO_START = 72 * 60.0 + 60.0
 
 
 @dataclass(frozen=True)
@@ -82,19 +86,45 @@ class Observation:
     decision_at: datetime          # the one information cutoff both respect
     minutes_to_start: float
     p_sharp: float
-    p_exchange: float              # mid at the cutoff
+    p_exchange: float              # mid at the cutoff -- the FORECAST price
     outcome: int                   # 1 if THIS contract's YES settled true
     yes_participant: str = ""
+    # The EXECUTABLE book. With a reaction delay these are the entry
+    # candle's prices, not the observation candle's: what you could trade at
+    # once you had acted, which is a different number from what you saw.
     exchange_bid: float | None = None
     exchange_ask: float | None = None
     sharp_at: datetime | None = None          # when the book moved the price
     sharp_snapshot_at: datetime | None = None  # when the archive captured it
-    exchange_at: datetime | None = None
+    exchange_at: datetime | None = None        # the OBSERVATION candle
     devig_method: str = "shin"
+    # Which checkpoint of the lead grid this row is. Rows at different
+    # checkpoints on the same game are repeated looks at one outcome, not
+    # independent bets -- `select_entries` is what turns them into a policy.
+    checkpoint_minutes: float | None = None
+    entry_at: datetime | None = None           # when the entry was executable
+    entry_delay_minutes: float = 0.0
+    # Pre-game exit, present only when an exit quote was actually found.
+    exit_at: datetime | None = None
+    exit_bid: float | None = None
+    exit_ask: float | None = None
 
     @property
     def disagreement(self) -> float:
         return self.p_sharp - self.p_exchange
+
+    @property
+    def checkpoint_key(self) -> str:
+        if self.checkpoint_minutes is None:
+            return "unlabelled"
+        return f"{self.checkpoint_minutes:g}"
+
+    @property
+    def checkpoint_label(self) -> str:
+        m = self.checkpoint_minutes
+        if m is None:
+            return "unlabelled"
+        return f"{int(m // 60)}h" if m >= 60 and m % 60 == 0 else f"{m:g}m"
 
 
 def _clamp(p: float) -> float:
@@ -258,7 +288,13 @@ class Eligibility:
 
     min_net_ev: float = 0.01          # predicted, per contract, after fee
     price_band: tuple[float, float] = (0.15, 0.85)
-    max_minutes_to_start: float = 24 * 60.0
+    # The ceiling must COVER THE LEAD GRID. At 24h it silently discarded every
+    # 72h, 48h and 24h-and-a-bit observation -- the rows a multi-day study
+    # exists to look at -- as "too far from start", which reads in the
+    # diagnostics as absent opportunity rather than as a misconfiguration.
+    # `run_study` derives it from the grid actually in use and refuses a
+    # ceiling that does not reach the earliest checkpoint.
+    max_minutes_to_start: float = DEFAULT_MAX_MINUTES_TO_START
     min_minutes_to_start: float = 5.0
     max_spread: float = 0.10          # a book this wide is not executable
 
@@ -511,11 +547,27 @@ def realized_return(
     bootstrap_rounds: int = DEFAULT_BOOTSTRAP,
     series: str | None = None,
     route: str = DEFAULT_ROUTE,
+    policy: "EntryPolicy | None" = None,
 ) -> ReturnReport:
-    """Net-of-fee return from acting on the signal, on the eligible subset."""
+    """Net-of-fee return from acting on the signal.
+
+    With an `EntryPolicy`, the subset is what the policy would actually have
+    BOUGHT -- one entry per game at its earliest qualifying checkpoint -- not
+    every row that cleared the screen. On a multi-checkpoint grid those differ
+    by a lot: a game quoted at seven checkpoints can clear the screen at five
+    of them, and counting five is counting one outcome five times.
+
+    Without a policy the behaviour is unchanged, which is what the
+    single-checkpoint baseline needs.
+    """
     eligibility = eligibility or Eligibility()
-    eligible = [o for o in observations
-                if eligibility.admits(o, venue, role, series, route)]
+    if policy is not None:
+        selected, _ = select_entries(observations, eligibility, venue, role,
+                                     series, route, policy)
+        eligible = [e.observation for e in selected]
+    else:
+        eligible = [o for o in observations
+                    if eligibility.admits(o, venue, role, series, route)]
 
     def mean_return(sample: list[Observation]) -> float:
         trades = [t for t in (as_trade(o, venue, role, eligibility, series, route)
@@ -672,6 +724,276 @@ def decay_series(
     return out
 
 
+# --- entry selection --------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EntryPolicy:
+    """How repeated looks at one game become at most one bet.
+
+    PREDECLARED, and applied chronologically. Seven checkpoints on one game are
+    seven looks at ONE outcome, not seven independent bets: summing every
+    qualifying row as if each were a separate profit inflates both the sample
+    and the return, and picking whichever checkpoint did best is choosing with
+    hindsight. Neither is a policy anyone could have followed.
+
+    The baseline here is the one a trader could actually have executed: process
+    checkpoints in time order and take the FIRST that qualifies, then stop
+    looking at that game. Mutually exclusive contracts fall out of the same
+    rule -- both team contracts of a game share `game_id`, so taking one closes
+    the game to the other, which is what "do not buy both sides" means
+    mechanically.
+    """
+
+    max_entries_per_game: int = 1
+    allow_reentry: bool = False
+    contracts_per_entry: int = 1
+
+    def describe(self) -> str:
+        return (f"at most {self.max_entries_per_game} entry/game at the EARLIEST "
+                f"qualifying checkpoint, chronological, "
+                f"{self.contracts_per_entry} contract(s) per entry, "
+                f"re-entry {'allowed' if self.allow_reentry else 'disallowed'}")
+
+
+@dataclass
+class SelectionDiagnostics:
+    """Why each look did or did not become a bet."""
+
+    considered: int = 0
+    taken: int = 0
+    skipped_game_already_entered: int = 0
+    skipped_not_qualifying: int = 0
+    games_seen: int = 0
+    games_entered: int = 0
+
+    def render(self) -> str:
+        return "\n".join([
+            "ENTRY SELECTION",
+            f"    looks considered        {self.considered:>8,}",
+            f"    -> entries taken        {self.taken:>8,}",
+            f"    skipped: game entered   {self.skipped_game_already_entered:>8,}",
+            f"    skipped: not qualifying {self.skipped_not_qualifying:>8,}",
+            f"    games seen / entered    {self.games_seen:>8,} / {self.games_entered:,}",
+        ])
+
+
+@dataclass(frozen=True)
+class SelectedEntry:
+    observation: Observation
+    trade: Trade
+
+    @property
+    def checkpoint_label(self) -> str:
+        return self.observation.checkpoint_label
+
+
+def select_entries(
+    observations: list[Observation],
+    eligibility: Eligibility | None = None,
+    venue: str = "kalshi",
+    role: str = "taker",
+    series: str | None = None,
+    route: str = DEFAULT_ROUTE,
+    policy: EntryPolicy | None = None,
+) -> tuple[list[SelectedEntry], SelectionDiagnostics]:
+    """Apply the entry policy chronologically. Returns the bets, and why.
+
+    Chronological is load-bearing: the decision at the 72h checkpoint is made
+    without knowing what the 24h one will look like. Sorting by anything else
+    -- or scanning for the best row per game -- uses information the trader did
+    not have.
+    """
+    eligibility = eligibility or Eligibility()
+    policy = policy or EntryPolicy()
+    diag = SelectionDiagnostics()
+    ordered = sorted(observations, key=lambda o: (o.decision_at, o.market_id))
+    diag.games_seen = len({o.game_id for o in observations})
+
+    entries_by_game: dict[str, int] = {}
+    out: list[SelectedEntry] = []
+    for o in ordered:
+        diag.considered += 1
+        if entries_by_game.get(o.game_id, 0) >= policy.max_entries_per_game:
+            diag.skipped_game_already_entered += 1
+            continue
+        trade = as_trade(o, venue, role, eligibility, series, route)
+        if trade is None:
+            diag.skipped_not_qualifying += 1
+            continue
+        entries_by_game[o.game_id] = entries_by_game.get(o.game_id, 0) + 1
+        out.append(SelectedEntry(o, trade))
+        diag.taken += 1
+    diag.games_entered = len(entries_by_game)
+    return out, diag
+
+
+# --- per-checkpoint diagnostics ---------------------------------------------
+
+
+@dataclass
+class CheckpointSlice:
+    """One lead time's opportunity frequency and edge -- NOT a profit line.
+
+    These are shown SEPARATELY and never summed. Every game appears at every
+    checkpoint it was quoted at, so adding the rows counts one outcome many
+    times; and reading down the column for the best one is retrospective
+    selection. The policy figure is `select_entries`, and only that.
+    """
+
+    key: str
+    label: str
+    minutes: float
+    baseline: bool
+    observations: int = 0
+    qualifying: int = 0
+    games: int = 0
+    gross_edges: list[float] = field(default_factory=list)
+    net_evs: list[float] = field(default_factory=list)
+
+    @property
+    def opportunity_rate(self) -> float:
+        return self.qualifying / self.observations if self.observations else 0.0
+
+    def _mean(self, values: list[float]) -> float:
+        return sum(values) / len(values) if values else float("nan")
+
+    @property
+    def mean_gross_edge(self) -> float:
+        return self._mean(self.gross_edges)
+
+    @property
+    def mean_net_ev(self) -> float:
+        return self._mean(self.net_evs)
+
+    @property
+    def best_net_ev(self) -> float:
+        return max(self.net_evs) if self.net_evs else float("nan")
+
+
+def checkpoint_slices(
+    observations: list[Observation],
+    eligibility: Eligibility | None = None,
+    venue: str = "kalshi",
+    role: str = "taker",
+    series: str | None = None,
+    route: str = DEFAULT_ROUTE,
+    baseline_minutes: float | None = None,
+) -> list[CheckpointSlice]:
+    """Opportunity frequency and edge by lead time, earliest lead first."""
+    eligibility = eligibility or Eligibility()
+    slices: dict[str, CheckpointSlice] = {}
+    games: dict[str, set[str]] = {}
+    for o in observations:
+        key = o.checkpoint_key
+        sl = slices.get(key)
+        if sl is None:
+            minutes = o.checkpoint_minutes if o.checkpoint_minutes is not None else -1.0
+            sl = slices[key] = CheckpointSlice(
+                key=key, label=o.checkpoint_label, minutes=minutes,
+                baseline=(baseline_minutes is not None
+                          and o.checkpoint_minutes == baseline_minutes),
+            )
+            games[key] = set()
+        sl.observations += 1
+        games[key].add(o.game_id)
+        quotes = side_quotes(o, venue, role, series, route)
+        if quotes:
+            best = max(quotes, key=lambda q: q.predicted_ev)
+            sl.gross_edges.append(best.win_probability - best.entry_price)
+            sl.net_evs.append(best.predicted_ev)
+            if eligibility.admits(o, venue, role, series, route):
+                sl.qualifying += 1
+    for key, sl in slices.items():
+        sl.games = len(games[key])
+    return sorted(slices.values(), key=lambda s: -s.minutes)
+
+
+def render_checkpoint_slices(slices: list[CheckpointSlice]) -> str:
+    lines = [
+        "BY LEAD TIME  (shown separately -- NEVER summed)",
+        "    Each game appears at every checkpoint it was quoted at, so adding",
+        "    these rows counts one outcome repeatedly, and reading off the best",
+        "    row is retrospective selection. The policy figure is the selected",
+        "    entries, below.",
+        f"    {'lead':<14}{'obs':>8}{'games':>8}{'qualify':>9}{'rate':>8}"
+        f"{'mean gross':>13}{'mean net EV':>13}{'best net EV':>13}",
+    ]
+    for s in slices:
+        lines.append(
+            f"    {s.label + (' *' if s.baseline else ''):<14}{s.observations:>8,}"
+            f"{s.games:>8,}{s.qualifying:>9,}{s.opportunity_rate:>8.1%}"
+            f"{s.mean_gross_edge:>+13.6f}{s.mean_net_ev:>+13.6f}"
+            f"{s.best_net_ev:>+13.6f}")
+    if any(s.baseline for s in slices):
+        lines.append("    * baseline checkpoint -- data already inspected, kept "
+                     "separate from the fresh grid")
+    return "\n".join(lines)
+
+
+# --- price paths ------------------------------------------------------------
+
+
+@dataclass
+class PricePath:
+    """One game's sharp and exchange prices in time order.
+
+    Divergence over days is the thing the multi-day design is looking for; a
+    single late snapshot cannot show it either way.
+    """
+
+    game_id: str
+    market_id: str
+    points: list[tuple[float, datetime, float, float]] = field(default_factory=list)
+
+    @property
+    def sharp_move(self) -> float:
+        return self.points[-1][2] - self.points[0][2] if len(self.points) > 1 else 0.0
+
+    @property
+    def exchange_move(self) -> float:
+        return self.points[-1][3] - self.points[0][3] if len(self.points) > 1 else 0.0
+
+    @property
+    def divergence(self) -> float:
+        """How differently the two moved over the observed span."""
+        return self.sharp_move - self.exchange_move
+
+
+def price_paths(observations: list[Observation]) -> list[PricePath]:
+    """Chronological sharp/exchange prices per contract across checkpoints."""
+    by_market: dict[str, PricePath] = {}
+    for o in sorted(observations, key=lambda o: o.decision_at):
+        path = by_market.get(o.market_id)
+        if path is None:
+            path = by_market[o.market_id] = PricePath(o.game_id, o.market_id)
+        path.points.append((o.checkpoint_minutes or float("nan"), o.decision_at,
+                            o.p_sharp, o.p_exchange))
+    return [p for p in by_market.values() if len(p.points) > 1]
+
+
+def render_price_paths(paths: list[PricePath], limit: int = 10) -> str:
+    if not paths:
+        return ("PRICE MOVEMENT ACROSS CHECKPOINTS\n"
+                "    no contract was observed at more than one checkpoint, so "
+                "no path exists")
+    ranked = sorted(paths, key=lambda p: -abs(p.divergence))
+    lines = [
+        "PRICE MOVEMENT ACROSS CHECKPOINTS",
+        f"    {len(paths):,} contracts observed at 2+ checkpoints; "
+        f"largest divergences first",
+        f"    {'market':<34}{'sharp move':>13}{'exch move':>13}{'divergence':>13}",
+    ]
+    for p in ranked[:limit]:
+        lines.append(f"    {p.market_id[:33]:<34}{p.sharp_move:>+13.4f}"
+                     f"{p.exchange_move:>+13.4f}{p.divergence:>+13.4f}")
+    lines.append("    A sparse grid shows whether the two diverge over DAYS. It")
+    lines.append("    cannot establish minute-scale reaction lag, and it does not")
+    lines.append("    claim to have caught every news-driven move -- only what")
+    lines.append("    happened to fall between two checkpoints.")
+    return "\n".join(lines)
+
+
 # --- fee scenarios ----------------------------------------------------------
 
 
@@ -748,6 +1070,11 @@ class StudyReport:
     exchange_calibration: list[CalibrationBin]
     decay: list[DecaySlice]
     coverage: Coverage = field(default_factory=Coverage)
+    slices: list[CheckpointSlice] = field(default_factory=list)
+    paths: list[PricePath] = field(default_factory=list)
+    selection: SelectionDiagnostics | None = None
+    policy: "EntryPolicy | None" = None
+    checkpoint_coverage: str = ""
     provenance: str = ""
     # The SAME facts, pre-split by their producer. Rendering used to split
     # `provenance` on "; ", which silently tore apart any part that contained
@@ -848,6 +1175,26 @@ class StudyReport:
         add(f"    -> {c.verdict()}")
         add("")
 
+        if self.checkpoint_coverage:
+            add(self.checkpoint_coverage)
+            add("")
+
+        if self.slices:
+            add(render_checkpoint_slices(self.slices))
+            add("")
+
+        if self.paths:
+            add(render_price_paths(self.paths))
+            add("")
+
+        if self.policy is not None:
+            add("ENTRY POLICY (predeclared)")
+            add(f"    {self.policy.describe()}")
+            add("")
+        if self.selection is not None:
+            add(self.selection.render())
+            add("")
+
         if self.screen is not None:
             add(self.screen.render())
             add("")
@@ -927,13 +1274,19 @@ def build_report(
     series: str | None = None,
     route: str = DEFAULT_ROUTE,
     bootstrap_rounds: int = DEFAULT_BOOTSTRAP,
+    policy: "EntryPolicy | None" = None,
+    baseline_minutes: float | None = None,
+    checkpoint_coverage: str = "",
 ) -> StudyReport:
     lines = [provenance] if isinstance(provenance, str) else list(provenance)
     lines = [ln for ln in lines if ln]
     outcomes = [o.outcome for o in observations]
     headline_returns = realized_return(observations, eligibility, series=series,
                                        bootstrap_rounds=bootstrap_rounds,
-                                       route=route)
+                                       route=route, policy=policy)
+    selected, selection = select_entries(
+        observations, eligibility or Eligibility(), series=series, route=route,
+        policy=policy or EntryPolicy()) if policy is not None else ([], None)
     headline_screen = screen_diagnostics(observations, eligibility, series=series,
                                          route=route)
     headline = FeeScenario(route=route, label=ROUTE_LABELS.get(route, route),
@@ -954,4 +1307,10 @@ def build_report(
                                 bootstrap_rounds=bootstrap_rounds,
                                 already=headline),
         route=route,
+        slices=checkpoint_slices(observations, eligibility, series=series,
+                                 route=route, baseline_minutes=baseline_minutes),
+        paths=price_paths(observations),
+        selection=selection,
+        policy=policy,
+        checkpoint_coverage=checkpoint_coverage,
     )

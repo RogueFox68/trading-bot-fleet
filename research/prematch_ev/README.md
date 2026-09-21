@@ -288,6 +288,118 @@ decision cutoffs the games actually imply**:
 grid-only configuration that cannot satisfy the bound, rather than running it
 and returning nothing.
 
+## The lead-time grid: days, not one late snapshot
+
+The study began with ONE checkpoint **60 minutes** before start. That measures
+the late pre-game market and nothing else — and the thesis it exists to test,
+that injuries, scratches, suspensions and other pre-game news reprice a game
+over **days**, lives almost entirely outside that window. A single late
+snapshot cannot reject that thesis, because it was never looking where the
+effect would be. The prior late-window result is a **baseline**, not a verdict.
+
+The default grid is **72h, 48h, 24h, 12h, 6h, 3h**, with the 60-minute point
+retained as a separately labelled baseline. `--lead-grid` changes it.
+
+This is **exploratory design, recorded as such** — chosen after inspecting the
+baseline window, so it is not a preregistered test. Sept 1–15 is development
+data that has been looked at; a later, untouched window must be reserved as a
+chronological holdout before anything is evaluated on it.
+
+**Inputs reach back before the study window; the universe does not.** A 72-hour
+checkpoint on a Sept 1 game needs an Aug 29 snapshot. Fetching that snapshot is
+not the same as studying Aug 29's games — those are still excluded on their own
+start times. The two filters are separate and stay separate.
+
+**The eligibility ceiling follows the grid.** It was `24 * 60` inline, and a
+literal is exactly what makes a widened grid a silent filter: every 72h and 48h
+row would be fetched, then dropped for being "too far from start", and the
+screen diagnostics would report that as *absent opportunity*. `run_study`
+derives the ceiling from the grid in use and **refuses** a ceiling that does not
+reach the earliest checkpoint rather than applying it quietly.
+
+### Coverage is game × checkpoint, and three outcomes are kept apart
+
+The denominator is every (contract, checkpoint) cell the **enumeration** says
+should exist, established before any quote is fetched. A denominator defined by
+its own successes always reads 100%.
+
+| group | meaning | counts as |
+|---|---|---|
+| `not_listed` | the contract did not exist yet (`decision_at < open_time`) | **a result** — there was no opportunity to miss |
+| `no_quote` | listed, but nobody quoted it or the quote was unusable | **a result** — listed but untradeable |
+| `source_failure` | the archive, parser or provider failed | **the only group that threatens the sample** |
+| `listing_unknown` | `open_time` unreadable — not evidence either way (rule 17) | its own bucket |
+| `unreported` | no run resolved this cell | expected before a run, a bug after one |
+
+An unrecognised status counts as a **source failure**, so a new failure mode
+cannot land in a benign bucket by default.
+
+### A reaction delay, because instant is not a neutral default
+
+`--entry-delay-minutes` makes a signal seen at *t* enter at the first quote
+at/after *t + delay*, within a declared tolerance and strictly before start.
+Zero delay keeps the **instantaneous bound** bit-for-bit, so the baseline stays
+comparable — but it is labelled as a bound, not as neutral.
+
+A **missing** delayed quote is not a fill at the price you saw. Substituting the
+observed price is precisely the error this parameter exists to measure, and it
+would do it at the exact moment the market had moved away from you. The cell
+records `no_entry_quote_after_delay` instead.
+
+### Repeated checkpoints are not independent bets
+
+Seven checkpoints on one game are seven looks at **one outcome**. Summing every
+qualifying row books the same settlement repeatedly and hands the bootstrap
+seven times the evidence it has; reading off whichever checkpoint did best is
+retrospective selection. Neither is a policy anyone could have followed.
+
+The predeclared baseline: process checkpoints **chronologically** and take the
+**first** that qualifies, then stop looking at that game. Mutually exclusive
+contracts deduplicate through the same rule — both team contracts share a
+`game_id`, so taking one closes the game to the other. Per-checkpoint figures
+are shown **separately and never summed**, under a header that says so.
+
+### What a sparse grid cannot do
+
+It can test whether the two prices **diverge over days**. It cannot establish
+minute-scale reaction lag, and it does not claim to have caught every
+news-driven move — only what happened to fall between two checkpoints. The
+report says this where the price paths are printed. A denser history around
+candidate moves is a **separately costed** design, and selection for it must use
+only information available at the time.
+
+**Price movement is not news attribution.** The multi-day price study runs
+without news labels, and it must not be described as measuring injuries,
+scratches or suspensions. Those claims need timestamped, historically available
+news records, and no retrospective attribution.
+
+### What the grid costs
+
+Cutoffs deduplicate across games *and* checkpoints, so N checkpoints cost far
+less than N times one. Modelled on a ~10-games/day slate over 15 days, using the
+study's own `decision_cutoffs`:
+
+```
+72h    +150 new cutoffs   (running  150 = 1,500 credits)
+48h    + 10               (running  160 = 1,600)
+24h    + 10               (running  170 = 1,700)
+12h    +150               (running  320 = 3,200)
+6h     +150               (running  470 = 4,700)
+3h     +150               (running  620 = 6,200)
+1h     +136               (running  756 = 7,560)
+```
+
+**The three 24h-multiple checkpoints are nearly free together.** Teams play the
+same clock time on consecutive days, so 48h and 24h land almost entirely on
+cutoffs the 72h pass already bought. The cost is in the *intra-day* points —
+12h, 6h, 3h, 1h — each of which is a full fresh pass. If the budget is tight,
+dropping 12h and 6h saves ~3,000 credits while 48h and 24h cost almost nothing
+on top of 72h. Whole-grid cost is about **5×** a single checkpoint, not 7×; the
+hard upper bound with no collisions at all would be 7×.
+
+`--preflight` reports the real figure for a real window, including how many of
+those snapshots are **already cached** and therefore free.
+
 ## Fees must carry the series *and the date*
 
 `fee_for()` takes a `series` **and an `at`**, and threads both to the venue
@@ -355,9 +467,10 @@ python3 run_study.py --probe --sport MLB
 python3 data/kalshi_history.py --audit-abbreviations --series KXMLBGAME --league MLB
 python3 run_study.py --sport MLB --series KXMLBGAME --from 2026-05-13 --to 2026-09-15
 python3 run_study.py ... --fee-route direct   # headline on the other account route
+python3 run_study.py ... --lead-grid 72h,48h,24h,12h,6h,3h --entry-delay-minutes 10
 ```
 
-Tests: `python3 -m unittest discover -s tests -t .` — 256 tests, no network, no
+Tests: `python3 -m unittest discover -s tests -t .` — 303 tests, no network, no
 credentials, and they pass with or without `rapidfuzz`.
 
 Artifacts land in `study_output/`: `report.txt`, `observations.json` (both
