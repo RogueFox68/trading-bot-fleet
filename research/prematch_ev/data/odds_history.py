@@ -41,6 +41,23 @@ REQUEST_TIMEOUT = 30
 RETRIES = 3
 BACKOFF_SECONDS = (2, 4, 8)
 
+# REQUEST THE BOOK, NOT A REGION THAT MIGHT CONTAIN IT. An earlier version sent
+# `regions=us` while the parser accepted only Pinnacle -- which the provider
+# classifies under EU. Every response came back without the book the study is
+# built on, every quote was discarded, and each call still cost 10 credits. The
+# `bookmakers` parameter names the book directly and is immune to a book moving
+# between regions, so it is what this uses; `regions` remains only as a
+# fallback for a caller that genuinely wants a whole region.
+DEFAULT_BOOKMAKERS = SHARP_BOOK
+
+# The provider notes that suspended or closed markets can linger in a response
+# for roughly fifteen minutes, and that its Pinnacle prices come from the
+# public site and may themselves be delayed. A fresh ENVELOPE therefore does
+# not imply a fresh QUOTE: without this bound, a stale sharp line sitting
+# beside a moving exchange price reads as edge, which is precisely the
+# measurement error this study exists to avoid making.
+MAX_QUOTE_AGE_SECONDS = 900
+
 SPORT_KEYS = {
     "MLB": "baseball_mlb",
     "NFL": "americanfootball_nfl",
@@ -82,7 +99,13 @@ class CreditLedger:
 
 @dataclass(frozen=True)
 class SharpQuote:
-    """One two-way moneyline from the sharp book, at one snapshot time."""
+    """One two-way moneyline from the sharp book, at one snapshot time.
+
+    Carries THREE times, not one, because they answer different questions:
+    `snapshot` is when the archive was captured, `last_update` is when the book
+    actually moved this price, and `commence_time` is scheduled start. A
+    comparison against an exchange quote is only honest against the second.
+    """
 
     snapshot: datetime
     commence_time: datetime
@@ -91,9 +114,25 @@ class SharpQuote:
     away_price: float          # American odds
     home_price: float
     book: str
+    provider_event_id: str     # the provider's stable id for this game
+    last_update: datetime | None = None
 
     def minutes_to_start(self) -> float:
         return (self.commence_time - self.snapshot).total_seconds() / 60.0
+
+    def age_seconds(self) -> float | None:
+        """How stale this price was when the snapshot was taken.
+
+        None when the book published no update time -- unknown, which is not
+        the same as fresh and must not be treated as it.
+        """
+        if self.last_update is None:
+            return None
+        return (self.snapshot - self.last_update).total_seconds()
+
+    def is_fresh(self, max_age: float = MAX_QUOTE_AGE_SECONDS) -> bool:
+        age = self.age_seconds()
+        return age is not None and 0 <= age <= max_age
 
 
 @dataclass
@@ -103,6 +142,12 @@ class SnapshotResult:
     coverage: Coverage = field(default_factory=Coverage)
     events_seen: int = 0
     events_without_sharp_book: int = 0
+    quotes_without_update_time: int = 0
+    quotes_stale: int = 0
+    events_without_id: int = 0
+
+    def fresh_quotes(self, max_age: float = MAX_QUOTE_AGE_SECONDS) -> list[SharpQuote]:
+        return [q for q in self.quotes if q.is_fresh(max_age)]
 
 
 def _iso(dt: datetime) -> str:
@@ -140,48 +185,72 @@ def parse_snapshot(payload: Any, book: str = SHARP_BOOK) -> SnapshotResult:
             "'data' missing or not a list"))
 
     quotes: list[SharpQuote] = []
-    missing_book = 0
+    missing_book = no_update_time = stale = missing_id = 0
     for event in events:
         if not isinstance(event, dict):
             continue
         commence = _parse_time(event.get("commence_time"))
         home_name = event.get("home_team")
         away_name = event.get("away_team")
+        event_id = event.get("id")
         if commence is None or not home_name or not away_name:
             continue
+        if not event_id:
+            # Without the provider's own id there is no reliable game identity:
+            # a date plus two team names collapses doubleheaders and cannot
+            # separate a rematch from a reschedule. Drop rather than invent one
+            # -- but COUNT the drop, or the loss is invisible downstream.
+            missing_id += 1
+            continue
 
-        outcomes = _sharp_h2h_outcomes(event, book)
-        if outcomes is None:
+        parsed = _sharp_h2h_outcomes(event, book)
+        if parsed is None:
             missing_book += 1
             continue
-        home_price, away_price = outcomes
-        quotes.append(
-            SharpQuote(
-                snapshot=snapshot or commence,
-                commence_time=commence,
-                away_name=str(away_name),
-                home_name=str(home_name),
-                away_price=away_price,
-                home_price=home_price,
-                book=book,
-            )
+        home_price, away_price, last_update = parsed
+
+        quote = SharpQuote(
+            snapshot=snapshot or commence,
+            commence_time=commence,
+            away_name=str(away_name),
+            home_name=str(home_name),
+            away_price=away_price,
+            home_price=home_price,
+            book=book,
+            provider_event_id=str(event_id),
+            last_update=last_update,
         )
+        if last_update is None:
+            no_update_time += 1
+        elif not quote.is_fresh():
+            stale += 1
+        quotes.append(quote)
 
-    return SnapshotResult(snapshot, quotes, coverage, len(events), missing_book)
+    return SnapshotResult(
+        snapshot, quotes, coverage, len(events), missing_book,
+        no_update_time, stale, missing_id,
+    )
 
 
-def _sharp_h2h_outcomes(event: dict, book: str) -> tuple[float, float] | None:
-    """(home_price, away_price) from the sharp book's h2h market, or None.
+def _sharp_h2h_outcomes(
+    event: dict, book: str
+) -> tuple[float, float, datetime | None] | None:
+    """(home_price, away_price, last_update) from the sharp book, or None.
 
     Returns None -- never a partial or a substituted book -- when the sharp
     book is absent, the market is not two-way, or a price is unreadable. A
     soft book's line silently standing in for Pinnacle would invalidate the
     entire thesis being tested.
+
+    `last_update` is taken from the MARKET when the provider supplies one and
+    falls back to the bookmaker envelope, because the market-level stamp is the
+    one that says when this particular price moved.
     """
     home_name, away_name = event.get("home_team"), event.get("away_team")
     for bookmaker in event.get("bookmakers", []) or []:
         if not isinstance(bookmaker, dict) or bookmaker.get("key") != book:
             continue
+        book_update = _parse_time(bookmaker.get("last_update"))
         for market in bookmaker.get("markets", []) or []:
             if not isinstance(market, dict) or market.get("key") != "h2h":
                 continue
@@ -193,35 +262,63 @@ def _sharp_h2h_outcomes(event: dict, book: str) -> tuple[float, float] | None:
                 if not isinstance(outcome, dict):
                     return None
                 name, price = outcome.get("name"), outcome.get("price")
-                if not isinstance(price, (int, float)):
+                if isinstance(price, bool) or not isinstance(price, (int, float)):
                     return None
                 prices[str(name)] = float(price)
             if home_name in prices and away_name in prices:
-                return prices[home_name], prices[away_name]
+                market_update = _parse_time(market.get("last_update"))
+                return (
+                    prices[home_name],
+                    prices[away_name],
+                    market_update or book_update,
+                )
             return None
     return None
+
+
+def build_snapshot_url(
+    sport: str,
+    at: datetime,
+    api_key: str,
+    bookmakers: str | None = DEFAULT_BOOKMAKERS,
+    regions: str | None = None,
+    base_url: str = BASE_URL,
+) -> str:
+    """The exact URL a snapshot fetch will request.
+
+    Split out from `fetch_snapshot` so a test can assert the QUERY, not just
+    the response parsing. The book-selection defect was invisible to every
+    parser test precisely because no test looked at what was requested.
+    """
+    if not bookmakers and not regions:
+        raise ValueError("a snapshot needs either `bookmakers` or `regions`")
+    sport_key = SPORT_KEYS.get(sport.upper(), sport)
+    params = {
+        "apiKey": api_key,
+        "markets": "h2h",
+        "oddsFormat": "american",
+        "date": _iso(at),
+    }
+    # `bookmakers` names the book directly and takes precedence; `regions` is
+    # only sent when no book was named.
+    if bookmakers:
+        params["bookmakers"] = bookmakers
+    else:
+        params["regions"] = regions
+    return f"{base_url}/historical/sports/{sport_key}/odds?{urllib.parse.urlencode(params)}"
 
 
 def fetch_snapshot(
     sport: str,
     at: datetime,
     api_key: str,
-    regions: str = "us",
+    bookmakers: str | None = DEFAULT_BOOKMAKERS,
+    regions: str | None = None,
     ledger: CreditLedger | None = None,
     base_url: str = BASE_URL,
 ) -> SnapshotResult:
     """One historical snapshot for one sport at one instant."""
-    sport_key = SPORT_KEYS.get(sport.upper(), sport)
-    query = urllib.parse.urlencode(
-        {
-            "apiKey": api_key,
-            "regions": regions,
-            "markets": "h2h",
-            "oddsFormat": "american",
-            "date": _iso(at),
-        }
-    )
-    url = f"{base_url}/historical/sports/{sport_key}/odds?{query}"
+    url = build_snapshot_url(sport, at, api_key, bookmakers, regions, base_url)
 
     last: Exception | None = None
     for attempt in range(RETRIES):

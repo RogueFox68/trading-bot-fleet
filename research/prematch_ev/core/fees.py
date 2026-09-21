@@ -35,13 +35,30 @@ from typing import Literal
 Role = Literal["maker", "taker"]
 
 # --- Kalshi -----------------------------------------------------------------
-# Verified 2026-09-21 against help.kalshi.com/en/articles/13823805-fees.
 # Taker:  ceil(0.07 * C * P * (1-P)), rounded UP to the next cent per order.
-# Maker:  same shape at roughly a quarter of the coefficient; on small orders
-#         the round-up step usually lands it at $0.00.
+# Maker:  same shape at roughly a quarter of the coefficient.
+#
+# THESE COEFFICIENTS ARE NOT UNIVERSAL. Kalshi publishes per-series schedules
+# and some series carry different rates or maker treatment entirely. Resolve
+# the schedule for the series actually being studied before trusting a result
+# built on these; `SERIES_OVERRIDES` is where a resolved one belongs.
+#
+# A NOTE ON THE ROUNDING, because an earlier version of this comment claimed
+# maker fees "usually round to $0.00 on small orders": that is impossible.
+# ceil() of any POSITIVE raw fee is at least one cent, so a positive maker
+# rate can never round down to nothing. The rounding cuts the other way -- it
+# makes SMALL orders relatively more expensive, and most so at the extremes.
+# One contract at 2c owes 0.0343c of raw maker fee and is charged 1c: fifty
+# percent of stake. `tests/test_fees.py::CeilingTest` pins this.
 KALSHI_TAKER_COEFF = 0.07
 KALSHI_MAKER_COEFF = 0.0175
 KALSHI_VERIFIED_ON = "2026-09-21"
+
+# series ticker -> {"taker": coeff, "maker": coeff}. Empty because no series
+# schedule has been resolved yet; `fee_for` takes a `series` and raises on an
+# unresolved one only when the caller asks it to, so a study can state which
+# schedule it actually used rather than assuming the generic one.
+SERIES_OVERRIDES: dict[str, dict[str, float]] = {}
 
 # --- Polymarket -------------------------------------------------------------
 # Verified 2026-09-21. Fee Structure V2; sports theta raised 0.03 -> 0.05 in
@@ -99,8 +116,15 @@ def _ceil_cent(dollars: float) -> float:
     return math.ceil(round(dollars * 100, 9)) / 100
 
 
-def kalshi_fee(n_contracts: float, price: float, role: Role = "taker") -> Fee:
-    coeff = KALSHI_TAKER_COEFF if role == "taker" else KALSHI_MAKER_COEFF
+def kalshi_fee(
+    n_contracts: float,
+    price: float,
+    role: Role = "taker",
+    series: str | None = None,
+) -> Fee:
+    override = SERIES_OVERRIDES.get(series or "", {})
+    default = KALSHI_TAKER_COEFF if role == "taker" else KALSHI_MAKER_COEFF
+    coeff = override.get(role, default)
     raw = coeff * n_contracts * price * (1.0 - price)
     return _quote(_ceil_cent(raw), n_contracts, price, "kalshi", role)
 
@@ -159,5 +183,6 @@ def describe() -> str:
         f"(verified {KALSHI_VERIFIED_ON}); "
         f"polymarket sports theta={POLYMARKET_SPORTS_THETA} maker=0 "
         f"(verified {POLYMARKET_VERIFIED_ON}); "
-        f"polymarket_us=UNVERIFIED (raises)"
+        f"polymarket_us=UNVERIFIED (raises); "
+        f"series overrides resolved: {sorted(SERIES_OVERRIDES) or 'NONE -- generic rates assumed'}"
     )

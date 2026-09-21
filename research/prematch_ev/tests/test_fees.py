@@ -40,6 +40,38 @@ class KalshiFeeTest(unittest.TestCase):
                              kalshi_fee(100, 0.5, "taker").dollars)
 
 
+class CeilingTest(unittest.TestCase):
+    """An earlier comment claimed maker fees 'usually round to $0.00 on small
+    orders'. ceil() of any POSITIVE raw fee is at least one cent, so that is
+    not merely optimistic, it is impossible -- and the rounding cuts the other
+    way, making small orders relatively MORE expensive."""
+
+    def test_a_positive_rate_can_never_round_to_zero(self):
+        for n in (1, 2, 3, 5, 10):
+            for price in (0.01, 0.02, 0.10, 0.50, 0.90, 0.99):
+                self.assertGreaterEqual(kalshi_fee(n, price, "maker").dollars, 0.01)
+                self.assertGreaterEqual(kalshi_fee(n, price, "taker").dollars, 0.01)
+
+    def test_ceiling_makes_small_extreme_orders_expensive(self):
+        # One contract at 2c owes 0.0343c of raw maker fee and is charged 1c.
+        self.assertAlmostEqual(kalshi_fee(1, 0.02, "maker").of_stake, 0.50, places=6)
+
+    def test_series_override_is_used_when_resolved(self):
+        """Kalshi publishes per-series schedules; the generic coefficients are
+        a default, not a universal rate."""
+        from core.fees import SERIES_OVERRIDES
+        SERIES_OVERRIDES["KXTEST"] = {"taker": 0.02}
+        try:
+            self.assertLess(kalshi_fee(1000, 0.5, "taker", series="KXTEST").dollars,
+                            kalshi_fee(1000, 0.5, "taker").dollars)
+        finally:
+            SERIES_OVERRIDES.pop("KXTEST", None)
+
+    def test_describe_states_whether_a_schedule_was_resolved(self):
+        from core.fees import describe
+        self.assertIn("series overrides resolved", describe())
+
+
 class PolymarketFeeTest(unittest.TestCase):
     def test_maker_pays_nothing(self):
         self.assertEqual(polymarket_fee(100, 0.5, "maker").dollars, 0.0)

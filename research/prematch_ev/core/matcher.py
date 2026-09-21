@@ -181,8 +181,43 @@ def resolve_team(name: str, league: str) -> TeamResolution:
 
 
 def canonical_event_id(league: str, start: datetime, away: str, home: str) -> str:
-    """Stable id for one game. Date is the UTC calendar date of first pitch/kick."""
-    return f"{league.upper()}_{start.strftime('%Y%m%d')}_{away.upper()}_{home.upper()}"
+    """Stable id for one game, to the MINUTE.
+
+    An earlier version keyed on the calendar date alone, which collapses a
+    doubleheader: both games of a 17:05 / 20:10 pair produced the same id, so
+    the join could attach one game's exchange prices to the other game's
+    settlement. The time is part of the identity, not decoration.
+
+    This remains a FALLBACK identity. When a provider supplies its own stable
+    event id -- the Odds API's `id`, Kalshi's `event_ticker` -- that is the
+    identity to carry, because it survives a reschedule that moves the start
+    time and this does not. See `GameKey`.
+    """
+    return (
+        f"{league.upper()}_{start.strftime('%Y%m%dT%H%MZ')}_"
+        f"{away.upper()}_{home.upper()}"
+    )
+
+
+@dataclass(frozen=True)
+class GameKey:
+    """One game, identified by both providers' own ids rather than a guess.
+
+    A date plus two team names cannot separate a doubleheader, a rematch or a
+    reschedule. Both sides publish a stable id for the event; carrying both is
+    what makes a join auditable after the fact -- every observation can name
+    the exact provider records it came from.
+    """
+
+    league: str
+    provider_event_id: str        # Odds API event id
+    kalshi_event_ticker: str      # Kalshi event (shared by both team contracts)
+    kalshi_market_ticker: str     # the specific YES contract
+    yes_participant: str          # abbreviation the YES side pays out on
+    start: datetime
+
+    def as_id(self) -> str:
+        return f"{self.provider_event_id}::{self.kalshi_market_ticker}"
 
 
 @dataclass(frozen=True)
@@ -242,19 +277,60 @@ def match_event(
     )
 
 
-# Kalshi game tickers look like KXNFLGAME-24NOV17-BUF-KC. The abbreviations are
-# read straight out of the ticker -- no fuzzy step is needed or wanted here.
+# Real Kalshi game tickers look like:
+#
+#     KXMLBGAME-26SEP201920MILBAL-MIL
+#     KXMLBGAME-26SEP201920MILBAL-BAL
+#
+# i.e. SERIES - EVENT - YES_PARTICIPANT, where the two contracts of one game
+# share an EVENT and differ only in the final segment, which names the team the
+# YES side pays out on.
+#
+# An earlier version of this matched `KXNFLGAME-24NOV17-BUF-KC`: a shape
+# invented from an illustrative example in the spec, never checked against a
+# response. It returns None for both real tickers above, so the normal path
+# discarded every actual market before the join -- and because the fixtures
+# were invented from the same assumption, the tests agreed with it.
+#
+# The event segment is NOT decoded. `26SEP201920MILBAL` concatenates date, time
+# and both abbreviations with no separator, and `MILBAL` cannot be split
+# reliably (MIL|BAL and MI|LBAL are equally valid readings of the string).
+# Start time and participants come from market metadata, which publishes them
+# as fields. This parser extracts only what the STRUCTURE guarantees: the
+# series, the event, and the YES participant.
 _KALSHI_TICKER = re.compile(
-    r"^(?P<series>KX[A-Z]+)-(?P<date>\d{2}[A-Z]{3}\d{2})-"
-    r"(?P<a>[A-Z0-9]{2,4})-(?P<b>[A-Z0-9]{2,4})$"
+    r"^(?P<series>KX[A-Z0-9]+)-(?P<event_body>[A-Z0-9]+)-(?P<yes>[A-Z0-9]{2,5})$"
 )
 
 
 def parse_kalshi_game_ticker(ticker: str) -> dict[str, str] | None:
-    """Pull (series, date, team_a, team_b) out of a Kalshi game ticker.
+    """Structural parse of a Kalshi game ticker.
 
-    Returns None on any ticker that does not fit the shape, so a format change
-    surfaces as unmatched coverage rather than as mis-parsed teams.
+    Returns series, event_ticker (series + event body, shared by both team
+    contracts of one game), and yes_participant. Returns None on any ticker
+    that does not fit, so a format change surfaces as unmatched coverage
+    rather than as mis-parsed teams.
     """
     m = _KALSHI_TICKER.match(ticker.strip().upper())
-    return m.groupdict() if m else None
+    if not m:
+        return None
+    series, event_body, yes = m.group("series"), m.group("event_body"), m.group("yes")
+    return {
+        "series": series,
+        "event_ticker": f"{series}-{event_body}",
+        "yes_participant": yes,
+        "ticker": ticker.strip().upper(),
+    }
+
+
+def kalshi_event_ticker(market: dict) -> str | None:
+    """The game a market belongs to, preferring the field over the parse.
+
+    Kalshi publishes `event_ticker` on the market object. Reading it is more
+    robust than reconstructing it, and the parse stays only as a fallback.
+    """
+    published = market.get("event_ticker")
+    if isinstance(published, str) and published.strip():
+        return published.strip().upper()
+    parsed = parse_kalshi_game_ticker(str(market.get("ticker", "")))
+    return parsed["event_ticker"] if parsed else None

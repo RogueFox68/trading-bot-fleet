@@ -88,6 +88,7 @@ class Candle:
     price_mean: float | None
     volume: float
     open_interest: float
+    has_malformed_price: bool = False
 
     @property
     def mid(self) -> float | None:
@@ -122,16 +123,57 @@ def _get(url: str) -> Any:
     raise KalshiFetchError(f"{url} failed after {RETRIES} attempts: {last}")
 
 
-def _dollars(node: Any, key: str) -> float | None:
-    """Read `<key>_dollars` out of an OHLC sub-object, tolerating absence.
+# Kalshi serialises `*_dollars` as a fixed-point STRING ("0.5600"), not a JSON
+# number. An earlier version accepted only int/float, so every real bid and ask
+# decoded to None, `mid` went with them, and the collector dropped the candle --
+# a total data loss that presented as thin coverage. The fixtures did not catch
+# it because they were written from an assumption about the wire format rather
+# than copied from a response (rule 30, one layer out: the shape under test was
+# invented, so the test could only ever confirm the invention).
+PRICE_MIN, PRICE_MAX = 0.0, 1.0
 
-    Returns None for a missing value rather than 0.0. A zero price is a real,
-    tradeable price on this venue; defaulting to it would manufacture data.
+ABSENT, OK, MALFORMED = "absent", "ok", "malformed"
+
+
+def _dollars(node: Any, key: str) -> tuple[float | None, str]:
+    """Read `<key>_dollars` from an OHLC sub-object.
+
+    Returns (value, status). The status distinguishes the three cases that a
+    bare None conflates:
+
+      absent     the field is not there, or is explicitly null -- no quote
+      ok         a finite decimal inside [0, 1]
+      malformed  present but unreadable, or outside the tradeable range
+
+    `malformed` must never be silently treated as `absent`: one is a market
+    with no quote on that side, the other is a parser that has fallen behind
+    the wire format, and only the second means the numbers cannot be trusted.
     """
     if not isinstance(node, dict):
-        return None
-    value = node.get(f"{key}_dollars")
-    return float(value) if isinstance(value, (int, float)) else None
+        return None, ABSENT
+    if f"{key}_dollars" not in node:
+        return None, ABSENT
+    raw = node[f"{key}_dollars"]
+    if raw is None:
+        return None, ABSENT
+
+    if isinstance(raw, bool):            # bool is an int subclass; not a price
+        return None, MALFORMED
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+    elif isinstance(raw, str):
+        try:
+            value = float(raw.strip())
+        except ValueError:
+            return None, MALFORMED
+    else:
+        return None, MALFORMED
+
+    if value != value or value in (float("inf"), float("-inf")):
+        return None, MALFORMED
+    if not PRICE_MIN <= value <= PRICE_MAX:
+        return None, MALFORMED
+    return value, OK
 
 
 def parse_candles(payload: Any) -> tuple[list[Candle], Coverage]:
@@ -150,33 +192,69 @@ def parse_candles(payload: Any) -> tuple[list[Candle], Coverage]:
         return [], coverage.fail(f"'candlesticks' was {type(raw).__name__}, expected list")
 
     out: list[Candle] = []
-    skipped = 0
+    skipped = malformed_prices = 0
     for item in raw:
         if not isinstance(item, dict):
             skipped += 1
             continue
         ts = item.get("end_period_ts")
-        if not isinstance(ts, (int, float)):
+        if not isinstance(ts, (int, float)) or isinstance(ts, bool):
             skipped += 1
             continue
         price = item.get("price") if isinstance(item.get("price"), dict) else {}
+
+        bid, bid_status = _dollars(item.get("yes_bid"), "close")
+        ask, ask_status = _dollars(item.get("yes_ask"), "close")
+        close, close_status = _dollars(price, "close")
+        mean, mean_status = _dollars(price, "mean")
+        statuses = (bid_status, ask_status, close_status, mean_status)
+        if MALFORMED in statuses:
+            malformed_prices += 1
+
         out.append(
             Candle(
                 ts=datetime.fromtimestamp(ts, tz=timezone.utc),
-                bid_close=_dollars(item.get("yes_bid"), "close"),
-                ask_close=_dollars(item.get("yes_ask"), "close"),
-                price_close=_dollars(price, "close"),
-                price_mean=_dollars(price, "mean"),
-                volume=float(item.get("volume_fp") or item.get("volume") or 0.0),
-                open_interest=float(
-                    item.get("open_interest_fp") or item.get("open_interest") or 0.0
-                ),
+                bid_close=bid,
+                ask_close=ask,
+                price_close=close,
+                price_mean=mean,
+                volume=_numeric(item, "volume_fp", "volume"),
+                open_interest=_numeric(item, "open_interest_fp", "open_interest"),
+                has_malformed_price=MALFORMED in statuses,
             )
         )
+
     if skipped:
         coverage.fail(f"{skipped}/{len(raw)} candlesticks were unparseable")
+    if malformed_prices:
+        # Not merely skipped: a price we could not read means the parser may
+        # be behind the wire format, which is a reason to distrust the rest.
+        coverage.fail(
+            f"{malformed_prices}/{len(raw)} candlesticks carried an unreadable "
+            "price field (wire format may have changed)"
+        )
     out.sort(key=lambda c: c.ts)
     return out, coverage
+
+
+def _numeric(item: dict, *keys: str) -> float:
+    """First readable numeric value among `keys`, else 0.0.
+
+    Volume and open interest are counts: absent genuinely means none, unlike a
+    price, where absent means no quote and zero means a 0c market.
+    """
+    for key in keys:
+        raw = item.get(key)
+        if isinstance(raw, bool):
+            continue
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        if isinstance(raw, str):
+            try:
+                return float(raw.strip())
+            except ValueError:
+                continue
+    return 0.0
 
 
 def fetch_candlesticks(
@@ -256,6 +334,143 @@ def iter_settled_markets(
         f"stopped at max_pages={max_pages} with a cursor still outstanding; "
         "series coverage is truncated"
     )
+
+
+# Kalshi partitions market data at a cutoff timestamp: markets that settled
+# BEFORE it are served from the historical archive and are absent from the live
+# /markets endpoint. Enumerating only /markets therefore silently omits the
+# older part of any window that straddles the cutoff -- and reports `complete`
+# while doing it, because nothing failed. The archive candlestick path cannot
+# recover a market that was never enumerated in the first place.
+CUTOFF_PATH = "/historical/cutoff"
+HISTORICAL_MARKETS_PATH = "/historical/markets"
+
+
+def fetch_historical_cutoff(base_url: str = BASE_URL) -> tuple[datetime | None, Coverage]:
+    """The live/historical partition boundary.
+
+    Returns (cutoff, coverage). An unreadable cutoff yields None and INCOMPLETE
+    coverage -- never a guessed boundary, because guessing it wrong routes an
+    entire span of markets to an endpoint that does not have them.
+    """
+    try:
+        payload = _get(f"{base_url}{CUTOFF_PATH}")
+    except KalshiFetchError as exc:
+        return None, Coverage().fail(f"could not read historical cutoff: {exc}")
+    if not isinstance(payload, dict):
+        return None, Coverage().fail("cutoff response was not an object")
+    for key in ("market_settled_ts", "cutoff_ts", "cutoff"):
+        value = payload.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return datetime.fromtimestamp(value, tz=timezone.utc), Coverage()
+        if isinstance(value, str):
+            try:
+                return (
+                    datetime.fromisoformat(value.replace("Z", "+00:00")),
+                    Coverage(),
+                )
+            except ValueError:
+                continue
+    return None, Coverage().fail(
+        f"cutoff response had no recognisable timestamp (keys: {sorted(payload)})"
+    )
+
+
+def _iter_market_pages(path: str, series_ticker: str, base_url: str, max_pages: int):
+    cursor = ""
+    for page_no in range(max_pages):
+        query = urllib.parse.urlencode(
+            {k: v for k, v in
+             {"series_ticker": series_ticker, "status": "settled",
+              "limit": PAGE_LIMIT, "cursor": cursor}.items() if v}
+        )
+        try:
+            payload = _get(f"{base_url}{path}?{query}")
+        except KalshiFetchError as exc:
+            yield [], Coverage().fail(f"{path} page {page_no}: {exc}")
+            return
+        if not isinstance(payload, dict):
+            yield [], Coverage().fail(f"{path} page {page_no}: response was not an object")
+            return
+        markets = payload.get("markets")
+        if not isinstance(markets, list):
+            yield [], Coverage().fail(f"{path} page {page_no}: 'markets' missing or not a list")
+            return
+        yield markets, Coverage()
+        cursor = payload.get("cursor") or ""
+        if not cursor:
+            return
+    yield [], Coverage().fail(
+        f"{path}: stopped at max_pages={max_pages} with a cursor outstanding; truncated"
+    )
+
+
+def enumerate_settled_markets(
+    series_ticker: str,
+    base_url: str = BASE_URL,
+    max_pages: int = MAX_PAGES,
+) -> tuple[dict[str, dict], Coverage]:
+    """Every settled market for a series, across BOTH partitions.
+
+    Reads the live endpoint and the historical archive, deduplicates on ticker
+    (a market near the boundary can appear in both), and merges the coverage of
+    each. A failure on either side makes the whole enumeration incomplete: half
+    a window is not a smaller window, it is a biased one.
+    """
+    coverage = Coverage()
+    markets: dict[str, dict] = {}
+    seen_in = {"live": 0, "historical": 0}
+
+    for label, path in (("live", "/markets"), ("historical", HISTORICAL_MARKETS_PATH)):
+        for page, page_cov in _iter_market_pages(path, series_ticker, base_url, max_pages):
+            coverage.merge(page_cov)
+            for market in page:
+                if not isinstance(market, dict):
+                    continue
+                ticker = str(market.get("ticker", "")).strip()
+                if not ticker:
+                    continue
+                seen_in[label] += 1
+                markets.setdefault(ticker, market)
+
+    if not markets and coverage.complete:
+        coverage.fail(
+            f"no settled markets found for series {series_ticker!r} in either "
+            "partition -- verify the series ticker before concluding"
+        )
+    return markets, coverage
+
+
+def settlement_time(market: dict) -> datetime | None:
+    """When the market settled, for routing candles to the right partition."""
+    for key in ("settled_ts", "settlement_ts", "close_ts", "expiration_ts"):
+        value = market.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+    for key in ("settled_time", "close_time", "expiration_time"):
+        value = market.get(key)
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+    return None
+
+
+def uses_archive(market: dict, cutoff: datetime | None) -> bool | None:
+    """Which candlestick partition holds this market's data.
+
+    Routed by the market's own SETTLEMENT time against the published cutoff,
+    not by how old a candle happens to be. Returns None when either is
+    unreadable, so the caller can record an unroutable market rather than
+    guessing an endpoint.
+    """
+    if cutoff is None:
+        return None
+    settled = settlement_time(market)
+    if settled is None:
+        return None
+    return settled < cutoff
 
 
 def settlement_outcome(market: dict) -> int | None:

@@ -1,213 +1,167 @@
 # Pre-Match +EV — Thesis Test
 
-A read-only study answering one question before any bot gets built:
+A read-only study. It holds no trading credentials, imports no exchange SDK,
+and cannot place an order.
 
-> **Does the de-vigged sharp line predict settlement better than the prediction
-> market's own price?**
+## What it asks, and what that is worth
 
-That is the entire strategy thesis. If the answer is no, the strategy is dead
-and no amount of connector quality, Kelly tuning or fee modelling rescues it.
-The question needs **no fill simulation, no order book model and no execution
-logic** — three columns per settled game answer it.
+> Does the de-vigged sharp line forecast settlement better than the prediction
+> market's own price — and would acting on the difference have paid, net of the
+> fee actually charged?
 
-Nothing here can place an order. It holds no trading credentials and imports no
-exchange SDK.
+Those are **two** questions. An earlier version asked only the first and
+treated a win on it as a go signal. Better forecasting is neither sufficient
+for positive net return (the spread and fee can eat it) nor necessary for a
+useful strategy (a globally weaker forecast can still improve decisions on a
+predefined subset). Both are now reported, separately.
 
----
+### The premise is a hypothesis, not ground truth
 
-## Why this exists before the bot
+"Pinnacle is fair value" is the assumption under test, not a given:
 
-The originating spec jumped from the maths straight
-to an execution engine. Three problems in it would have lost money, and one of
-them inverts the strategy's own selection. All three are corrected here, and
-each correction is pinned by a test.
+- The odds provider takes Pinnacle prices from the **public website**, which
+  may itself be delayed. A disagreement can mean the exchange is wrong, the
+  book is stale, the feed is lagging, or the two instruments settle on
+  different rules.
+- Avoiding in-play trading removes one latency race. Pre-game injury, lineup
+  and starting-pitcher news is still a race.
+- **Shin is a candidate de-vig model, not a proof** that longshot bias has been
+  removed. Run both and compare on held-out data; `--devig` selects.
 
-### 1. The fee model was structurally wrong
+### Which strategy is being tested
 
-The spec modelled fees as a flat fraction of the $1.00 payout
-(`W_net = 1 - F_rate`). Neither venue works that way — both charge a
-**parabolic fee at execution**:
+This code tests **one pre-game forecast against settlement**, i.e. buy before
+the game and hold. It does **not** measure whether a pre-game repricing can be
+caught and monetised before start — that needs entry-to-exit returns, both
+transaction costs, depth, and failed-exit behaviour, none of which is here.
 
-| Venue | Taker | Maker |
+## What the review found, and what changed
+
+Every item below was a real defect, each with a reproduction.
+
+| # | Defect | Effect |
 |---|---|---|
-| Kalshi | `ceil(0.07 × C × P × (1-P))`, rounded up per order | ~¼ the coefficient; often $0 after rounding |
-| Polymarket (intl.) | `C × θ × P × (1-P)`, θ = 0.05 for sports | zero, plus rebates |
+| 1 | `regions=us` requested while the parser accepted only Pinnacle, an **EU**-listed book | Every call cost 10 credits and returned nothing usable |
+| 2 | Kalshi serialises `*_dollars` as a **string**; the parser took only numbers | Every real bid/ask decoded to `None`; candles dropped as "thin coverage" |
+| 3 | Ticker regex matched an **invented** shape (`...-BUF-KC`) | Real tickers (`KXMLBGAME-26SEP201920MILBAL-MIL`) all returned `None` |
+| 4 | Join compared id **suffixes** and ignored the date | A July 5 market joined to a July 4 game; doubleheaders collapsed |
+| 5 | Only the live `/markets` endpoint was enumerated | Markets settled before the archive cutoff silently missing, reported `complete` |
+| 6 | The bookmaker's `last_update` was discarded | A stale line in a fresh envelope read as edge |
+| 7 | Sharp and exchange records chosen from **different windows** | One predictor could hold 15 minutes more information |
+| 8 | Bootstrap resampled **rows**, not games | 200 copies of one row → n=200, **zero-width CI**, "SHARP LINE WINS" |
+| 9 | Disagreement "hit rate" counted the favoured side's **base rate** | Calibrated exchange scored 80% "wrong"; correct sharp longshot scored 26.5% |
+| 10 | Probability always taken from the **home** team | Away-team contracts would receive an inverted signal |
+| 11 | Join/parse losses never reached `coverage` | A run could discard most markets and still certify `complete` |
 
-As a fraction of **stake** — the unit a `EV / price` screen is denominated in —
-the Kalshi fee is `0.07 × (1 - price)`: **monotonically decreasing in price.**
-A 5¢ contract costs 6.65% of stake to trade; a 95¢ contract costs 0.35%.
-
-No flat rate approximates a parabola. Modelled at a flat 2%, every contract
-clearing a 3% screen has a true edge between **−1.55% and +4.75%**:
-
-```
- price  P_fair@3%  spec says   fee/stake   TRUE edge
-  0.05     0.0526       3.0%       6.65%      -1.55%
-  0.10     0.1051       3.0%       6.30%      -1.20%
-  0.35     0.3679       3.0%       4.55%      +0.55%
-  0.50     0.5255       3.0%       3.50%      +1.60%
-  0.90     0.9459       3.0%       0.70%      +4.40%
-```
-
-Pinned by `tests/test_fees.py::FeeCurveTest`.
-
-### 2. The threshold was non-uniform, and three errors compounded
-
-`EV / price ≥ 3%` demands **18× less probability edge** on a 5¢ contract
-(0.26pp) than on a 90¢ one (4.59pp). Meanwhile multiplicative de-vigging
-**overstates longshot probability**, and fees are highest there. Threshold
-loosest, model most biased upward, fees highest — all in the same corner of the
-price curve. A screen that systematically selects cheap contracts.
-
-Corrected three ways: an absolute probability floor rides alongside the
-percentage, Shin's method is available and is the default, and a stated price
-band (0.15–0.85) marks where the model is trustworthy.
-
-### 3. Fuzzy title matching is a silent wrong-answer generator
-
-`rapidfuzz.extractOne` at 85 over natural-language market titles will
-confidently return the wrong game for a divisional rematch or any shared-city
-pair. A mismatched event means trading the wrong game holding a confident fair
-probability — not an error, a wrong-side-of-the-market position.
-
-Here, fuzzy matching is **scoped and bounded**: it maps one team name to an
-abbreviation within one league's closed roster, never compares two titles. The
-match key is hard — `(league, date, away, home)` plus start-time agreement.
-Ambiguous names reject. There is no default answer, the same rule as the
-fleet's ownership resolver.
-
----
-
-## Running it
-
-Staged deliberately — archive depth decides whether the study is possible at
-all, and that costs almost nothing to check.
-
-```bash
-cd research/prematch_ev
-cp .env.example .env          # fill in ODDS_API_KEY
-pip install -r requirements.txt   # optional; stdlib-only otherwise
-
-# 0. What would this cost? No network calls.
-python3 run_study.py --plan --sport MLB --from 2026-05-13 --to 2026-09-15
-
-# 1. How deep is the odds archive? ~5 credits. RUN THIS FIRST.
-python3 run_study.py --probe --sport MLB
-
-# 2. Do our abbreviations match Kalshi's tickers? Free.
-python3 data/kalshi_history.py --audit-abbreviations --series KXMLBGAME --league MLB
-
-# 3. The study.
-python3 run_study.py --sport MLB --series KXMLBGAME \
-    --from 2026-05-13 --to 2026-09-15 --lead-minutes 60
-```
-
-Tests: `python3 -m unittest discover -s tests -t .` (77 tests, no network, no
-credentials, runs with or without rapidfuzz).
-
-### Start with MLB
-
-If the odds archive is as shallow as it appears (~May 2026), MLB is the only
-sport with a usable sample right now: a full May–September stretch, roughly
-2,000 games, and two-way moneylines that fit the de-vig maths exactly. NFL has
-about three weeks of the 2026 season; NBA and NHL have essentially nothing in
-that window.
-
----
+Fixtures are now copied from observed responses rather than invented, which is
+what let defects 2 and 3 pass 77 tests.
 
 ## Reading the result
 
-Four sections, in the order they matter.
+Six sections. **No single number is a go signal.**
 
-**[1] Accuracy** — Brier and log loss with a bootstrap CI on the *paired*
-difference. `SHARP LINE WINS` requires the interval to exclude zero.
+1. **Forecast accuracy** — Brier and log loss, with a **cluster** bootstrap CI
+   on the paired difference. Clusters are games, not rows: Kalshi lists one
+   contract per team and their outcomes are complements.
+2. **Net return** on a **predeclared** eligible subset, priced at the
+   executable quote (YES at the ask, NO at `1 − bid`) net of the venue fee.
+3. **Where they disagree** — a conditional *proper score*, not a hit rate.
+4. **Calibration** — by price band.
+5. **Over time** — with intervals. A drifting point estimate is not a trend;
+   game mix and noise move it too.
+6. **Go criteria** — all four must hold.
 
-**[2] Calibration** — a predictor can win on Brier while being biased in the
-exact price region you intend to trade.
+### Go criteria
 
-**[3] Disagreement** — when the two differ materially, who is right? This is
-the money table. An edge only exists where they disagree, so pooled accuracy
-over games they agree on dilutes the signal being tested.
+```
+coverage complete
+sample above the game floor
+sharp forecasts better          (CI excludes zero)
+positive net return             (CI excludes zero, on the declared subset)
+```
 
-**[4] Decay** — everything above, by month. **Read the trend, not the pooled
-mean.** Kalshi's sports markets are young and their volume has ramped hard; an
-edge that existed in early 2025 and has since been arbitraged away produces an
-encouraging pooled number and no tradeable present.
+**"Insufficient evidence" means insufficient evidence** — not that the strategy
+is dead. And the 200-game floor is a floor, not a power calculation: the
+interval is what says whether the evidence is enough.
 
-### Calibrating your expectations
+### Freeze before you look
 
-On synthetic data where the sharp line genuinely *is* sharper (1% noise vs 6%),
-the disagreement hit rate runs about **51–54%**, not 60%. A real edge here
-looks like many small correct nudges, not dramatic per-game calls. If the
-disagreement table shows 65% you have a bug, not a goldmine.
+Thresholds, lead time, price band, de-vig model and market eligibility go in
+`Eligibility` and the CLI flags. **Set them before running a chronological
+holdout**, and report sensitivity to latency, spread, fee and de-vig choice.
+Tuning them after seeing returns is how a study confirms itself.
 
-### What counts as a go
+## Running it
 
-- Accuracy CI strictly below zero, **and**
-- disagreement hit rate above 50% and rising with the threshold, **and**
-- the decay series **not** trending to zero in recent months, **and**
-- coverage `complete`.
+```bash
+cd research/prematch_ev
+cp .env.example .env              # ODDS_API_KEY
+python3 run_study.py --plan --sport MLB --from 2026-05-13 --to 2026-09-15
+python3 run_study.py --probe --sport MLB
+python3 data/kalshi_history.py --audit-abbreviations --series KXMLBGAME --league MLB
+python3 run_study.py --sport MLB --series KXMLBGAME --from 2026-05-13 --to 2026-09-15
+```
 
-Anything less is a no-go or a re-run, not a judgement call.
+Tests: `python3 -m unittest discover -s tests -t .` — 142 tests, no network, no
+credentials, and they pass with or without `rapidfuzz`.
 
----
+Artifacts land in `study_output/`: `report.txt`, `observations.json` (both
+source timestamps, actual lead, YES participant, bid/ask), and `coverage.json`
+(stage denominators, every rejection reason with examples, and the run config).
 
-## What this does not answer
+### Archive depth
 
-**Maker fills cannot be simulated honestly.** Queue position is unrecoverable
-from historical data: a bid resting at 52¢ with trades printing tells you
-nothing about whether *you* would have been filled, since you would have been
-behind everyone already there. Every naive maker backtest overestimates fills.
+The Odds API publishes **MLB history from June 2020** — earlier than this study
+originally claimed. "~May 2026" was wrong and must not be treated as a
+provider-wide archive start. What matters is coverage for the **particular
+bookmaker and market**, which is narrower than sport coverage and is what
+`--probe` checks. Note the probe can mistake an **off-season** empty snapshot
+for absent history: probe an in-season date.
 
-Treat any maker result as an **upper bound**. That is still a valid
-one-directional test — if it is not profitable under optimistic fill
-assumptions, it certainly is not in reality — but it can only kill the
-strategy, never confirm it.
+## What this does not establish
 
-**Adverse selection is measurable even though fills are not.** For every
-hypothetical fill, look at where the price went over the next 5/15/60 minutes.
-If they are systematically followed by adverse movement, you have measured the
-effect directly — better than live paper trading would, because you have the
-complete forward path on every observation, not just the ones that filled.
-That analysis is not built yet; `observations.json` carries the bid/ask needed
-for it.
+**Maker fills are not simulable, and "fill everything" is not an upper bound.**
+Queue position is unrecoverable from historical data. An earlier version of
+this file claimed that assuming every maker fill gives a profit ceiling — it
+does not: unfilled hypothetical winners can offset real adverse-selected
+losers, so adding imagined fills moves the total in **either** direction. A
+valid bound needs an explicit fill-selection argument. Keep maker scenarios
+separate from evidence of achievable returns.
 
-**Taker fills are clean**, bounded by depth. Candlesticks carry no size at the
-quote, so full-size fills on thin markets are assumed, not proven.
+**Markouts are not fill-conditioned adverse selection.** Price movement after
+every hypothetical quote describes the market, not what you would have been
+filled on. Estimating adverse selection requires conditioning on actual or
+plausible execution. `observations.json` currently stores one timestamp's
+bid/ask — not a forward path — so that analysis is not yet possible here.
 
----
+**Depth is absent.** Returns are computed against a historical quote with no
+size attached: indicative of an opportunity, not demonstrated fills.
 
-## Relationship to the fleet
-
-**None, deliberately.** Different exchange, different broker, different
-settlement model, different risk profile.
-
-- Not registered in `fleet_registry.BOTS`. That registry derives ownership
-  tags, accountant queries, `reconcile_fills`, Alpaca-denominated budgets and
-  the config audit — a non-Alpaca entry breaks every one of those consumers.
-- No entry in `deploy/ecosystem.config.js`. Nothing here runs under PM2.
-- Separate `requirements.txt`. The root manifest is pinned and drives the
-  container image; this directory must never touch it.
-- Imports nothing from the fleet, and the fleet imports nothing from here.
-
-It lives in this repo as a **quarantined study** because the Beelink is where
-the eventual service would run, and because the observability plane
-(`logger.py`, `error_watchdog.py` → InfluxDB → Grafana) is worth inheriting.
-When the thesis validates, this directory lifts out into its own repo and
-becomes a sibling container — it does not join the fleet.
-
----
+**Fixed costs are excluded.** The data subscription and operating cost are not
+in the return figure; include them separately before calling anything viable.
 
 ## Verify before trusting
 
-Two things in here are conventional spellings rather than verified facts, and
-both fail *silently* as thin coverage rather than loudly as errors:
+- **Fee schedules vary by series.** The generic Kalshi coefficients are a
+  default, not a universal rate; resolve the applicable schedule into
+  `fees.SERIES_OVERRIDES` and `describe()` will say whether you did. The
+  Polymarket **US** entity deliberately raises rather than borrowing the
+  international θ. (An earlier comment claimed maker fees "usually round to
+  $0.00" — impossible: `ceil` of any positive fee is ≥ 1¢, and the rounding
+  makes *small* orders relatively more expensive.)
+- **Roster abbreviations are unverified** against live Kalshi tickers. Run the
+  audit; a mismatch shows up as a team contributing no data, not as an error.
 
-1. **Fee schedules change.** Both are stamped with the date verified
-   (2026-09-21) and the source. `core.fees.describe()` prints the stamps and
-   every report carries them. The Polymarket **US** entity publishes a
-   different schedule and is deliberately `NotImplementedError` rather than a
-   plausible guess.
-2. **Roster abbreviations have not been checked against live Kalshi tickers.**
-   Run the audit in step 2 above first. An abbreviation the exchange spells
-   differently never matches, and shows up as a team contributing no data.
+## Relationship to the fleet
+
+None, deliberately. No `fleet_registry` entry, no PM2 app, separate
+`requirements.txt`, no imports in either direction. It lives here because the
+Beelink is where any eventual service would run and the observability plane is
+worth inheriting; it lifts out to its own repo if the thesis survives.
+
+## If it survives
+
+Only then: a read-only **forward recorder** of signals, depth and latency —
+because paper fills establish no queue priority. Any execution service after
+that needs start-time order expiry, position and exposure reconciliation, and
+event-level risk accounting built for Kalshi.

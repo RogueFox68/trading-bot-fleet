@@ -25,15 +25,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from analysis.scoring import Observation, build_report              # noqa: E402
-from core import fees                                              # noqa: E402
-from core.devig import DevigError, devig_american                   # noqa: E402
-from core.matcher import match_event, parse_kalshi_game_ticker, unverified_note  # noqa: E402
-from data.kalshi_history import (                                   # noqa: E402
-    Coverage, fetch_candlesticks, iter_settled_markets, settlement_outcome,
+from analysis.scoring import Eligibility, Observation, build_report  # noqa: E402
+from collect import (                                              # noqa: E402
+    Ledger, join_markets, observation_at_cutoff,
 )
-from data.odds_history import (                                     # noqa: E402
-    CreditLedger, SPORT_KEYS, estimate_credits, fetch_snapshot, probe_earliest_snapshot,
+from core import fees                                              # noqa: E402
+from core.matcher import match_event, unverified_note              # noqa: E402
+from data.kalshi_history import (                                  # noqa: E402
+    Coverage, enumerate_settled_markets, fetch_candlesticks,
+    fetch_historical_cutoff, uses_archive,
+)
+from data.odds_history import (                                    # noqa: E402
+    CreditLedger, MAX_QUOTE_AGE_SECONDS, SPORT_KEYS, estimate_credits,
+    fetch_snapshot, probe_earliest_snapshot,
 )
 
 
@@ -49,6 +53,10 @@ def parse_args(argv=None):
                    help="observe both predictors this many minutes before start")
     p.add_argument("--snapshots-per-day", type=int, default=8)
     p.add_argument("--devig", choices=("shin", "multiplicative"), default="shin")
+    p.add_argument("--max-quote-age", type=float, default=MAX_QUOTE_AGE_SECONDS,
+                   help="reject a sharp quote older than this at the cutoff")
+    p.add_argument("--min-disagreement", type=float, default=0.02,
+                   help="predeclared eligibility filter for the return test")
     p.add_argument("--api-key", help="Odds API key (or set ODDS_API_KEY)")
     p.add_argument("--plan", action="store_true", help="print the budget and exit")
     p.add_argument("--probe", action="store_true", help="find archive depth and exit")
@@ -100,103 +108,84 @@ def probe(args) -> int:
     return 0 if found else 1
 
 
-def collect(args, key: str) -> tuple[list[Observation], Coverage, CreditLedger]:
-    """Pull both sides, match, and build observations at the target lead time."""
+def collect(args, key: str):
+    """Pull both sides, join on identity, and build observations at one cutoff.
+
+    Returns (observations, coverage, credit ledger, collection ledger). Every
+    stage records a denominator and every drop records a reason -- see
+    collect.Ledger for why an aggregate print was not enough.
+    """
     coverage = Coverage()
-    ledger = CreditLedger()
+    credits = CreditLedger()
+    ledger = Ledger()
     start, end = _date(args.start), _date(args.end)
 
-    # --- exchange side: settled game markets + their pre-start quote ---------
-    settled: dict[str, dict] = {}
-    for page, page_cov in iter_settled_markets(args.series):
-        coverage.merge(page_cov)
-        for market in page:
-            ticker = str(market.get("ticker", ""))
-            parsed = parse_kalshi_game_ticker(ticker)
-            if parsed and settlement_outcome(market) is not None:
-                settled[ticker] = market
-    print(f"  kalshi: {len(settled):,} settled game markets ({coverage})")
+    # --- exchange side: BOTH partitions -------------------------------------
+    cutoff, cutoff_cov = fetch_historical_cutoff()
+    coverage.merge(cutoff_cov)
+    markets, market_cov = enumerate_settled_markets(args.series)
+    coverage.merge(market_cov)
+    ledger.count("markets_enumerated", len(markets))
+    unroutable = sum(1 for m in markets.values() if uses_archive(m, cutoff) is None)
+    if unroutable:
+        ledger.reject("candle_partition_unroutable", f"{unroutable} markets")
+    print(f"  kalshi: {len(markets):,} settled markets across both partitions "
+          f"(cutoff {cutoff.date() if cutoff else 'UNKNOWN'}) ({coverage})")
 
-    # --- sharp side: one call per snapshot, keyed by canonical event id ------
-    sharp_by_event: dict[str, list] = {}
+    # --- sharp side: one call per snapshot ----------------------------------
+    quotes_by_event: dict[str, list] = {}
     cursor, step = start, timedelta(hours=24 / max(1, args.snapshots_per_day))
+    snapshots = 0
     while cursor <= end:
-        if ledger.exhausted():
+        if credits.exhausted():
             coverage.fail(f"odds quota exhausted at {cursor.date()}; window truncated")
             break
-        snap = fetch_snapshot(args.sport, cursor, key, ledger=ledger)
+        snap = fetch_snapshot(args.sport, cursor, key, ledger=credits)
         coverage.merge(snap.coverage)
+        snapshots += 1
+        ledger.count("odds_events_seen", snap.events_seen)
+        if snap.events_without_sharp_book:
+            ledger.reject("event_without_sharp_book",
+                          f"{snap.events_without_sharp_book} at {cursor.isoformat()}")
+        if snap.quotes_without_update_time:
+            ledger.reject("sharp_quote_without_update_time",
+                          f"{snap.quotes_without_update_time} at {cursor.isoformat()}")
         for quote in snap.quotes:
-            m = match_event(args.sport, quote.away_name, quote.home_name,
-                            quote.commence_time)
-            if m.matched:
-                sharp_by_event.setdefault(m.event_id, []).append(quote)
+            quotes_by_event.setdefault(quote.provider_event_id, []).append(quote)
         cursor += step
-    print(f"  odds:   {len(sharp_by_event):,} matched events ({ledger})")
+    ledger.count("odds_snapshots_fetched", snapshots)
+    ledger.count("sharp_events_collected", len(quotes_by_event))
+    print(f"  odds:   {len(quotes_by_event):,} sharp events over {snapshots:,} "
+          f"snapshots ({credits})")
 
-    # --- join at the target lead time ---------------------------------------
+    # --- join on identity ----------------------------------------------------
+    joined = join_markets(markets, quotes_by_event, args.sport, ledger)
+    print(f"  joined: {len(joined):,} contracts matched to a sharp event")
+
+    # --- one decision timestamp per game -------------------------------------
     observations: list[Observation] = []
-    target = float(args.lead_minutes)
-    unmatched = 0
-    for ticker, market in settled.items():
-        parsed = parse_kalshi_game_ticker(ticker)
-        commence = market.get("open_time") or market.get("expected_expiration_time")
-        if not parsed or not commence:
-            unmatched += 1
-            continue
-        event_id = None
-        for candidate, quotes in sharp_by_event.items():
-            if candidate.endswith(f"_{parsed['a']}_{parsed['b']}") or \
-               candidate.endswith(f"_{parsed['b']}_{parsed['a']}"):
-                event_id = candidate
-                break
-        if event_id is None:
-            unmatched += 1
-            continue
-
-        quotes = sharp_by_event[event_id]
-        quote = min(quotes, key=lambda q: abs(q.minutes_to_start() - target))
-        if abs(quote.minutes_to_start() - target) > 30:
-            unmatched += 1
-            continue
-
-        try:
-            result = devig_american([quote.home_price, quote.away_price])
-        except DevigError:
-            unmatched += 1
-            continue
-        p_sharp = (result.shin if args.devig == "shin" else result.multiplicative)[0]
-
+    for jm in joined:
+        decision_at = jm.start - timedelta(minutes=args.lead_minutes)
         candles, cand_cov = fetch_candlesticks(
-            ticker, args.series,
-            quote.commence_time - timedelta(minutes=target + 15),
-            quote.commence_time - timedelta(minutes=max(0, target - 15)),
+            jm.market_ticker, args.series,
+            decision_at - timedelta(minutes=args.lead_minutes),
+            decision_at,
+            use_archive=uses_archive(markets[jm.market_ticker], cutoff),
         )
         coverage.merge(cand_cov)
-        usable = [c for c in candles if c.mid is not None]
-        if not usable:
-            unmatched += 1
-            continue
-        candle = usable[-1]
-
-        observations.append(
-            Observation(
-                event_id=event_id,
-                observed_at=candle.ts,
-                minutes_to_start=quote.minutes_to_start(),
-                p_sharp=p_sharp,
-                p_exchange=candle.mid,
-                outcome=settlement_outcome(market),
-                exchange_bid=candle.bid_close,
-                exchange_ask=candle.ask_close,
-                devig_method=args.devig,
-            )
+        obs = observation_at_cutoff(
+            jm, quotes_by_event.get(jm.provider_event_id, []), candles,
+            decision_at, args.sport, ledger, method=args.devig,
+            max_quote_age=args.max_quote_age,
         )
+        if obs is not None:
+            observations.append(obs)
 
-    if unmatched:
-        print(f"  joined: {len(observations):,} observations "
-              f"({unmatched:,} markets dropped, unmatched or unreadable)")
-    return observations, coverage, ledger
+    ledger.count("observations_built", len(observations))
+    ledger.apply_to(coverage)
+    print(f"  built:  {len(observations):,} observations "
+          f"({ledger.total_rejected:,} dropped, see ledger)")
+    return observations, coverage, credits, ledger
 
 
 def main(argv=None) -> int:
@@ -217,28 +206,55 @@ def main(argv=None) -> int:
         return 2
 
     print(f"collecting {args.sport} {args.start}..{args.end}")
-    observations, coverage, ledger = collect(args, key)
+    observations, coverage, credits, ledger = collect(args, key)
     if not observations:
         print("no observations built -- nothing to score. Check --probe first.",
               file=sys.stderr)
+        print(ledger.render(), file=sys.stderr)
         return 1
 
-    report = build_report(observations, coverage, fees.describe())
+    report = build_report(
+        observations, coverage, fees.describe(),
+        eligibility=Eligibility(min_disagreement=args.min_disagreement),
+        ledger_text=ledger.render(),
+    )
     print()
     print(report.render())
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "report.txt").write_text(report.render(), encoding="utf-8")
+    # The ledger is persisted, not just printed: a reader of the artifacts has
+    # to be able to see what was lost without going back to a terminal buffer.
+    (out / "coverage.json").write_text(json.dumps({
+        "complete": coverage.complete,
+        "reasons": coverage.reasons,
+        "collection": ledger.as_dict(),
+        "credits": str(credits),
+        "run": {
+            "sport": args.sport, "series": args.series,
+            "from": args.start, "to": args.end,
+            "lead_minutes": args.lead_minutes,
+            "snapshots_per_day": args.snapshots_per_day,
+            "devig": args.devig,
+            "max_quote_age_seconds": args.max_quote_age,
+            "min_disagreement": args.min_disagreement,
+            "fees": fees.describe(),
+        },
+    }, indent=2), encoding="utf-8")
     (out / "observations.json").write_text(
         json.dumps([{
-            "event_id": o.event_id, "observed_at": o.observed_at.isoformat(),
-            "minutes_to_start": o.minutes_to_start, "p_sharp": o.p_sharp,
-            "p_exchange": o.p_exchange, "outcome": o.outcome,
-            "bid": o.exchange_bid, "ask": o.exchange_ask,
+            "game_id": o.game_id, "market_id": o.market_id,
+            "decision_at": o.decision_at.isoformat(),
+            "sharp_at": o.sharp_at.isoformat() if o.sharp_at else None,
+            "exchange_at": o.exchange_at.isoformat() if o.exchange_at else None,
+            "minutes_to_start": o.minutes_to_start,
+            "yes_participant": o.yes_participant,
+            "p_sharp": o.p_sharp, "p_exchange": o.p_exchange,
+            "outcome": o.outcome, "bid": o.exchange_bid, "ask": o.exchange_ask,
             "devig_method": o.devig_method,
         } for o in observations], indent=2), encoding="utf-8")
-    print(f"\nwrote {out}/report.txt and {out}/observations.json ({ledger})")
+    print(f"\nwrote {out}/report.txt, observations.json and coverage.json ({credits})")
     return 0 if coverage.complete else 1
 
 

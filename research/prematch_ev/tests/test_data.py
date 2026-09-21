@@ -7,10 +7,14 @@ to read. This is the fleet's `_influx_series` lesson in a different database.
 """
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from data.kalshi_history import Coverage, parse_candles, settlement_outcome
-from data.odds_history import CreditLedger, estimate_credits, parse_snapshot
+from data.kalshi_history import (
+    Coverage, parse_candles, settlement_outcome, settlement_time, uses_archive,
+)
+from data.odds_history import (
+    CreditLedger, build_snapshot_url, estimate_credits, parse_snapshot,
+)
 
 
 class CoverageTest(unittest.TestCase):
@@ -33,18 +37,24 @@ class CoverageTest(unittest.TestCase):
 
 
 class CandleParseTest(unittest.TestCase):
+    # Copied from the documented wire format: `*_dollars` is a fixed-point
+    # STRING, not a JSON number. The previous fixture used numbers because it
+    # was invented rather than observed, which is why the parser could only
+    # ever agree with it.
     GOOD = {"candlesticks": [{
         "end_period_ts": 1758400000,
-        "yes_bid": {"close_dollars": 0.52}, "yes_ask": {"close_dollars": 0.54},
-        "price": {"close_dollars": 0.53, "mean_dollars": 0.53},
-        "volume_fp": 120, "open_interest_fp": 900,
+        "yes_bid": {"close_dollars": "0.5600"},
+        "yes_ask": {"close_dollars": "0.5800"},
+        "price": {"close_dollars": "0.5700", "mean_dollars": "0.5700"},
+        "volume_fp": "120", "open_interest_fp": 900,
     }]}
 
     def test_parses_bid_ask_and_mid(self):
         candles, coverage = parse_candles(self.GOOD)
         self.assertTrue(coverage.complete)
-        self.assertAlmostEqual(candles[0].mid, 0.53, places=10)
-        self.assertAlmostEqual(candles[0].spread, 0.02, places=10)
+        self.assertAlmostEqual(candles[0].mid, 0.57, places=8)
+        self.assertAlmostEqual(candles[0].spread, 0.02, places=8)
+        self.assertEqual(candles[0].volume, 120.0)
 
     def test_empty_market_is_complete_with_no_rows(self):
         candles, coverage = parse_candles({"candlesticks": []})
@@ -91,8 +101,9 @@ class SettlementTest(unittest.TestCase):
 
 
 class SnapshotParseTest(unittest.TestCase):
-    def _event(self, book="pinnacle", outcomes=None):
+    def _event(self, book="pinnacle", outcomes=None, event_id="evt-9"):
         return {
+            "id": event_id,
             "commence_time": "2026-07-04T23:05:00Z",
             "home_team": "New York Yankees", "away_team": "Boston Red Sox",
             "bookmakers": [{"key": book, "markets": [{"key": "h2h", "outcomes":
@@ -134,6 +145,153 @@ class SnapshotParseTest(unittest.TestCase):
     def test_error_body_is_incomplete(self):
         for body in ({"message": "quota exceeded"}, [], None):
             self.assertFalse(parse_snapshot(body).coverage.complete)
+
+    def test_event_without_id_is_counted_not_silently_dropped(self):
+        event = self._event()
+        del event["id"]
+        result = parse_snapshot(self._body([event]))
+        self.assertEqual(len(result.quotes), 0)
+        self.assertEqual(result.events_without_id, 1)
+
+
+class StringPriceTest(unittest.TestCase):
+    """THE parse regression: string prices decoded to None, so `mid` went with
+    them and the collector dropped every real candle -- presenting as thin
+    coverage rather than as an error."""
+
+    def _bid(self, node):
+        candles, coverage = parse_candles(
+            {"candlesticks": [{"end_period_ts": 1, "yes_bid": node,
+                               "yes_ask": {"close_dollars": "0.60"}}]})
+        return candles[0], coverage
+
+    def test_documented_string_prices_decode(self):
+        candle, coverage = self._bid({"close_dollars": "0.5600"})
+        self.assertAlmostEqual(candle.bid_close, 0.56, places=8)
+        self.assertTrue(coverage.complete)
+
+    def test_numeric_prices_still_decode(self):
+        candle, _ = self._bid({"close_dollars": 0.56})
+        self.assertAlmostEqual(candle.bid_close, 0.56, places=8)
+
+    def test_absent_is_not_malformed(self):
+        for node in ({"close_dollars": None}, {}):
+            candle, coverage = self._bid(node)
+            self.assertIsNone(candle.bid_close)
+            self.assertFalse(candle.has_malformed_price)
+            self.assertTrue(coverage.complete, "no quote is not a parser failure")
+
+    def test_malformed_fails_coverage(self):
+        """A price we cannot read means the parser may be behind the wire
+        format, which is a reason to distrust the rest of the run."""
+        for node in ({"close_dollars": "abc"}, {"close_dollars": "1.40"},
+                     {"close_dollars": True}, {"close_dollars": []}):
+            candle, coverage = self._bid(node)
+            self.assertIsNone(candle.bid_close)
+            self.assertTrue(candle.has_malformed_price)
+            self.assertFalse(coverage.complete)
+
+
+class PartitionTest(unittest.TestCase):
+    """Markets settled before the cutoff are absent from the live endpoint, so
+    enumerating only /markets silently omits the older half of a window."""
+
+    CUTOFF = datetime(2026, 6, 1, tzinfo=timezone.utc)
+
+    def test_routes_by_settlement_not_candle_age(self):
+        before = {"settled_ts": datetime(2026, 5, 15, tzinfo=timezone.utc).timestamp()}
+        after = {"settled_ts": datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp()}
+        self.assertTrue(uses_archive(before, self.CUTOFF))
+        self.assertFalse(uses_archive(after, self.CUTOFF))
+
+    def test_boundary_fixture_puts_one_market_on_each_side(self):
+        day_before = {"settled_ts": (self.CUTOFF - timedelta(hours=1)).timestamp()}
+        day_after = {"settled_ts": (self.CUTOFF + timedelta(hours=1)).timestamp()}
+        self.assertNotEqual(uses_archive(day_before, self.CUTOFF),
+                            uses_archive(day_after, self.CUTOFF))
+
+    def test_iso_settlement_times_parse(self):
+        self.assertEqual(settlement_time({"close_time": "2026-05-20T00:00:00Z"}),
+                         datetime(2026, 5, 20, tzinfo=timezone.utc))
+
+    def test_unroutable_returns_none_not_a_guess(self):
+        self.assertIsNone(uses_archive({}, self.CUTOFF))
+        self.assertIsNone(uses_archive({"settled_ts": 1}, None))
+
+
+class BookSelectionTest(unittest.TestCase):
+    """THE credit-burning regression: `regions=us` was requested while the
+    parser accepted only Pinnacle, which the provider lists under EU. Every
+    call cost 10 credits and returned nothing usable."""
+
+    def test_url_names_the_bookmaker(self):
+        url = build_snapshot_url("MLB", datetime(2026, 7, 4, tzinfo=timezone.utc), "K")
+        self.assertIn("bookmakers=pinnacle", url)
+
+    def test_url_does_not_fall_back_to_a_region_by_default(self):
+        url = build_snapshot_url("MLB", datetime(2026, 7, 4, tzinfo=timezone.utc), "K")
+        self.assertNotIn("regions=", url)
+
+    def test_region_only_when_no_book_named(self):
+        url = build_snapshot_url("MLB", datetime(2026, 7, 4, tzinfo=timezone.utc), "K",
+                                 bookmakers=None, regions="eu")
+        self.assertIn("regions=eu", url)
+
+    def test_neither_is_an_error(self):
+        with self.assertRaises(ValueError):
+            build_snapshot_url("MLB", datetime(2026, 7, 4, tzinfo=timezone.utc), "K",
+                               bookmakers=None, regions=None)
+
+
+class QuoteFreshnessTest(unittest.TestCase):
+    """A fresh ENVELOPE does not imply a fresh QUOTE. The provider notes that
+    suspended markets linger for ~15 minutes and that its Pinnacle prices come
+    from the public site, so an old line beside a moving exchange price reads
+    as edge."""
+
+    def body(self, market_update="2026-07-04T17:58:00Z",
+             book_update="2026-07-04T17:20:00Z"):
+        market = {"key": "h2h", "outcomes": [
+            {"name": "New York Yankees", "price": -155},
+            {"name": "Boston Red Sox", "price": 135}]}
+        if market_update is not None:
+            market["last_update"] = market_update
+        return {"timestamp": "2026-07-04T18:00:00Z", "data": [{
+            "id": "evt-1", "commence_time": "2026-07-04T23:05:00Z",
+            "home_team": "New York Yankees", "away_team": "Boston Red Sox",
+            "bookmakers": [{"key": "pinnacle", "last_update": book_update,
+                            "markets": [market]}]}]}
+
+    def test_fresh_quote_is_fresh(self):
+        q = parse_snapshot(self.body()).quotes[0]
+        self.assertEqual(q.age_seconds(), 120.0)
+        self.assertTrue(q.is_fresh())
+
+    def test_stale_odds_in_a_fresh_envelope_are_flagged(self):
+        result = parse_snapshot(self.body(market_update="2026-07-04T15:00:00Z"))
+        self.assertFalse(result.quotes[0].is_fresh())
+        self.assertEqual(result.quotes_stale, 1)
+        self.assertEqual(result.fresh_quotes(), [])
+
+    def test_missing_source_timestamp_is_not_fresh(self):
+        """Unknown age is not the same as fresh and must not be treated as it."""
+        result = parse_snapshot(self.body(market_update=None, book_update=None))
+        self.assertIsNone(result.quotes[0].last_update)
+        self.assertIsNone(result.quotes[0].age_seconds())
+        self.assertFalse(result.quotes[0].is_fresh())
+        self.assertEqual(result.quotes_without_update_time, 1)
+
+    def test_market_stamp_preferred_over_book_envelope(self):
+        q = parse_snapshot(self.body()).quotes[0]
+        self.assertEqual(q.last_update.strftime("%H:%M"), "17:58")
+
+    def test_provider_event_id_is_preserved(self):
+        self.assertEqual(parse_snapshot(self.body()).quotes[0].provider_event_id, "evt-1")
+
+    def test_event_without_an_id_is_dropped(self):
+        body = self.body()
+        del body["data"][0]["id"]
+        self.assertEqual(len(parse_snapshot(body).quotes), 0)
 
 
 class CreditTest(unittest.TestCase):
