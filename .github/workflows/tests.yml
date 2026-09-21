@@ -1,0 +1,157 @@
+# =============================================================================
+# Fleet test suites.
+#
+# Until this existed the repo's thirteen regression suites only ran when
+# someone remembered to run them -- including the ones written specifically to
+# fail the build on a known defect. `test_bar_freshness` parses every bar
+# request and fails if `limit` is paired with `start`, because that bug
+# produces a plausible frame rather than an error and is invisible to review.
+# That guard is only a guard if something runs it.
+#
+# This deliberately does NOT try to be fleet_doctor. The doctor checks the
+# RUNNING FLEET -- live Alpaca, InfluxDB round-trips, VIX sources, pm2 state,
+# whether a process is running the code on disk -- none of which exists on a
+# CI runner, and a check that cannot reach its dependency is worse than no
+# check (rule 25). What CI can own is everything decidable from the source:
+# syntax, imports, and the suites.
+# =============================================================================
+name: tests
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+# A superseded run tells you about a commit nobody is looking at any more.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fleet:
+    name: fleet suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 3.11 only, and deliberately not a matrix. requirements.txt is pinned
+      # and its header records that the set was "verified together on Python
+      # 3.11"; the container runs 3.11. Testing 3.12 would test something the
+      # fleet does not run, and a green 3.12 job would imply support that is
+      # not there.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # The suites import the bots, which import `config`. The real config.py
+      # is gitignored and lives on the Beelink; config.example.py carries the
+      # same keys with placeholder values, which is all the suites need since
+      # every one of them mocks the broker.
+      #
+      # NO REAL CREDENTIALS ARE NEEDED HERE, and none should ever be added.
+      # If a suite ever genuinely requires a live key, that suite is testing
+      # the broker rather than the fleet and belongs in fleet_doctor instead.
+      - name: seed placeholder config
+        run: cp config.example.py config.py
+
+      # `ta` is sdist-only and is the one pin that can fail a build outright on
+      # a toolchain change -- it did exactly that on a clean 3.11 box in
+      # 2026-09. Installing it here means CI finds that out before a container
+      # rebuild on the Beelink does.
+      - name: install pinned dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Ordered syntax -> imports -> behaviour, so the first failure reported
+      # is the most basic one. A syntax error surfacing as a confusing import
+      # error, or a broken import as a wall of test errors, costs a debugging
+      # cycle for no reason.
+      - name: compile every module
+        run: python -m compileall -q .
+
+      # The failure class a bot's own main-loop try/except cannot catch, and
+      # the one fleet_doctor section 3 exists for: a module that does not
+      # import is a process that never starts, and pm2 will report it
+      # `errored` long after the deploy that broke it.
+      #
+      # The process list comes from deploy/ecosystem.config.js -- the canonical
+      # PM2 process list -- evaluated as real JavaScript rather than pattern
+      # matched. A hardcoded list here would be exactly the per-bot list that
+      # rule 2 forbids, and would silently skip the next bot added.
+      - name: every pm2 process survives import
+        run: |
+          # node's exit status is captured explicitly rather than read through
+          # a process substitution, where it would be discarded: a config that
+          # fails to evaluate would otherwise yield an empty list, and an empty
+          # list of processes to check reads as a pass. Same reason the empty
+          # lines are filtered before counting -- `mapfile` on empty input
+          # produces a ONE element array holding an empty string, so a bare
+          # length check never fires. An unreadable list is not an empty one.
+          if ! raw=$(node -e "
+            const apps = require('./deploy/ecosystem.config.js').apps;
+            console.log(apps.map(a => a.script.replace(/^.*\//, '').replace(/\.py$/, '')).join('\n'));
+          "); then
+            echo "::error::could not evaluate deploy/ecosystem.config.js"
+            exit 1
+          fi
+          mapfile -t processes < <(printf '%s\n' "$raw" | grep -v '^[[:space:]]*$')
+          if [ ${#processes[@]} -eq 0 ]; then
+            echo "::error::ecosystem.config.js yielded no processes -- the parser broke, it did not pass"
+            exit 1
+          fi
+          echo "checking ${#processes[@]} processes from deploy/ecosystem.config.js"
+          failed=0
+          for module in "${processes[@]}"; do
+            if python -c "import ${module}" 2>/tmp/import_err; then
+              echo "  ok      ${module}"
+            else
+              echo "::error file=${module}.py::${module} fails to import"
+              sed 's/^/      /' /tmp/import_err
+              failed=1
+            fi
+          done
+          exit $failed
+
+      # Discovery rather than the twelve module names CLAUDE.md lists: a suite
+      # added later is picked up without anyone remembering to add it here.
+      # Verified to find the same 419 tests as the explicit list, and not to
+      # descend into research/ (no __init__.py above its tests package, so it
+      # is not importable from the root).
+      - name: run fleet suites
+        run: python -m unittest discover -s . -p 'test_*.py' -v
+
+  study:
+    name: prematch_ev study
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: research/prematch_ev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Run FIRST with nothing installed. The study claims to be stdlib-only so
+      # it can run anywhere, including inside the fleet container without
+      # widening that image's dependency surface. An untested claim of that
+      # kind quietly stops being true on the first convenient import.
+      - name: suite on a bare interpreter (difflib backend)
+        run: |
+          python -c "from core.matcher import FUZZY_BACKEND; assert FUZZY_BACKEND == 'difflib', FUZZY_BACKEND"
+          python -m unittest discover -s tests -t .
+
+      # Then again with rapidfuzz, which scores team names differently from
+      # difflib. The matcher's safety property is that ambiguous names REJECT,
+      # and the tests assert that rather than which reject reason fired -- so
+      # both backends have to be exercised or the assertion only ever covers
+      # whichever one happens to be installed.
+      - name: suite with rapidfuzz
+        run: |
+          pip install -r requirements.txt
+          python -c "from core.matcher import FUZZY_BACKEND; assert FUZZY_BACKEND == 'rapidfuzz', FUZZY_BACKEND"
+          python -m unittest discover -s tests -t .
