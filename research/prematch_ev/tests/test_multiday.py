@@ -194,6 +194,22 @@ class NotYetListedTest(unittest.TestCase):
         self.assertEqual(matrix.source_failures(), 0)
         self.assertEqual(matrix.by_checkpoint()["4320"]["not_listed"], 2)
 
+    def test_an_empty_matrix_says_it_is_blind_not_clean(self):
+        """A header and an explanation over an EMPTY table reads as 'nothing
+        went wrong here'. It is confident formatting over an unasked question
+        -- the same shape as reporting a tuple's arity as a bar count."""
+        text = CheckpointMatrix().render()
+        self.assertIn("NO CELLS", text)
+        self.assertIn("blind rather than clean", text)
+
+    def test_a_populated_matrix_renders_a_row_per_checkpoint(self):
+        matrix = CheckpointMatrix()
+        matrix.expect(checkpoint_targets(milbal(), default_lead_grid()))
+        lines = matrix.render().splitlines()
+        for checkpoint in default_lead_grid():
+            self.assertTrue(any(checkpoint.label in ln for ln in lines),
+                            f"{checkpoint.label} missing from the table")
+
     def test_a_malformed_price_does_count_as_a_source_failure(self):
         matrix = CheckpointMatrix()
         cp = Checkpoint(180)

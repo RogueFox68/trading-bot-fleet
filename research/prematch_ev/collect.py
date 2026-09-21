@@ -565,6 +565,17 @@ class CheckpointMatrix:
         cols = ["observed", "not_listed", "no_quote", "no_sharp",
                 "listing_unknown", "source_failure", "unreported"]
         grouped = self.by_checkpoint()
+        if not self.checkpoints:
+            # A section that prints its header and its explanation over an
+            # EMPTY table reads as "nothing went wrong here". It has to say it
+            # has nothing to show, or it is confident formatting over an
+            # unasked question -- the same shape as reporting "2 bars" for a
+            # tuple's arity.
+            return ("GAME x CHECKPOINT COVERAGE\n"
+                    "    NO CELLS. The expected universe was never built, so "
+                    "this section\n"
+                    "    is blind rather than clean -- it is not reporting that "
+                    "coverage is fine.")
         lines = ["GAME x CHECKPOINT COVERAGE",
                  "    the denominator is the ENUMERATED universe, not the rows that",
                  "    succeeded. 'not_listed' is a RESULT (no contract existed that",
