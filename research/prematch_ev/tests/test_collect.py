@@ -258,6 +258,52 @@ class JoinTest(unittest.TestCase):
         join_markets(milbal(), quotes, "MLB", led)
         self.assertIn("sharp_teams_unresolvable", led.rejections)
 
+    def test_unrelated_provider_event_does_not_fail_study_coverage(self):
+        """INTEGRATION regression, through join_markets rather than a
+        hand-marked Ledger.
+
+        The feed returns events the study never asked about. One whose team
+        names this roster does not know previously rejected into a stage name
+        nothing counted any more, producing a zero denominator that failed
+        coverage on a run where BOTH target contracts resolved.
+        """
+        led = Ledger()
+        led.count("contracts", 2, unit="contracts")
+        led.count("provider_events", 2, unit="event-quotes", diagnostic=True)
+        quotes = {
+            "target": [quote("target", GAME1)],
+            "unrelated": [quote("unrelated", GAME1 + timedelta(days=2),
+                                home="Unknown Expansion Club",
+                                away="Unlisted Club")],
+        }
+        joined = join_markets(milbal(), quotes, "MLB", led)
+        self.assertEqual(len(joined), 2, "both target contracts must join")
+        coverage = led.apply_to(Coverage())
+        self.assertTrue(coverage.complete, str(coverage))
+        self.assertEqual(led.unaccounted_stages(), [])
+
+    def test_the_unrelated_event_is_still_reported(self):
+        """Suppressed from the gate, not from the output."""
+        led = Ledger()
+        led.count("provider_events", 1, unit="event-quotes", diagnostic=True)
+        quotes = {"target": [quote("target", GAME1)],
+                  "unrelated": [quote("unrelated", GAME1 + timedelta(days=2),
+                                      home="Unknown Expansion Club",
+                                      away="Unlisted Club")]}
+        join_markets(milbal(), quotes, "MLB", led)
+        self.assertIn("sharp_teams_unresolvable", led.rejections)
+        self.assertEqual(led.rejection_stage["sharp_teams_unresolvable"],
+                         "provider_events")
+
+    def test_no_stage_is_left_with_a_zero_denominator(self):
+        """Any stage join_markets writes to must carry its own denominator."""
+        led = Ledger()
+        led.count("contracts", 2, unit="contracts")
+        join_markets(milbal(), {"t": [quote("t", GAME1)]}, "MLB", led)
+        for name, stage in led.stages.items():
+            self.assertTrue(stage.accounting_is_valid,
+                            f"stage {name!r} rejected against no denominator")
+
 
 class OrientationTest(unittest.TestCase):
     QUOTE = quote("evt-1", GAME1)

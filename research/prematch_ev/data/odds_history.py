@@ -81,10 +81,18 @@ class CreditLedger:
     afterwards.
     """
 
-    used: int = 0
+    # None means NOT READ, which is not the same as zero. A cache-only replay
+    # makes no request, so no header is seen and the account's cumulative
+    # usage is unknown -- printing "0 cumulative" claimed a fact the run never
+    # established.
+    used: int | None = None
     remaining: int | None = None
     calls: int = 0
     cap: int | None = None
+    # RESERVED, not billed. Debited before each attempt, including attempts
+    # that then fail, because a provider can charge a request whose response
+    # never arrives. It is the figure the cap acts on, and an upper bound on
+    # what was actually billed.
     spent_this_run: int = 0
 
     def spend_or_raise(self, credits: int = CREDITS_PER_HISTORICAL_CALL) -> None:
@@ -98,7 +106,9 @@ class CreditLedger:
     def observe(self, headers: Any) -> None:
         self.calls += 1
         try:
-            self.used = int(headers.get("x-requests-used", self.used))
+            raw = headers.get("x-requests-used")
+            if raw is not None:
+                self.used = int(raw)
         except (TypeError, ValueError):
             pass
         try:
@@ -118,8 +128,10 @@ class CreditLedger:
         what THIS run reserved, and is the figure a `--max-credits` cap acts on.
         """
         left = "unknown" if self.remaining is None else f"{self.remaining:,}"
-        return (f"{self.calls} calls, {self.spent_this_run:,} credits this run, "
-                f"{self.used:,} cumulative on the account, {left} remaining")
+        cumulative = "unknown" if self.used is None else f"{self.used:,}"
+        return (f"{self.calls} calls, {self.spent_this_run:,} credits reserved "
+                f"this run, {cumulative} cumulative on the account, "
+                f"{left} remaining")
 
 
 @dataclass(frozen=True)

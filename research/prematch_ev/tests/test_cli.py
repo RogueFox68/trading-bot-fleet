@@ -257,13 +257,28 @@ class QuotaLabelTest(unittest.TestCase):
         led.observe({"x-requests-used": "340", "x-requests-remaining": "19660"})
         led.spent_this_run = 140
         text = str(led)
-        self.assertIn("140 credits this run", text)
+        self.assertIn("140 credits reserved this run", text)
         self.assertIn("340 cumulative on the account", text)
 
     def test_cumulative_is_not_presented_as_this_runs_spend(self):
         led = CreditLedger()
         led.observe({"x-requests-used": "340"})
         self.assertNotIn("340 credits used", str(led))
+
+    def test_unread_cumulative_is_unknown_not_zero(self):
+        """A cache-only replay makes no request, so no header is seen. Printing
+        "0 cumulative" claimed a fact the run never established."""
+        led = CreditLedger()
+        self.assertIsNone(led.used)
+        self.assertIn("unknown cumulative", str(led))
+        self.assertNotIn("0 cumulative", str(led))
+
+    def test_spend_is_labelled_reserved_not_billed(self):
+        """It is debited before each attempt, including ones that then fail, so
+        it is an upper bound on what was actually billed."""
+        led = CreditLedger()
+        led.spend_or_raise()
+        self.assertIn("reserved this run", str(led))
 
 
 class ScreenDiagnosticsTest(unittest.TestCase):

@@ -475,8 +475,17 @@ def join_markets(
         key = (matchup, _local_date(quotes[0].commence_time))
         by_key.setdefault(key, []).append((event_id, quotes[0]))
     if unresolved:
+        # A PROVIDER event whose team names this roster does not know. The feed
+        # returns events the study never asked about -- other leagues, other
+        # days -- so this is a diagnostic, not a gap in the study's own
+        # universe. It previously rejected into a stage name nothing counted
+        # any more, producing a zero denominator that failed coverage on a run
+        # whose every target contract resolved.
         ledger.reject("sharp_teams_unresolvable", f"{unresolved} events",
-                      count=unresolved, stage="odds_events")
+                      count=unresolved, stage="provider_events",
+                      diagnostic=True)
+
+    ledger.stage("provider_events", unit="event-quotes", diagnostic=True)
 
     joined: list[JoinedMarket] = []
     agreed = disagreed = 0
