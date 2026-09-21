@@ -10,7 +10,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from data.kalshi_history import (
-    Coverage, parse_candles, settlement_outcome, settlement_time, uses_archive,
+    PARTITION_FIELD, Coverage, fetch_candlesticks, parse_candles,
+    settlement_outcome, settlement_time, uses_archive,
 )
 from data.odds_history import (
     CreditLedger, build_snapshot_url, estimate_credits, parse_snapshot,
@@ -210,9 +211,40 @@ class PartitionTest(unittest.TestCase):
         self.assertNotEqual(uses_archive(day_before, self.CUTOFF),
                             uses_archive(day_after, self.CUTOFF))
 
-    def test_iso_settlement_times_parse(self):
-        self.assertEqual(settlement_time({"close_time": "2026-05-20T00:00:00Z"}),
-                         datetime(2026, 5, 20, tzinfo=timezone.utc))
+    def test_documented_iso_settlement_ts_parses(self):
+        """`settlement_ts` is an ISO string with sub-second precision. An
+        earlier version accepted it only as a number, fell through to
+        `close_time`, and returned a time ~3 minutes early -- enough to route a
+        market to the wrong partition near the cutoff."""
+        self.assertEqual(
+            settlement_time({"close_time": "2026-09-21T02:19:32Z",
+                             "settlement_ts": "2026-09-21T02:22:34.56292Z"}),
+            datetime(2026, 9, 21, 2, 22, 34, 562920, tzinfo=timezone.utc))
+
+    def test_close_and_expiration_are_not_settlement(self):
+        for field in ("close_time", "expiration_time", "close_ts", "expiration_ts"):
+            self.assertIsNone(settlement_time({field: "2026-05-20T00:00:00Z"}),
+                              f"{field} is a lifecycle fact, not settlement")
+
+    def test_enumeration_provenance_outranks_inference(self):
+        """Which endpoint returned the market is what the API itself
+        established; a timestamp comparison is only a fallback."""
+        early = "2026-05-15T00:00:00Z"
+        self.assertFalse(uses_archive(
+            {PARTITION_FIELD: "live", "settlement_ts": early}, self.CUTOFF))
+        late = "2026-09-15T00:00:00Z"
+        self.assertTrue(uses_archive(
+            {PARTITION_FIELD: "historical", "settlement_ts": late}, self.CUTOFF))
+
+    def test_unroutable_candles_refuse_rather_than_guess(self):
+        """`use_archive=None` must not fall back to the 90-day age heuristic
+        this module was told to stop using."""
+        candles, coverage = fetch_candlesticks(
+            "KX-X", "KXS", datetime(2020, 1, 1, tzinfo=timezone.utc),
+            datetime(2020, 1, 2, tzinfo=timezone.utc), use_archive=None)
+        self.assertEqual(candles, [])
+        self.assertFalse(coverage.complete)
+        self.assertIn("refusing to guess", str(coverage))
 
     def test_unroutable_returns_none_not_a_guess(self):
         self.assertIsNone(uses_archive({}, self.CUTOFF))

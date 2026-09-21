@@ -53,6 +53,10 @@ from data.kalshi_history import Coverage
 # it is a floor below which nothing is reported, and the interval is what
 # actually says whether the evidence is sufficient.
 MIN_GAMES = 200
+# The gate that matters is on games the policy would actually have TRADED.
+# An earlier version gated on all forecast games, so a large unrelated universe
+# could satisfy the floor for a tiny trading subset.
+MIN_TRADED_GAMES = 200
 EPSILON = 1e-6
 DEFAULT_BOOTSTRAP = 2000
 
@@ -79,7 +83,8 @@ class Observation:
     yes_participant: str = ""
     exchange_bid: float | None = None
     exchange_ask: float | None = None
-    sharp_at: datetime | None = None
+    sharp_at: datetime | None = None          # when the book moved the price
+    sharp_snapshot_at: datetime | None = None  # when the archive captured it
     exchange_at: datetime | None = None
     devig_method: str = "shin"
 
@@ -232,40 +237,103 @@ def compare(
 
 @dataclass(frozen=True)
 class Eligibility:
-    """A PREDECLARED filter. Freeze it before looking at returns."""
+    """A PREDECLARED policy. Freeze it before looking at returns.
 
-    min_disagreement: float = 0.02
+    THE SCREEN IS PREDICTED NET EV AT THE EXECUTABLE PRICE, not disagreement
+    with the midpoint. An earlier version screened on |p_sharp - mid| >= 0.02,
+    but the trade happens at the ask (or 1 - bid), so on a wide book a passing
+    signal could be a large predicted LOSS: bid .40 / ask .60 / sharp .53
+    cleared the screen and bought YES at .60 plus 2c of fee -- a predicted
+    **-0.09 per contract** before the outcome was known. That tests buying
+    midpoint disagreements, not a positive-EV policy, and it can bury a viable
+    narrower policy under trades it already knew were negative.
+
+    Midpoint disagreement survives as a DIAGNOSTIC (`conditional_scores`), not
+    as the selection rule.
+    """
+
+    min_net_ev: float = 0.01          # predicted, per contract, after fee
     price_band: tuple[float, float] = (0.15, 0.85)
     max_minutes_to_start: float = 24 * 60.0
     min_minutes_to_start: float = 5.0
+    max_spread: float = 0.10          # a book this wide is not executable
 
-    def admits(self, o: Observation) -> bool:
-        if abs(o.disagreement) < self.min_disagreement:
-            return False
+    def admits(self, o: "Observation", venue: str = "kalshi",
+               role: str = "taker") -> bool:
         if not self.price_band[0] <= o.p_exchange <= self.price_band[1]:
             return False
         if not self.min_minutes_to_start <= o.minutes_to_start <= self.max_minutes_to_start:
             return False
-        return o.exchange_bid is not None and o.exchange_ask is not None
+        if o.exchange_bid is None or o.exchange_ask is None:
+            return False
+        if o.exchange_ask - o.exchange_bid > self.max_spread:
+            return False
+        return as_trade(o, venue, role, self) is not None
+
+
+@dataclass(frozen=True)
+class SideQuote:
+    """One executable side, priced with its own fee and outcome mapping."""
+
+    side: str
+    entry_price: float
+    fee: float
+    win_probability: float     # p_sharp for YES, 1 - p_sharp for NO
+    payout: float              # realised: 1.0 or 0.0
+
+    @property
+    def cost(self) -> float:
+        return self.entry_price + self.fee
+
+    @property
+    def predicted_ev(self) -> float:
+        """EV before the outcome is known -- what a screen must select on."""
+        return self.win_probability - self.cost
+
+    @property
+    def profit(self) -> float:
+        return self.payout - self.cost
+
+
+def side_quotes(o: "Observation", venue: str = "kalshi",
+                role: str = "taker") -> list[SideQuote]:
+    """Both executable sides of one contract, each priced net of its own fee.
+
+    YES pays the ask and wins when the contract settles true. NO pays
+    (1 - bid) -- the mirror of the YES book -- and wins when it settles false.
+    Computed explicitly rather than by negating a YES figure, because getting
+    the NO mapping wrong inverts half the sample.
+    """
+    if o.exchange_bid is None or o.exchange_ask is None:
+        return []
+    if not 0.0 < o.exchange_ask < 1.0 or not 0.0 < o.exchange_bid < 1.0:
+        return []
+    if o.exchange_bid > o.exchange_ask:
+        return []
+
+    out: list[SideQuote] = []
+    for side, entry, win_p, payout in (
+        ("YES", o.exchange_ask, o.p_sharp, float(o.outcome)),
+        ("NO", 1.0 - o.exchange_bid, 1.0 - o.p_sharp, float(1 - o.outcome)),
+    ):
+        if not 0.0 < entry < 1.0:
+            continue
+        out.append(SideQuote(side, entry, fee_for(venue, 1.0, entry, role).dollars,
+                             win_p, payout))
+    return out
 
 
 @dataclass(frozen=True)
 class Trade:
-    """What acting on one observation would have cost and returned.
-
-    Buying YES pays the ask and wins $1 when the contract settles true.
-    Buying NO pays (1 - bid) -- the mirror of the YES book -- and wins $1 when
-    it settles false. Both legs carry the venue's execution fee on the price
-    actually paid. Getting the NO mapping wrong inverts half the sample, so it
-    is computed explicitly rather than by negating a YES return.
-    """
+    """What acting on one observation would have cost and returned."""
 
     game_id: str
-    side: str                  # "YES" | "NO"
+    side: str
     entry_price: float
     fee: float
-    payout: float              # 1.0 or 0.0
-    profit: float              # payout - entry_price - fee, per contract
+    payout: float
+    profit: float
+    predicted_ev: float
 
     @property
     def return_on_stake(self) -> float:
@@ -273,29 +341,23 @@ class Trade:
         return self.profit / cost if cost else 0.0
 
 
-def as_trade(o: Observation, venue: str = "kalshi", role: str = "taker") -> Trade | None:
-    """The trade the signal implies, priced at the executable quote.
+def as_trade(o: "Observation", venue: str = "kalshi", role: str = "taker",
+             eligibility: "Eligibility | None" = None) -> Trade | None:
+    """The best executable side, if it clears the predeclared EV threshold.
 
-    Sharp above the exchange means the contract looks cheap: buy YES at the
-    ASK. Sharp below means it looks rich: buy NO, which costs (1 - bid).
-    Crossed or missing quotes yield None rather than a synthesised price.
+    Both sides are priced and the better PREDICTED EV wins. The direction is
+    not taken from the sign of a midpoint disagreement, because the midpoint is
+    not a price anyone trades at.
     """
-    if o.exchange_bid is None or o.exchange_ask is None:
+    quotes = side_quotes(o, venue, role)
+    if not quotes:
         return None
-    if not 0.0 < o.exchange_ask < 1.0 or not 0.0 < o.exchange_bid < 1.0:
+    best = max(quotes, key=lambda q: q.predicted_ev)
+    threshold = eligibility.min_net_ev if eligibility else 0.0
+    if best.predicted_ev < threshold:
         return None
-    if o.exchange_bid > o.exchange_ask:
-        return None
-
-    if o.disagreement > 0:
-        side, entry, payout = "YES", o.exchange_ask, float(o.outcome)
-    else:
-        side, entry, payout = "NO", 1.0 - o.exchange_bid, float(1 - o.outcome)
-    if not 0.0 < entry < 1.0:
-        return None
-
-    fee = fee_for(venue, 1.0, entry, role).dollars
-    return Trade(o.game_id, side, entry, fee, payout, payout - entry - fee)
+    return Trade(o.game_id, best.side, best.entry_price, best.fee,
+                 best.payout, best.profit, best.predicted_ev)
 
 
 @dataclass
@@ -344,16 +406,16 @@ def realized_return(
 ) -> ReturnReport:
     """Net-of-fee return from acting on the signal, on the eligible subset."""
     eligibility = eligibility or Eligibility()
-    eligible = [o for o in observations if eligibility.admits(o)]
+    eligible = [o for o in observations if eligibility.admits(o, venue, role)]
 
     def mean_return(sample: list[Observation]) -> float:
-        trades = [t for t in (as_trade(o, venue, role) for o in sample) if t]
+        trades = [t for t in (as_trade(o, venue, role, eligibility) for o in sample) if t]
         if not trades:
             raise ValueError("no trades in sample")
         staked = sum(t.entry_price + t.fee for t in trades)
         return sum(t.profit for t in trades) / staked if staked else 0.0
 
-    trades = [t for t in (as_trade(o, venue, role) for o in eligible) if t]
+    trades = [t for t in (as_trade(o, venue, role, eligibility) for o in eligible) if t]
     if not trades:
         return ReturnReport(0, 0, 0.0, 0.0, float("nan"), float("nan"),
                             0, 0, 0.0, eligibility, venue, role)
@@ -514,23 +576,35 @@ class StudyReport:
     provenance: str = ""
     ledger_text: str = ""
 
-    def go_criteria(self) -> list[tuple[str, bool, str]]:
-        """The criteria, each with its own verdict.
+    def readiness(self) -> list[tuple[str, bool, str]]:
+        """Diagnostics and gates, separated.
 
-        There is no single pass/fail line on purpose. An earlier version made
-        ">50% disagreement hit rate and rising" a go criterion, which a base
-        rate satisfies; and it treated "no significant difference" as proof the
-        strategy was dead, when it means the evidence is insufficient.
+        Global forecast accuracy is a DIAGNOSTIC, not a gate. The premise
+        section says plainly that global Brier superiority is neither
+        sufficient for positive net return nor necessary for a useful
+        conditional policy -- and an earlier version then made it a mandatory
+        GO criterion, contradicting itself. It is reported, not required.
+
+        The sample gate counts games the policy would have TRADED, not every
+        game forecast: a large unrelated universe must not satisfy the floor
+        for a tiny trading subset.
         """
-        c, r = self.comparison, self.returns
+        r = self.returns
         return [
             ("coverage complete", self.coverage.complete, str(self.coverage)),
-            ("sample above floor", not c.underpowered,
-             f"{c.games} distinct games ({c.rows} rows)"),
-            ("sharp forecasts better", bool(c.sharp_wins), c.verdict().split(":")[0]),
-            ("positive net return on the declared subset", r.profitable(),
+            ("traded sample above floor", r.games >= MIN_TRADED_GAMES,
+             f"{r.games} traded games ({r.trades} trades) vs floor {MIN_TRADED_GAMES}"),
+            ("positive net return on the frozen policy", r.profitable(),
              r.verdict().split(":")[0]),
         ]
+
+    def is_exploratory(self) -> bool:
+        """True until a chronological holdout and cost/delay robustness exist.
+
+        Neither is implemented here, so no run of this code can be a GO. The
+        label is structural, not a judgement about a particular result.
+        """
+        return True
 
     def render(self) -> str:
         lines: list[str] = []
@@ -560,10 +634,12 @@ class StudyReport:
 
         r = self.returns
         add("[2] NET RETURN on the predeclared eligible subset")
-        add(f"    filter: disagreement >= {r.eligibility.min_disagreement}, "
-            f"price in {r.eligibility.price_band}, "
+        add(f"    frozen policy: predicted net EV >= {r.eligibility.min_net_ev:+.3f}/contract, "
+            f"price in {r.eligibility.price_band}, spread <= {r.eligibility.max_spread:.2f}, "
             f"{r.eligibility.min_minutes_to_start:.0f}-"
             f"{r.eligibility.max_minutes_to_start:.0f} min to start")
+        add("    (selection is on PREDICTED EV at the executable price, not on")
+        add("     disagreement with the midpoint -- the midpoint is not tradeable)")
         add(f"    priced as {r.role} on {r.venue}, held to settlement")
         add(f"    -> {r.verdict()}")
         add("    Historical quotes carry no depth: this is indicative of an")
@@ -602,13 +678,22 @@ class StudyReport:
             add(f"    {s.period:>9} {s.games:>7,} {s.brier_delta:>+13.5f} {ci:>24} {ret:>11}")
         add("")
 
-        add("[6] GO CRITERIA")
-        for name, passed, detail in self.go_criteria():
+        add("[6] READINESS")
+        for name, passed, detail in self.readiness():
             add(f"    [{'PASS' if passed else 'no  '}] {name}")
             add(f"           {detail}")
         add("")
-        add("    All four must hold. None of them is sufficient alone, and failing")
-        add("    the accuracy test means INSUFFICIENT EVIDENCE, not a dead strategy.")
+        add(f"    [diag] forecast accuracy: {c.verdict().split(':')[0]}")
+        add("           Diagnostic only. Global Brier superiority is neither")
+        add("           sufficient for net return nor necessary for a useful")
+        add("           conditional policy, so it does not gate anything.")
+        add("")
+        if self.is_exploratory():
+            add("    >> RESULT IS EXPLORATORY, NOT A GO. <<")
+            add("    No chronological holdout and no delay/cost robustness check")
+            add("    exist in this code, so nothing it prints can clear that bar.")
+            add("    Passing every line above means the policy is worth testing")
+            add("    out of sample -- not that it is worth trading.")
         add("=" * 76)
         return "\n".join(lines)
 

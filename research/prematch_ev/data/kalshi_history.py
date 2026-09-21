@@ -273,8 +273,15 @@ def fetch_candlesticks(
     the cutoff has moved.
     """
     if use_archive is None:
-        age_days = (datetime.now(timezone.utc) - end).days
-        use_archive = age_days > 90
+        # NO AGE HEURISTIC. `now - end > 90 days` was the rule this module was
+        # told to stop using, and letting an unroutable market fall back to it
+        # quietly reinstates it for exactly the markets whose partition could
+        # not be established -- the ones most likely to be routed wrongly.
+        return [], Coverage().fail(
+            f"{ticker}: candlestick partition could not be established "
+            "(no enumeration provenance and no readable settlement time); "
+            "refusing to guess an endpoint"
+        )
 
     path = (
         HISTORICAL_PATH.format(ticker=ticker)
@@ -431,7 +438,12 @@ def enumerate_settled_markets(
                 if not ticker:
                     continue
                 seen_in[label] += 1
-                markets.setdefault(ticker, market)
+                if ticker not in markets:
+                    # Stamp where it came from: the routing fact the API itself
+                    # established, rather than one inferred from a timestamp.
+                    market[PARTITION_FIELD] = (
+                        PARTITION_LIVE if label == "live" else PARTITION_ARCHIVE)
+                    markets[ticker] = market
 
     if not markets and coverage.complete:
         coverage.fail(
@@ -441,30 +453,54 @@ def enumerate_settled_markets(
     return markets, coverage
 
 
+# Kalshi's documented settlement field is `settlement_ts`, an ISO STRING with
+# sub-second precision, e.g. "2026-09-21T02:22:34.56292Z". An earlier version
+# accepted it only as a number and listed `close_time` among its string keys,
+# so on a real payload it returned close_time -- roughly three minutes earlier
+# than actual settlement. Near the partition cutoff that routes a market to the
+# wrong endpoint.
+#
+# close/expiration are contract lifecycle facts, NOT settlement, and are no
+# longer consulted for this question at all.
+SETTLEMENT_KEYS_ISO = ("settlement_ts", "settled_time", "settlement_time")
+SETTLEMENT_KEYS_NUMERIC = ("settled_ts",)
+
+# Where a market was actually enumerated from. This is the authoritative
+# routing fact -- better than inferring a partition from a timestamp, because
+# it is what the API itself did.
+PARTITION_FIELD = "_partition"
+PARTITION_LIVE, PARTITION_ARCHIVE = "live", "historical"
+
+
 def settlement_time(market: dict) -> datetime | None:
-    """When the market settled, for routing candles to the right partition."""
-    for key in ("settled_ts", "settlement_ts", "close_ts", "expiration_ts"):
-        value = market.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return datetime.fromtimestamp(value, tz=timezone.utc)
-    for key in ("settled_time", "close_time", "expiration_time"):
+    """When the market settled. None when no documented field carries it."""
+    for key in SETTLEMENT_KEYS_ISO:
         value = market.get(key)
         if isinstance(value, str):
             try:
                 return datetime.fromisoformat(value.replace("Z", "+00:00"))
             except ValueError:
                 continue
+    for key in SETTLEMENT_KEYS_NUMERIC:
+        value = market.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return datetime.fromtimestamp(value, tz=timezone.utc)
     return None
 
 
 def uses_archive(market: dict, cutoff: datetime | None) -> bool | None:
     """Which candlestick partition holds this market's data.
 
-    Routed by the market's own SETTLEMENT time against the published cutoff,
-    not by how old a candle happens to be. Returns None when either is
-    unreadable, so the caller can record an unroutable market rather than
-    guessing an endpoint.
+    Prefers the ENUMERATION PROVENANCE -- which endpoint actually returned this
+    market -- and falls back to the settlement time against the published
+    cutoff. Returns None when neither answers, so the caller records an
+    unroutable market rather than guessing an endpoint.
     """
+    partition = market.get(PARTITION_FIELD)
+    if partition == PARTITION_ARCHIVE:
+        return True
+    if partition == PARTITION_LIVE:
+        return False
     if cutoff is None:
         return None
     settled = settlement_time(market)

@@ -56,6 +56,43 @@ Every item below was a real defect, each with a reproduction.
 Fixtures are now copied from observed responses rather than invented, which is
 what let defects 2 and 3 pass 77 tests.
 
+## Second review round — and one open blocker
+
+A replay of two real market payloads found that the first round of fixes still
+could not process real data. Eight further defects, all reproduced:
+
+| # | Defect | Effect |
+|---|---|---|
+| 1 | **No verified scheduled-start key exists** | `market_start_time` returned `None` for every real market; the tests passed because the fixtures invented `game_start_ts` |
+| 2 | Join filtered candidates on **time alone** | A MIL–BAL market was discarded as "ambiguous" because an unrelated BOS–NYY game started the same minute — it would have voided any busy slate |
+| 3 | Eligibility screened on **midpoint** disagreement | bid .40 / ask .60 / sharp .53 passed, buying YES at .60 + 2¢ fee: predicted **−0.09/contract** |
+| 4 | Only `last_update <= decision` was required | A snapshot **captured after** the decision was accepted — lookahead |
+| 5 | `settlement_ts` read only as a number | Fell through to `close_time`, ~3 min early, mis-routing near the cutoff |
+| 6 | No study-window filter | Every market in a series' whole history became a join failure; a clean one-day run could report catastrophic loss |
+| 7 | Batch rejections counted **once** | 10,000 missing-book events recorded as one rejection, coverage still `complete` |
+| 8 | Global Brier was a mandatory **GO** gate | Contradicted this file's own premise; sample gate counted untraded games |
+
+### ⚠ Open blocker: scheduled start time
+
+`VERIFIED_START_KEYS` is **empty**, deliberately. The real market payloads carry
+no field this code has verified as first pitch — `open_time` is the listing
+time and the sample occurrence time lands around game *end*, so neither is a
+substitute. Inventing seven more key names is what produced defect #1, and it
+would be the third time the same mistake was made.
+
+Until a field is confirmed from a recorded response, the join **degrades
+explicitly**:
+
+- Matching is on **participants** — the union of an event's YES suffixes *is*
+  the matchup, derived without splitting the ambiguous `MILBAL` event body.
+- Where the matchup is unique, the join succeeds and records
+  `start_verified=False`, using the sharp event's start.
+- **Doubleheaders are rejected**, not guessed, with
+  `doubleheader_unresolvable_no_verified_start_key`.
+
+`tests/test_collect.py` proves the seam works once a key is supplied. What is
+missing is the key name, and that needs a recorded payload.
+
 ## Reading the result
 
 Six sections. **No single number is a go signal.**
@@ -71,18 +108,35 @@ Six sections. **No single number is a go signal.**
    game mix and noise move it too.
 6. **Go criteria** — all four must hold.
 
-### Go criteria
+### Readiness, not GO
 
 ```
 coverage complete
-sample above the game floor
-sharp forecasts better          (CI excludes zero)
-positive net return             (CI excludes zero, on the declared subset)
+traded sample above floor        (games the POLICY would have traded)
+positive net return              (CI excludes zero, on the frozen policy)
+—
+forecast accuracy                DIAGNOSTIC ONLY, gates nothing
 ```
 
+Global Brier superiority is **not** a gate. It is neither sufficient for net
+return nor necessary for a useful conditional policy, and making it mandatory
+contradicted that. The sample gate counts games the policy would have *traded*,
+so a large unrelated universe cannot satisfy it for a tiny trading subset.
+
+**Every run of this code is EXPLORATORY.** No chronological holdout and no
+delay/cost robustness check exist here, so nothing it prints can be a GO.
+Passing every line means the policy is worth testing out of sample.
+
 **"Insufficient evidence" means insufficient evidence** — not that the strategy
-is dead. And the 200-game floor is a floor, not a power calculation: the
-interval is what says whether the evidence is enough.
+is dead. The 200-game floor is a floor, not a power calculation.
+
+### The selection rule is predicted net EV
+
+Eligibility screens on **predicted EV at the executable price** — YES at the
+ask, NO at `1 − bid`, each with its own fee — not on disagreement with the
+midpoint, which is not a price anyone trades at. Both sides are priced and the
+better predicted EV wins; the direction is not taken from the sign of a
+midpoint gap. Midpoint disagreement survives only as a diagnostic.
 
 ### Freeze before you look
 

@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from analysis.scoring import Eligibility, Observation, build_report  # noqa: E402
 from collect import (                                              # noqa: E402
-    Ledger, join_markets, observation_at_cutoff,
+    Ledger, in_study_window, join_markets, observation_at_cutoff,
 )
 from core import fees                                              # noqa: E402
 from core.matcher import match_event, unverified_note              # noqa: E402
@@ -55,8 +55,11 @@ def parse_args(argv=None):
     p.add_argument("--devig", choices=("shin", "multiplicative"), default="shin")
     p.add_argument("--max-quote-age", type=float, default=MAX_QUOTE_AGE_SECONDS,
                    help="reject a sharp quote older than this at the cutoff")
-    p.add_argument("--min-disagreement", type=float, default=0.02,
-                   help="predeclared eligibility filter for the return test")
+    p.add_argument("--min-net-ev", type=float, default=0.01,
+                   help="predeclared minimum PREDICTED net EV per contract, at "
+                        "the executable price after fee")
+    p.add_argument("--max-spread", type=float, default=0.10,
+                   help="widest book the policy will treat as executable")
     p.add_argument("--api-key", help="Odds API key (or set ODDS_API_KEY)")
     p.add_argument("--plan", action="store_true", help="print the budget and exit")
     p.add_argument("--probe", action="store_true", help="find archive depth and exit")
@@ -112,54 +115,88 @@ def collect(args, key: str):
     """Pull both sides, join on identity, and build observations at one cutoff.
 
     Returns (observations, coverage, credit ledger, collection ledger). Every
-    stage records a denominator and every drop records a reason -- see
-    collect.Ledger for why an aggregate print was not enough.
+    stage carries its own denominator in its own units and every drop carries a
+    reason and a count -- see collect.Ledger.
     """
     coverage = Coverage()
     credits = CreditLedger()
     ledger = Ledger()
-    start, end = _date(args.start), _date(args.end)
+    start = _date(args.start)
+    # `--to` is INCLUSIVE, so the exclusive bound is the following midnight.
+    # With `cursor <= midnight(end)` the final day got only its midnight
+    # snapshot, silently truncating the last day of every window.
+    end_inclusive = _date(args.end)
+    end_exclusive = end_inclusive + timedelta(days=1)
 
-    # --- exchange side: BOTH partitions -------------------------------------
+    # --- exchange side: BOTH partitions, then restricted to the window ------
     cutoff, cutoff_cov = fetch_historical_cutoff()
     coverage.merge(cutoff_cov)
-    markets, market_cov = enumerate_settled_markets(args.series)
+    all_markets, market_cov = enumerate_settled_markets(args.series)
     coverage.merge(market_cov)
-    ledger.count("markets_enumerated", len(markets))
+    ledger.count("contracts", len(all_markets), unit="contracts")
+
+    markets: dict[str, dict] = {}
+    outside = undatable = 0
+    for ticker, market in all_markets.items():
+        verdict = in_study_window(market, start, end_exclusive)
+        if verdict is True:
+            markets[ticker] = market
+        elif verdict is False:
+            outside += 1
+        else:
+            undatable += 1
+    if outside:
+        # A market the study deliberately skipped is not a gap in what it could
+        # see. Counting these as failures made a fully collected one-day run
+        # report massive unexplained loss.
+        ledger.exclude("settled_outside_study_window", count=outside,
+                       stage="contracts")
+    if undatable:
+        ledger.reject("settlement_time_unreadable", f"{undatable} markets",
+                      count=undatable, stage="contracts")
+
     unroutable = sum(1 for m in markets.values() if uses_archive(m, cutoff) is None)
     if unroutable:
-        ledger.reject("candle_partition_unroutable", f"{unroutable} markets")
-    print(f"  kalshi: {len(markets):,} settled markets across both partitions "
-          f"(cutoff {cutoff.date() if cutoff else 'UNKNOWN'}) ({coverage})")
+        ledger.reject("candle_partition_unroutable", f"{unroutable} markets",
+                      count=unroutable, stage="contracts")
+    print(f"  kalshi: {len(all_markets):,} settled markets -> {len(markets):,} in window "
+          f"({outside:,} outside, cutoff {cutoff.date() if cutoff else 'UNKNOWN'})")
 
     # --- sharp side: one call per snapshot ----------------------------------
     quotes_by_event: dict[str, list] = {}
     cursor, step = start, timedelta(hours=24 / max(1, args.snapshots_per_day))
     snapshots = 0
-    while cursor <= end:
+    while cursor < end_exclusive:
         if credits.exhausted():
             coverage.fail(f"odds quota exhausted at {cursor.date()}; window truncated")
             break
         snap = fetch_snapshot(args.sport, cursor, key, ledger=credits)
         coverage.merge(snap.coverage)
         snapshots += 1
-        ledger.count("odds_events_seen", snap.events_seen)
+        ledger.count("odds_events", snap.events_seen, unit="event-quotes")
         if snap.events_without_sharp_book:
-            ledger.reject("event_without_sharp_book",
-                          f"{snap.events_without_sharp_book} at {cursor.isoformat()}")
+            ledger.reject("event_without_sharp_book", f"at {cursor.isoformat()}",
+                          count=snap.events_without_sharp_book, stage="odds_events")
+        if snap.events_without_id:
+            ledger.reject("odds_event_without_id", f"at {cursor.isoformat()}",
+                          count=snap.events_without_id, stage="odds_events")
         if snap.quotes_without_update_time:
-            ledger.reject("sharp_quote_without_update_time",
-                          f"{snap.quotes_without_update_time} at {cursor.isoformat()}")
+            ledger.reject("sharp_quote_without_update_time", f"at {cursor.isoformat()}",
+                          count=snap.quotes_without_update_time, stage="odds_events")
         for quote in snap.quotes:
             quotes_by_event.setdefault(quote.provider_event_id, []).append(quote)
         cursor += step
-    ledger.count("odds_snapshots_fetched", snapshots)
-    ledger.count("sharp_events_collected", len(quotes_by_event))
-    print(f"  odds:   {len(quotes_by_event):,} sharp events over {snapshots:,} "
-          f"snapshots ({credits})")
+    ledger.count("odds_snapshots", snapshots, unit="snapshots")
+    print(f"  odds:   {len(quotes_by_event):,} sharp events over {snapshots:,} snapshots "
+          f"({credits})")
 
-    # --- join on identity ----------------------------------------------------
+    # --- join on participants, then time ------------------------------------
     joined = join_markets(markets, quotes_by_event, args.sport, ledger)
+    ledger.count("joined_contracts", len(joined), unit="contracts")
+    unverified_starts = sum(1 for j in joined if not j.start_verified)
+    if unverified_starts:
+        print(f"  NOTE: {unverified_starts:,} joins used the SHARP event's start time; "
+              "no verified exchange start key is configured")
     print(f"  joined: {len(joined):,} contracts matched to a sharp event")
 
     # --- one decision timestamp per game -------------------------------------
@@ -181,10 +218,10 @@ def collect(args, key: str):
         if obs is not None:
             observations.append(obs)
 
-    ledger.count("observations_built", len(observations))
+    ledger.count("observations", len(observations), unit="contracts")
     ledger.apply_to(coverage)
     print(f"  built:  {len(observations):,} observations "
-          f"({ledger.total_rejected:,} dropped, see ledger)")
+          f"({ledger.total_rejected:,} records dropped, see ledger)")
     return observations, coverage, credits, ledger
 
 
@@ -215,7 +252,8 @@ def main(argv=None) -> int:
 
     report = build_report(
         observations, coverage, fees.describe(),
-        eligibility=Eligibility(min_disagreement=args.min_disagreement),
+        eligibility=Eligibility(min_net_ev=args.min_net_ev,
+                                max_spread=args.max_spread),
         ledger_text=ledger.render(),
     )
     print()
@@ -238,7 +276,8 @@ def main(argv=None) -> int:
             "snapshots_per_day": args.snapshots_per_day,
             "devig": args.devig,
             "max_quote_age_seconds": args.max_quote_age,
-            "min_disagreement": args.min_disagreement,
+            "min_net_ev": args.min_net_ev,
+            "max_spread": args.max_spread,
             "fees": fees.describe(),
         },
     }, indent=2), encoding="utf-8")
