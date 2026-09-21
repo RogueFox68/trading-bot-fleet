@@ -133,6 +133,37 @@ def unverified_note() -> str:
 # added on a hunch: `normalise_exchange_code` returns the input unchanged and
 # the join records the unresolved code by name, so one run enumerates the rest
 # rather than a guess hiding them.
+# HOW A LEAGUE'S SCHEDULED START IS DERIVED, per a VERIFIED payload shape.
+#
+# STRUCTURAL parsing is league-agnostic -- series, event ticker and YES
+# participant come out of any of these. DERIVING A START IS NOT, and conflating
+# the two is how NFL looked supported when it is not:
+#
+#   MLB  26SEP152140MIAAZ   date + HHMM + teams   -> the start is in the ticker
+#   NFL  26SEP14DENKC       date + teams, NO TIME -> the ticker cannot say when
+#
+# NFL is deliberately ABSENT rather than mapped to a guess. A date-only body
+# gives a day, not a kickoff, and the checkpoint grid is measured in hours.
+#
+# It must NOT be inferred from `close_time`, `expected_expiration_time` or
+# `settlement_ts`: on the sampled KC contract those are 03:15:19Z, 03:15:00Z
+# and 03:21:19Z on the day AFTER the game -- they describe the end of the
+# contract, not the start of the match. A study whose lead times are measured
+# backwards from the final whistle is measuring the wrong thing precisely.
+START_SOURCES: dict[str, str] = {
+    "MLB": "event_ticker",
+}
+
+
+def start_source(league: str) -> str | None:
+    """Where this league's scheduled start comes from, or None if nowhere."""
+    return START_SOURCES.get((league or "").upper())
+
+
+def league_has_schedule(league: str) -> bool:
+    return start_source(league) is not None
+
+
 def supported_leagues() -> tuple[str, ...]:
     """Leagues this code can actually resolve team identity for.
 

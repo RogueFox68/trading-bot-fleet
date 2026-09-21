@@ -20,12 +20,80 @@ how "we could not see it" becomes "there was nothing there".
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from collect import Ledger, SupportReport, join_markets, support_report
-from core.matcher import ROSTERS, league_is_supported, supported_leagues
+from collect import (
+    Ledger, SupportReport, join_markets, market_start_time,
+    parse_event_body_start, support_report,
+)
+from core.matcher import (
+    ROSTERS, league_has_schedule, league_is_supported, parse_kalshi_game_ticker,
+    start_source, supported_leagues,
+)
 from data.odds_history import SPORT_KEYS, SharpQuote
 import run_study
 
 UTC = timezone.utc
+
+
+# REAL tickers, read off live KXNFLGAME contracts during PR #27's review.
+# Note what is NOT here: a time. `26SEP14DENKC` is a date and two teams.
+#
+# The synthetic `KXNFLGAME-26SEP211300BUFKC` used in an earlier round had
+# `1300` in the middle because I put it there. It parsed a start perfectly and
+# proved nothing -- the fourth time in this study that a fixture built from an
+# assumption agreed with the assumption. These are copied, not composed.
+REAL_NFL_TICKERS = (
+    "KXNFLGAME-26SEP14DENKC-KC",
+    "KXNFLGAME-26SEP13DALNYG-NYG",
+)
+# From the sampled KC contract. Every one of these is the END of the contract,
+# on the day AFTER kickoff. None of them is a start.
+KC_END_OF_GAME_FIELDS = {
+    "close_time": "2026-09-15T03:15:19Z",
+    "expected_expiration_time": "2026-09-15T03:15:00Z",
+    "settlement_ts": "2026-09-15T03:21:19.283583Z",
+}
+
+
+class NflTickerHasNoKickoffTest(unittest.TestCase):
+    """Structural parsing is league-agnostic. Deriving a START is not.
+
+    I claimed otherwise, on the strength of a ticker I had invented.
+    """
+
+    def test_the_structural_parse_still_works(self):
+        for ticker in REAL_NFL_TICKERS:
+            parsed = parse_kalshi_game_ticker(ticker)
+            self.assertIsNotNone(parsed, ticker)
+            self.assertEqual(parsed["series"], "KXNFLGAME")
+            self.assertTrue(parsed["yes_participant"])
+
+    def test_but_no_start_can_be_derived(self):
+        for ticker in REAL_NFL_TICKERS:
+            event = parse_kalshi_game_ticker(ticker)["event_ticker"]
+            self.assertIsNone(parse_event_body_start(event),
+                              f"{event} has no kickoff to find")
+
+    def test_the_mlb_body_does_carry_one(self):
+        """The contrast that makes this a per-league fact, not a parser bug."""
+        event = parse_kalshi_game_ticker(
+            "KXMLBGAME-26SEP152140MIAAZ-MIA")["event_ticker"]
+        self.assertIsNotNone(parse_event_body_start(event))
+
+    def test_end_of_contract_fields_are_never_a_start(self):
+        """close_time, expected_expiration_time and settlement_ts are all on
+        the day AFTER kickoff. A study whose lead times count back from the
+        final whistle is measuring the wrong thing precisely."""
+        market = {"ticker": REAL_NFL_TICKERS[0],
+                  "event_ticker": "KXNFLGAME-26SEP14DENKC",
+                  **KC_END_OF_GAME_FIELDS}
+        self.assertIsNone(market_start_time(market),
+                          "a start was inferred from an end-of-contract field")
+
+    def test_nfl_declares_no_start_source(self):
+        self.assertIsNone(start_source("NFL"))
+        self.assertFalse(league_has_schedule("NFL"))
+        self.assertEqual(start_source("MLB"), "event_ticker")
+        self.assertTrue(league_has_schedule("MLB"))
 
 
 class SupportedLeagueTest(unittest.TestCase):
@@ -50,15 +118,35 @@ class SupportedLeagueTest(unittest.TestCase):
         self.assertFalse(report.ready)
         self.assertIsNone(report.odds_key)
         self.assertEqual(report.roster_teams, 0)
-        self.assertEqual(len(report.blockers()), 2)
+        self.assertIsNone(report.start_source)
+        # Three, not two: odds key, roster, AND schedule source.
+        self.assertEqual(len(report.blockers()), 3)
 
 
 class SupportReportTest(unittest.TestCase):
-    def test_nfl_is_join_ready(self):
+    def test_nfl_is_roster_ready_but_not_schedule_ready(self):
+        """THE distinction. These were one flag, and NFL passed it -- 32 teams,
+        a valid odds key -- while every contract failed on
+        no_readable_start_time. A report saying "ready" over a sport that
+        cannot produce one observation is worse than no report."""
         report = support_report("NFL", "KXNFLGAME")
-        self.assertTrue(report.ready)
+        self.assertTrue(report.roster_ready)
+        self.assertFalse(report.schedule_ready)
+        self.assertFalse(report.ready, "collectable needs BOTH")
         self.assertEqual(report.odds_key, "americanfootball_nfl")
         self.assertEqual(report.roster_teams, 32)
+
+    def test_the_nfl_blocker_names_the_schedule_and_warns_off_the_shortcut(self):
+        blockers = " ".join(support_report("NFL", "KXNFLGAME").blockers())
+        self.assertIn("scheduled-start source", blockers)
+        for field in ("close_time", "expected_expiration_time", "settlement_ts"):
+            self.assertIn(field, blockers)
+
+    def test_mlb_is_both(self):
+        report = support_report("MLB", "KXMLBGAME")
+        self.assertTrue(report.roster_ready)
+        self.assertTrue(report.schedule_ready)
+        self.assertTrue(report.ready)
         self.assertEqual(report.blockers(), [])
 
     def test_nfl_carries_the_missing_alias_caveat(self):
@@ -83,8 +171,8 @@ class SupportReportTest(unittest.TestCase):
 
     def test_ready_does_not_claim_data_exists(self):
         """The distinction the whole MLB result turned on."""
-        report = SupportReport("NFL", "americanfootball_nfl", 32, 0,
-                               "KXNFLGAME", False)
+        report = SupportReport("MLB", "baseball_mlb", 30, 1, "KXMLBGAME",
+                               True, "event_ticker")
         self.assertTrue(report.ready)
         self.assertEqual(report.blockers(), [])
 
@@ -97,6 +185,13 @@ class RefusedBeforeSpendTest(unittest.TestCase):
             "--sport", sport, "--series", series,
             "--from", "2026-09-01", "--to", "2026-09-02", "--cache-dir", ""])
         return run_study.survey(args)
+
+    def test_nfl_is_refused_before_spend_for_its_missing_schedule(self):
+        """The live preflight bought nothing and still reported exit 0."""
+        markets, cutoffs, _, coverage, _, _, _ = self._survey("NFL", "KXNFLGAME")
+        self.assertFalse(coverage.complete)
+        self.assertEqual(cutoffs, [])
+        self.assertIn("scheduled-start source", str(coverage))
 
     def test_a_roster_less_sport_fails_coverage_with_no_cutoffs(self):
         markets, cutoffs, _, coverage, _, _, matrix = self._survey("NBA", "KXNBAGAME")
@@ -114,14 +209,21 @@ class RefusedBeforeSpendTest(unittest.TestCase):
         code = run_study.main(["--support", "--sport", "NBA", "--series", "KXNBAGAME"])
         self.assertEqual(code, 1)
 
-    def test_support_exits_zero_for_a_ready_sport(self):
-        code = run_study.main(["--support", "--sport", "NFL", "--series", "KXNFLGAME"])
+    def test_support_exits_zero_for_a_collectable_sport(self):
+        code = run_study.main(["--support", "--sport", "MLB", "--series", "KXMLBGAME"])
         self.assertEqual(code, 0)
+
+    def test_support_exits_nonzero_for_nfl_until_it_has_a_schedule(self):
+        """Roster-ready is not collectable. This test was written against NFL
+        as the READY example, and it is the one that broke when the two were
+        separated -- which is the whole point of separating them."""
+        code = run_study.main(["--support", "--sport", "NFL", "--series", "KXNFLGAME"])
+        self.assertEqual(code, 1)
 
     def test_support_costs_nothing_and_needs_no_window(self):
         """It reads the code. No api key, no dates, no network."""
         self.assertEqual(
-            run_study.main(["--support", "--sport", "NFL", "--series", "KXNFLGAME"]), 0)
+            run_study.main(["--support", "--sport", "MLB", "--series", "KXMLBGAME"]), 0)
 
 
 class JoinFailsWithoutARosterTest(unittest.TestCase):

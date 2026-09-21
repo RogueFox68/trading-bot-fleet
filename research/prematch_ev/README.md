@@ -427,13 +427,42 @@ those snapshots are **already cached** and therefore free.
 `python3 run_study.py --support --sport NFL --series KXNFLGAME` reads this out
 of the code. No network, no key, no cost.
 
-| league | odds key | roster | aliases | dated fees | join-ready |
-|---|---|---|---|---|---|
-| MLB | `baseball_mlb` | 30 | 1 (`AZ→ARI`) | **yes** | yes |
-| NFL | `americanfootball_nfl` | 32 | **0** | no | yes |
-| NBA | `basketball_nba` | **0** | 0 | no | **no** |
-| NHL | `icehockey_nhl` | **0** | 0 | no | **no** |
-| NCAAF | **none** | **0** | 0 | no | **no** |
+| league | odds key | roster | start source | roster-ready | schedule-ready | collectable |
+|---|---|---|---|---|---|---|
+| MLB | `baseball_mlb` | 30 | `event_ticker` | yes | yes | **yes** |
+| NFL | `americanfootball_nfl` | 32 | **none** | yes | **no** | **no** |
+| NBA | `basketball_nba` | **0** | none | no | no | **no** |
+| NHL | `icehockey_nhl` | **0** | none | no | no | **no** |
+| NCAAF | **none** | **0** | none | no | no | **no** |
+
+**Roster-ready and schedule-ready are different questions, and NFL is why they
+are reported apart.** Structural ticker parsing *is* league-agnostic — series,
+event and YES participant come out of any of these. **Deriving a start is not:**
+
+```
+MLB  26SEP152140MIAAZ   date + HHMM + teams   -> the start is in the ticker
+NFL  26SEP14DENKC       date + teams, NO TIME -> the ticker cannot say when
+```
+
+NFL has 32 teams and a valid odds key, and every one of its contracts fails on
+`no_readable_start_time`. A single "ready" flag said yes.
+
+`START_SOURCES` therefore declares per league where a start comes from, and NFL
+is **deliberately absent** rather than mapped to a guess: a date-only body gives
+a day, and the checkpoint grid is measured in hours. It must not be inferred
+from `close_time`, `expected_expiration_time` or `settlement_ts` — on the
+sampled KC contract those are 03:15:19Z, 03:15:00Z and 03:21:19Z on the day
+*after* the game. A study whose lead times count back from the final whistle is
+measuring the wrong thing precisely.
+
+**An empty universe is not a free study.** The live NFL preflight went
+826 settled → 32 retrieved → **0 eligible**, all 32 rejected as
+`no_readable_start_time` — and reported *coverage complete, cost 0, exit 0*.
+The ledger had measured the loss correctly and printed `contracts lost 32
+(100%)` right beside it; nothing consulted it. `collect()` applied the loss
+ledger to coverage, the **free** path never did — so the cheapest way to run
+the study was also the only way to have it certify itself. `survey()` now
+applies it before returning.
 
 **`--sport NBA` used to be accepted, survive preflight, and fail at JOIN time**
 — after every snapshot had been paid for — because the join maps bookmaker team
@@ -569,7 +598,7 @@ python3 run_study.py ... --fee-route direct   # headline on the other account ro
 python3 run_study.py ... --lead-grid 72h,48h,24h,12h,6h,3h --entry-delay-minutes 10
 ```
 
-Tests: `python3 -m unittest discover -s tests -t .` — 360 tests, no network, no
+Tests: `python3 -m unittest discover -s tests -t .` — 369 tests, no network, no
 credentials, and they pass with or without `rapidfuzz`.
 
 Artifacts land in `study_output/`: `report.txt`, `observations.json` (schema 2 —

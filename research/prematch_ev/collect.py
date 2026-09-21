@@ -46,7 +46,7 @@ from zoneinfo import ZoneInfo
 
 from core.matcher import (
     EVENT_BODY_TIMEZONE, EXCHANGE_CODE_ALIASES, ROSTERS,
-    kalshi_event_ticker, normalise_exchange_code,
+    kalshi_event_ticker, normalise_exchange_code, start_source,
     parse_event_body_start, parse_kalshi_game_ticker, resolve_team,
     unknown_exchange_codes,
 )
@@ -649,10 +649,29 @@ class SupportReport:
     alias_count: int
     series: str | None
     fee_schedule: bool
+    start_source: str | None = None
+
+    @property
+    def roster_ready(self) -> bool:
+        """Team identity resolves: the JOIN can match names to codes."""
+        return bool(self.odds_key) and self.roster_teams > 0
+
+    @property
+    def schedule_ready(self) -> bool:
+        """A scheduled START can be derived. A DIFFERENT question."""
+        return self.start_source is not None
 
     @property
     def ready(self) -> bool:
-        return bool(self.odds_key) and self.roster_teams > 0
+        """Collectable: identity AND a schedule. Both, or neither is enough.
+
+        These were one flag, and NFL passed it -- 32 teams and a valid odds
+        key -- while every one of its contracts failed on `no_readable_start_time`,
+        because an NFL event body carries no kickoff. A report that says
+        "ready" over a sport that cannot produce a single observation is worse
+        than no report.
+        """
+        return self.roster_ready and self.schedule_ready
 
     def blockers(self) -> list[str]:
         out: list[str] = []
@@ -664,6 +683,15 @@ class SupportReport:
                        "(core.matcher.ROSTERS) -- every game would fail the "
                        "join as sharp_teams_unresolvable, AFTER paying for "
                        "its snapshots")
+        if not self.schedule_ready:
+            out.append(f"no verified scheduled-start source for {self.league!r} "
+                       "(core.matcher.START_SOURCES). Real event bodies for "
+                       "this league carry a DATE and no kickoff time, so every "
+                       "contract fails on no_readable_start_time and the "
+                       "checkpoint grid -- which is measured in hours -- has "
+                       "nothing to count back from. close_time, "
+                       "expected_expiration_time and settlement_ts describe "
+                       "the END of the contract and must not be substituted.")
         return out
 
     def caveats(self) -> list[str]:
@@ -694,6 +722,7 @@ def support_report(league: str, series: str | None = None) -> SupportReport:
         alias_count=len(EXCHANGE_CODE_ALIASES.get(key, {})),
         series=series,
         fee_schedule=bool(series and fees.series_schedule(series)),
+        start_source=start_source(key),
     )
 
 

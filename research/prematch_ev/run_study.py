@@ -271,15 +271,27 @@ def support(args) -> int:
     print(f"  roster teams         {report.roster_teams}")
     print(f"  exchange aliases     {report.alias_count}")
     print(f"  dated fee schedule   {'yes' if report.fee_schedule else 'NO (generic rates)'}")
-    print(f"  JOIN READY           {'yes' if report.ready else 'NO'}")
+    print(f"  start source         {report.start_source or 'NONE'}")
+    print()
+    print(f"  roster-ready         {'yes' if report.roster_ready else 'NO'}"
+          "   (team identity resolves)")
+    print(f"  schedule-ready       {'yes' if report.schedule_ready else 'NO'}"
+          "   (a kickoff time can be derived)")
+    print(f"  COLLECTABLE          {'yes' if report.ready else 'NO'}"
+          "   (needs BOTH)")
     for blocker in report.blockers():
         print(f"  !! BLOCKER  {blocker}")
     for caveat in report.caveats():
         print(f"  ?  CAVEAT   {caveat}")
     print()
-    print("  'ready' means the JOIN can work. It does NOT mean data exists at")
-    print("  any given lead time -- listing lead times and historical sharp")
-    print("  coverage are separate questions that only a live audit answers.")
+    print("  Roster-ready and schedule-ready are DIFFERENT questions, and NFL")
+    print("  is the reason they are reported apart: 32 teams and a valid odds")
+    print("  key, yet every contract fails on no_readable_start_time because an")
+    print("  NFL event body carries a date and no kickoff.")
+    print()
+    print("  Even COLLECTABLE does not mean data exists at any given lead time.")
+    print("  Listing lead times and historical sharp coverage are separate")
+    print("  questions again, which only a live audit answers.")
     print()
     print(f"  leagues with a roster: {', '.join(supported_leagues())}")
     return 0 if report.ready else 1
@@ -401,6 +413,21 @@ def survey(args):
             f"{len(markets):,} contracts are in the window but no decision "
             f"cutoff was derived at leads {grid_describe(grid)}; "
             "widen --from or shorten --lead-grid"
+        )
+
+    # AN EMPTY UNIVERSE IS NOT A FREE STUDY. The ledger already knew that 32
+    # of 32 contracts were lost to `no_readable_start_time` -- it printed
+    # "contracts lost 32 (100%)" -- while the preflight beside it reported
+    # coverage complete, cost 0, exit 0. The loss was measured and then not
+    # consulted (rule 21: a log line is not a control). `collect()` applied
+    # this; the FREE path never did, so the cheapest way to run the study was
+    # also the only way to have it certify itself.
+    ledger.apply_to(coverage)
+    if not markets and ledger.total_rejected:
+        coverage.fail(
+            f"no contract survived to be studied: {ledger.total_rejected:,} "
+            "were rejected. A zero-cost run over an empty universe is a "
+            "failure that happens to be cheap, not a success."
         )
 
     return markets, cutoffs, cutoff, coverage, ledger, grid, matrix
