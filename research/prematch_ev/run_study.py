@@ -121,6 +121,11 @@ def _date(value: str) -> datetime:
 # would drop those rows for being one minute early.
 LEAD_CEILING_SLACK = 60.0
 
+# `observations.json` layout. Bumped when a field CHANGES MEANING, not just
+# when one is added: schema 1 called the decision book `bid`/`ask` and
+# documented it as the entry book.
+OBSERVATION_SCHEMA = 2
+
 
 def lead_grid_for(args) -> tuple[Checkpoint, ...]:
     """The checkpoints this run observes, earliest lead first.
@@ -645,25 +650,41 @@ def main(argv=None) -> int:
 
     write_coverage()
     (out / "report.txt").write_text(report.render(), encoding="utf-8")
+    # SCHEMA 2 renamed bid/ask and added the execution book. Version it
+    # rather than reusing the old names: schema 1's `bid`/`ask` were described
+    # as the entry book, and silently changing what a field MEANS is worse
+    # than changing what it is called -- an old reader would keep working and
+    # keep being wrong. A delayed run that saved only one book could not be
+    # reproduced from its own artifacts at all.
     (out / "observations.json").write_text(
-        json.dumps([{
-            "game_id": o.game_id, "market_id": o.market_id,
-            "decision_at": o.decision_at.isoformat(),
-            "sharp_at": o.sharp_at.isoformat() if o.sharp_at else None,
-            "exchange_at": o.exchange_at.isoformat() if o.exchange_at else None,
-            "minutes_to_start": o.minutes_to_start,
-            "yes_participant": o.yes_participant,
-            "p_sharp": o.p_sharp, "p_exchange": o.p_exchange,
-            "outcome": o.outcome, "bid": o.exchange_bid, "ask": o.exchange_ask,
-            "devig_method": o.devig_method,
-            # The checkpoint and the entry are separate facts from the
-            # observation: with a reaction delay, bid/ask above are the ENTRY
-            # book, while p_exchange is the price that was observed.
-            "checkpoint_minutes": o.checkpoint_minutes,
-            "checkpoint": o.checkpoint_label,
-            "entry_at": o.entry_at.isoformat() if o.entry_at else None,
-            "entry_delay_minutes": o.entry_delay_minutes,
-        } for o in observations], indent=2), encoding="utf-8")
+        json.dumps({
+            "schema": OBSERVATION_SCHEMA,
+            "semantics": (
+                "decision_* is the book SEEN AT decision_at and is what the "
+                "screen and the side selection used; entry_* is the book AT "
+                "entry_at and is what execution paid. They are the same candle "
+                "when entry_delay_minutes is 0."
+            ),
+            "observations": [{
+                "game_id": o.game_id, "market_id": o.market_id,
+                "decision_at": o.decision_at.isoformat(),
+                "sharp_at": o.sharp_at.isoformat() if o.sharp_at else None,
+                "sharp_snapshot_at": (o.sharp_snapshot_at.isoformat()
+                                      if o.sharp_snapshot_at else None),
+                "exchange_at": o.exchange_at.isoformat() if o.exchange_at else None,
+                "minutes_to_start": o.minutes_to_start,
+                "yes_participant": o.yes_participant,
+                "p_sharp": o.p_sharp, "p_exchange": o.p_exchange,
+                "outcome": o.outcome,
+                "decision_bid": o.exchange_bid, "decision_ask": o.exchange_ask,
+                "entry_bid": o.entry_bid, "entry_ask": o.entry_ask,
+                "entry_at": o.entry_at.isoformat() if o.entry_at else None,
+                "entry_delay_minutes": o.entry_delay_minutes,
+                "checkpoint_minutes": o.checkpoint_minutes,
+                "checkpoint": o.checkpoint_label,
+                "devig_method": o.devig_method,
+            } for o in observations],
+        }, indent=2), encoding="utf-8")
     print(f"\nwrote {out}/report.txt, observations.json and coverage.json ({credits})")
     return 0 if coverage.complete else 1
 

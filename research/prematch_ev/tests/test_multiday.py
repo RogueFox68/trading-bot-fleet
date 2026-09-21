@@ -25,8 +25,12 @@ report rather than an error.
                             ONE outcome, not seven independent bets
 """
 
+import json
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest import mock
 
 from analysis.scoring import (
     DEFAULT_MAX_MINUTES_TO_START, Eligibility, EntryPolicy, Observation,
@@ -40,6 +44,7 @@ from collect import (
     in_study_window, listing_status, observation_with_status, parse_lead_grid,
 )
 from data.kalshi_history import Coverage
+from data.odds_history import CreditLedger
 import run_study
 
 from tests.test_collect import Candle, GAME1, event_ticker, market, milbal, quote
@@ -648,6 +653,217 @@ class CommittedSignalTest(unittest.TestCase):
         self.assertEqual(a.side, b.side)
         self.assertEqual(a.predicted_ev, b.predicted_ev, "the screen is identical")
         self.assertGreater(a.profit, b.profit, "but the outcome is worse")
+
+
+class UnexecutableDelayedEntryTest(unittest.TestCase):
+    """A delayed side with no usable execution price is NOT filled.
+
+    `side_quotes` priced such a side at the DECISION book, because
+    `SideQuote.paid` falls back when `exec_price` is None. So a side that
+    could only have executed at 1.00 reported paying the 0.51 it was quoted at
+    the decision -- the same silent substitution the delay knob exists to
+    measure, one layer further down, and always in the flattering direction.
+    """
+
+    ELIG = Eligibility(min_net_ev=0.0)
+
+    def _obs(self, **kw):
+        return Observation("G", "M", datetime(2026, 9, 5, tzinfo=UTC), 1440.0,
+                           0.8, 0.50, 1, exchange_bid=0.49, exchange_ask=0.51,
+                           checkpoint_minutes=1440.0, **kw)
+
+    def test_an_out_of_bounds_execution_price_is_not_a_fill(self):
+        """The reproduction from review: execution ask of 1.00."""
+        o = self._obs(entry_bid=0.99, entry_ask=1.0, entry_delay_minutes=10.0)
+        self.assertIsNone(as_trade(o, eligibility=self.ELIG))
+
+    def test_a_crossed_execution_book_is_not_a_book(self):
+        """The collector admits a candle on its mid and price sanity, not on
+        whether the two sides are ordered."""
+        o = self._obs(entry_bid=0.70, entry_ask=0.60, entry_delay_minutes=10.0)
+        self.assertIsNone(as_trade(o, eligibility=self.ELIG))
+
+    def test_an_absent_execution_book_is_not_the_decision_book(self):
+        o = self._obs(entry_delay_minutes=10.0)
+        self.assertIsNone(as_trade(o, eligibility=self.ELIG))
+
+    def test_a_one_sided_execution_book_fills_neither_side(self):
+        o = self._obs(entry_bid=0.60, entry_delay_minutes=10.0)
+        self.assertIsNone(as_trade(o, eligibility=self.ELIG))
+
+    def test_a_valid_execution_price_is_what_gets_paid(self):
+        o = self._obs(entry_bid=0.60, entry_ask=0.62, entry_delay_minutes=10.0)
+        trade = as_trade(o, eligibility=self.ELIG)
+        self.assertAlmostEqual(trade.paid, 0.64, places=9)
+        self.assertNotAlmostEqual(trade.paid, trade.entry_price + trade.fee)
+
+    def test_zero_delay_reuses_the_decision_book_by_definition(self):
+        """The fallback is legitimate here and ONLY here: same candle."""
+        o = self._obs()
+        trade = as_trade(o, eligibility=self.ELIG)
+        self.assertAlmostEqual(trade.paid, trade.entry_price + trade.fee, places=12)
+
+    def test_a_delayed_quote_always_carries_its_execution_price(self):
+        """The invariant that makes `paid`'s fallback unreachable when delayed."""
+        o = self._obs(entry_bid=0.60, entry_ask=0.62, entry_delay_minutes=10.0)
+        for q in side_quotes(o):
+            self.assertTrue(q.delayed)
+            self.assertIsNotNone(q.exec_price)
+            self.assertIsNotNone(q.exec_fee)
+
+    def test_the_execution_fee_is_resolved_at_the_execution_time(self):
+        """A delay can cross a dated fee-schedule boundary. Pricing the
+        execution at the DECISION's schedule would bill September's halved
+        multiplier for an August trade, or the reverse."""
+        from core.fees import fee_for
+        before = datetime(2026, 8, 7, 4, 30, tzinfo=UTC)      # multiplier 1
+        after = datetime(2026, 8, 7, 5, 30, tzinfo=UTC)       # multiplier 0.5
+        o = Observation("G", "M", before, 1440.0, 0.8, 0.50, 1,
+                        exchange_bid=0.49, exchange_ask=0.51,
+                        entry_bid=0.49, entry_ask=0.51,
+                        entry_at=after, entry_delay_minutes=60.0)
+        quote = [q for q in side_quotes(o, series="KXMLBGAME") if q.side == "YES"][0]
+        self.assertAlmostEqual(
+            quote.exec_fee,
+            fee_for("kalshi", 1.0, 0.51, "taker", "KXMLBGAME", after).dollars,
+            places=12)
+        self.assertNotAlmostEqual(quote.exec_fee, quote.fee, places=12)
+
+
+class MonthBoundaryExposureTest(unittest.TestCase):
+    """A game cannot regain exposure at a month boundary.
+
+    `decay_series` selected entries INSIDE each month, so one game entered in
+    August at its 72h checkpoint and again in September at its 24h one. Not
+    hypothetical here: the early checkpoints of a Sept 1 game land in August.
+    """
+
+    def _straddling(self):
+        return [
+            Observation("G", "M", datetime(2026, 8, 31, 20, 0, tzinfo=UTC),
+                        720.0, 0.60, 0.50, 1, exchange_bid=0.49,
+                        exchange_ask=0.51, checkpoint_minutes=720.0),
+            Observation("G", "M", datetime(2026, 9, 1, 8, 0, tzinfo=UTC),
+                        60.0, 0.60, 0.50, 1, exchange_bid=0.49,
+                        exchange_ask=0.51, checkpoint_minutes=60.0),
+        ]
+
+    def test_only_one_month_reports_a_trade(self):
+        months = decay_series(self._straddling(), Eligibility(min_net_ev=0.0),
+                              bootstrap_rounds=20, policy=EntryPolicy())
+        traded = [m for m in months if m.mean_return == m.mean_return]
+        self.assertEqual(len(traded), 1, "the game was entered in two months")
+        self.assertEqual(traded[0].period, "2026-08",
+                         "the entry belongs to its EARLIEST qualifying checkpoint")
+
+    def test_the_monthly_trade_count_matches_the_global_selection(self):
+        looks = self._straddling()
+        entries, _ = select_entries(looks, Eligibility(min_net_ev=0.0),
+                                    policy=EntryPolicy())
+        months = decay_series(looks, Eligibility(min_net_ev=0.0),
+                              bootstrap_rounds=20, policy=EntryPolicy())
+        traded = [m for m in months if m.mean_return == m.mean_return]
+        self.assertEqual(len(traded), len(entries))
+
+    def test_the_forecast_diagnostic_still_covers_every_month(self):
+        """Only the RETURN carries exposure. The per-row Brier comparison has
+        none, so it must keep reporting both months."""
+        months = decay_series(self._straddling(), Eligibility(min_net_ev=0.0),
+                              bootstrap_rounds=20, policy=EntryPolicy())
+        self.assertEqual([m.period for m in months], ["2026-08", "2026-09"])
+        self.assertTrue(all(m.games == 1 for m in months))
+
+
+class ArtifactRoundTripTest(unittest.TestCase):
+    """A delayed run must be reproducible from its own saved observations.
+
+    The writer kept `bid`/`ask` from the decision book and never saved the
+    execution book, while its comment still claimed bid/ask WERE the entry
+    book. So the saved artifacts of a delayed run could not reproduce the
+    trade they described -- and would silently reproduce a cheaper one.
+    """
+
+    def _delayed_run(self, tmp):
+        start = datetime(2026, 9, 14, 23, 0, tzinfo=UTC)
+        obs_rows = [
+            Observation(f"EVT{i}", f"M{i}", start - timedelta(minutes=1440),
+                        1440.0, 0.70, 0.50, i % 2,
+                        exchange_bid=0.49, exchange_ask=0.51,
+                        entry_bid=0.60, entry_ask=0.62,
+                        entry_at=start - timedelta(minutes=1430),
+                        entry_delay_minutes=10.0, checkpoint_minutes=1440.0)
+            for i in range(8)
+        ]
+        out = Path(tmp) / "study"
+        with mock.patch.object(
+            run_study, "collect",
+            return_value=(obs_rows, Coverage(), CreditLedger(), Ledger(),
+                          default_lead_grid(), CheckpointMatrix())
+        ):
+            run_study.main([
+                "--sport", "MLB", "--series", "KXMLBGAME",
+                "--from", "2026-09-14", "--to", "2026-09-15",
+                "--api-key", "K", "--out", str(out), "--cache-dir", "",
+                "--entry-delay-minutes", "10", "--min-net-ev", "0.0",
+            ])
+        return obs_rows, json.loads((out / "observations.json").read_text())
+
+    def _rebuild(self, payload):
+        def parse(value):
+            return datetime.fromisoformat(value) if value else None
+        return [Observation(
+            game_id=r["game_id"], market_id=r["market_id"],
+            decision_at=parse(r["decision_at"]),
+            minutes_to_start=r["minutes_to_start"], p_sharp=r["p_sharp"],
+            p_exchange=r["p_exchange"], outcome=r["outcome"],
+            exchange_bid=r["decision_bid"], exchange_ask=r["decision_ask"],
+            entry_bid=r["entry_bid"], entry_ask=r["entry_ask"],
+            entry_at=parse(r["entry_at"]),
+            entry_delay_minutes=r["entry_delay_minutes"],
+            checkpoint_minutes=r["checkpoint_minutes"],
+        ) for r in payload["observations"]]
+
+    def test_both_books_are_persisted_and_the_schema_is_versioned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, payload = self._delayed_run(tmp)
+        self.assertEqual(payload["schema"], run_study.OBSERVATION_SCHEMA)
+        row = payload["observations"][0]
+        self.assertEqual((row["decision_bid"], row["decision_ask"]), (0.49, 0.51))
+        self.assertEqual((row["entry_bid"], row["entry_ask"]), (0.60, 0.62))
+        self.assertEqual(row["entry_delay_minutes"], 10.0)
+        self.assertNotIn("bid", row, "schema 1's ambiguous name must be gone")
+
+    def test_selection_paid_cost_and_return_survive_the_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            original, payload = self._delayed_run(tmp)
+        restored = self._rebuild(payload)
+        elig = Eligibility(min_net_ev=0.0)
+
+        a, _ = select_entries(original, elig, policy=EntryPolicy())
+        b, _ = select_entries(restored, elig, policy=EntryPolicy())
+        self.assertEqual(len(a), len(b))
+        self.assertEqual([e.trade.side for e in a], [e.trade.side for e in b])
+        for x, y in zip(a, b):
+            self.assertAlmostEqual(x.trade.paid, y.trade.paid, places=12)
+            self.assertAlmostEqual(x.trade.profit, y.trade.profit, places=12)
+
+        ra = realized_return(original, elig, bootstrap_rounds=20, policy=EntryPolicy())
+        rb = realized_return(restored, elig, bootstrap_rounds=20, policy=EntryPolicy())
+        self.assertAlmostEqual(ra.mean_return_on_stake, rb.mean_return_on_stake,
+                               places=12)
+
+    def test_the_round_trip_would_fail_without_the_execution_book(self):
+        """Proof the persisted field is load-bearing: drop it and the restored
+        run reports a cheaper trade than the one that happened."""
+        with tempfile.TemporaryDirectory() as tmp:
+            original, payload = self._delayed_run(tmp)
+        for row in payload["observations"]:
+            row["entry_bid"] = row["entry_ask"] = None
+        lossy = self._rebuild(payload)
+        elig = Eligibility(min_net_ev=0.0)
+        self.assertTrue(select_entries(original, elig, policy=EntryPolicy())[0])
+        self.assertEqual(select_entries(lossy, elig, policy=EntryPolicy())[0], [],
+                         "without the execution book the trade is unpriceable")
 
 
 class CheckpointDiagnosticsTest(unittest.TestCase):

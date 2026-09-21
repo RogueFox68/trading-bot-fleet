@@ -122,7 +122,18 @@ class Observation:
         return self.p_sharp - self.p_exchange
 
     def execution_book(self) -> tuple[float | None, float | None]:
-        """(bid, ask) at execution, falling back to the decision book."""
+        """(bid, ask) at execution.
+
+        At ZERO delay the execution book IS the decision book -- literally the
+        same candle -- so reading the decision prices is a definition.
+
+        Under a DELAY there is NO fallback. An absent entry book means the
+        execution price is unknown, and answering with the decision book would
+        supply a price nobody could have traded at, silently and in the
+        favourable direction. The caller drops the side instead.
+        """
+        if self.entry_delay_minutes > 0.0:
+            return self.entry_bid, self.entry_ask
         bid = self.entry_bid if self.entry_bid is not None else self.exchange_bid
         ask = self.entry_ask if self.entry_ask is not None else self.exchange_ask
         return bid, ask
@@ -339,6 +350,10 @@ class SideQuote:
     fee_route: str = ""
     exec_price: float | None = None   # the price actually paid, at t + delay
     exec_fee: float | None = None
+    # True when a reaction delay applied. A delayed quote ALWAYS carries an
+    # exec_price: `side_quotes` drops the side outright when execution is
+    # missing, crossed or out of bounds, rather than letting `paid` fall back.
+    delayed: bool = False
 
     @property
     def cost(self) -> float:
@@ -347,7 +362,16 @@ class SideQuote:
 
     @property
     def paid(self) -> float:
-        """What the trade actually cost. Equals `cost` at zero delay."""
+        """What the trade actually cost.
+
+        At ZERO delay the execution book IS the decision book -- the same
+        candle -- so falling back to the decision price is a definition, not a
+        guess. Under a DELAY it would be a guess, and a flattering one: a side
+        that could only have executed at 1.00 would report paying the 0.51 it
+        was quoted at the decision. `side_quotes` therefore never builds a
+        delayed quote without an execution price, so the fallback below is
+        only ever reached in the zero-delay case.
+        """
         price = self.exec_price if self.exec_price is not None else self.entry_price
         fee = self.exec_fee if self.exec_fee is not None else self.fee
         return price + fee
@@ -394,6 +418,14 @@ def side_quotes(o: "Observation", venue: str = "kalshi",
         return []
 
     exec_bid, exec_ask = o.execution_book()
+    delayed = o.entry_delay_minutes > 0.0
+    # A CROSSED execution book is not a book. The collector admits a candle on
+    # its mid and its price sanity, not on whether the two sides are ordered,
+    # so this has to be checked where the trade is priced.
+    exec_ordered = (exec_bid is None or exec_ask is None or exec_bid <= exec_ask)
+    # The fee is resolved at the moment of EXECUTION, which may sit on the
+    # other side of a dated schedule change from the decision.
+    exec_at = o.entry_at or o.decision_at
 
     out: list[SideQuote] = []
     for side, entry, exec_entry, win_p, payout in (
@@ -405,12 +437,22 @@ def side_quotes(o: "Observation", venue: str = "kalshi",
             continue
         fee = fee_for(venue, 1.0, entry, role, series, o.decision_at, route)
         exec_price = exec_fee = None
-        if exec_entry is not None and 0.0 < exec_entry < 1.0 and exec_entry != entry:
+        if delayed:
+            # UNEXECUTABLE IS NOT FREE. Missing, crossed or out-of-bounds
+            # execution means this side could not have been traded -- so the
+            # side is dropped, and the cell records that there was no fill.
+            # Pricing it at the decision book instead would report a trade at
+            # a price that was gone, which is the whole error the delay knob
+            # exists to measure.
+            if (not exec_ordered or exec_entry is None
+                    or not 0.0 < exec_entry < 1.0):
+                continue
             exec_price = exec_entry
             exec_fee = fee_for(venue, 1.0, exec_entry, role, series,
-                               o.decision_at, route).dollars
+                               exec_at, route).dollars
         out.append(SideQuote(side, entry, fee.dollars, win_p, payout,
-                             fee.raw_dollars, fee.route, exec_price, exec_fee))
+                             fee.raw_dollars, fee.route, exec_price, exec_fee,
+                             delayed))
     return out
 
 
@@ -763,20 +805,43 @@ def decay_series(
     the headline return has to be computed the same way as the headline
     return.
     """
+    # The FORECAST diagnostic groups every observation by month -- that
+    # comparison is per-row and has no exposure to carry.
     by_month: dict[str, list[Observation]] = {}
     for o in observations:
         by_month.setdefault(o.decision_at.strftime("%Y-%m"), []).append(o)
+
+    # The RETURN does have exposure to carry, so the policy is applied ONCE
+    # over the whole window and the resulting bets are then bucketed. Selecting
+    # inside each month independently let a game be entered in August at its
+    # 72h checkpoint and AGAIN in September at its 24h one -- a game regaining
+    # exposure at a month boundary, which is not a boundary the policy knows
+    # about. That is not hypothetical for this study: the early checkpoints of
+    # a Sept 1 game land in August.
+    traded_by_month: dict[str, list[Observation]] = {}
+    if policy is not None:
+        selected, _ = select_entries(observations, eligibility or Eligibility(),
+                                     series=series, route=route, policy=policy)
+        for entry in selected:
+            key = entry.observation.decision_at.strftime("%Y-%m")
+            traded_by_month.setdefault(key, []).append(entry.observation)
+    else:
+        traded_by_month = by_month
 
     out: list[DecaySlice] = []
     for period in sorted(by_month):
         members = by_month[period]
         lo, hi = cluster_bootstrap(members, _brier_delta, bootstrap_rounds)
-        ret = realized_return(members, eligibility,
-                              bootstrap_rounds=bootstrap_rounds,
-                              series=series, route=route, policy=policy)
+        traded = traded_by_month.get(period, [])
+        # Already selected above, so no policy here -- re-applying it to a
+        # single month's bets would be a no-op that reads like a second rule.
+        ret = (realized_return(traded, eligibility,
+                               bootstrap_rounds=bootstrap_rounds,
+                               series=series, route=route)
+               if traded else None)
         out.append(DecaySlice(
             period, len(cluster(members)), _brier_delta(members), lo, hi,
-            ret.mean_return_on_stake if ret.trades else float("nan"),
+            ret.mean_return_on_stake if ret and ret.trades else float("nan"),
         ))
     return out
 

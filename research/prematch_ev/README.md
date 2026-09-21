@@ -499,11 +499,13 @@ python3 run_study.py ... --fee-route direct   # headline on the other account ro
 python3 run_study.py ... --lead-grid 72h,48h,24h,12h,6h,3h --entry-delay-minutes 10
 ```
 
-Tests: `python3 -m unittest discover -s tests -t .` — 321 tests, no network, no
+Tests: `python3 -m unittest discover -s tests -t .` — 335 tests, no network, no
 credentials, and they pass with or without `rapidfuzz`.
 
-Artifacts land in `study_output/`: `report.txt`, `observations.json` (both
-source timestamps, actual lead, YES participant, bid/ask), and `coverage.json`
+Artifacts land in `study_output/`: `report.txt`, `observations.json` (schema 2 —
+both source timestamps, actual lead, YES participant, and **both books**:
+`decision_*` as seen at the cutoff, `entry_*` as paid at execution), and
+`coverage.json`
 (stage denominators, every rejection reason with examples, and the run config).
 
 ### Archive depth
