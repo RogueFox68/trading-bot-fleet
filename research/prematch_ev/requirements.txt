@@ -1,0 +1,13 @@
+# Study dependencies. SEPARATE from the fleet's root requirements.txt on
+# purpose -- nothing here is installed into the trading-fleet image, and this
+# directory must never be added to deploy/ecosystem.config.js.
+#
+# The study itself runs on the standard library alone: scoring, de-vigging and
+# both pullers use urllib, json and math. That is deliberate -- the analysis
+# has to be runnable anywhere, including inside the fleet container, without
+# widening the image's dependency surface.
+#
+# rapidfuzz is OPTIONAL. core/matcher.py falls back to difflib when it is
+# absent (same discipline as the fleet's lazy yfinance import), so a box that
+# cannot build it still runs the study and the suites.
+rapidfuzz==3.9.7
