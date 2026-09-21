@@ -31,7 +31,8 @@ from analysis.scoring import (                                     # noqa: E402
 )
 from collect import (                                              # noqa: E402
     BASELINE_LEAD_MINUTES, MAX_SOURCE_LAG, Checkpoint, CheckpointMatrix, Ledger,
-    STATUS_NOT_YET_LISTED, STATUS_OBSERVED, checkpoint_targets,
+    STATUS_NOT_YET_LISTED, STATUS_OBSERVED, STATUS_UNJOINED,
+    checkpoint_targets, record_cell_outcome,
     decision_cutoffs, default_lead_grid, grid_reach, in_study_window,
     join_markets, listing_status, market_start_time, observation_with_status,
     parse_lead_grid, snapshots_per_day_for,
@@ -469,6 +470,23 @@ def collect(args, key: str):
     joined = join_markets(markets, quotes_by_event, args.sport, ledger)
     print(f"  joined: {len(joined):,} contracts matched to a sharp event")
 
+    # AN UNJOINED CONTRACT IS NOT AN UNREPORTED CELL. The loop below only
+    # visits joined markets, so every cell of a contract that failed to match
+    # a sharp event stayed blank -- and "unreported" means "the collector
+    # skipped this", i.e. a bug. These are an EXPLAINED loss: the contract was
+    # enumerated, the join could not match it, and nobody is coming back for
+    # it. The denominator is untouched either way; only the label changes,
+    # from a bug to a reason.
+    matched = {jm.market_ticker for jm in joined}
+    unjoined = [t for t in markets if t not in matched]
+    for ticker in unjoined:
+        matrix.record_all(ticker, STATUS_UNJOINED)
+        record_cell_outcome(ledger, STATUS_UNJOINED, ticker,
+                            count=len(grid))
+    if unjoined:
+        print(f"          {len(unjoined):,} enumerated contract(s) never matched "
+              f"a sharp event ({len(unjoined) * len(grid):,} cells)")
+
     # --- every (contract, checkpoint) cell -----------------------------------
     # THE STUDY'S OWN DENOMINATOR is the enumerated cell count, not the rows
     # that succeeded: a denominator defined by its successes always reads 100%.
@@ -498,20 +516,15 @@ def collect(args, key: str):
             # opportunity to miss -- and it is counted as an eligibility
             # exclusion, never as a coverage failure.
             listing = listing_status(market, decision_at)
-            if listing == STATUS_NOT_YET_LISTED:
-                matrix.record(jm.market_ticker, checkpoint, listing)
-                ledger.exclude("contract_not_yet_listed", stage="checkpoint_cells")
-                continue
             if listing is not None:
                 matrix.record(jm.market_ticker, checkpoint, listing)
-                ledger.reject("listing_time_unreadable", jm.market_ticker,
-                              stage="checkpoint_cells")
+                record_cell_outcome(ledger, listing, jm.market_ticker)
                 continue
 
             if not candles:
                 matrix.record(jm.market_ticker, checkpoint, "candles_unavailable")
-                ledger.reject("candles_unavailable", jm.market_ticker,
-                              stage="checkpoint_cells")
+                record_cell_outcome(ledger, "candles_unavailable",
+                                    jm.market_ticker)
                 continue
 
             obs, status = observation_with_status(

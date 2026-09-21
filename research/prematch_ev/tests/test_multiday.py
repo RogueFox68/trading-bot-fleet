@@ -38,10 +38,11 @@ from analysis.scoring import (
     price_paths, realized_return, select_entries, side_quotes,
 )
 from collect import (
-    BASELINE_LEAD_MINUTES, Checkpoint, CheckpointMatrix, Ledger,
+    BASELINE_LEAD_MINUTES, BENIGN_GROUPS, Checkpoint, CheckpointMatrix, Ledger,
     STATUS_LISTING_UNKNOWN, STATUS_NOT_YET_LISTED, STATUS_OBSERVED,
-    checkpoint_targets, decision_cutoffs, default_lead_grid, grid_reach,
-    in_study_window, listing_status, observation_with_status, parse_lead_grid,
+    STATUS_UNJOINED, cell_is_benign, checkpoint_targets, decision_cutoffs,
+    default_lead_grid, grid_reach, in_study_window, listing_status,
+    observation_with_status, parse_lead_grid, record_cell_outcome,
 )
 from data.kalshi_history import Coverage
 from data.odds_history import CreditLedger
@@ -864,6 +865,130 @@ class ArtifactRoundTripTest(unittest.TestCase):
         self.assertTrue(select_entries(original, elig, policy=EntryPolicy())[0])
         self.assertEqual(select_entries(lossy, elig, policy=EntryPolicy())[0], [],
                          "without the execution book the trade is unpriceable")
+
+
+class OneClassifierTest(unittest.TestCase):
+    """The matrix and the ledger must give one verdict per cell.
+
+    The matrix called `exchange_quote_too_old_at_cutoff` a RESULT (`no_quote`
+    -- listed, but nobody had a fresh price) while the ledger counted it as a
+    parse/join FAILURE against coverage. Two answers to one question, in the
+    two places a reader would check.
+    """
+
+    BENIGN = ("no_exchange_quote_at_cutoff", "exchange_quote_too_old_at_cutoff",
+              "no_entry_quote_after_delay", "cutoff_at_or_after_start",
+              STATUS_NOT_YET_LISTED, STATUS_OBSERVED)
+    LOSSY = ("no_sharp_quote_available_at_cutoff", "sharp_quote_too_old_at_cutoff",
+             "exchange_quote_malformed", "candles_unavailable",
+             "yes_side_unresolvable", STATUS_LISTING_UNKNOWN, STATUS_UNJOINED)
+
+    def test_the_ledger_files_a_benign_cell_as_an_exclusion(self):
+        for status in self.BENIGN:
+            led = Ledger()
+            record_cell_outcome(led, status, "KX-A")
+            self.assertIn(status, led.eligibility_exclusions, status)
+            self.assertNotIn(status, led.rejections, status)
+
+    def test_the_ledger_files_a_lossy_cell_as_a_rejection(self):
+        for status in self.LOSSY:
+            led = Ledger()
+            record_cell_outcome(led, status, "KX-A")
+            self.assertIn(status, led.rejections, status)
+            self.assertNotIn(status, led.eligibility_exclusions, status)
+
+    def test_the_two_readers_agree_on_every_known_status(self):
+        """The general property. A status the matrix calls benign must not be
+        a rejection in the ledger, and vice versa, for every status either
+        side knows about."""
+        matrix = CheckpointMatrix()
+        for status in set(self.BENIGN) | set(self.LOSSY):
+            led = Ledger()
+            record_cell_outcome(led, status, "KX-A")
+            matrix_says_benign = matrix.group_of(status) in BENIGN_GROUPS
+            ledger_says_benign = status in led.eligibility_exclusions
+            self.assertEqual(matrix_says_benign, ledger_says_benign,
+                             f"{status}: matrix and ledger disagree")
+
+    def test_a_missing_sharp_quote_stays_loud(self):
+        """The 48h finding was 400/400 no_sharp. A provider not covering a
+        game two days out is a coverage limit of the FEED, not a property of
+        the market, so it must stay on the rejection side."""
+        self.assertFalse(cell_is_benign("no_sharp_quote_available_at_cutoff"))
+        led = Ledger()
+        led.count("checkpoint_cells", 10, unit="game-checkpoints")
+        record_cell_outcome(led, "no_sharp_quote_available_at_cutoff", "KX-A",
+                            count=10)
+        self.assertTrue(led.stages["checkpoint_cells"].rejected)
+
+    def test_an_unknown_status_is_lossy_not_benign(self):
+        self.assertFalse(cell_is_benign("some_new_reason"))
+
+
+class UnjoinedContractTest(unittest.TestCase):
+    """An unjoined contract's cells are an explained loss, not a blank.
+
+    The collection loop only visits joined markets, so a contract that never
+    matched a sharp event left every one of its cells `unreported` -- and
+    after a run, `unreported` means the collector skipped rows, i.e. a bug.
+    The live run showed exactly this: 2 contracts, 2 unreported at every one
+    of the seven checkpoints.
+    """
+
+    def _matrix(self, markets, grid):
+        matrix = CheckpointMatrix()
+        matrix.expect(checkpoint_targets(markets, grid))
+        return matrix
+
+    def test_record_all_covers_every_checkpoint(self):
+        markets = milbal()
+        grid = default_lead_grid()
+        matrix = self._matrix(markets, grid)
+        ticker = list(markets)[0]
+        matrix.record_all(ticker, STATUS_UNJOINED)
+        for checkpoint in grid:
+            self.assertEqual(matrix.statuses[(ticker, checkpoint.key)],
+                             STATUS_UNJOINED)
+
+    def test_the_denominator_is_unchanged(self):
+        """The whole point of an independent denominator: labelling a loss
+        must not shrink what it is a loss OUT OF."""
+        markets = milbal()
+        grid = default_lead_grid()
+        matrix = self._matrix(markets, grid)
+        before = len(matrix.statuses)
+        matrix.record_all(list(markets)[0], STATUS_UNJOINED)
+        self.assertEqual(len(matrix.statuses), before)
+        self.assertEqual(before, len(markets) * len(grid))
+
+    def test_unjoined_cells_are_no_longer_unreported(self):
+        markets = milbal()
+        grid = default_lead_grid()
+        matrix = self._matrix(markets, grid)
+        self.assertEqual(matrix.unreported(), len(markets) * len(grid))
+        for ticker in markets:
+            matrix.record_all(ticker, STATUS_UNJOINED)
+        self.assertEqual(matrix.unreported(), 0)
+        self.assertEqual(matrix.by_checkpoint()["4320"]["unjoined"], len(markets))
+
+    def test_unjoined_counts_against_coverage_not_as_a_result(self):
+        """It is an EXPLAINED loss, but still a loss: those cells were never
+        reachable, so the study did not observe what it enumerated."""
+        self.assertFalse(cell_is_benign(STATUS_UNJOINED))
+        markets = milbal()
+        matrix = self._matrix(markets, default_lead_grid())
+        matrix.record_all(list(markets)[0], STATUS_UNJOINED)
+        self.assertEqual(matrix.source_failures(), len(default_lead_grid()))
+        led = Ledger()
+        led.count("checkpoint_cells", 14, unit="game-checkpoints")
+        record_cell_outcome(led, STATUS_UNJOINED, "KX-A", count=7)
+        self.assertEqual(led.stages["checkpoint_cells"].rejected, 7)
+
+    def test_the_matrix_renders_an_unjoined_column(self):
+        markets = milbal()
+        matrix = self._matrix(markets, default_lead_grid())
+        matrix.record_all(list(markets)[0], STATUS_UNJOINED)
+        self.assertIn("unjoined", matrix.render())
 
 
 class CheckpointDiagnosticsTest(unittest.TestCase):

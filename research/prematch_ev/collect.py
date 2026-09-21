@@ -420,6 +420,11 @@ class Ledger:
 STATUS_OBSERVED = "observed"
 STATUS_NOT_YET_LISTED = "not_yet_listed"
 STATUS_LISTING_UNKNOWN = "listing_time_unknown"
+# A contract the enumeration found but the join could not match to a sharp
+# event. Its cells are NOT "unreported" -- nobody is coming back for them, and
+# leaving them blank made a real, explained loss look like a collector that
+# skipped rows. The denominator keeps them either way.
+STATUS_UNJOINED = "contract_unjoined"
 
 STATUS_GROUPS: dict[str, str] = {
     STATUS_OBSERVED: "observed",
@@ -434,6 +439,7 @@ STATUS_GROUPS: dict[str, str] = {
     "candles_unavailable": "source_failure",
     "yes_side_unresolvable": "source_failure",
     "cutoff_at_or_after_start": "not_listed",
+    STATUS_UNJOINED: "unjoined",
 }
 # Groups that do NOT indicate a gap in what the study could see.
 #
@@ -443,6 +449,36 @@ STATUS_GROUPS: dict[str, str] = {
 # count equal to the whole universe. It is counted separately, and after a run
 # a non-zero count means the collector skipped cells, which is its own bug.
 BENIGN_GROUPS = frozenset({"observed", "not_listed", "no_quote", "unreported"})
+
+
+def cell_is_benign(status: str) -> bool:
+    """Is this cell outcome a RESULT rather than a gap in what we could see?
+
+    THE ONE CLASSIFIER. The matrix and the collection ledger used to answer
+    this separately, and disagreed: the matrix called
+    `exchange_quote_too_old_at_cutoff` a result (`no_quote` -- the market was
+    listed and nobody had a fresh price on it) while the ledger counted it as a
+    parse/join FAILURE against coverage. Two verdicts on one fact, in the two
+    places a reader would check (rule 19). Both now read this.
+    """
+    return STATUS_GROUPS.get(status, "source_failure") in BENIGN_GROUPS
+
+
+def record_cell_outcome(ledger: "Ledger", status: str, example: str = "",
+                        stage: str = "checkpoint_cells", count: int = 1) -> None:
+    """File a cell outcome under the bucket its own classification implies.
+
+    A benign outcome is an ELIGIBILITY exclusion -- the contract could not have
+    been traded at that moment, which is a fact about the market. Anything else
+    is a REJECTION, a gap in what the study could see. `no_sharp` is
+    deliberately on the rejection side: the provider not covering a game 48
+    hours out is a coverage limit of the feed, not a property of the market,
+    and it has to stay loud.
+    """
+    if cell_is_benign(status):
+        ledger.exclude(status, count=count, stage=stage)
+    else:
+        ledger.reject(status, example, count=count, stage=stage)
 
 
 @dataclass(frozen=True)
@@ -521,6 +557,11 @@ class CheckpointMatrix:
     def record(self, market_ticker: str, checkpoint: Checkpoint, status: str) -> None:
         self.statuses[(market_ticker, checkpoint.key)] = status
 
+    def record_all(self, market_ticker: str, status: str) -> None:
+        """Set one status across every checkpoint of a contract."""
+        for checkpoint in self.checkpoints:
+            self.record(market_ticker, checkpoint, status)
+
     def group_of(self, status: str) -> str:
         if not status:
             return "unreported"
@@ -563,7 +604,7 @@ class CheckpointMatrix:
 
     def render(self) -> str:
         cols = ["observed", "not_listed", "no_quote", "no_sharp",
-                "listing_unknown", "source_failure", "unreported"]
+                "listing_unknown", "unjoined", "source_failure", "unreported"]
         grouped = self.by_checkpoint()
         if not self.checkpoints:
             # A section that prints its header and its explanation over an
@@ -579,7 +620,10 @@ class CheckpointMatrix:
         lines = ["GAME x CHECKPOINT COVERAGE",
                  "    the denominator is the ENUMERATED universe, not the rows that",
                  "    succeeded. 'not_listed' is a RESULT (no contract existed that",
-                 "    early), not a gap; only 'source_failure' threatens the sample.",
+                 "    early), not a gap. 'unjoined' is an explained loss: the",
+                 "    contract never matched a sharp event, so its cells were never",
+                 "    reachable. 'unreported' after a run means the collector skipped",
+                 "    cells, which is a bug.",
                  "    " + f"{'lead':<14}" + "".join(f"{c:>16}" for c in cols)]
         for checkpoint in self.checkpoints:
             counts = grouped.get(checkpoint.key, {})
@@ -916,7 +960,7 @@ def observation_with_status(
         and q.last_update <= q.snapshot <= decision_at
     ]
     if not usable_quotes:
-        ledger.reject("no_sharp_quote_available_at_cutoff", joined.market_ticker, stage=reject_stage)
+        record_cell_outcome(ledger, "no_sharp_quote_available_at_cutoff", joined.market_ticker, stage=reject_stage)
         return None, "no_sharp_quote_available_at_cutoff"
 
     quote = max(usable_quotes, key=lambda q: q.last_update)
@@ -926,30 +970,30 @@ def observation_with_status(
     # while a separate constant applied at the decision.
     age_at_decision = (decision_at - quote.last_update).total_seconds()
     if age_at_decision > max_quote_age:
-        ledger.reject("sharp_quote_too_old_at_cutoff",
+        record_cell_outcome(ledger, "sharp_quote_too_old_at_cutoff",
                       f"{joined.market_ticker} {age_at_decision:.0f}s", stage=reject_stage)
         return None, "sharp_quote_too_old_at_cutoff"
 
     usable_candles = [c for c in candles if c.mid is not None and c.ts <= decision_at]
     if not usable_candles:
-        ledger.reject("no_exchange_quote_at_cutoff", joined.market_ticker, stage=reject_stage)
+        record_cell_outcome(ledger, "no_exchange_quote_at_cutoff", joined.market_ticker, stage=reject_stage)
         return None, "no_exchange_quote_at_cutoff"
     candle = max(usable_candles, key=lambda c: c.ts)
     if decision_at - candle.ts > max_lag:
-        ledger.reject("exchange_quote_too_old_at_cutoff", joined.market_ticker, stage=reject_stage)
+        record_cell_outcome(ledger, "exchange_quote_too_old_at_cutoff", joined.market_ticker, stage=reject_stage)
         return None, "exchange_quote_too_old_at_cutoff"
     if candle.has_malformed_price:
-        ledger.reject("exchange_quote_malformed", joined.market_ticker, stage=reject_stage)
+        record_cell_outcome(ledger, "exchange_quote_malformed", joined.market_ticker, stage=reject_stage)
         return None, "exchange_quote_malformed"
 
     p_sharp = orient_probability(quote, joined.yes_participant, league, method)
     if p_sharp is None:
-        ledger.reject("yes_side_unresolvable", f"{joined.market_ticker} YES={joined.yes_participant}", stage=reject_stage)
+        record_cell_outcome(ledger, "yes_side_unresolvable", f"{joined.market_ticker} YES={joined.yes_participant}", stage=reject_stage)
         return None, "yes_side_unresolvable"
 
     lead_minutes = (joined.start - decision_at).total_seconds() / 60.0
     if lead_minutes <= 0:
-        ledger.reject("cutoff_at_or_after_start", joined.market_ticker, stage=reject_stage)
+        record_cell_outcome(ledger, "cutoff_at_or_after_start", joined.market_ticker, stage=reject_stage)
         return None, "cutoff_at_or_after_start"
 
     # THE ENTRY IS NOT THE OBSERVATION, and it does not get to change the
@@ -974,7 +1018,7 @@ def observation_with_status(
             # A missing delayed quote is NOT a fill at the observation price.
             # Substituting the price you saw for the price you could have got
             # is the whole error this parameter exists to measure.
-            ledger.reject("no_entry_quote_after_delay",
+            record_cell_outcome(ledger, "no_entry_quote_after_delay",
                           f"{joined.market_ticker} +{entry_delay.total_seconds() / 60:.0f}m",
                           stage=reject_stage)
             return None, "no_entry_quote_after_delay"

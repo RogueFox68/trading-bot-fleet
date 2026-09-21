@@ -422,6 +422,37 @@ hard upper bound with no collisions at all would be 7×.
 `--preflight` reports the real figure for a real window, including how many of
 those snapshots are **already cached** and therefore free.
 
+### What the first multi-day run found
+
+Sept 1–15, full grid, zero delay, one entry per game, thresholds unchanged.
+402 contracts enumerated, 400 joined, **1,595 observations over 200 games**.
+Coverage INCOMPLETE. Observed cells per contract, by checkpoint:
+
+| lead | observed | not listed | no sharp quote |
+|---|---|---|---|
+| 72h | **0** | **400** | — |
+| 48h | **0** | — | **400** |
+| 24h | 95 | — | 304 |
+| 12h | 322 | — | 76 |
+| 6h | 378 | — | 22 |
+| 3h | **400** | — | — |
+| 1h | **400** | — | — |
+
+**The days-ahead window is not observable from these two sources.** Kalshi
+contracts do not exist at 72h, and the sharp feed does not carry the game at
+48h. Coverage only becomes usable inside ~12 hours of first pitch — which is
+roughly the window the study already had.
+
+This is a **data-availability** finding, not a verdict on the thesis. It says
+these sources cannot see the period the thesis is about; it does not say
+nothing happens there. The headline policy selected 1 trade, which is not
+feasibility evidence in either direction. Aggregate checkpoint loss was
+805/2,414 eligible cells (33.3%).
+
+The next question is therefore a *sourcing* question — when do Pinnacle prices
+and Kalshi listings actually become available, and is there a feed that covers
+the earlier window — not a bigger run against the same two sources.
+
 **The measured figure for Sept 1–15 on the full grid** (run free against the
 real cache): 402 contracts, **2,814 cells**, **732 unique snapshots**, 145
 cached, **587 missing → 5,870 new credits**, worst case 17,610 with retries.
@@ -499,7 +530,7 @@ python3 run_study.py ... --fee-route direct   # headline on the other account ro
 python3 run_study.py ... --lead-grid 72h,48h,24h,12h,6h,3h --entry-delay-minutes 10
 ```
 
-Tests: `python3 -m unittest discover -s tests -t .` — 335 tests, no network, no
+Tests: `python3 -m unittest discover -s tests -t .` — 345 tests, no network, no
 credentials, and they pass with or without `rapidfuzz`.
 
 Artifacts land in `study_output/`: `report.txt`, `observations.json` (schema 2 —

@@ -406,13 +406,18 @@ class AsOfCutoffTest(unittest.TestCase):
             [Candle(cutoff, 0.40, 0.42, malformed=True)], cutoff, "MLB", led))
         self.assertIn("exchange_quote_malformed", led.rejections)
 
-    def test_cutoff_at_or_after_start_is_rejected(self):
+    def test_cutoff_at_or_after_start_is_excluded_not_a_failure(self):
+        """A checkpoint landing at or after first pitch is a SCOPE fact --
+        there was no pre-game moment to trade -- not a gap in what the study
+        could see. It is filed as an eligibility exclusion so the matrix and
+        the ledger give the same verdict on the same cell."""
         led = Ledger()
         self.assertIsNone(observation_at_cutoff(
             self.joined(),
             [quote("evt-1", GAME1, snapshot=GAME1, last_update=GAME1)],
             [Candle(GAME1, 0.40, 0.42)], GAME1, "MLB", led))
-        self.assertIn("cutoff_at_or_after_start", led.rejections)
+        self.assertIn("cutoff_at_or_after_start", led.eligibility_exclusions)
+        self.assertNotIn("cutoff_at_or_after_start", led.rejections)
 
 
 class LedgerTest(unittest.TestCase):
