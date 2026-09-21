@@ -7,7 +7,7 @@ building, so it is driven against data whose right answer is known.
 
 import random
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from analysis.scoring import (
     Eligibility, MIN_GAMES, MIN_TRADED_GAMES, Observation, as_trade, brier,
@@ -17,10 +17,17 @@ from analysis.scoring import (
 from data.kalshi_history import Coverage
 
 
+# Timestamps are UTC-AWARE because the fee schedule is dated and resolving it
+# against a naive timestamp means resolving it against whatever the reader
+# assumes. The collector emits aware datetimes (`decision_cutoffs`), so a naive
+# fixture would test a shape production never produces.
+BASE = datetime(2026, 5, 1, tzinfo=timezone.utc)
+
+
 def obs(game, market, p_sharp, p_exch, outcome, when=None, bid=None, ask=None):
     return Observation(
         game_id=game, market_id=market,
-        decision_at=when or datetime(2026, 5, 1),
+        decision_at=when or BASE,
         minutes_to_start=120.0, p_sharp=p_sharp, p_exchange=p_exch,
         outcome=outcome,
         exchange_bid=bid if bid is not None else round(p_exch - 0.01, 2),
@@ -33,7 +40,7 @@ def synth(mid, sharp, true_p, n=1000, seed=3):
     rng = random.Random(seed)
     return [obs(f"EVT{i}", f"M{i}", sharp, mid,
                 1 if rng.random() < true_p else 0,
-                datetime(2026, 5, 1) + timedelta(hours=3 * i))
+                BASE + timedelta(hours=3 * i))
             for i in range(n)]
 
 
@@ -47,7 +54,7 @@ def noisy(n=600, sharp_noise=0.05, exchange_noise=0.05, seed=3):
         s = min(0.99, max(0.01, true_p + rng.gauss(0, sharp_noise)))
         out.append(obs(f"EVT{i}", f"M{i}", s, mid,
                        1 if rng.random() < true_p else 0,
-                       datetime(2026, 5, 1) + timedelta(hours=3 * i)))
+                       BASE + timedelta(hours=3 * i)))
     return out
 
 
@@ -158,7 +165,7 @@ class TradeMappingTest(unittest.TestCase):
         self.assertAlmostEqual(t.profit, 1.0 - t.entry_price - t.fee)
 
     def test_missing_or_crossed_quotes_yield_no_trade(self):
-        self.assertIsNone(as_trade(Observation("E", "M", datetime(2026, 5, 1),
+        self.assertIsNone(as_trade(Observation("E", "M", BASE,
                                                120.0, 0.6, 0.5, 1)))
         self.assertIsNone(as_trade(obs("E", "M", 0.60, 0.50, 1, bid=0.60, ask=0.40)))
 
@@ -203,32 +210,76 @@ class NetEvScreenTest(unittest.TestCase):
 
 
 class SeriesFeeTest(unittest.TestCase):
-    """The return path must price with the study's own series schedule."""
+    """The return path must price with the study's own series schedule, AT THE
+    DATE OF THE DECISION.
 
-    def setUp(self):
-        from core.fees import SERIES_OVERRIDES
-        self.overrides = SERIES_OVERRIDES
-        self.overrides["KXTEST"] = {"taker": 0.001}
+    Kalshi's KXMLBGAME multiplier halved on 2026-08-07. A study that prices by
+    series alone gets one rate for the whole history; a study that prices at
+    "now" reprices its own past every time it is re-run. Both produce a number,
+    and the number is wrong by a factor of two on one side of that date.
+    """
 
-    def tearDown(self):
-        self.overrides.pop("KXTEST", None)
+    JULY = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
+    SEPTEMBER = datetime(2026, 9, 8, 18, 0, tzinfo=timezone.utc)
 
-    def test_side_quotes_apply_the_series_schedule(self):
-        o = obs("E", "M", 0.60, 0.50, 1, bid=0.49, ask=0.51)
-        cheap = [q for q in side_quotes(o, series="KXTEST") if q.side == "YES"][0]
-        generic = [q for q in side_quotes(o) if q.side == "YES"][0]
-        self.assertLess(cheap.fee, generic.fee)
-        self.assertGreater(cheap.predicted_ev, generic.predicted_ev)
+    def _yes(self, o, **kw):
+        return [q for q in side_quotes(o, series="KXMLBGAME", **kw)
+                if q.side == "YES"][0]
 
-    def test_realized_return_threads_the_series(self):
-        data = [obs(f"E{i}", f"M{i}", 0.60, 0.50, i % 2, bid=0.49, ask=0.51)
-                for i in range(60)]
-        cheap = realized_return(data, Eligibility(min_net_ev=0.0),
-                                bootstrap_rounds=100, series="KXTEST")
-        generic = realized_return(data, Eligibility(min_net_ev=0.0),
-                                  bootstrap_rounds=100)
-        self.assertGreater(cheap.mean_profit_per_contract,
-                           generic.mean_profit_per_contract)
+    def test_side_quotes_price_at_the_decision_date_not_the_series(self):
+        july = self._yes(obs("E", "M", 0.60, 0.50, 1, when=self.JULY,
+                             bid=0.49, ask=0.51))
+        september = self._yes(obs("E", "M", 0.60, 0.50, 1, when=self.SEPTEMBER,
+                                  bid=0.49, ask=0.51))
+        self.assertLess(september.fee, july.fee,
+                        "the halved multiplier did not reach the pricing path")
+        self.assertGreater(september.predicted_ev, july.predicted_ev)
+
+    def test_the_identical_quote_differs_only_by_its_date(self):
+        """Same price, same book, same series -- only `decision_at` moves."""
+        july = self._yes(obs("E", "M", 0.60, 0.50, 1, when=self.JULY,
+                             bid=0.49, ask=0.51))
+        september = self._yes(obs("E", "M", 0.60, 0.50, 1, when=self.SEPTEMBER,
+                                  bid=0.49, ask=0.51))
+        self.assertEqual(july.entry_price, september.entry_price)
+        self.assertEqual((july.fee, september.fee), (0.02, 0.01))
+
+    def test_the_account_route_reaches_the_pricing_path(self):
+        o = obs("E", "M", 0.60, 0.50, 1, when=self.SEPTEMBER, bid=0.49, ask=0.51)
+        direct = self._yes(o, route="direct")
+        non_direct = self._yes(o, route="non_direct")
+        self.assertLess(direct.fee, non_direct.fee)
+        self.assertEqual(direct.fee_route, "direct")
+        # The pre-rounding charge is the same; only the alignment differs.
+        self.assertEqual(direct.fee_raw, non_direct.fee_raw)
+
+    def test_realized_return_threads_the_series_and_the_date(self):
+        def sample(when):
+            return [obs(f"E{i}", f"M{i}", 0.60, 0.50, i % 2, when=when,
+                        bid=0.49, ask=0.51) for i in range(60)]
+
+        september = realized_return(sample(self.SEPTEMBER),
+                                    Eligibility(min_net_ev=0.0),
+                                    bootstrap_rounds=100, series="KXMLBGAME")
+        july = realized_return(sample(self.JULY), Eligibility(min_net_ev=0.0),
+                               bootstrap_rounds=100, series="KXMLBGAME")
+        self.assertGreater(september.mean_profit_per_contract,
+                           july.mean_profit_per_contract)
+
+    def test_a_decision_outside_the_recorded_schedule_refuses_to_price(self):
+        """Proof the DATE is consulted, not just the series name.
+
+        Before the earliest recorded entry there is no rate to apply, and
+        borrowing the oldest one on file is the retroactive repricing this
+        whole mechanism exists to prevent -- so it raises rather than
+        returning a study-shaped number.
+        """
+        from core.fees import FeeScheduleUnresolved
+        ancient = obs("E", "M", 0.60, 0.50, 1,
+                      when=datetime(2025, 1, 1, tzinfo=timezone.utc),
+                      bid=0.49, ask=0.51)
+        with self.assertRaises(FeeScheduleUnresolved):
+            side_quotes(ancient, series="KXMLBGAME")
 
 
 class GroundTruthTest(unittest.TestCase):
@@ -274,9 +325,17 @@ class DecayTest(unittest.TestCase):
 
 
 class ReportTest(unittest.TestCase):
+    """These assert STRUCTURE -- labels, ordering, which gates exist -- so they
+    run at a low bootstrap count. The interval widths are exercised by the
+    tests that are actually about them; paying for 2000 rounds per route here
+    only buys a slower suite."""
+
+    ROUNDS = 100
+
     def test_incomplete_coverage_is_shouted_above_the_numbers(self):
         bad = Coverage().fail("odds quota exhausted mid-window")
-        text = build_report(noisy(n=400), bad).render()
+        text = build_report(noisy(n=400), bad,
+                             bootstrap_rounds=self.ROUNDS).render()
         self.assertIn("COVERAGE IS INCOMPLETE", text)
         self.assertLess(text.index("COVERAGE IS INCOMPLETE"),
                         text.index("[1] FORECAST ACCURACY"))
@@ -285,7 +344,8 @@ class ReportTest(unittest.TestCase):
         """Global forecast accuracy is a DIAGNOSTIC. An earlier version made it
         a mandatory GO criterion while the premise section said it is neither
         sufficient nor necessary -- a contradiction."""
-        report = build_report(noisy(n=400), Coverage())
+        report = build_report(noisy(n=400), Coverage(),
+                              bootstrap_rounds=self.ROUNDS)
         names = [name for name, _, _ in report.readiness()]
         self.assertIn("positive net return on the frozen policy", names)
         self.assertIn("coverage complete", names)
@@ -295,7 +355,8 @@ class ReportTest(unittest.TestCase):
     def test_output_is_labelled_exploratory(self):
         """No holdout and no cost/delay robustness exist here, so no run of
         this code can be a GO."""
-        report = build_report(noisy(n=400), Coverage())
+        report = build_report(noisy(n=400), Coverage(),
+                              bootstrap_rounds=self.ROUNDS)
         self.assertTrue(report.is_exploratory())
         self.assertIn("EXPLORATORY", report.render())
 
@@ -306,8 +367,9 @@ class ReportTest(unittest.TestCase):
                   for i in range(40)]
         untraded = [obs(f"U{i}", f"U{i}", 0.51, 0.50, i % 2, bid=0.20, ask=0.80)
                     for i in range(900)]
-        alone = build_report(traded, Coverage())
-        padded = build_report(traded + untraded, Coverage())
+        alone = build_report(traded, Coverage(), bootstrap_rounds=self.ROUNDS)
+        padded = build_report(traded + untraded, Coverage(),
+                              bootstrap_rounds=self.ROUNDS)
         gate = lambda r: [p for n, p, _ in r.readiness() if "sample" in n][0]
         self.assertEqual(alone.returns.games, padded.returns.games)
         self.assertEqual(gate(alone), gate(padded))
@@ -315,11 +377,84 @@ class ReportTest(unittest.TestCase):
 
     def test_no_hit_rate_gate_remains(self):
         """The >50% rule is gone; nothing should reintroduce it."""
-        text = build_report(noisy(n=400), Coverage()).render()
+        text = build_report(noisy(n=400), Coverage(),
+                             bootstrap_rounds=self.ROUNDS).render()
         self.assertNotIn("hit rate", text.lower().replace("not a hit rate", ""))
 
+    def test_both_fee_routes_are_rendered_and_the_headline_is_named(self):
+        """The account route is unresolved, so the report shows both.
+
+        A single headline number priced at an unexamined default is exactly
+        what "do not silently choose one" forbids -- and at one-contract size
+        the route is most of the fee, not a rounding digit.
+        """
+        report = build_report(noisy(n=400), Coverage(), series="KXMLBGAME",
+                              bootstrap_rounds=self.ROUNDS)
+        text = report.render()
+        self.assertIn("THE ACCOUNT ROUTE IS NOT RESOLVED", text)
+        self.assertEqual({s.route for s in report.scenarios},
+                         {"direct", "non_direct"})
+        for route in ("direct", "non_direct"):
+            self.assertIn(route, text)
+        self.assertIn("<- headline", text)
+
+    def test_the_headline_scenario_is_the_same_object_as_the_headline(self):
+        """Not merely equal -- identical, so the table cannot drift from the
+        sections above it (a second computation of one fact is rule 26)."""
+        report = build_report(noisy(n=400), Coverage(), series="KXMLBGAME",
+                              bootstrap_rounds=self.ROUNDS)
+        headline = [s for s in report.scenarios if s.route == report.route][0]
+        self.assertIs(headline.returns, report.returns)
+        self.assertIs(headline.screen, report.screen)
+
+    def test_readiness_reports_whether_the_route_would_change_the_verdict(self):
+        """It does not decide which route is right; it says whether it matters."""
+        report = build_report(noisy(n=400), Coverage(), series="KXMLBGAME",
+                              bootstrap_rounds=self.ROUNDS)
+        names = [name for name, _, _ in report.readiness()]
+        self.assertIn("conclusion survives the unresolved account route", names)
+
+    def test_a_cheaper_route_admits_at_least_as_many_trades(self):
+        """Sanity on the direction: lower fees cannot reject a trade the
+        higher-fee route admitted, at the same EV floor."""
+        data = [obs(f"E{i}", f"M{i}", 0.60, 0.50, i % 2,
+                    when=datetime(2026, 9, 8, tzinfo=timezone.utc),
+                    bid=0.49, ask=0.51) for i in range(60)]
+        report = build_report(data, Coverage(), series="KXMLBGAME",
+                              eligibility=Eligibility(min_net_ev=0.085),
+                              bootstrap_rounds=self.ROUNDS)
+        by_route = {s.route: s for s in report.scenarios}
+        self.assertGreaterEqual(by_route["direct"].screen.admitted,
+                                by_route["non_direct"].screen.admitted)
+        self.assertGreater(by_route["direct"].best_net_ev,
+                           by_route["non_direct"].best_net_ev)
+
+    def test_provenance_parts_survive_rendering_intact(self):
+        """A provenance part containing a semicolon must not be torn in two.
+
+        `render()` used to split the joined provenance on "; ", so
+        "PR #27 review; transcribed, not re-read in-session" printed as two
+        lines -- the second of which read as a provenance claim of its own.
+        A string joined for one consumer is not a structure for another.
+        """
+        parts = ["source: an endpoint; read once", "CONFLICT: a PDF disagrees"]
+        report = build_report(noisy(n=40), Coverage(), parts,
+                              bootstrap_rounds=self.ROUNDS)
+        self.assertEqual(report.provenance_lines, parts)
+        text = report.render()
+        self.assertIn("source: an endpoint; read once", text)
+
+    def test_a_plain_string_provenance_still_renders(self):
+        """The parameter takes either; a bare string must not become a list of
+        characters."""
+        report = build_report(noisy(n=40), Coverage(), "one line of stamps",
+                              bootstrap_rounds=self.ROUNDS)
+        self.assertEqual(report.provenance_lines, ["one line of stamps"])
+        self.assertIn("one line of stamps", report.render())
+
     def test_return_section_states_its_own_limits(self):
-        text = build_report(noisy(n=400), Coverage()).render()
+        text = build_report(noisy(n=400), Coverage(),
+                             bootstrap_rounds=self.ROUNDS).render()
         self.assertIn("no depth", text)
         self.assertIn("NOT included", text)
 

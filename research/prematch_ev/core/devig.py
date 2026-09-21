@@ -34,7 +34,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-from .fees import Role, fee_for
+from datetime import datetime
+
+from .fees import DEFAULT_ROUTE, AccountRoute, Role, fee_for
 
 # Outside this band the de-vig model error and the fee-as-fraction-of-stake
 # curve both grow faster than any plausible edge. Not a hard gate -- a stated
@@ -199,6 +201,9 @@ def net_ev(
     n_contracts: float,
     venue: str = "kalshi",
     role: Role = "taker",
+    series: str | None = None,
+    at: datetime | None = None,
+    route: AccountRoute = DEFAULT_ROUTE,
 ) -> EdgeQuote:
     """EV of buying `n_contracts` at `price`, net of that venue's real fee.
 
@@ -208,10 +213,15 @@ def net_ev(
         cost   = n * price + fee(n, price)
         payout = n * 1.00   on a win, 0 otherwise
         EV     = p * n - cost
+
+    `series` and `at` are both forwarded to the fee model. Omitting them
+    prices at the generic Kalshi coefficients, which is right for a bare
+    what-if and wrong for anything that claims to be a historical figure --
+    the per-series multiplier is dated and has changed.
     """
     if not 0.0 <= p_fair <= 1.0:
         raise ValueError(f"p_fair must be a probability, got {p_fair}")
-    fee = fee_for(venue, n_contracts, price, role)
+    fee = fee_for(venue, n_contracts, price, role, series, at, route)
     cost = n_contracts * price + fee.dollars
     ev = p_fair * n_contracts - cost
     stake = n_contracts * price
@@ -255,22 +265,31 @@ def kelly_stake(
     role: Role = "taker",
     kelly_multiplier: float = 0.25,
     max_per_bet: float = 50.0,
+    series: str | None = None,
+    at: datetime | None = None,
+    route: AccountRoute = DEFAULT_ROUTE,
 ) -> KellyStake:
     """Fractional Kelly with the execution fee inside the payoff odds.
 
     Your outlay per contract is price + fee, not price, and that outlay is what
     is lost on a loss -- so the fee belongs in `b`, not bolted on afterwards.
 
-    The fee is linear in size before the per-order ceiling, so the per-contract
-    rate used here is size-independent and the sizing does not need to iterate.
-    The ceiling is applied afterwards, by `net_ev`, against the integer contract
-    count actually ordered.
+    The fee is linear in size before the per-order alignment, so the
+    per-contract rate used here is size-independent and the sizing does not
+    need to iterate. The alignment is applied afterwards, by `net_ev`, against
+    the integer contract count actually ordered.
+
+    CAVEAT, because it biases this function and not `net_ev`: the unit-size
+    quote below is alignment-inflated. A one-contract order rounds up to the
+    account's whole quantum ($0.01 non-direct), so `fee_pc` here overstates the
+    marginal per-contract rate at any real size, and the stake it returns is
+    therefore conservative. That is the safe direction, but it is not neutral.
     """
     if bankroll <= 0:
         raise ValueError(f"bankroll must be positive, got {bankroll}")
 
     # Smooth (pre-ceiling) per-contract rate, taken at unit size.
-    fee_pc = fee_for(venue, 1.0, price, role).dollars
+    fee_pc = fee_for(venue, 1.0, price, role, series, at, route).dollars
     outlay = price + fee_pc
     if outlay >= 1.0:
         # Fees alone exceed the payout; no size is correct.

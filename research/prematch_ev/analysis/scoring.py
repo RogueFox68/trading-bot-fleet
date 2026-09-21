@@ -43,10 +43,14 @@ from __future__ import annotations
 
 import math
 import random
+import textwrap
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Sequence
 
-from core.fees import fee_for
+from core.fees import (
+    DEFAULT_ROUTE, ROUTE_ALIGNMENT, ROUTE_LABELS, fee_for,
+)
 from data.kalshi_history import Coverage
 
 # Distinct GAMES, not rows. Deliberately not presented as a power calculation:
@@ -259,7 +263,8 @@ class Eligibility:
     max_spread: float = 0.10          # a book this wide is not executable
 
     def admits(self, o: "Observation", venue: str = "kalshi",
-               role: str = "taker", series: str | None = None) -> bool:
+               role: str = "taker", series: str | None = None,
+               route: str = DEFAULT_ROUTE) -> bool:
         if not self.price_band[0] <= o.p_exchange <= self.price_band[1]:
             return False
         if not self.min_minutes_to_start <= o.minutes_to_start <= self.max_minutes_to_start:
@@ -268,7 +273,7 @@ class Eligibility:
             return False
         if o.exchange_ask - o.exchange_bid > self.max_spread:
             return False
-        return as_trade(o, venue, role, self, series) is not None
+        return as_trade(o, venue, role, self, series, route) is not None
 
 
 @dataclass(frozen=True)
@@ -280,6 +285,8 @@ class SideQuote:
     fee: float
     win_probability: float     # p_sharp for YES, 1 - p_sharp for NO
     payout: float              # realised: 1.0 or 0.0
+    fee_raw: float = 0.0       # the charge BEFORE the account's alignment
+    fee_route: str = ""
 
     @property
     def cost(self) -> float:
@@ -296,13 +303,20 @@ class SideQuote:
 
 
 def side_quotes(o: "Observation", venue: str = "kalshi",
-                role: str = "taker", series: str | None = None) -> list[SideQuote]:
+                role: str = "taker", series: str | None = None,
+                route: str = DEFAULT_ROUTE) -> list[SideQuote]:
     """Both executable sides of one contract, each priced net of its own fee.
 
     YES pays the ask and wins when the contract settles true. NO pays
     (1 - bid) -- the mirror of the YES book -- and wins when it settles false.
     Computed explicitly rather than by negating a YES figure, because getting
     the NO mapping wrong inverts half the sample.
+
+    The fee is resolved AT `o.decision_at`, not at whatever schedule is current
+    when the study runs. Kalshi's per-series multiplier changes on a dated
+    `scheduled_ts`, so pricing a September decision at a later rate is
+    retroactive repricing -- and it moves every EV here, not a rounding digit:
+    KXMLBGAME's recorded change halves the taker coefficient.
     """
     if o.exchange_bid is None or o.exchange_ask is None:
         return []
@@ -318,9 +332,9 @@ def side_quotes(o: "Observation", venue: str = "kalshi",
     ):
         if not 0.0 < entry < 1.0:
             continue
-        out.append(SideQuote(side, entry,
-                             fee_for(venue, 1.0, entry, role, series).dollars,
-                             win_p, payout))
+        fee = fee_for(venue, 1.0, entry, role, series, o.decision_at, route)
+        out.append(SideQuote(side, entry, fee.dollars, win_p, payout,
+                             fee.raw_dollars, fee.route))
     return out
 
 
@@ -344,14 +358,15 @@ class Trade:
 
 def as_trade(o: "Observation", venue: str = "kalshi", role: str = "taker",
              eligibility: "Eligibility | None" = None,
-             series: str | None = None) -> Trade | None:
+             series: str | None = None,
+             route: str = DEFAULT_ROUTE) -> Trade | None:
     """The best executable side, if it clears the predeclared EV threshold.
 
     Both sides are priced and the better PREDICTED EV wins. The direction is
     not taken from the sign of a midpoint disagreement, because the midpoint is
     not a price anyone trades at.
     """
-    quotes = side_quotes(o, venue, role, series)
+    quotes = side_quotes(o, venue, role, series, route)
     if not quotes:
         return None
     best = max(quotes, key=lambda q: q.predicted_ev)
@@ -418,7 +433,8 @@ class ScreenDiagnostics:
 def screen_diagnostics(observations: list["Observation"],
                        eligibility: "Eligibility | None" = None,
                        venue: str = "kalshi", role: str = "taker",
-                       series: str | None = None) -> ScreenDiagnostics:
+                       series: str | None = None,
+                       route: str = DEFAULT_ROUTE) -> ScreenDiagnostics:
     """Count why each observation passed or failed the frozen policy."""
     eligibility = eligibility or Eligibility()
     d = ScreenDiagnostics(considered=len(observations))
@@ -436,7 +452,7 @@ def screen_diagnostics(observations: list["Observation"],
         if o.exchange_ask - o.exchange_bid > eligibility.max_spread:
             d.rejected_spread += 1
             continue
-        quotes = side_quotes(o, venue, role, series)
+        quotes = side_quotes(o, venue, role, series, route)
         if not quotes:
             d.rejected_no_quotes += 1
             continue
@@ -494,20 +510,22 @@ def realized_return(
     role: str = "taker",
     bootstrap_rounds: int = DEFAULT_BOOTSTRAP,
     series: str | None = None,
+    route: str = DEFAULT_ROUTE,
 ) -> ReturnReport:
     """Net-of-fee return from acting on the signal, on the eligible subset."""
     eligibility = eligibility or Eligibility()
-    eligible = [o for o in observations if eligibility.admits(o, venue, role, series)]
+    eligible = [o for o in observations
+                if eligibility.admits(o, venue, role, series, route)]
 
     def mean_return(sample: list[Observation]) -> float:
-        trades = [t for t in (as_trade(o, venue, role, eligibility, series)
+        trades = [t for t in (as_trade(o, venue, role, eligibility, series, route)
                               for o in sample) if t]
         if not trades:
             raise ValueError("no trades in sample")
         staked = sum(t.entry_price + t.fee for t in trades)
         return sum(t.profit for t in trades) / staked if staked else 0.0
 
-    trades = [t for t in (as_trade(o, venue, role, eligibility, series)
+    trades = [t for t in (as_trade(o, venue, role, eligibility, series, route)
                           for o in eligible) if t]
     if not trades:
         return ReturnReport(0, 0, 0.0, 0.0, float("nan"), float("nan"),
@@ -654,6 +672,70 @@ def decay_series(
     return out
 
 
+# --- fee scenarios ----------------------------------------------------------
+
+
+@dataclass
+class FeeScenario:
+    """One account route, priced end to end.
+
+    Kalshi's rounding rules align a direct member's balance at $0.0001 and a
+    non-direct member's at $0.01. Which one applies is a fact about the
+    ACCOUNT, not about the market, and this study does not know it. At the
+    one-contract size priced here the quantum is not a rounding digit -- it is
+    most of the fee -- so the study reports both and adopts neither.
+    """
+
+    route: str
+    label: str
+    screen: ScreenDiagnostics
+    returns: ReturnReport
+
+    @property
+    def best_net_ev(self) -> float:
+        return max(self.screen.best_net_ev) if self.screen.best_net_ev else float("nan")
+
+    @property
+    def median_fee_alignment(self) -> str:
+        return ROUTE_ALIGNMENT.get(self.route, "?")
+
+
+def fee_scenarios(
+    observations: list["Observation"],
+    eligibility: "Eligibility | None" = None,
+    venue: str = "kalshi",
+    role: str = "taker",
+    series: str | None = None,
+    bootstrap_rounds: int = DEFAULT_BOOTSTRAP,
+    already: "FeeScenario | None" = None,
+) -> list[FeeScenario]:
+    """Every account route the fee model knows, each priced in full.
+
+    Deliberately derived from `ROUTE_ALIGNMENT` rather than a literal pair, so
+    a third route added to the fee model appears here without being listed
+    twice (the same reason the fleet keeps one bot registry).
+
+    `already` splices in a route the caller has ALREADY computed -- the report's
+    headline figures are one of these scenarios, and recomputing a 2000-round
+    cluster bootstrap to print the same number twice is waste. It is the same
+    object, so the table can never disagree with the sections above it.
+    """
+    out: list[FeeScenario] = []
+    for route in sorted(ROUTE_ALIGNMENT):
+        if already is not None and already.route == route:
+            out.append(already)
+            continue
+        out.append(FeeScenario(
+            route=route,
+            label=ROUTE_LABELS.get(route, route),
+            screen=screen_diagnostics(observations, eligibility, venue, role,
+                                      series, route),
+            returns=realized_return(observations, eligibility, venue, role,
+                                    bootstrap_rounds, series, route),
+        ))
+    return out
+
+
 # --- report -----------------------------------------------------------------
 
 
@@ -667,8 +749,16 @@ class StudyReport:
     decay: list[DecaySlice]
     coverage: Coverage = field(default_factory=Coverage)
     provenance: str = ""
+    # The SAME facts, pre-split by their producer. Rendering used to split
+    # `provenance` on "; ", which silently tore apart any part that contained
+    # one -- "PR #27 review; transcribed, not re-read in-session" became two
+    # lines, one of which read as a provenance claim of its own. A string
+    # joined for one consumer is not a structure for another.
+    provenance_lines: list[str] = field(default_factory=list)
     ledger_text: str = ""
     screen: ScreenDiagnostics | None = None
+    scenarios: list[FeeScenario] = field(default_factory=list)
+    route: str = DEFAULT_ROUTE
 
     def readiness(self) -> list[tuple[str, bool, str]]:
         """Diagnostics and gates, separated.
@@ -684,13 +774,27 @@ class StudyReport:
         for a tiny trading subset.
         """
         r = self.returns
-        return [
+        rows = [
             ("coverage complete", self.coverage.complete, str(self.coverage)),
             ("traded sample above floor", r.games >= MIN_TRADED_GAMES,
              f"{r.games} traded games ({r.trades} trades) vs floor {MIN_TRADED_GAMES}"),
             ("positive net return on the frozen policy", r.profitable(),
              r.verdict().split(":")[0]),
         ]
+        if self.scenarios:
+            # The account route is unresolved, so a conclusion that holds on
+            # one route and not the other is a conclusion about an unexamined
+            # default, not about the strategy. This does not decide which
+            # route is right; it reports whether it would matter.
+            verdicts = {s.returns.profitable() for s in self.scenarios}
+            rows.append((
+                "conclusion survives the unresolved account route",
+                len(verdicts) == 1,
+                "; ".join(f"{s.route}: "
+                          f"{'profitable' if s.returns.profitable() else 'not profitable'} "
+                          f"({s.returns.trades} trades)" for s in self.scenarios),
+            ))
+        return rows
 
     def is_exploratory(self) -> bool:
         """True until a chronological holdout and cost/delay robustness exist.
@@ -706,9 +810,27 @@ class StudyReport:
         add("=" * 76)
         add("PRE-MATCH +EV THESIS TEST")
         add("=" * 76)
-        if self.provenance:
-            add(f"fees: {self.provenance}")
+        parts = self.provenance_lines or ([self.provenance] if self.provenance else [])
+        if parts:
+            add("FEE MODEL PROVENANCE")
+            for part in parts:
+                for i, line in enumerate(textwrap.wrap(part, 72) or [""]):
+                    add(f"    {'' if i == 0 else '  '}{line}")
         add(f"coverage: {self.coverage}")
+        if self.scenarios:
+            add("")
+            add("FEE ROUNDING SCENARIOS -- THE ACCOUNT ROUTE IS NOT RESOLVED")
+            add("    Kalshi aligns a direct member's balance at $0.0001 and a")
+            add("    non-direct member's at $0.01, over a model fee ceiled to")
+            add("    $0.000001. At the one-contract size priced here the quantum")
+            add("    IS most of the fee. Both are shown; neither is adopted.")
+            add(f"    {'route':<12}{'align':>9}{'admitted':>10}"
+                f"{'best net EV':>14}{'return':>32}")
+            for sc in self.scenarios:
+                flag = "  <- headline" if sc.route == self.route else ""
+                add(f"    {sc.route:<12}{'$' + sc.median_fee_alignment:>9}"
+                    f"{sc.screen.admitted:>10,}{sc.best_net_ev:>+14.6f}"
+                    f"{sc.returns.verdict().split(':')[0]:>32}{flag}")
         if not self.coverage.complete:
             add("")
             add("!! COVERAGE IS INCOMPLETE. Figures below describe the data that")
@@ -799,21 +921,37 @@ class StudyReport:
 def build_report(
     observations: list[Observation],
     coverage: Coverage | None = None,
-    provenance: str = "",
+    provenance: "str | Sequence[str]" = "",
     eligibility: Eligibility | None = None,
     ledger_text: str = "",
     series: str | None = None,
+    route: str = DEFAULT_ROUTE,
+    bootstrap_rounds: int = DEFAULT_BOOTSTRAP,
 ) -> StudyReport:
+    lines = [provenance] if isinstance(provenance, str) else list(provenance)
+    lines = [ln for ln in lines if ln]
     outcomes = [o.outcome for o in observations]
+    headline_returns = realized_return(observations, eligibility, series=series,
+                                       bootstrap_rounds=bootstrap_rounds,
+                                       route=route)
+    headline_screen = screen_diagnostics(observations, eligibility, series=series,
+                                         route=route)
+    headline = FeeScenario(route=route, label=ROUTE_LABELS.get(route, route),
+                           screen=headline_screen, returns=headline_returns)
     return StudyReport(
-        comparison=compare(observations),
-        returns=realized_return(observations, eligibility, series=series),
+        comparison=compare(observations, bootstrap_rounds=bootstrap_rounds),
+        returns=headline_returns,
         conditional=conditional_scores(observations),
         sharp_calibration=calibration([o.p_sharp for o in observations], outcomes),
         exchange_calibration=calibration([o.p_exchange for o in observations], outcomes),
         decay=decay_series(observations, eligibility),
         coverage=coverage or Coverage(),
-        provenance=provenance,
+        provenance="; ".join(lines),
+        provenance_lines=lines,
         ledger_text=ledger_text,
-        screen=screen_diagnostics(observations, eligibility, series=series),
+        screen=headline_screen,
+        scenarios=fee_scenarios(observations, eligibility, series=series,
+                                bootstrap_rounds=bootstrap_rounds,
+                                already=headline),
+        route=route,
     )

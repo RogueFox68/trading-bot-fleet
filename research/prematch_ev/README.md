@@ -192,6 +192,22 @@ maximum *pre-fee* edge of **$0.0055** — the fee alone exceeds the best gross
 edge found. That is a legitimate no-trade result, and it is visible as one.
 **It is not a reason to loosen the frozen threshold.**
 
+Those figures were priced at the generic 0.07 coefficient, before the dated
+schedule landed. The best quote on that sample survives every combination of
+the corrections below and stays negative:
+
+| taker coeff | account route | fee on the best quote | best net EV |
+|---|---|---|---|
+| 0.07 (generic) | non-direct, `$0.01` | `$0.0200` | **−$0.014525** |
+| 0.035 (dated, Sept 2026) | non-direct, `$0.01` | `$0.0100` | **−$0.004525** |
+| 0.035 (dated, Sept 2026) | direct, `$0.0001` | `$0.0088` | **−$0.003325** |
+
+The first two reproduce the review's own offline sensitivity check exactly; the
+third is the most favourable combination available and is still below zero.
+`tests/test_fees.py::ReviewSensitivityTest` pins all three. This is a 20-game
+sample and settles nothing — it says the correction did not turn a no into a
+yes, which is the only thing a sensitivity check can say.
+
 ## Three different credit numbers
 
 `x-requests-used` is the **account's cumulative** usage across every run.
@@ -272,13 +288,60 @@ decision cutoffs the games actually imply**:
 grid-only configuration that cannot satisfy the bound, rather than running it
 and returning nothing.
 
-## Fees must carry the series
+## Fees must carry the series *and the date*
 
-`fee_for()` takes a `series` and threads it to the venue model. A resolved
-`SERIES_OVERRIDES` entry that the *pricing* path cannot see is worse than no
-feature: `describe()` reported an override as resolved while every fee was
-still computed at the generic rate. `describe(series)` now names whether **this
-run's** series has a resolved schedule, and says plainly when it does not.
+`fee_for()` takes a `series` **and an `at`**, and threads both to the venue
+model. A resolved schedule the *pricing* path cannot see is worse than no
+feature: `describe()` once reported an override as resolved while every fee was
+still computed at the generic rate.
+
+The date is not a refinement. Kalshi publishes per-series fee changes with a
+`scheduled_ts`, and KXMLBGAME's multiplier went from **1 to 0.5 on
+2026-08-07T04:59:45.131Z** (id `38032af2-e3fa-4659-9280-da64300b544c`, read from
+the public `fee_changes` endpoint on 2026-09-21). So the taker coefficient for a
+September 2026 decision is **0.035, not 0.07** — a factor of two on every fee in
+the study. Pricing by series alone gives one rate for all of history; pricing at
+"now" silently reprices the study's own past every time it is re-run.
+`resolve_schedule()` is strictly `effective_from <= at`, and refuses (rather
+than extrapolating) both a scheduled series with no timestamp and a date earlier
+than the first recorded entry.
+
+**The conflict is carried, not resolved.** Kalshi's fee-schedule PDF dated
+2026-07-07 still lists multiplier 1 for this series. The dated API says 0.5. The
+API is dated and the PDF is not, which is why the API is used — but
+`SCHEDULE_CONFLICTS` puts the disagreement into `describe()` so no report can
+print "verified" over an open question.
+
+**Maker quotes on a scheduled series raise.** `quadratic_with_maker_fees`
+establishes that makers are charged; no source consulted says what, or whether
+the multiplier scales maker fees. The study prices takers only, so refusing
+costs nothing and removes an invented number.
+
+## The account route is unresolved, so both are reported
+
+Kalshi's rounding rules ceil the model fee to `$0.000001`, then align the charge
+to the account's balance precision: **`$0.0001` for a direct member, `$0.01` for
+a non-direct member**. Which applies is a fact about the *account*, not the
+market, and this study does not know it.
+
+At the one-contract size the study prices at, that quantum is not a rounding
+digit — it is most of the fee. A 50c September taker contract owes `$0.00875`
+raw, which a non-direct account pays as `$0.01` (+14%) and a direct account as
+`$0.0088` (+0.6%). So the report renders **both routes, labelled**, flags which
+one the narrative sections used (`--fee-route`), and `readiness()` carries a row
+saying whether the conclusion survives the difference. Neither is adopted.
+
+One ambiguity in the source turns out not to matter, and that is worth knowing:
+its prose says centicents while its own example table shows cents. That sits at
+the *model* step — and since `$0.0001` and `$0.01` are both whole multiples of
+`$0.000001`, ceiling to the model precision and then to the alignment gives
+exactly the alignment ceiling alone. The prose/table conflict is confined to the
+account-route question, which is the one reported both ways.
+
+**Raw fees are computed in `Decimal`.** In float, `0.035 * 100 * 0.50 * 0.50` is
+`0.8750000000000001`, and a ceiling turns that last bit into a whole extra
+quantum — billing an exact `$0.8750` as `$0.8751`. The noise is invisible until
+something rounds up, which is the very next step.
 
 ## Running it
 
@@ -291,9 +354,10 @@ python3 run_study.py --plan --sport MLB --from 2026-05-13 --to 2026-09-15
 python3 run_study.py --probe --sport MLB
 python3 data/kalshi_history.py --audit-abbreviations --series KXMLBGAME --league MLB
 python3 run_study.py --sport MLB --series KXMLBGAME --from 2026-05-13 --to 2026-09-15
+python3 run_study.py ... --fee-route direct   # headline on the other account route
 ```
 
-Tests: `python3 -m unittest discover -s tests -t .` — 142 tests, no network, no
+Tests: `python3 -m unittest discover -s tests -t .` — 256 tests, no network, no
 credentials, and they pass with or without `rapidfuzz`.
 
 Artifacts land in `study_output/`: `report.txt`, `observations.json` (both
@@ -333,13 +397,20 @@ in the return figure; include them separately before calling anything viable.
 
 ## Verify before trusting
 
-- **Fee schedules vary by series.** The generic Kalshi coefficients are a
-  default, not a universal rate; resolve the applicable schedule into
-  `fees.SERIES_OVERRIDES` and `describe()` will say whether you did. The
-  Polymarket **US** entity deliberately raises rather than borrowing the
+- **Fee schedules vary by series *and by date*.** The generic Kalshi
+  coefficients are a default, not a universal rate; resolve the applicable
+  schedule into `fees.KALSHI_SERIES_SCHEDULES` with its `effective_from` and
+  its source, and `describe(series, at)` will say which entry it used and what
+  it could not check. The two KXMLBGAME entries here were **transcribed** from
+  a 2026-09-21 reading of Kalshi's public endpoint and have **not** been
+  re-verified since — re-read them before promoting any result built on them.
+  The Polymarket **US** entity deliberately raises rather than borrowing the
   international θ. (An earlier comment claimed maker fees "usually round to
-  $0.00" — impossible: `ceil` of any positive fee is ≥ 1¢, and the rounding
-  makes *small* orders relatively more expensive.)
+  $0.00" — impossible: a ceiling of any positive fee is ≥ one quantum, and the
+  rounding makes *small* orders relatively more expensive.)
+- **The account route is not resolved.** Every fee figure here exists in two
+  versions and the report shows both. Before any number is quoted outside this
+  study, establish which balance precision the account actually settles at.
 - **Roster abbreviations are unverified** against live Kalshi tickers. Run the
   audit; a mismatch shows up as a team contributing no data, not as an error.
 

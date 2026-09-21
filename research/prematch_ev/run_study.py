@@ -74,12 +74,45 @@ def parse_args(argv=None):
                    help="replay cache for paid responses; the credential never "
                         "enters a key, a path or a log. Empty string disables")
     p.add_argument("--probe", action="store_true", help="find archive depth and exit")
+    p.add_argument("--fee-route", dest="fee_route",
+                   choices=sorted(fees.ROUTE_ALIGNMENT), default=fees.DEFAULT_ROUTE,
+                   help="which account's fee rounding drives the HEADLINE "
+                        "figures. Both routes are reported either way -- this "
+                        "only picks which one the narrative sections use. "
+                        "The route is not resolved for this study.")
     p.add_argument("--out", default="study_output", help="directory for artifacts")
     return p.parse_args(argv)
 
 
 def _date(value: str) -> datetime:
     return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+
+def fee_provenance(args) -> list[str]:
+    """The fee stamps for THIS run, resolved at the window it actually covers.
+
+    `describe()` takes a timestamp because the per-series multiplier is dated.
+    Passing the window START (not "now") is the point: a run of this study in
+    six months must print the rate that was in force in the window it studied,
+    not the rate current when it ran.
+    """
+    at = _date(args.start) if args.start else None
+    return fees.describe_lines(args.series, at, args.fee_route)
+
+
+def fee_schedule_warnings(args) -> list[str]:
+    """A window that straddles a fee change is priced at two rates.
+
+    That is correct -- each decision gets the rate in force on its own day --
+    but it is invisible in an averaged result, so it is said out loud.
+    """
+    if not (args.start and args.end):
+        return []
+    changes = fees.schedule_changes_within(
+        args.series, _date(args.start), _date(args.end) + timedelta(days=1))
+    return [f"fee schedule CHANGES INSIDE this window: {e.label()} -- "
+            "decisions before and after it are priced at different rates"
+            for e in changes]
 
 
 def plan(args) -> int:
@@ -111,7 +144,10 @@ def plan(args) -> int:
     print(f"  bound needs {snapshots_per_day_for(args.max_quote_age)}/day = "
           f"~{grid_equivalent:,} credits, which is why fetches are targeted.")
     print()
-    print(f"  fee models       {fees.describe(args.series)}")
+    print(f"  fee models       {'; '.join(fee_provenance(args))}")
+    print(f"  fee rounding     {fees.route_warning()}")
+    for warning in fee_schedule_warnings(args):
+        print(f"  !! {warning}")
     print()
     print(f"  NOTE  {unverified_note()}")
     return 0
@@ -386,7 +422,10 @@ def main(argv=None) -> int:
                 "max_spread": args.max_spread,
                 "max_credits": args.max_credits,
                 "cache_dir": args.cache_dir or None,
-                "fees": fees.describe(args.series),
+                "fees": "; ".join(fee_provenance(args)),
+                "fee_route_headline": args.fee_route,
+                "fee_route_resolved": fees.ROUTE_RESOLVED,
+                "fee_schedule_warnings": fee_schedule_warnings(args),
                 "event_body_timezone": EVENT_BODY_TIMEZONE,
             },
         }, indent=2), encoding="utf-8")
@@ -407,12 +446,15 @@ def main(argv=None) -> int:
         print(ledger.render(), file=sys.stderr)
         return 1
 
+    for warning in fee_schedule_warnings(args):
+        print(f"!! {warning}")
     report = build_report(
-        observations, coverage, fees.describe(args.series),
+        observations, coverage, fee_provenance(args),
         eligibility=Eligibility(min_net_ev=args.min_net_ev,
                                 max_spread=args.max_spread),
         series=args.series,
         ledger_text=ledger.render(),
+        route=args.fee_route,
     )
     print()
     print(report.render())

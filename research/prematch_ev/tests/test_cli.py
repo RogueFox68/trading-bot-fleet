@@ -109,6 +109,90 @@ class ArtifactPersistenceTest(unittest.TestCase):
                 self.assertNotIn("SECRET-KEY-VALUE", (out / name).read_text())
 
 
+class FeeRouteCliTest(unittest.TestCase):
+    """The fee corrections have to reach the ARTIFACTS, not just the model.
+
+    A dated schedule and a dual-route report that `main()` never wires up look
+    exactly like a working one from the unit tests -- which is the failure this
+    file exists for. `fake_observation` is stamped 2026-09-14, so these drive
+    the real KXMLBGAME schedule through the real CLI.
+    """
+
+    def _run(self, **over):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "study"
+            with mock.patch.object(
+                run_study, "collect",
+                return_value=([fake_observation(i) for i in range(40)],
+                              Coverage(), CreditLedger(), Ledger())
+            ):
+                code = run_study.main(args_for(out, **over))
+            return (code,
+                    (out / "report.txt").read_text(),
+                    json.loads((out / "coverage.json").read_text()))
+
+    def test_the_report_names_the_dated_schedule_it_priced_with(self):
+        _, report, _ = self._run()
+        self.assertIn("38032af2-e3fa-4659-9280-da64300b544c", report)
+        self.assertIn("taker=0.035", report)
+
+    def test_the_report_carries_the_unresolved_pdf_conflict(self):
+        _, report, _ = self._run()
+        self.assertIn("UNRESOLVED CONFLICT", report)
+
+    def test_the_report_shows_both_account_routes(self):
+        _, report, _ = self._run()
+        self.assertIn("THE ACCOUNT ROUTE IS NOT RESOLVED", report)
+        self.assertIn("direct", report)
+        self.assertIn("non_direct", report)
+
+    def test_the_headline_route_is_selectable_and_recorded(self):
+        _, report, coverage = self._run(**{"--fee-route": "direct"})
+        self.assertEqual(coverage["run"]["fee_route_headline"], "direct")
+        self.assertFalse(coverage["run"]["fee_route_resolved"])
+        self.assertIn("$0.0001", report)
+
+    def test_coverage_records_the_fee_provenance(self):
+        _, _, coverage = self._run()
+        fees_text = coverage["run"]["fees"]
+        self.assertIsInstance(fees_text, str)
+        self.assertIn("KXMLBGAME", fees_text)
+        self.assertIn("not re-read in-session", fees_text)
+
+    def test_a_window_straddling_a_fee_change_is_flagged(self):
+        """The August change falls inside this window, so the run must say the
+        decisions before and after it are priced differently."""
+        args = run_study.parse_args(args_for(Path("/tmp/unused"),
+                                             **{"--from": "2026-08-01",
+                                                "--to": "2026-08-31"}))
+        warnings = run_study.fee_schedule_warnings(args)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("CHANGES INSIDE", warnings[0])
+
+    def test_a_window_clear_of_a_fee_change_is_not_flagged(self):
+        args = run_study.parse_args(args_for(Path("/tmp/unused")))
+        self.assertEqual(run_study.fee_schedule_warnings(args), [])
+
+    def test_the_provenance_is_resolved_at_the_window_not_at_now(self):
+        """A run of this study in six months must still print the rate that
+        was in force in the window it studied."""
+        def this_run(args):
+            # The generic line always says 0.07, so asserting on the joined
+            # text would pass whatever the resolution did. Only the THIS RUN
+            # line reports what was actually applied.
+            return [ln for ln in run_study.fee_provenance(args)
+                    if ln.startswith("THIS RUN:")][0]
+
+        july = run_study.parse_args(args_for(Path("/tmp/unused"),
+                                             **{"--from": "2026-07-01",
+                                                "--to": "2026-07-31"}))
+        september = run_study.parse_args(args_for(Path("/tmp/unused")))
+        self.assertIn("taker=0.07", this_run(july))
+        self.assertIn("effective 2025-10-04", this_run(july))
+        self.assertIn("taker=0.035", this_run(september))
+        self.assertIn("effective 2026-08-07", this_run(september))
+
+
 class PreflightTest(unittest.TestCase):
     """`--plan` prints a fixed offline estimate; it cannot validate the real
     cutoff count, which is what a pre-spend check needs."""
