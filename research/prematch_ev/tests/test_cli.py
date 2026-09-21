@@ -1,0 +1,281 @@
+"""End-to-end CLI regressions.
+
+Both crashes in this file's scope shipped with 171 other tests passing, because
+nothing drove `main()` or the audit command. A component suite cannot catch a
+missing import in an entry point -- only calling the entry point can.
+"""
+
+import json
+import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest import mock
+
+import run_study
+from analysis.scoring import Observation
+from collect import Ledger
+from data.cache import CreditCapReached, ResponseCache, key_for, redact
+from data.kalshi_history import Coverage
+from data.odds_history import CreditLedger
+
+UTC = timezone.utc
+
+
+def args_for(out, **over):
+    base = ["--sport", "MLB", "--series", "KXMLBGAME",
+            "--from", "2026-09-14", "--to", "2026-09-15",
+            "--api-key", "SECRET-KEY-VALUE", "--out", str(out),
+            "--cache-dir", ""]
+    for k, v in over.items():
+        base += [k, str(v)]
+    return base
+
+
+def fake_observation(i=0):
+    start = datetime(2026, 9, 14, 23, 0, tzinfo=UTC)
+    return Observation(
+        game_id=f"EVT{i}", market_id=f"M{i}",
+        decision_at=start - timedelta(minutes=60), minutes_to_start=60.0,
+        p_sharp=0.60, p_exchange=0.50, outcome=i % 2,
+        exchange_bid=0.49, exchange_ask=0.51,
+    )
+
+
+class ArtifactPersistenceTest(unittest.TestCase):
+    """THE crash: `write_coverage()` referenced EVENT_BODY_TIMEZONE, which
+    run_study never imported. Every completed collection path raised NameError
+    -- AFTER the credits had been spent, which is exactly when the persistence
+    fix was supposed to help."""
+
+    def _run(self, observations, ledger=None):
+        ledger = ledger or Ledger()
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "study"
+            with mock.patch.object(
+                run_study, "collect",
+                return_value=(observations, Coverage(), CreditLedger(), ledger)
+            ):
+                code = run_study.main(args_for(out))
+            return code, out
+
+    def test_zero_observations_still_writes_coverage(self):
+        code, out = self._run([])
+        self.assertEqual(code, 1)
+
+    def test_zero_observations_coverage_is_readable_json(self):
+        ledger = Ledger()
+        ledger.count("contracts", 100, unit="contracts")
+        ledger.reject("no_readable_start_time", "KX-X", count=100,
+                      stage="contracts")
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "study"
+            with mock.patch.object(
+                run_study, "collect",
+                return_value=([], Coverage(), CreditLedger(), ledger)
+            ):
+                run_study.main(args_for(out))
+            payload = json.loads((out / "coverage.json").read_text())
+        self.assertEqual(payload["observations_built"], 0)
+        self.assertIn("collection", payload)
+        self.assertIn("no_readable_start_time", payload["collection"]["rejections"])
+
+    def test_nonzero_observations_writes_all_promised_artifacts(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "study"
+            with mock.patch.object(
+                run_study, "collect",
+                return_value=([fake_observation(i) for i in range(40)],
+                              Coverage(), CreditLedger(), Ledger())
+            ):
+                code = run_study.main(args_for(out))
+            self.assertEqual(code, 0)
+            for name in ("report.txt", "coverage.json", "observations.json"):
+                self.assertTrue((out / name).exists(), f"{name} must be written")
+            json.loads((out / "observations.json").read_text())
+            json.loads((out / "coverage.json").read_text())
+
+    def test_no_credential_reaches_the_artifacts(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "study"
+            with mock.patch.object(
+                run_study, "collect",
+                return_value=([fake_observation()], Coverage(), CreditLedger(), Ledger())
+            ):
+                run_study.main(args_for(out))
+            for name in ("report.txt", "coverage.json", "observations.json"):
+                self.assertNotIn("SECRET-KEY-VALUE", (out / name).read_text())
+
+
+class PreflightTest(unittest.TestCase):
+    """`--plan` prints a fixed offline estimate; it cannot validate the real
+    cutoff count, which is what a pre-spend check needs."""
+
+    def test_preflight_uses_the_shared_survey(self):
+        with mock.patch.object(run_study, "survey",
+                               return_value=({}, [], None, Coverage(), Ledger())) as sv:
+            run_study.main(["--preflight", "--sport", "MLB", "--series", "KXMLBGAME",
+                            "--from", "2026-09-14", "--to", "2026-09-15",
+                            "--api-key", "K"])
+        sv.assert_called_once()
+
+    def test_preflight_reports_the_real_cutoff_count(self):
+        cutoffs = [datetime(2026, 9, 14, 22, 0, tzinfo=UTC),
+                   datetime(2026, 9, 15, 1, 0, tzinfo=UTC)]
+        with mock.patch.object(run_study, "survey",
+                               return_value=({"a": {}}, cutoffs, None,
+                                             Coverage(), Ledger())):
+            with mock.patch("builtins.print") as printed:
+                code = run_study.main(
+                    ["--preflight", "--sport", "MLB", "--series", "KXMLBGAME",
+                     "--from", "2026-09-14", "--to", "2026-09-15", "--api-key", "K"])
+        text = " ".join(str(c) for c in printed.call_args_list)
+        self.assertEqual(code, 0)
+        self.assertIn("REAL credit cost", text)
+        self.assertIn("20", text, "2 cutoffs x 10 credits")
+
+    def test_preflight_fails_on_incomplete_coverage_before_spending(self):
+        bad = Coverage().fail("enumeration truncated")
+        with mock.patch.object(run_study, "survey",
+                               return_value=({}, [], None, bad, Ledger())):
+            code = run_study.main(
+                ["--preflight", "--sport", "MLB", "--series", "KXMLBGAME",
+                 "--from", "2026-09-14", "--to", "2026-09-15", "--api-key", "K"])
+        self.assertEqual(code, 1)
+
+
+class CreditCapTest(unittest.TestCase):
+    """A cap that only warns is not a cap."""
+
+    def test_cap_refuses_the_call_that_would_exceed_it(self):
+        led = CreditLedger(cap=30)
+        led.spend_or_raise(); led.spend_or_raise(); led.spend_or_raise()
+        with self.assertRaises(CreditCapReached):
+            led.spend_or_raise()
+
+    def test_no_cap_never_refuses(self):
+        led = CreditLedger()
+        for _ in range(50):
+            led.spend_or_raise()
+        self.assertEqual(led.spent_this_run, 500)
+
+    def test_cap_counts_only_what_was_spent(self):
+        led = CreditLedger(cap=100)
+        led.spend_or_raise()
+        self.assertEqual(led.spent_this_run, 10)
+
+
+class CacheTest(unittest.TestCase):
+    """The previous run spent 200 credits and lost its diagnostics to a local
+    crash. Every retry of a local bug must not cost money again."""
+
+    def test_key_never_contains_a_credential(self):
+        at = datetime(2026, 9, 15, 20, 40, tzinfo=UTC)
+        key = key_for("MLB", at, "pinnacle", "h2h")
+        self.assertNotIn("SECRET", key)
+        self.assertEqual(key, key_for("MLB", at, "pinnacle", "h2h"))
+
+    def test_redact_scrubs_secrets_from_messages(self):
+        self.assertNotIn("SECRET123",
+                         redact("https://x/v4?apiKey=SECRET123&regions=us"))
+
+    def test_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = ResponseCache(Path(d))
+            self.assertIsNone(cache.get("k"))
+            cache.put("k", {"data": [1]})
+            self.assertEqual(cache.get("k"), {"data": [1]})
+
+    def test_corrupt_entry_is_a_miss_not_a_crash_and_not_an_empty_response(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = ResponseCache(Path(d))
+            (Path(d) / "k.json").write_text("not json")
+            self.assertIsNone(cache.get("k"), "must be a miss, never {}")
+            self.assertTrue(cache.errors)
+
+    def test_disabled_cache_is_inert(self):
+        cache = ResponseCache(None)
+        cache.put("k", {"a": 1})
+        self.assertIsNone(cache.get("k"))
+        self.assertFalse(cache.enabled)
+
+    def test_no_credential_in_cache_paths(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = ResponseCache(Path(d))
+            cache.put(key_for("MLB", datetime(2026, 9, 15, tzinfo=UTC),
+                              "pinnacle", "h2h"), {"data": []})
+            for path in Path(d).iterdir():
+                self.assertNotIn("apiKey", path.name)
+                self.assertNotIn("SECRET", path.name)
+
+
+class AuditCommandTest(unittest.TestCase):
+    """The FREE audit I recommended running crashed on the first real ticker:
+    it still read parsed["a"]/["b"], keys removed when the parser was rewritten
+    for real tickers. It had no test, so the suite stayed green."""
+
+    REAL_PAGE = [
+        {"ticker": "KXMLBGAME-26SEP152140MIAAZ-AZ"},
+        {"ticker": "KXMLBGAME-26SEP152140MIAAZ-MIA"},
+        {"ticker": "KXMLBGAME-26SEP131920SDSF-SF"},
+        {"ticker": "KXMLBGAME-26SEP131920SDSF-SD"},
+    ]
+
+    def _audit(self, pages):
+        import data.kalshi_history as kh
+        with mock.patch.object(
+            kh, "_iter_market_pages",
+            return_value=iter([(pages, Coverage())])
+        ):
+            with mock.patch("builtins.print") as printed:
+                code = kh.audit_abbreviations("KXMLBGAME", "MLB")
+        return code, " ".join(str(c) for c in printed.call_args_list)
+
+    def test_runs_on_real_shaped_tickers_without_crashing(self):
+        code, text = self._audit(self.REAL_PAGE)
+        self.assertIn("distinct exchange codes seen", text)
+        self.assertEqual(code, 0, f"AZ is aliased, so nothing unresolved: {text}")
+
+    def test_aliased_code_is_not_reported_unresolved(self):
+        _, text = self._audit(self.REAL_PAGE)
+        self.assertIn("UNRESOLVED exchange codes (0)", text)
+
+    def test_unknown_code_is_named_so_one_run_closes_the_gap(self):
+        code, text = self._audit(
+            self.REAL_PAGE + [{"ticker": "KXMLBGAME-26SEP151800CHWDET-CHW"}])
+        self.assertIn("CHW", text)
+        self.assertEqual(code, 1, "an unresolved code must fail the audit")
+
+    def test_malformed_tickers_are_counted_not_fatal(self):
+        code, text = self._audit(self.REAL_PAGE + [{"ticker": "garbage"}])
+        self.assertIn("did not fit the expected shape", text)
+
+    def test_incomplete_enumeration_is_reported(self):
+        import data.kalshi_history as kh
+        with mock.patch.object(
+            kh, "_iter_market_pages",
+            return_value=iter([(self.REAL_PAGE, Coverage().fail("page 3 timed out"))])
+        ):
+            with mock.patch("builtins.print") as printed:
+                code = kh.audit_abbreviations("KXMLBGAME", "MLB")
+        text = " ".join(str(c) for c in printed.call_args_list)
+        self.assertIn("INCOMPLETE", text)
+        self.assertEqual(code, 1, "a truncated code list must not read as clean")
+
+
+class BoundaryLookbackTest(unittest.TestCase):
+    """A 00:30 UTC eligible game at a 60-minute lead needs the PREVIOUS day's
+    23:30 snapshot. Clipping cutoffs to the study window dropped it, and
+    widening --from is not a substitute: that changes the study universe."""
+
+    def test_cutoff_before_the_window_is_still_fetched(self):
+        from collect import decision_cutoffs
+        game = datetime(2026, 9, 14, 0, 30, tzinfo=UTC)
+        cutoffs = decision_cutoffs([game], 60)
+        self.assertEqual(len(cutoffs), 1)
+        self.assertLess(cutoffs[0], datetime(2026, 9, 14, tzinfo=UTC),
+                        "the needed snapshot precedes --from")
+
+
+if __name__ == "__main__":
+    unittest.main()

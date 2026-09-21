@@ -30,12 +30,14 @@ from collect import (                                              # noqa: E402
     Ledger, decision_cutoffs, in_study_window, join_markets,
     market_start_time, observation_at_cutoff, snapshots_per_day_for,
 )
-from core import fees                                              # noqa: E402
+from core import fees
+from core.matcher import EVENT_BODY_TIMEZONE                                              # noqa: E402
 from core.matcher import match_event, unverified_note              # noqa: E402
 from data.kalshi_history import (                                  # noqa: E402
     Coverage, enumerate_settled_markets, fetch_candlesticks,
     fetch_historical_cutoff, uses_archive,
 )
+from data.cache import CreditCapReached, ResponseCache             # noqa: E402
 from data.odds_history import (                                    # noqa: E402
     CreditLedger, MAX_QUOTE_AGE_SECONDS, SPORT_KEYS, estimate_credits,
     fetch_snapshot, probe_earliest_snapshot,
@@ -61,7 +63,16 @@ def parse_args(argv=None):
     p.add_argument("--max-spread", type=float, default=0.10,
                    help="widest book the policy will treat as executable")
     p.add_argument("--api-key", help="Odds API key (or set ODDS_API_KEY)")
-    p.add_argument("--plan", action="store_true", help="print the budget and exit")
+    p.add_argument("--plan", action="store_true",
+                   help="offline ESTIMATE only; use --preflight for the real count")
+    p.add_argument("--preflight", action="store_true",
+                   help="enumerate the real cutoffs and credit cost. FREE")
+    p.add_argument("--max-credits", type=int, default=None,
+                   help="hard paid-request budget; collection stops and keeps "
+                        "partial diagnostics rather than exceeding it")
+    p.add_argument("--cache-dir", default="study_output/cache",
+                   help="replay cache for paid responses; the credential never "
+                        "enters a key, a path or a log. Empty string disables")
     p.add_argument("--probe", action="store_true", help="find archive depth and exit")
     p.add_argument("--out", default="study_output", help="directory for artifacts")
     return p.parse_args(argv)
@@ -125,19 +136,14 @@ def probe(args) -> int:
     return 0 if found else 1
 
 
-def collect(args, key: str):
-    """Pull both sides, join on identity, and build observations at one cutoff.
+def survey(args):
+    """The FREE half: enumerate the exchange, filter, derive the cutoffs.
 
-    ORDERING MATTERS. The exchange enumeration is free and its tickers carry
-    the scheduled start, so the schedule is known BEFORE any paid call. That
-    removes the discovery pass entirely and, more importantly, lets the
-    targeted cutoffs be derived from the games actually being studied. A live
-    run previously joined two contracts and then failed both with
-    `no_sharp_quote_available_at_cutoff`, because the cutoffs had been derived
-    from a separate discovery grid that never covered them.
+    Shared by `--preflight` and the real run so the two cannot disagree about
+    how many paid requests a window needs. A preflight that estimated its own
+    way would eventually differ from the run it is meant to predict.
     """
     coverage = Coverage()
-    credits = CreditLedger()
     ledger = Ledger()
     start = _date(args.start)
     end_inclusive = _date(args.end)
@@ -197,10 +203,18 @@ def collect(args, key: str):
           f"-> {len(markets):,} in the declared game window")
 
     # --- cutoffs derived from THOSE games -----------------------------------
+    # Cutoffs are NOT clipped to the study window. They are derived from games
+    # already filtered for eligibility, so by construction each one is needed.
+    # Clipping them dropped the source snapshot for any game near the lower
+    # boundary: a 00:30 UTC game at a 60-minute lead needs the PREVIOUS day's
+    # 23:30 snapshot. Widening --from instead would change the study universe,
+    # which is a different thing from fetching the inputs that universe needs.
     starts = [market_start_time(m) for m in markets.values()]
-    cutoffs = [c for c in decision_cutoffs([s for s in starts if s],
-                                           args.lead_minutes)
-               if start <= c < end_exclusive]
+    cutoffs = decision_cutoffs([s for s in starts if s], args.lead_minutes)
+    outside_window = sum(1 for c in cutoffs if not (start <= c < end_exclusive))
+    if outside_window:
+        print(f"          {outside_window:,} cutoff(s) fall outside the game "
+              "window and are fetched anyway -- eligible games need them")
     print(f"          {len(cutoffs):,} distinct decision cutoffs from "
           f"{len(markets):,} contracts")
 
@@ -211,6 +225,41 @@ def collect(args, key: str):
             "widen --from or reduce --lead-minutes"
         )
 
+    return markets, cutoffs, cutoff, coverage, ledger
+
+
+def preflight(args) -> int:
+    """Enumerate the real work before any paid call. Costs nothing."""
+    markets, cutoffs, cutoff, coverage, ledger = survey(args)
+    per_call = estimate_credits(1, 1)
+    print()
+    print("PREFLIGHT (no paid requests made)")
+    print(f"  eligible contracts   {len(markets):,}")
+    print(f"  distinct cutoffs     {len(cutoffs):,}")
+    print(f"  REAL credit cost     {len(cutoffs) * per_call:,} "
+          f"({per_call} per call)")
+    if args.max_credits is not None:
+        over = len(cutoffs) * per_call > args.max_credits
+        print(f"  configured cap       {args.max_credits:,}"
+              f"{'  <-- WOULD BE EXCEEDED' if over else ''}")
+    else:
+        print("  configured cap       none  <-- set --max-credits before a paid run")
+    print(f"  coverage             {coverage}")
+    print()
+    print(ledger.render())
+    if not coverage.complete:
+        print()
+        print("  Coverage is incomplete BEFORE any paid call. Fix that first.")
+        return 1
+    return 0
+
+
+def collect(args, key: str):
+    """Pull both sides, join on identity, and build observations at one cutoff."""
+    markets, cutoffs, cutoff, coverage, ledger = survey(args)
+    credits = CreditLedger(cap=args.max_credits)
+    cache = ResponseCache(Path(args.cache_dir) if args.cache_dir else None)
+
     # --- sharp side: one fetch per cutoff -----------------------------------
     quotes_by_event: dict[str, list] = {}
     snapshots = 0
@@ -219,7 +268,14 @@ def collect(args, key: str):
             coverage.fail(f"odds quota exhausted at cutoff {at.isoformat()}; "
                           "window truncated")
             break
-        snap = fetch_snapshot(args.sport, at, key, ledger=credits)
+        try:
+            snap = fetch_snapshot(args.sport, at, key, ledger=credits, cache=cache)
+        except CreditCapReached as exc:
+            # Stop and keep what we have: the point of a cap is that partial
+            # diagnostics survive rather than the overspend being discovered
+            # afterwards.
+            coverage.fail(str(exc))
+            break
         coverage.merge(snap.coverage)
         snapshots += 1
         ledger.count("odds_events", snap.events_seen, unit="event-quotes")
@@ -233,8 +289,8 @@ def collect(args, key: str):
         for quote in snap.quotes:
             quotes_by_event.setdefault(quote.provider_event_id, []).append(quote)
     ledger.count("odds_snapshots", snapshots, unit="snapshots")
-    print(f"  odds:   {snapshots:,} targeted snapshots -> "
-          f"{len(quotes_by_event):,} sharp events ({credits})")
+    print(f"  odds:   {snapshots:,} snapshots -> {len(quotes_by_event):,} "
+          f"sharp events ({credits}; {cache})")
 
     # --- join ----------------------------------------------------------------
     joined = join_markets(markets, quotes_by_event, args.sport, ledger)
@@ -271,6 +327,11 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     if args.plan:
         return plan(args)
+    if args.preflight:
+        if not (args.start and args.end):
+            print("--preflight needs --from and --to", file=sys.stderr)
+            return 2
+        return preflight(args)
 
     import os
     key = args.api_key or os.environ.get("ODDS_API_KEY", "")
@@ -310,6 +371,8 @@ def main(argv=None) -> int:
                 "max_quote_age_seconds": args.max_quote_age,
                 "min_net_ev": args.min_net_ev,
                 "max_spread": args.max_spread,
+                "max_credits": args.max_credits,
+                "cache_dir": args.cache_dir or None,
                 "fees": fees.describe(args.series),
                 "event_body_timezone": EVENT_BODY_TIMEZONE,
             },

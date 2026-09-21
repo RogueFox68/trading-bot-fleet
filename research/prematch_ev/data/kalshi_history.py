@@ -535,43 +535,56 @@ def audit_abbreviations(series_ticker: str, league: str, base_url: str = BASE_UR
     from pathlib import Path
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from core.matcher import ROSTERS, parse_kalshi_game_ticker
+    from core.matcher import (
+        ROSTERS, normalise_exchange_code, parse_kalshi_game_ticker,
+        unknown_exchange_codes,
+    )
 
     roster = ROSTERS.get(league.upper())
     if roster is None:
         print(f"unknown league {league!r}; known: {sorted(ROSTERS)}")
         return 2
 
-    seen: set[str] = set()
+    # Reads `yes_participant` -- the key the real-ticker parser returns. An
+    # earlier version still read parsed["a"]/["b"], keys removed when the
+    # parser was rewritten, so the free audit raised KeyError on the very
+    # first real ticker. It had no test, which is why the suite stayed green.
+    raw_codes: set[str] = set()
     tickers = malformed = 0
     coverage = Coverage()
-    for page, page_cov in iter_settled_markets(series_ticker, base_url=base_url):
+    for page, page_cov in _iter_market_pages('/markets', series_ticker, base_url, MAX_PAGES):
         coverage.merge(page_cov)
         for market in page:
             tickers += 1
             parsed = parse_kalshi_game_ticker(str(market.get("ticker", "")))
             if parsed:
-                seen.update((parsed["a"], parsed["b"]))
+                raw_codes.add(parsed["yes_participant"])
             else:
                 malformed += 1
 
-    known = set(roster)
-    never_seen = sorted(known - seen)
-    unknown_to_us = sorted(seen - known)
+    # Normalise through the SAME alias map the collector uses, or the audit
+    # reports a gap the collector does not actually have (and vice versa).
+    canonical = {normalise_exchange_code(c, league) for c in raw_codes}
+    unresolved = unknown_exchange_codes(raw_codes, league)
+    never_seen = sorted(set(roster) - canonical)
 
     print(f"series {series_ticker} / league {league}: {tickers:,} settled markets "
           f"({coverage})")
     if malformed:
         print(f"  {malformed:,} tickers did not fit the expected shape")
-    print(f"  roster abbreviations never seen in a ticker ({len(never_seen)}): "
+    print(f"  distinct exchange codes seen: {len(raw_codes)}")
+    print(f"  UNRESOLVED exchange codes ({len(unresolved)}): "
+          f"{', '.join(unresolved) or 'none'}")
+    print(f"  roster teams never seen ({len(never_seen)}): "
           f"{', '.join(never_seen) or 'none'}")
-    print(f"  ticker abbreviations absent from our roster ({len(unknown_to_us)}): "
-          f"{', '.join(unknown_to_us) or 'none'}")
-    if never_seen or unknown_to_us:
-        print("  -> fix these in core/matcher.ROSTERS before running the study;")
-        print("     each one is a team that will silently contribute no data.")
+    if unresolved:
+        print("  -> add each to core.matcher.EXCHANGE_CODE_ALIASES with the date")
+        print("     observed; until then every game for those teams is dropped.")
+    if not coverage.complete:
+        print(f"  -> enumeration was INCOMPLETE ({coverage}); the code list above")
+        print("     may be missing teams that simply were not fetched.")
         return 1
-    return 0
+    return 1 if unresolved else 0
 
 
 if __name__ == "__main__":

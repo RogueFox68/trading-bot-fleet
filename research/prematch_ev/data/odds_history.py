@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from .cache import CreditCapReached, ResponseCache, key_for, redact
 from .kalshi_history import Coverage
 
 BASE_URL = "https://api.the-odds-api.com/v4"
@@ -72,11 +73,27 @@ class OddsFetchError(RuntimeError):
 
 @dataclass
 class CreditLedger:
-    """Running quota state, read from the API's own response headers."""
+    """Running quota state, read from the API's own response headers.
+
+    `cap` is a HARD budget for this run, counted in credits actually spent. A
+    cap that only warns is not a cap: `spend_or_raise` refuses the call so the
+    caller persists partial diagnostics instead of discovering an overspend
+    afterwards.
+    """
 
     used: int = 0
     remaining: int | None = None
     calls: int = 0
+    cap: int | None = None
+    spent_this_run: int = 0
+
+    def spend_or_raise(self, credits: int = CREDITS_PER_HISTORICAL_CALL) -> None:
+        if self.cap is not None and self.spent_this_run + credits > self.cap:
+            raise CreditCapReached(
+                f"paid-request budget reached: {self.spent_this_run} credits "
+                f"spent of a {self.cap} cap; refusing the next call"
+            )
+        self.spent_this_run += credits
 
     def observe(self, headers: Any) -> None:
         self.calls += 1
@@ -316,8 +333,22 @@ def fetch_snapshot(
     regions: str | None = None,
     ledger: CreditLedger | None = None,
     base_url: str = BASE_URL,
+    cache: ResponseCache | None = None,
 ) -> SnapshotResult:
-    """One historical snapshot for one sport at one instant."""
+    """One historical snapshot for one sport at one instant.
+
+    A cache hit costs no credits and is not counted against the budget -- that
+    is the point: debugging a local join must not cost money twice.
+    """
+    if cache is not None and cache.enabled:
+        key = key_for(sport, at, bookmakers or "", "h2h")
+        hit = cache.get(key)
+        if hit is not None:
+            return parse_snapshot(hit)
+
+    if ledger is not None:
+        ledger.spend_or_raise()          # raises before any paid request
+
     url = build_snapshot_url(sport, at, api_key, bookmakers, regions, base_url)
 
     last: Exception | None = None
@@ -329,14 +360,21 @@ def fetch_snapshot(
                     ledger.observe(resp.headers)
                 if resp.status != 200:
                     raise OddsFetchError(f"HTTP {resp.status}")
-                return parse_snapshot(json.loads(resp.read().decode("utf-8")))
+                payload = json.loads(resp.read().decode("utf-8"))
+                result = parse_snapshot(payload)
+                # Only a successful, parseable response is stored; caching a
+                # failure would make a transient outage permanent on replay.
+                if (cache is not None and cache.enabled
+                        and result.coverage.complete):
+                    cache.put(key_for(sport, at, bookmakers or "", "h2h"), payload)
+                return result
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
             last = exc
             if attempt < RETRIES - 1:
                 time.sleep(BACKOFF_SECONDS[attempt])
 
     return SnapshotResult(None, [], Coverage().fail(
-        f"snapshot at {_iso(at)} failed after {RETRIES} attempts: {last}"))
+        redact(f"snapshot at {_iso(at)} failed after {RETRIES} attempts: {last}")))
 
 
 def probe_earliest_snapshot(

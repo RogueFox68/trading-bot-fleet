@@ -122,6 +122,42 @@ actually being studied. The previous run derived cutoffs from a separate
 discovery grid that never covered the two contracts it managed to join — which
 is why both then failed `no_sharp_quote_available_at_cutoff`.
 
+## Before any paid run
+
+Two crashes shipped with 171 tests passing, because nothing drove `main()` or
+the audit command. A component suite cannot catch a missing import in an entry
+point — only calling the entry point can. `tests/test_cli.py` now does.
+
+```bash
+# 1. FREE. Enumerates every exchange code the roster does not know,
+#    so the alias gap closes in one pass, not one code per paid run.
+python3 data/kalshi_history.py --audit-abbreviations --series KXMLBGAME --league MLB
+
+# 2. FREE. The REAL cutoff count and credit cost, from the actual schedule.
+#    `--plan` is an offline estimate and cannot validate this.
+python3 run_study.py --preflight --sport MLB --series KXMLBGAME \
+    --from 2026-09-14 --to 2026-09-15
+
+# 3. Paid, capped, cached.
+python3 run_study.py --sport MLB --series KXMLBGAME \
+    --from 2026-09-14 --to 2026-09-15 --max-credits 300
+```
+
+**`--max-credits` is a hard stop, not a warning.** Collection halts and keeps
+its partial diagnostics rather than the overspend being discovered afterwards.
+
+**Responses are cached** under `--cache-dir`, so debugging a local join or
+report never costs credits twice. The credential never enters a cache key, a
+path or a log: keys are built from the request's *meaning* (sport, instant,
+book, market), and `redact()` scrubs anything destined for a message. Only
+successful, parseable responses are stored — caching a failure would make a
+transient outage permanent on replay.
+
+**Cutoffs are not clipped to the study window.** A 00:30 UTC game at a
+60-minute lead needs the previous day's 23:30 snapshot. Widening `--from`
+would change the study universe, which is a different thing from fetching the
+inputs that universe needs.
+
 ## Reading the result## Reading the result
 
 Six sections. **No single number is a go signal.**
