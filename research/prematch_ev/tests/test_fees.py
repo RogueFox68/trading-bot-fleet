@@ -86,6 +86,34 @@ class PolymarketFeeTest(unittest.TestCase):
             polymarket_us_fee(10, 0.5)
 
 
+class SeriesThreadingTest(unittest.TestCase):
+    """A resolved per-series schedule that the PRICING path cannot see is worse
+    than no feature: `describe()` reported an override as resolved while every
+    fee was still computed at the generic rate."""
+
+    def setUp(self):
+        from core.fees import SERIES_OVERRIDES
+        self.overrides = SERIES_OVERRIDES
+        self.overrides["KXTEST"] = {"taker": 0.02}
+
+    def tearDown(self):
+        self.overrides.pop("KXTEST", None)
+
+    def test_fee_for_accepts_and_applies_a_series(self):
+        with_series = fee_for("kalshi", 1000, 0.5, "taker", series="KXTEST")
+        generic = fee_for("kalshi", 1000, 0.5, "taker")
+        self.assertLess(with_series.dollars, generic.dollars)
+
+    def test_unknown_series_falls_back_to_generic_not_an_error(self):
+        self.assertEqual(fee_for("kalshi", 1000, 0.5, "taker", series="KXOTHER").dollars,
+                         fee_for("kalshi", 1000, 0.5, "taker").dollars)
+
+    def test_describe_names_an_unresolved_series_for_this_run(self):
+        from core.fees import describe
+        self.assertIn("NO resolved fee schedule", describe("KXOTHER"))
+        self.assertNotIn("NO resolved fee schedule", describe("KXTEST"))
+
+
 class DispatchTest(unittest.TestCase):
     def test_unknown_venue_raises(self):
         with self.assertRaises(ValueError):

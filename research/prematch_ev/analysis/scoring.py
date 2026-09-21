@@ -259,7 +259,7 @@ class Eligibility:
     max_spread: float = 0.10          # a book this wide is not executable
 
     def admits(self, o: "Observation", venue: str = "kalshi",
-               role: str = "taker") -> bool:
+               role: str = "taker", series: str | None = None) -> bool:
         if not self.price_band[0] <= o.p_exchange <= self.price_band[1]:
             return False
         if not self.min_minutes_to_start <= o.minutes_to_start <= self.max_minutes_to_start:
@@ -268,7 +268,7 @@ class Eligibility:
             return False
         if o.exchange_ask - o.exchange_bid > self.max_spread:
             return False
-        return as_trade(o, venue, role, self) is not None
+        return as_trade(o, venue, role, self, series) is not None
 
 
 @dataclass(frozen=True)
@@ -296,7 +296,7 @@ class SideQuote:
 
 
 def side_quotes(o: "Observation", venue: str = "kalshi",
-                role: str = "taker") -> list[SideQuote]:
+                role: str = "taker", series: str | None = None) -> list[SideQuote]:
     """Both executable sides of one contract, each priced net of its own fee.
 
     YES pays the ask and wins when the contract settles true. NO pays
@@ -318,7 +318,8 @@ def side_quotes(o: "Observation", venue: str = "kalshi",
     ):
         if not 0.0 < entry < 1.0:
             continue
-        out.append(SideQuote(side, entry, fee_for(venue, 1.0, entry, role).dollars,
+        out.append(SideQuote(side, entry,
+                             fee_for(venue, 1.0, entry, role, series).dollars,
                              win_p, payout))
     return out
 
@@ -342,14 +343,15 @@ class Trade:
 
 
 def as_trade(o: "Observation", venue: str = "kalshi", role: str = "taker",
-             eligibility: "Eligibility | None" = None) -> Trade | None:
+             eligibility: "Eligibility | None" = None,
+             series: str | None = None) -> Trade | None:
     """The best executable side, if it clears the predeclared EV threshold.
 
     Both sides are priced and the better PREDICTED EV wins. The direction is
     not taken from the sign of a midpoint disagreement, because the midpoint is
     not a price anyone trades at.
     """
-    quotes = side_quotes(o, venue, role)
+    quotes = side_quotes(o, venue, role, series)
     if not quotes:
         return None
     best = max(quotes, key=lambda q: q.predicted_ev)
@@ -403,19 +405,22 @@ def realized_return(
     venue: str = "kalshi",
     role: str = "taker",
     bootstrap_rounds: int = DEFAULT_BOOTSTRAP,
+    series: str | None = None,
 ) -> ReturnReport:
     """Net-of-fee return from acting on the signal, on the eligible subset."""
     eligibility = eligibility or Eligibility()
-    eligible = [o for o in observations if eligibility.admits(o, venue, role)]
+    eligible = [o for o in observations if eligibility.admits(o, venue, role, series)]
 
     def mean_return(sample: list[Observation]) -> float:
-        trades = [t for t in (as_trade(o, venue, role, eligibility) for o in sample) if t]
+        trades = [t for t in (as_trade(o, venue, role, eligibility, series)
+                              for o in sample) if t]
         if not trades:
             raise ValueError("no trades in sample")
         staked = sum(t.entry_price + t.fee for t in trades)
         return sum(t.profit for t in trades) / staked if staked else 0.0
 
-    trades = [t for t in (as_trade(o, venue, role, eligibility) for o in eligible) if t]
+    trades = [t for t in (as_trade(o, venue, role, eligibility, series)
+                          for o in eligible) if t]
     if not trades:
         return ReturnReport(0, 0, 0.0, 0.0, float("nan"), float("nan"),
                             0, 0, 0.0, eligibility, venue, role)
@@ -704,11 +709,12 @@ def build_report(
     provenance: str = "",
     eligibility: Eligibility | None = None,
     ledger_text: str = "",
+    series: str | None = None,
 ) -> StudyReport:
     outcomes = [o.outcome for o in observations]
     return StudyReport(
         comparison=compare(observations),
-        returns=realized_return(observations, eligibility),
+        returns=realized_return(observations, eligibility, series=series),
         conditional=conditional_scores(observations),
         sharp_calibration=calibration([o.p_sharp for o in observations], outcomes),
         exchange_calibration=calibration([o.p_exchange for o in observations], outcomes),

@@ -27,7 +27,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from analysis.scoring import Eligibility, Observation, build_report  # noqa: E402
 from collect import (                                              # noqa: E402
-    Ledger, in_study_window, join_markets, observation_at_cutoff,
+    Ledger, cadence_is_viable, decision_cutoffs, in_study_window, join_markets,
+    observation_at_cutoff, snapshots_per_day_for,
 )
 from core import fees                                              # noqa: E402
 from core.matcher import match_event, unverified_note              # noqa: E402
@@ -51,7 +52,9 @@ def parse_args(argv=None):
     p.add_argument("--to", dest="end", help="YYYY-MM-DD")
     p.add_argument("--lead-minutes", type=int, default=60,
                    help="observe both predictors this many minutes before start")
-    p.add_argument("--snapshots-per-day", type=int, default=8)
+    p.add_argument("--discovery-snapshots-per-day", type=int, default=2,
+                   help="coarse grid used ONLY to learn when the games are; "
+                        "the real fetches are targeted at decision cutoffs")
     p.add_argument("--devig", choices=("shin", "multiplicative"), default="shin")
     p.add_argument("--max-quote-age", type=float, default=MAX_QUOTE_AGE_SECONDS,
                    help="reject a sharp quote older than this at the cutoff")
@@ -76,17 +79,32 @@ def plan(args) -> int:
         print("--plan needs --from and --to")
         return 2
     days = (_date(args.end) - _date(args.start)).days + 1
-    credits = estimate_credits(days, args.snapshots_per_day)
+    discovery = estimate_credits(days, args.discovery_snapshots_per_day)
+    # Games cluster on common start times; this is a deliberately pessimistic
+    # per-day figure for distinct cutoffs, refined by the discovery pass.
+    assumed_cutoffs = 6
+    targeted = estimate_credits(days, assumed_cutoffs)
+    grid_equivalent = estimate_credits(
+        days, snapshots_per_day_for(args.max_quote_age))
+
     print("STUDY PLAN")
     print(f"  sport            {args.sport}  (series {args.series})")
     print(f"  window           {args.start} .. {args.end}  ({days} days)")
-    print(f"  snapshots/day    {args.snapshots_per_day}")
-    print(f"  odds credits     ~{credits:,}  (10 per region per market per call)")
-    print(f"  kalshi calls     free, unauthenticated")
     print(f"  lead time        {args.lead_minutes} min before scheduled start")
+    print(f"  freshness bound  {args.max_quote_age:.0f}s at the decision timestamp")
     print(f"  de-vig           {args.devig}")
     print()
-    print(f"  fee models       {fees.describe()}")
+    print(f"  discovery pass   {args.discovery_snapshots_per_day}/day  "
+          f"~{discovery:,} credits (learns the schedule only)")
+    print(f"  targeted pass    ~{assumed_cutoffs}/day at decision cutoffs  "
+          f"~{targeted:,} credits")
+    print(f"  ESTIMATED TOTAL  ~{discovery + targeted:,} credits")
+    print()
+    print(f"  for comparison, a fixed grid fine enough to satisfy the freshness")
+    print(f"  bound needs {snapshots_per_day_for(args.max_quote_age)}/day = "
+          f"~{grid_equivalent:,} credits, which is why fetches are targeted.")
+    print()
+    print(f"  fee models       {fees.describe(args.series)}")
     print()
     print(f"  NOTE  {unverified_note()}")
     return 0
@@ -162,33 +180,72 @@ def collect(args, key: str):
     print(f"  kalshi: {len(all_markets):,} settled markets -> {len(markets):,} in window "
           f"({outside:,} outside, cutoff {cutoff.date() if cutoff else 'UNKNOWN'})")
 
-    # --- sharp side: one call per snapshot ----------------------------------
+    # --- sharp side: DISCOVER the schedule, then TARGET the cutoffs ---------
+    #
+    # A fixed grid cannot do this job. At the old default of 8 snapshots a day
+    # the grid steps every 180 minutes against a 15-minute freshness bound, so
+    # essentially no decision cutoff had a fresh quote and the study produced
+    # almost nothing -- a working collector returning an empty answer. A grid
+    # fine enough to satisfy the bound needs 96/day, which is ~121k credits for
+    # a season. Targeting the cutoffs the games actually imply costs ~4k for
+    # the same season, because games cluster on common start times.
     quotes_by_event: dict[str, list] = {}
-    cursor, step = start, timedelta(hours=24 / max(1, args.snapshots_per_day))
     snapshots = 0
-    while cursor < end_exclusive:
-        if credits.exhausted():
-            coverage.fail(f"odds quota exhausted at {cursor.date()}; window truncated")
-            break
-        snap = fetch_snapshot(args.sport, cursor, key, ledger=credits)
+
+    def absorb(snap, at):
+        nonlocal snapshots
         coverage.merge(snap.coverage)
         snapshots += 1
         ledger.count("odds_events", snap.events_seen, unit="event-quotes")
-        if snap.events_without_sharp_book:
-            ledger.reject("event_without_sharp_book", f"at {cursor.isoformat()}",
-                          count=snap.events_without_sharp_book, stage="odds_events")
-        if snap.events_without_id:
-            ledger.reject("odds_event_without_id", f"at {cursor.isoformat()}",
-                          count=snap.events_without_id, stage="odds_events")
-        if snap.quotes_without_update_time:
-            ledger.reject("sharp_quote_without_update_time", f"at {cursor.isoformat()}",
-                          count=snap.quotes_without_update_time, stage="odds_events")
+        for reason, n in (("event_without_sharp_book", snap.events_without_sharp_book),
+                          ("odds_event_without_id", snap.events_without_id),
+                          ("sharp_quote_without_update_time",
+                           snap.quotes_without_update_time)):
+            if n:
+                ledger.reject(reason, f"at {at.isoformat()}", count=n,
+                              stage="odds_events")
         for quote in snap.quotes:
             quotes_by_event.setdefault(quote.provider_event_id, []).append(quote)
-        cursor += step
-    ledger.count("odds_snapshots", snapshots, unit="snapshots")
-    print(f"  odds:   {len(quotes_by_event):,} sharp events over {snapshots:,} snapshots "
-          f"({credits})")
+        return snap
+
+    # Pass 1: a coarse grid, only to learn when the games are.
+    schedule: set = set()
+    cursor = start
+    discovery_step = timedelta(hours=24 / max(1, args.discovery_snapshots_per_day))
+    while cursor < end_exclusive:
+        if credits.exhausted():
+            coverage.fail(f"odds quota exhausted during discovery at {cursor.date()}")
+            break
+        snap = absorb(fetch_snapshot(args.sport, cursor, key, ledger=credits), cursor)
+        schedule.update(q.commence_time for q in snap.quotes)
+        cursor += discovery_step
+    ledger.count("discovery_snapshots", snapshots, unit="snapshots")
+    print(f"  odds:   discovery found {len(schedule):,} scheduled starts "
+          f"over {snapshots:,} snapshots")
+
+    # Pass 2: one fetch per distinct decision cutoff those games imply.
+    cutoffs = [c for c in decision_cutoffs(schedule, args.lead_minutes)
+               if start <= c < end_exclusive]
+    targeted = 0
+    for cutoff in cutoffs:
+        if credits.exhausted():
+            coverage.fail(f"odds quota exhausted at cutoff {cutoff.isoformat()}; "
+                          "window truncated")
+            break
+        absorb(fetch_snapshot(args.sport, cutoff, key, ledger=credits), cutoff)
+        targeted += 1
+    ledger.count("targeted_snapshots", targeted, unit="snapshots")
+    print(f"          {targeted:,} targeted snapshots at decision cutoffs "
+          f"-> {len(quotes_by_event):,} sharp events ({credits})")
+
+    if not cadence_is_viable(args.discovery_snapshots_per_day, args.max_quote_age) \
+            and not cutoffs:
+        coverage.fail(
+            f"no decision cutoffs were derived and the discovery grid "
+            f"({args.discovery_snapshots_per_day}/day) is coarser than the "
+            f"{args.max_quote_age:.0f}s freshness bound, so no fresh quote can "
+            "exist at any cutoff"
+        )
 
     # --- join on participants, then time ------------------------------------
     joined = join_markets(markets, quotes_by_event, args.sport, ledger)
@@ -251,9 +308,10 @@ def main(argv=None) -> int:
         return 1
 
     report = build_report(
-        observations, coverage, fees.describe(),
+        observations, coverage, fees.describe(args.series),
         eligibility=Eligibility(min_net_ev=args.min_net_ev,
                                 max_spread=args.max_spread),
+        series=args.series,
         ledger_text=ledger.render(),
     )
     print()
@@ -273,12 +331,12 @@ def main(argv=None) -> int:
             "sport": args.sport, "series": args.series,
             "from": args.start, "to": args.end,
             "lead_minutes": args.lead_minutes,
-            "snapshots_per_day": args.snapshots_per_day,
+            "discovery_snapshots_per_day": args.discovery_snapshots_per_day,
             "devig": args.devig,
             "max_quote_age_seconds": args.max_quote_age,
             "min_net_ev": args.min_net_ev,
             "max_spread": args.max_spread,
-            "fees": fees.describe(),
+            "fees": fees.describe(args.series),
         },
     }, indent=2), encoding="utf-8")
     (out / "observations.json").write_text(

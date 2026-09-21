@@ -35,6 +35,8 @@ FOUR RULES, each replacing a specific defect:
 
 from __future__ import annotations
 
+import math
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -60,6 +62,55 @@ MAX_SOURCE_LAG = timedelta(minutes=20)
 # Above this share of unexplained loss the surviving sample cannot be assumed
 # representative, and coverage fails rather than certifying it.
 MAX_UNEXPLAINED_LOSS = 0.20
+
+
+# The archive's snapshot resolution. Requesting a time between snapshots
+# returns the closest one at or before it, so cutoffs are aligned to this grid
+# before deduplication -- two games five minutes apart share one fetch.
+SNAPSHOT_RESOLUTION = timedelta(minutes=5)
+
+
+def cadence_is_viable(snapshots_per_day: int, max_quote_age: float) -> bool:
+    """Whether a FIXED GRID of snapshots can ever satisfy the freshness limit.
+
+    These two settings are individually reasonable and jointly fatal. At the
+    old default of 8 snapshots a day the grid steps every 180 minutes while the
+    freshness bound is 15, so a decision cutoff almost never has a quote within
+    the limit and the study yields close to nothing -- a fully working
+    collector producing an empty result, which is the worst kind of failure
+    because it looks like an answer.
+
+    A grid is viable only when its step is no wider than the freshness bound.
+    Otherwise snapshots must be TARGETED at the decision cutoffs instead.
+    """
+    if snapshots_per_day <= 0:
+        return False
+    return (24 * 3600 / snapshots_per_day) <= max_quote_age
+
+
+def snapshots_per_day_for(max_quote_age: float) -> int:
+    """The coarsest grid that could satisfy a freshness bound."""
+    return max(1, math.ceil(24 * 3600 / max_quote_age))
+
+
+def decision_cutoffs(
+    commence_times: Iterable[datetime],
+    lead_minutes: float,
+    resolution: timedelta = SNAPSHOT_RESOLUTION,
+) -> list[datetime]:
+    """The distinct instants a targeted fetch actually needs.
+
+    Games cluster on common start times, so a slate of fifteen games usually
+    needs a handful of fetches rather than fifteen: each cutoff is floored to
+    the archive's snapshot grid and then deduplicated. This is what makes
+    targeting cheaper than a grid fine enough to satisfy the freshness bound.
+    """
+    step = resolution.total_seconds()
+    seen: set[float] = set()
+    for start in commence_times:
+        cutoff = start - timedelta(minutes=lead_minutes)
+        seen.add(math.floor(cutoff.timestamp() / step) * step)
+    return [datetime.fromtimestamp(ts, tz=timezone.utc) for ts in sorted(seen)]
 
 
 @dataclass

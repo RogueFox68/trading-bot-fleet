@@ -133,6 +133,7 @@ def polymarket_fee(
     n_contracts: float,
     price: float,
     role: Role = "taker",
+    series: str | None = None,
     theta: float = POLYMARKET_SPORTS_THETA,
 ) -> Fee:
     # Makers pay nothing and are rebated; the rebate is deliberately NOT
@@ -142,7 +143,8 @@ def polymarket_fee(
     return _quote(raw, n_contracts, price, "polymarket", role)
 
 
-def polymarket_us_fee(n_contracts: float, price: float, role: Role = "taker") -> Fee:
+def polymarket_us_fee(n_contracts: float, price: float, role: Role = "taker",
+                      series: str | None = None) -> Fee:
     raise NotImplementedError(
         "The Polymarket US entity publishes a different fee schedule from the "
         "international venue and it has not been verified for this study. "
@@ -159,8 +161,14 @@ _VENUES = {
 }
 
 
-def fee_for(venue: str, n_contracts: float, price: float, role: Role = "taker") -> Fee:
+def fee_for(venue: str, n_contracts: float, price: float, role: Role = "taker",
+            series: str | None = None) -> Fee:
     """Dispatch to a venue's fee model. Unknown venue raises, never defaults.
+
+    `series` is threaded through because a resolved per-series schedule that
+    the pricing path cannot see is worse than no feature at all: `describe()`
+    would report an override as resolved while every fee was still computed at
+    the generic rate. Callers that price a trade MUST pass the series.
 
     There is no fallback schedule on purpose. Defaulting an unknown venue to
     some other venue's numbers produces a confident, wrong EV -- the same
@@ -173,10 +181,19 @@ def fee_for(venue: str, n_contracts: float, price: float, role: Role = "taker") 
         raise ValueError(
             f"unknown venue {venue!r}; known venues are {sorted(_VENUES)}"
         ) from None
-    return model(n_contracts, price, role)
+    return model(n_contracts, price, role, series)
 
 
-def describe() -> str:
+def unresolved_series_warning(series: str | None) -> str | None:
+    """Says when a study is pricing at the generic rate for its own series."""
+    if series and series not in SERIES_OVERRIDES:
+        return (f"series {series!r} has NO resolved fee schedule; the generic "
+                "Kalshi coefficients are assumed and every return figure "
+                "inherits that assumption")
+    return None
+
+
+def describe(series: str | None = None) -> str:
     """Provenance line for a study report, so results carry their own stamps."""
     return (
         f"kalshi taker={KALSHI_TAKER_COEFF} maker={KALSHI_MAKER_COEFF} "
@@ -184,5 +201,8 @@ def describe() -> str:
         f"polymarket sports theta={POLYMARKET_SPORTS_THETA} maker=0 "
         f"(verified {POLYMARKET_VERIFIED_ON}); "
         f"polymarket_us=UNVERIFIED (raises); "
-        f"series overrides resolved: {sorted(SERIES_OVERRIDES) or 'NONE -- generic rates assumed'}"
+        f"series overrides resolved: {sorted(SERIES_OVERRIDES) or 'NONE'}"
+        + (f"; THIS RUN: {unresolved_series_warning(series)}"
+           if unresolved_series_warning(series) else
+           f"; THIS RUN: {series} uses {SERIES_OVERRIDES.get(series or '', 'generic')}")
     )

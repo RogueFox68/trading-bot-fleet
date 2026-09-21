@@ -202,6 +202,35 @@ class NetEvScreenTest(unittest.TestCase):
         self.assertFalse(Eligibility(min_net_ev=0.50).admits(o))
 
 
+class SeriesFeeTest(unittest.TestCase):
+    """The return path must price with the study's own series schedule."""
+
+    def setUp(self):
+        from core.fees import SERIES_OVERRIDES
+        self.overrides = SERIES_OVERRIDES
+        self.overrides["KXTEST"] = {"taker": 0.001}
+
+    def tearDown(self):
+        self.overrides.pop("KXTEST", None)
+
+    def test_side_quotes_apply_the_series_schedule(self):
+        o = obs("E", "M", 0.60, 0.50, 1, bid=0.49, ask=0.51)
+        cheap = [q for q in side_quotes(o, series="KXTEST") if q.side == "YES"][0]
+        generic = [q for q in side_quotes(o) if q.side == "YES"][0]
+        self.assertLess(cheap.fee, generic.fee)
+        self.assertGreater(cheap.predicted_ev, generic.predicted_ev)
+
+    def test_realized_return_threads_the_series(self):
+        data = [obs(f"E{i}", f"M{i}", 0.60, 0.50, i % 2, bid=0.49, ask=0.51)
+                for i in range(60)]
+        cheap = realized_return(data, Eligibility(min_net_ev=0.0),
+                                bootstrap_rounds=100, series="KXTEST")
+        generic = realized_return(data, Eligibility(min_net_ev=0.0),
+                                  bootstrap_rounds=100)
+        self.assertGreater(cheap.mean_profit_per_contract,
+                           generic.mean_profit_per_contract)
+
+
 class GroundTruthTest(unittest.TestCase):
     def test_detects_a_real_edge(self):
         """Sharp materially less noisy than the exchange."""

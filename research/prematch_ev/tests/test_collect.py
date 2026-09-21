@@ -14,8 +14,9 @@ from unittest import mock
 
 import collect
 from collect import (
-    JoinedMarket, Ledger, in_study_window, join_markets, market_start_time,
-    observation_at_cutoff, orient_probability, start_metadata_available,
+    JoinedMarket, Ledger, cadence_is_viable, decision_cutoffs, in_study_window,
+    join_markets, market_start_time, observation_at_cutoff, orient_probability,
+    snapshots_per_day_for, start_metadata_available,
 )
 from data.kalshi_history import Coverage
 from data.odds_history import SharpQuote
@@ -94,6 +95,56 @@ class StartMetadataTest(unittest.TestCase):
         with mock.patch.object(collect, "VERIFIED_START_KEYS_ISO", ("real_start",)):
             self.assertEqual(market_start_time({"real_start": "2026-07-04T17:05:00Z"}),
                              GAME1)
+
+
+class CadenceTest(unittest.TestCase):
+    """Two individually reasonable settings that were jointly fatal.
+
+    A fixed grid of 8 snapshots/day steps every 180 minutes against a
+    15-minute freshness bound, so essentially no decision cutoff had a fresh
+    quote: a fully working collector returning an empty answer, which is the
+    worst failure shape because it looks like a result.
+    """
+
+    BOUND = 900.0     # 15 minutes
+
+    def test_the_old_default_grid_is_not_viable(self):
+        self.assertFalse(cadence_is_viable(8, self.BOUND))
+
+    def test_a_grid_at_or_finer_than_the_bound_is_viable(self):
+        self.assertTrue(cadence_is_viable(96, self.BOUND))
+        self.assertTrue(cadence_is_viable(288, self.BOUND))
+
+    def test_zero_or_negative_cadence_is_not_viable(self):
+        self.assertFalse(cadence_is_viable(0, self.BOUND))
+        self.assertFalse(cadence_is_viable(-1, self.BOUND))
+
+    def test_coarsest_viable_grid_is_reported(self):
+        self.assertEqual(snapshots_per_day_for(self.BOUND), 96)
+
+    def test_cutoffs_cluster_so_targeting_is_cheaper_than_a_viable_grid(self):
+        base = datetime(2026, 7, 4, 17, 5, tzinfo=UTC)
+        starts = ([base] * 6 + [base + timedelta(minutes=5)] * 4
+                  + [base + timedelta(hours=3)] * 5)
+        cuts = decision_cutoffs(starts, 60)
+        self.assertEqual(len(cuts), 3, "15 games share three cutoffs")
+        self.assertLess(len(cuts), snapshots_per_day_for(self.BOUND))
+
+    def test_cutoffs_are_floored_to_the_snapshot_grid(self):
+        base = datetime(2026, 7, 4, 17, 7, tzinfo=UTC)
+        cut = decision_cutoffs([base], 60)[0]
+        self.assertEqual(cut.minute % 5, 0)
+        self.assertLessEqual(cut, base - timedelta(minutes=60))
+
+    def test_cutoffs_are_sorted_and_unique(self):
+        base = datetime(2026, 7, 4, 17, 5, tzinfo=UTC)
+        starts = [base + timedelta(hours=h) for h in (3, 0, 1, 3, 0)]
+        cuts = decision_cutoffs(starts, 60)
+        self.assertEqual(cuts, sorted(set(cuts)))
+        self.assertEqual(len(cuts), 3)
+
+    def test_no_games_yields_no_cutoffs(self):
+        self.assertEqual(decision_cutoffs([], 60), [])
 
 
 class WindowTest(unittest.TestCase):

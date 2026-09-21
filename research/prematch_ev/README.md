@@ -145,7 +145,38 @@ Thresholds, lead time, price band, de-vig model and market eligibility go in
 holdout**, and report sensitivity to latency, spread, fee and de-vig choice.
 Tuning them after seeing returns is how a study confirms itself.
 
+## Snapshots are targeted, not gridded
+
+Two settings that were individually reasonable and jointly fatal: a fixed grid
+of **8 snapshots/day** steps every 180 minutes against a **15-minute** freshness
+bound, so essentially no decision cutoff had a fresh quote. A fully working
+collector returning an empty answer — the worst failure shape, because it looks
+like a result.
+
+A grid fine enough to satisfy the bound needs 96/day: **~121,000 credits** for a
+126-day season, far past any sane tier. So fetches are **targeted at the
+decision cutoffs the games actually imply**:
+
+1. **Discovery pass** — a coarse grid (2/day) purely to learn when the games are.
+2. **Targeted pass** — one fetch per distinct cutoff, floored to the archive's
+   5-minute snapshot grid and deduplicated. Games cluster on common start
+   times, so a 15-game slate needs about three fetches, not fifteen.
+
+**~10,000 credits** for the same season. `cadence_is_viable()` refuses a
+grid-only configuration that cannot satisfy the bound, rather than running it
+and returning nothing.
+
+## Fees must carry the series
+
+`fee_for()` takes a `series` and threads it to the venue model. A resolved
+`SERIES_OVERRIDES` entry that the *pricing* path cannot see is worse than no
+feature: `describe()` reported an override as resolved while every fee was
+still computed at the generic rate. `describe(series)` now names whether **this
+run's** series has a resolved schedule, and says plainly when it does not.
+
 ## Running it
+
+
 
 ```bash
 cd research/prematch_ev
