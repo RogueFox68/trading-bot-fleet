@@ -13,7 +13,9 @@ from pathlib import Path
 from unittest import mock
 
 import run_study
-from analysis.scoring import Observation
+from analysis.scoring import (
+    Eligibility, Observation, screen_diagnostics,
+)
 from collect import Ledger
 from data.cache import CreditCapReached, ResponseCache, key_for, redact
 from data.kalshi_history import Coverage
@@ -243,6 +245,70 @@ class RetryBudgetTest(unittest.TestCase):
         import collect as collect_mod
         self.assertIn("CreditCapReached", Path("run_study.py").read_text(),
                       "collect() must catch the cap and keep what it has")
+
+
+class QuotaLabelTest(unittest.TestCase):
+    """`used` is the ACCOUNT's cumulative usage from `x-requests-used`, not
+    this run's spend. Presenting it as "credits used" made a 140-credit run
+    report 340."""
+
+    def test_this_run_and_cumulative_are_named_separately(self):
+        led = CreditLedger()
+        led.observe({"x-requests-used": "340", "x-requests-remaining": "19660"})
+        led.spent_this_run = 140
+        text = str(led)
+        self.assertIn("140 credits this run", text)
+        self.assertIn("340 cumulative on the account", text)
+
+    def test_cumulative_is_not_presented_as_this_runs_spend(self):
+        led = CreditLedger()
+        led.observe({"x-requests-used": "340"})
+        self.assertNotIn("340 credits used", str(led))
+
+
+class ScreenDiagnosticsTest(unittest.TestCase):
+    """A run that finds no trades and a run whose collection broke both print
+    "no eligible trades". The distribution is what separates them."""
+
+    def _obs(self, n, sharp, mid, bid, ask):
+        return [Observation(f"E{i}", f"M{i}",
+                            datetime(2026, 9, 14, tzinfo=UTC) + timedelta(hours=i),
+                            60.0, sharp, mid, i % 2,
+                            exchange_bid=bid, exchange_ask=ask)
+                for i in range(n)]
+
+    def test_absent_edge_is_distinguishable_from_collection_failure(self):
+        d = screen_diagnostics(self._obs(40, 0.505, 0.50, 0.49, 0.51),
+                               Eligibility(min_net_ev=0.01))
+        self.assertEqual(d.considered, 40)
+        self.assertEqual(d.admitted, 0)
+        self.assertEqual(d.rejected_below_ev, 40,
+                         "rejected on EV, not on missing data")
+        self.assertEqual(d.rejected_no_quotes, 0)
+        self.assertTrue(d.best_net_ev, "the distribution must be reported")
+
+    def test_missing_quotes_are_counted_separately_from_thin_edge(self):
+        obs = [Observation("E", "M", datetime(2026, 9, 14, tzinfo=UTC), 60.0,
+                           0.60, 0.50, 1)]
+        d = screen_diagnostics(obs, Eligibility(min_net_ev=0.01))
+        self.assertEqual(d.rejected_no_quotes, 1)
+        self.assertEqual(d.rejected_below_ev, 0)
+
+    def test_each_filter_is_attributed(self):
+        wide = screen_diagnostics(self._obs(5, 0.60, 0.50, 0.30, 0.70),
+                                  Eligibility(min_net_ev=0.0, max_spread=0.05))
+        self.assertEqual(wide.rejected_spread, 5)
+        band = screen_diagnostics(self._obs(5, 0.99, 0.97, 0.96, 0.98),
+                                  Eligibility(min_net_ev=0.0))
+        self.assertEqual(band.rejected_price_band, 5)
+
+    def test_report_includes_the_diagnostics(self):
+        from data.kalshi_history import Coverage as Cov
+        text = run_study.build_report(self._obs(40, 0.505, 0.50, 0.49, 0.51),
+                                      Cov()).render()
+        self.assertIn("SCREEN DIAGNOSTICS", text)
+        self.assertIn("NO TRADES", text)
+        self.assertIn("not a reason", text)
 
 
 class CacheTest(unittest.TestCase):

@@ -110,8 +110,16 @@ class CreditLedger:
         return self.remaining is not None and self.remaining <= reserve
 
     def __str__(self) -> str:
-        left = "unknown" if self.remaining is None else str(self.remaining)
-        return f"{self.calls} calls, {self.used} credits used, {left} remaining"
+        """Three different numbers, named as three different things.
+
+        `used` is the ACCOUNT's cumulative usage, read from
+        `x-requests-used`; it includes every earlier run. Presenting it as
+        "credits used" made a 140-credit run report 340. `spent_this_run` is
+        what THIS run reserved, and is the figure a `--max-credits` cap acts on.
+        """
+        left = "unknown" if self.remaining is None else f"{self.remaining:,}"
+        return (f"{self.calls} calls, {self.spent_this_run:,} credits this run, "
+                f"{self.used:,} cumulative on the account, {left} remaining")
 
 
 @dataclass(frozen=True)

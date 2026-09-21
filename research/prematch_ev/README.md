@@ -165,6 +165,40 @@ transient outage permanent on replay.
 would change the study universe, which is a different thing from fetching the
 inputs that universe needs.
 
+## Study coverage vs provider diagnostics
+
+These are different questions and were being conflated. A snapshot
+legitimately carries events the study never asked about — other days, other
+games, times nowhere near a decision cutoff. A live run returned 344
+event-quotes across snapshots; 88 had empty bookmaker arrays, **78 of them for
+a day outside the declared window**, and none was a required observation. All
+40 target contracts resolved, yet coverage failed.
+
+Coverage is now measured against the **independently enumerated target
+universe** — the eligible contracts and the decision cutoffs they require,
+counted from the free exchange side. Provider-side counts are marked
+`diagnostic`: reported in full, never gating. The denominator is deliberately
+**not** derived from how many observations succeeded, because a denominator
+defined by its successes always reads 100%.
+
+## Telling absent edge from a broken collection
+
+Both print "no eligible trades". `SCREEN DIAGNOSTICS` separates them: counts by
+filter (price band, lead time, missing quotes, spread, below the EV floor) plus
+the distribution of best predicted net EV and best gross edge per contract.
+
+A real run produced predicted net EV between **−$0.0247 and −$0.0145** with a
+maximum *pre-fee* edge of **$0.0055** — the fee alone exceeds the best gross
+edge found. That is a legitimate no-trade result, and it is visible as one.
+**It is not a reason to loosen the frozen threshold.**
+
+## Three different credit numbers
+
+`x-requests-used` is the **account's cumulative** usage across every run.
+Presenting it as "credits used" made a 140-credit run report 340. The ledger
+now names all three: this run's spend (what `--max-credits` acts on), the
+account cumulative, and the remaining balance.
+
 ## Reading the result## Reading the result
 
 Six sections. **No single number is a go signal.**

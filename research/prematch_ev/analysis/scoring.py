@@ -363,6 +363,94 @@ def as_trade(o: "Observation", venue: str = "kalshi", role: str = "taker",
 
 
 @dataclass
+class ScreenDiagnostics:
+    """Why the frozen policy rejected what it rejected.
+
+    A run that finds no trades and a run whose collection broke both print
+    "no eligible trades". These counts, and the EV distribution underneath
+    them, are what tells the two apart -- and they are the honest alternative
+    to loosening a frozen threshold until trades appear.
+    """
+
+    considered: int = 0
+    rejected_price_band: int = 0
+    rejected_lead_time: int = 0
+    rejected_no_quotes: int = 0
+    rejected_spread: int = 0
+    rejected_below_ev: int = 0
+    admitted: int = 0
+    best_net_ev: list[float] = field(default_factory=list)
+    best_gross_edge: list[float] = field(default_factory=list)
+
+    def _pct(self, values, q):
+        if not values:
+            return float("nan")
+        ordered = sorted(values)
+        return ordered[min(len(ordered) - 1, int(q * len(ordered)))]
+
+    def render(self) -> str:
+        lines = ["SCREEN DIAGNOSTICS"]
+        lines.append(f"    considered              {self.considered:>8,}")
+        for label, n in (("rejected: price band", self.rejected_price_band),
+                         ("rejected: lead time", self.rejected_lead_time),
+                         ("rejected: no quotes", self.rejected_no_quotes),
+                         ("rejected: spread too wide", self.rejected_spread),
+                         ("rejected: below EV floor", self.rejected_below_ev)):
+            lines.append(f"    {label:24}{n:>8,}")
+        lines.append(f"    ADMITTED                {self.admitted:>8,}")
+        if self.best_net_ev:
+            lines.append("  best predicted NET EV per contract (after fee):")
+            lines.append(f"    min {min(self.best_net_ev):+.6f}   "
+                         f"median {self._pct(self.best_net_ev, 0.5):+.6f}   "
+                         f"max {max(self.best_net_ev):+.6f}")
+        if self.best_gross_edge:
+            lines.append("  best GROSS edge per contract (before fee):")
+            lines.append(f"    min {min(self.best_gross_edge):+.6f}   "
+                         f"median {self._pct(self.best_gross_edge, 0.5):+.6f}   "
+                         f"max {max(self.best_gross_edge):+.6f}")
+        if self.considered and not self.admitted:
+            lines.append("  -> NO TRADES. The distribution above says whether that is")
+            lines.append("     absent edge or a collection failure. It is not a reason")
+            lines.append("     to loosen the frozen threshold.")
+        return "\n".join(lines)
+
+
+def screen_diagnostics(observations: list["Observation"],
+                       eligibility: "Eligibility | None" = None,
+                       venue: str = "kalshi", role: str = "taker",
+                       series: str | None = None) -> ScreenDiagnostics:
+    """Count why each observation passed or failed the frozen policy."""
+    eligibility = eligibility or Eligibility()
+    d = ScreenDiagnostics(considered=len(observations))
+    for o in observations:
+        if not eligibility.price_band[0] <= o.p_exchange <= eligibility.price_band[1]:
+            d.rejected_price_band += 1
+            continue
+        if not (eligibility.min_minutes_to_start <= o.minutes_to_start
+                <= eligibility.max_minutes_to_start):
+            d.rejected_lead_time += 1
+            continue
+        if o.exchange_bid is None or o.exchange_ask is None:
+            d.rejected_no_quotes += 1
+            continue
+        if o.exchange_ask - o.exchange_bid > eligibility.max_spread:
+            d.rejected_spread += 1
+            continue
+        quotes = side_quotes(o, venue, role, series)
+        if not quotes:
+            d.rejected_no_quotes += 1
+            continue
+        best = max(quotes, key=lambda q: q.predicted_ev)
+        d.best_net_ev.append(best.predicted_ev)
+        d.best_gross_edge.append(best.win_probability - best.entry_price)
+        if best.predicted_ev < eligibility.min_net_ev:
+            d.rejected_below_ev += 1
+        else:
+            d.admitted += 1
+    return d
+
+
+@dataclass
 class ReturnReport:
     games: int
     trades: int
@@ -580,6 +668,7 @@ class StudyReport:
     coverage: Coverage = field(default_factory=Coverage)
     provenance: str = ""
     ledger_text: str = ""
+    screen: ScreenDiagnostics | None = None
 
     def readiness(self) -> list[tuple[str, bool, str]]:
         """Diagnostics and gates, separated.
@@ -636,6 +725,10 @@ class StudyReport:
         add(f"    exchange  Brier {c.exchange_brier:.5f}   log loss {c.exchange_log_loss:.5f}")
         add(f"    -> {c.verdict()}")
         add("")
+
+        if self.screen is not None:
+            add(self.screen.render())
+            add("")
 
         r = self.returns
         add("[2] NET RETURN on the predeclared eligible subset")
@@ -722,4 +815,5 @@ def build_report(
         coverage=coverage or Coverage(),
         provenance=provenance,
         ledger_text=ledger_text,
+        screen=screen_diagnostics(observations, eligibility, series=series),
     )

@@ -281,14 +281,20 @@ def collect(args, key: str):
             break
         coverage.merge(snap.coverage)
         snapshots += 1
-        ledger.count("odds_events", snap.events_seen, unit="event-quotes")
+        # PROVIDER diagnostics, not study coverage. A snapshot legitimately
+        # carries events the study never asked about: other days, other games,
+        # times nowhere near a decision cutoff. Counting those against coverage
+        # let 88 irrelevant event-quotes -- 78 of them for a day outside the
+        # declared window -- fail a run whose 40 target contracts all resolved.
+        ledger.count("provider_events", snap.events_seen, unit="event-quotes",
+                     diagnostic=True)
         for reason, n in (("event_without_sharp_book", snap.events_without_sharp_book),
                           ("odds_event_without_id", snap.events_without_id),
                           ("sharp_quote_without_update_time",
                            snap.quotes_without_update_time)):
             if n:
                 ledger.reject(reason, f"at {at.isoformat()}", count=n,
-                              stage="odds_events")
+                              stage="provider_events", diagnostic=True)
         for quote in snap.quotes:
             quotes_by_event.setdefault(quote.provider_event_id, []).append(quote)
     ledger.count("odds_snapshots", snapshots, unit="snapshots")
@@ -300,8 +306,12 @@ def collect(args, key: str):
     print(f"  joined: {len(joined):,} contracts matched to a sharp event")
 
     # --- one decision timestamp per game -------------------------------------
+    # THE STUDY'S OWN DENOMINATOR: one target contract per joined market, each
+    # needing a usable quote at its required cutoff. Independently enumerated
+    # from the exchange side, never derived from how many observations
+    # succeeded -- a denominator defined by its successes always reads 100%.
     observations: list[Observation] = []
-    ledger.count("observation_build", len(joined), unit="contracts")
+    ledger.count("target_contracts", len(joined), unit="contracts")
     for jm in joined:
         decision_at = jm.start - timedelta(minutes=args.lead_minutes)
         candles, cand_cov = fetch_candlesticks(
@@ -314,7 +324,7 @@ def collect(args, key: str):
         obs = observation_at_cutoff(
             jm, quotes_by_event.get(jm.provider_event_id, []), candles,
             decision_at, args.sport, ledger, method=args.devig,
-            max_quote_age=args.max_quote_age, reject_stage="observation_build",
+            max_quote_age=args.max_quote_age, reject_stage="target_contracts",
         )
         if obs is not None:
             observations.append(obs)

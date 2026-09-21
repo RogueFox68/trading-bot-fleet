@@ -119,12 +119,22 @@ def decision_cutoffs(
 
 @dataclass
 class Stage:
-    """One pipeline stage, in its OWN units."""
+    """One pipeline stage, in its OWN units.
+
+    `diagnostic` marks a stage that describes what a PROVIDER returned rather
+    than whether the STUDY got what it needed. A snapshot legitimately carries
+    events the study never asked about -- other days, other games, times far
+    from any decision cutoff -- and counting those against coverage let 88
+    irrelevant event-quotes (78 of them for a day outside the declared window)
+    fail a run whose 40 target contracts all resolved. Diagnostic stages are
+    reported in full and never gate coverage.
+    """
 
     unit: str                 # "snapshots" | "event-quotes" | "contracts" | "games"
     considered: int = 0
     excluded: int = 0         # eligibility: the study's own choice
     rejected: int = 0         # failures: a gap in what it could see
+    diagnostic: bool = False
 
     @property
     def eligible(self) -> int:
@@ -174,17 +184,24 @@ class Ledger:
     eligibility_exclusions: dict[str, int] = field(default_factory=dict)
     examples: dict[str, list[str]] = field(default_factory=dict)
 
-    def stage(self, name: str, unit: str = "records") -> Stage:
-        return self.stages.setdefault(name, Stage(unit=unit))
+    def stage(self, name: str, unit: str = "records",
+              diagnostic: bool = False) -> Stage:
+        found = self.stages.get(name)
+        if found is None:
+            found = self.stages[name] = Stage(unit=unit, diagnostic=diagnostic)
+        elif diagnostic:
+            found.diagnostic = True
+        return found
 
-    def count(self, stage: str, n: int = 1, unit: str = "records") -> None:
-        self.stage(stage, unit).considered += n
+    def count(self, stage: str, n: int = 1, unit: str = "records",
+              diagnostic: bool = False) -> None:
+        self.stage(stage, unit, diagnostic).considered += n
 
     def reject(self, reason: str, example: str = "", count: int = 1,
-               stage: str = "contracts") -> None:
+               stage: str = "contracts", diagnostic: bool = False) -> None:
         self.rejections[reason] = self.rejections.get(reason, 0) + count
         self.rejection_stage[reason] = stage
-        self.stage(stage).rejected += count
+        self.stage(stage, diagnostic=diagnostic).rejected += count
         if example:
             shown = self.examples.setdefault(reason, [])
             if len(shown) < 5:
@@ -206,12 +223,13 @@ class Ledger:
     def lossy_stages(self, threshold: float = None) -> list[tuple[str, Stage]]:
         limit = MAX_UNEXPLAINED_LOSS if threshold is None else threshold
         return [(name, s) for name, s in sorted(self.stages.items())
-                if s.loss_rate is not None and s.eligible and s.loss_rate > limit]
+                if not s.diagnostic and s.loss_rate is not None
+                and s.eligible and s.loss_rate > limit]
 
     def unaccounted_stages(self) -> list[tuple[str, Stage]]:
         """Stages that rejected records against no denominator."""
         return [(name, s) for name, s in sorted(self.stages.items())
-                if not s.accounting_is_valid]
+                if not s.diagnostic and not s.accounting_is_valid]
 
     def apply_to(self, coverage: Coverage) -> Coverage:
         for name, s in self.unaccounted_stages():
@@ -234,7 +252,8 @@ class Ledger:
                            "excluded": s.excluded, "rejected": s.rejected,
                            "loss_rate": (round(s.loss_rate, 6)
                                          if s.loss_rate is not None else None),
-                           "accounting_valid": s.accounting_is_valid}
+                           "accounting_valid": s.accounting_is_valid,
+                           "diagnostic": s.diagnostic}
                        for n, s in sorted(self.stages.items())},
             "rejections": {r: {"count": c, "stage": self.rejection_stage.get(r, "?")}
                            for r, c in sorted(self.rejections.items())},
@@ -246,7 +265,8 @@ class Ledger:
     def render(self) -> str:
         lines = ["COLLECTION LEDGER"]
         for name, s in sorted(self.stages.items()):
-            rate = ("UNACCOUNTED" if s.loss_rate is None
+            rate = ("diagnostic" if s.diagnostic
+                    else "UNACCOUNTED" if s.loss_rate is None
                     else f"{s.loss_rate:.1%}")
             lines.append(
                 f"    {name:26} {s.considered:>8,} {s.unit:<13} "

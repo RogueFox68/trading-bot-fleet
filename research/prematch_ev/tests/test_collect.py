@@ -447,6 +447,53 @@ class LedgerTest(unittest.TestCase):
         text = led.render()
         self.assertIn("UNACCOUNTED", text)
 
+    def test_irrelevant_provider_events_cannot_fail_study_coverage(self):
+        """A live run returned 344 event-quotes across snapshots; 88 had empty
+        bookmakers, 78 of them for a day OUTSIDE the declared window and the
+        rest at times nowhere near any decision cutoff. None of them was a
+        required observation, yet all 40 target contracts resolved."""
+        led = Ledger()
+        led.count("provider_events", 344, unit="event-quotes", diagnostic=True)
+        led.reject("event_without_sharp_book", "Sept 16 games", count=88,
+                   stage="provider_events", diagnostic=True)
+        led.count("target_contracts", 40, unit="contracts")
+        coverage = led.apply_to(Coverage())
+        self.assertTrue(coverage.complete, str(coverage))
+        self.assertEqual(led.lossy_stages(), [])
+
+    def test_diagnostic_counts_are_still_reported(self):
+        """Suppressed from the gate, not from the output."""
+        led = Ledger()
+        led.count("provider_events", 344, unit="event-quotes", diagnostic=True)
+        led.reject("event_without_sharp_book", "x", count=88,
+                   stage="provider_events", diagnostic=True)
+        text = led.render()
+        self.assertIn("provider_events", text)
+        self.assertIn("88", text)
+        self.assertIn("diagnostic", text)
+        self.assertEqual(led.as_dict()["stages"]["provider_events"]["diagnostic"],
+                         True)
+
+    def test_a_missing_target_quote_at_its_cutoff_still_fails_coverage(self):
+        """The gate must still bite on the study's own universe."""
+        led = Ledger()
+        led.count("provider_events", 344, unit="event-quotes", diagnostic=True)
+        led.count("target_contracts", 40, unit="contracts")
+        led.reject("no_sharp_quote_available_at_cutoff", "KX-X", count=30,
+                   stage="target_contracts")
+        coverage = led.apply_to(Coverage())
+        self.assertFalse(coverage.complete)
+        self.assertIn("target_contracts", str(coverage))
+
+    def test_denominator_is_not_derived_from_successes(self):
+        """A denominator defined by its successes always reads 100%."""
+        led = Ledger()
+        led.count("target_contracts", 40, unit="contracts")
+        led.reject("no_sharp_quote_available_at_cutoff", "KX-X", count=40,
+                   stage="target_contracts")
+        self.assertEqual(led.stages["target_contracts"].considered, 40)
+        self.assertEqual(led.stages["target_contracts"].loss_rate, 1.0)
+
     def test_ledger_serialises_with_stages_and_units(self):
         led = Ledger()
         led.count("contracts", 10, unit="contracts")
