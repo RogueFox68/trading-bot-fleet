@@ -346,13 +346,20 @@ def fetch_snapshot(
         if hit is not None:
             return parse_snapshot(hit)
 
-    if ledger is not None:
-        ledger.spend_or_raise()          # raises before any paid request
-
     url = build_snapshot_url(sport, at, api_key, bookmakers, regions, base_url)
 
     last: Exception | None = None
     for attempt in range(RETRIES):
+        # RESERVE BEFORE EACH ATTEMPT, not once before the loop. A provider can
+        # process and charge a request whose response never reaches us, so a
+        # retry is not free: reserving once let three network attempts run
+        # against a single debit, and a 10-credit cap permit three chargeable
+        # requests. CreditCapReached is a RuntimeError and is deliberately not
+        # in the except clause below, so it propagates to the caller's
+        # partial-artifact handler rather than being retried away.
+        if ledger is not None:
+            ledger.spend_or_raise()
+
         try:
             req = urllib.request.Request(url, headers={"Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:

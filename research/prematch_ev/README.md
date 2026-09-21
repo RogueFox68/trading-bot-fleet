@@ -146,6 +146,13 @@ python3 run_study.py --sport MLB --series KXMLBGAME \
 **`--max-credits` is a hard stop, not a warning.** Collection halts and keeps
 its partial diagnostics rather than the overspend being discovered afterwards.
 
+**A retry is budgeted, not free.** The reservation happens immediately before
+*each* network attempt, not once before the retry loop — a provider can process
+and charge a request whose response never reaches us. Reserving once let three
+attempts run against a single debit, so a 10-credit cap permitted three
+chargeable requests. `--preflight` therefore reports a **base** cost and a
+worst case at `RETRIES` attempts; the base figure is not a guaranteed bill.
+
 **Responses are cached** under `--cache-dir`, so debugging a local join or
 report never costs credits twice. The credential never enters a cache key, a
 path or a log: keys are built from the request's *meaning* (sport, instant,

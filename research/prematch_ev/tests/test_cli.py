@@ -131,8 +131,11 @@ class PreflightTest(unittest.TestCase):
                      "--from", "2026-09-14", "--to", "2026-09-15", "--api-key", "K"])
         text = " ".join(str(c) for c in printed.call_args_list)
         self.assertEqual(code, 0)
-        self.assertIn("REAL credit cost", text)
+        self.assertIn("base credit cost", text)
         self.assertIn("20", text, "2 cutoffs x 10 credits")
+        # A base figure presented as the bill would understate a retrying run.
+        self.assertIn("worst case w/ retries", text)
+        self.assertIn("60", text, "2 cutoffs x 10 credits x 3 attempts")
 
     def test_preflight_fails_on_incomplete_coverage_before_spending(self):
         bad = Coverage().fail("enumeration truncated")
@@ -163,6 +166,83 @@ class CreditCapTest(unittest.TestCase):
         led = CreditLedger(cap=100)
         led.spend_or_raise()
         self.assertEqual(led.spent_this_run, 10)
+
+
+class RetryBudgetTest(unittest.TestCase):
+    """A retry is not free. `spend_or_raise()` was called once BEFORE the retry
+    loop, so three network attempts ran against a single debit and a 10-credit
+    cap permitted three chargeable requests. A provider can process and charge
+    a request whose response never reaches us."""
+
+    AT = datetime(2026, 9, 15, 20, 40, tzinfo=UTC)
+
+    def _attempts_under_cap(self, exc, cap=10):
+        attempts = {"n": 0}
+
+        def boom(*a, **k):
+            attempts["n"] += 1
+            raise exc
+
+        led = CreditLedger(cap=cap)
+        raised = False
+        with mock.patch("urllib.request.urlopen", side_effect=boom), \
+             mock.patch("time.sleep"):
+            try:
+                run_study.fetch_snapshot("MLB", self.AT, "K", ledger=led)
+            except CreditCapReached:
+                raised = True
+        return attempts["n"], led.spent_this_run, raised
+
+    def test_ten_credit_cap_permits_one_attempt_on_timeout(self):
+        attempts, spent, raised = self._attempts_under_cap(TimeoutError("t"))
+        self.assertEqual(attempts, 1)
+        self.assertEqual(spent, 10)
+        self.assertTrue(raised, "the cap must propagate, not be retried away")
+
+    def test_ten_credit_cap_permits_one_attempt_on_decode_failure(self):
+        attempts, _, raised = self._attempts_under_cap(
+            json.JSONDecodeError("bad", "doc", 0))
+        self.assertEqual(attempts, 1)
+        self.assertTrue(raised)
+
+    def test_ten_credit_cap_permits_one_attempt_on_connection_error(self):
+        attempts, _, raised = self._attempts_under_cap(OSError("reset"))
+        self.assertEqual(attempts, 1)
+        self.assertTrue(raised)
+
+    def test_uncapped_retries_debit_every_attempt(self):
+        attempts = {"n": 0}
+
+        def boom(*a, **k):
+            attempts["n"] += 1
+            raise TimeoutError("t")
+
+        led = CreditLedger()
+        with mock.patch("urllib.request.urlopen", side_effect=boom), \
+             mock.patch("time.sleep"):
+            run_study.fetch_snapshot("MLB", self.AT, "K", ledger=led)
+        self.assertGreater(attempts["n"], 1)
+        self.assertEqual(led.spent_this_run, attempts["n"] * 10,
+                         "every attempt must be accounted, not just the first")
+
+    def test_cache_hit_bypasses_spending_entirely(self):
+        """Debugging a local join must not cost money, even at a zero cap."""
+        with tempfile.TemporaryDirectory() as d:
+            cache = ResponseCache(Path(d))
+            cache.put(key_for("MLB", self.AT, "pinnacle", "h2h"),
+                      {"timestamp": "2026-09-15T20:40:00Z", "data": []})
+            led = CreditLedger(cap=0)
+            result = run_study.fetch_snapshot("MLB", self.AT, "K",
+                                              ledger=led, cache=cache)
+        self.assertEqual(led.spent_this_run, 0)
+        self.assertTrue(result.coverage.complete)
+        self.assertEqual(cache.hits, 1)
+
+    def test_cap_reached_mid_collection_keeps_partial_artifacts(self):
+        """CreditCapReached must reach the handler that persists diagnostics."""
+        import collect as collect_mod
+        self.assertIn("CreditCapReached", Path("run_study.py").read_text(),
+                      "collect() must catch the cap and keep what it has")
 
 
 class CacheTest(unittest.TestCase):

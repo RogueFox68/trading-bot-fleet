@@ -39,8 +39,8 @@ from data.kalshi_history import (                                  # noqa: E402
 )
 from data.cache import CreditCapReached, ResponseCache             # noqa: E402
 from data.odds_history import (                                    # noqa: E402
-    CreditLedger, MAX_QUOTE_AGE_SECONDS, SPORT_KEYS, estimate_credits,
-    fetch_snapshot, probe_earliest_snapshot,
+    CreditLedger, MAX_QUOTE_AGE_SECONDS, RETRIES, SPORT_KEYS,
+    estimate_credits, fetch_snapshot, probe_earliest_snapshot,
 )
 
 
@@ -236,10 +236,13 @@ def preflight(args) -> int:
     print("PREFLIGHT (no paid requests made)")
     print(f"  eligible contracts   {len(markets):,}")
     print(f"  distinct cutoffs     {len(cutoffs):,}")
-    print(f"  REAL credit cost     {len(cutoffs) * per_call:,} "
-          f"({per_call} per call)")
+    base = len(cutoffs) * per_call
+    print(f"  base credit cost     {base:,} ({per_call} per call)")
+    print(f"  worst case w/ retries {base * RETRIES:,} ({RETRIES} attempts each)")
+    print("                        a provider can charge a request whose response")
+    print("                        is lost, so retries are budgeted, not free")
     if args.max_credits is not None:
-        over = len(cutoffs) * per_call > args.max_credits
+        over = base > args.max_credits
         print(f"  configured cap       {args.max_credits:,}"
               f"{'  <-- WOULD BE EXCEEDED' if over else ''}")
     else:
