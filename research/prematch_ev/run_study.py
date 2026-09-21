@@ -35,11 +35,12 @@ from collect import (                                              # noqa: E402
     checkpoint_targets, record_cell_outcome,
     decision_cutoffs, default_lead_grid, grid_reach, in_study_window,
     join_markets, listing_status, market_start_time, observation_with_status,
-    parse_lead_grid, snapshots_per_day_for,
+    parse_lead_grid, snapshots_per_day_for, support_report,
 )
 from core import fees
 from core.matcher import EVENT_BODY_TIMEZONE                                              # noqa: E402
 from core.matcher import match_event, unverified_note              # noqa: E402
+from core.matcher import supported_leagues                         # noqa: E402
 from data.kalshi_history import (                                  # noqa: E402
     Coverage, enumerate_settled_markets, fetch_candlesticks,
     fetch_historical_cutoff, uses_archive,
@@ -101,6 +102,10 @@ def parse_args(argv=None):
     p.add_argument("--cache-dir", default="study_output/cache",
                    help="replay cache for paid responses; the credential never "
                         "enters a key, a path or a log. Empty string disables")
+    p.add_argument("--support", action="store_true",
+                   help="report what this code supports for --sport/--series "
+                        "and exit. Reads the code, makes no request, costs "
+                        "nothing.")
     p.add_argument("--probe", action="store_true", help="find archive depth and exit")
     p.add_argument("--fee-route", dest="fee_route",
                    choices=sorted(fees.ROUTE_ALIGNMENT), default=fees.DEFAULT_ROUTE,
@@ -258,6 +263,28 @@ def probe(args) -> int:
     return 0 if found else 1
 
 
+def support(args) -> int:
+    """What this code supports for one sport. No network, no cost."""
+    report = support_report(args.sport, args.series)
+    print(f"SUPPORT: {report.league}  (series {report.series})")
+    print(f"  odds-provider key    {report.odds_key or 'NONE'}")
+    print(f"  roster teams         {report.roster_teams}")
+    print(f"  exchange aliases     {report.alias_count}")
+    print(f"  dated fee schedule   {'yes' if report.fee_schedule else 'NO (generic rates)'}")
+    print(f"  JOIN READY           {'yes' if report.ready else 'NO'}")
+    for blocker in report.blockers():
+        print(f"  !! BLOCKER  {blocker}")
+    for caveat in report.caveats():
+        print(f"  ?  CAVEAT   {caveat}")
+    print()
+    print("  'ready' means the JOIN can work. It does NOT mean data exists at")
+    print("  any given lead time -- listing lead times and historical sharp")
+    print("  coverage are separate questions that only a live audit answers.")
+    print()
+    print(f"  leagues with a roster: {', '.join(supported_leagues())}")
+    return 0 if report.ready else 1
+
+
 def survey(args):
     """The FREE half: enumerate the exchange, filter, derive the cutoffs.
 
@@ -267,6 +294,18 @@ def survey(args):
     """
     coverage = Coverage()
     ledger = Ledger()
+
+    # SUPPORT BEFORE SPEND. A sport with no roster is accepted by argparse,
+    # survives preflight, and fails at JOIN time -- after every snapshot has
+    # been paid for. That is the `regions=us` defect again: a run that costs
+    # credits and returns nothing usable. Refuse it here, where nothing has
+    # been spent yet.
+    report = support_report(args.sport, args.series)
+    for blocker in report.blockers():
+        coverage.fail(blocker)
+    if not report.ready:
+        return {}, [], None, coverage, ledger, lead_grid_for(args), CheckpointMatrix()
+
     start = _date(args.start)
     end_inclusive = _date(args.end)
     end_exclusive = end_inclusive + timedelta(days=1)
@@ -549,6 +588,8 @@ def collect(args, key: str):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.support:
+        return support(args)
     if args.plan:
         return plan(args)
     if args.preflight:

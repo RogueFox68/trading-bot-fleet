@@ -422,6 +422,45 @@ hard upper bound with no collisions at all would be 7×.
 `--preflight` reports the real figure for a real window, including how many of
 those snapshots are **already cached** and therefore free.
 
+## Sport support, and what "supported" does not mean
+
+`python3 run_study.py --support --sport NFL --series KXNFLGAME` reads this out
+of the code. No network, no key, no cost.
+
+| league | odds key | roster | aliases | dated fees | join-ready |
+|---|---|---|---|---|---|
+| MLB | `baseball_mlb` | 30 | 1 (`AZ→ARI`) | **yes** | yes |
+| NFL | `americanfootball_nfl` | 32 | **0** | no | yes |
+| NBA | `basketball_nba` | **0** | 0 | no | **no** |
+| NHL | `icehockey_nhl` | **0** | 0 | no | **no** |
+| NCAAF | **none** | **0** | 0 | no | **no** |
+
+**`--sport NBA` used to be accepted, survive preflight, and fail at JOIN time**
+— after every snapshot had been paid for — because the join maps bookmaker team
+*names* onto exchange team *codes* and neither NBA nor NHL has a roster. That is
+the `regions=us` defect from round 1 in different clothes: a run that costs
+credits and returns nothing, whose only symptom is an empty result that reads
+like an absent edge. `survey()` now refuses such a sport before anything is
+spent, and `--support` exits non-zero.
+
+**`ready` means the JOIN can work. It does not mean data exists at any lead
+time.** Those are separate questions, and conflating them is exactly how "we
+could not see it" becomes "there was nothing there".
+
+Two caveats the report raises for NFL specifically:
+
+- **No exchange-code aliases are recorded.** That is an unverified assumption,
+  not evidence there are none — MLB needed `AZ→ARI`, and a missing alias shows
+  up as a team contributing no data, never as an error.
+- **No dated fee schedule for `KXNFLGAME`.** The generic coefficients would be
+  assumed, and every return figure would inherit that. The MLB schedule *halved*
+  the taker coefficient, so this is not a rounding concern.
+
+The ticker parser and the identity path are league-agnostic — identity comes
+from the YES suffixes rather than splitting the concatenated team tail — so an
+NFL or NCAA-shaped ticker parses correctly today. The roster is the gap, not
+the shape.
+
 ### What the first multi-day run found
 
 Sept 1–15, full grid, zero delay, one entry per game, thresholds unchanged.
@@ -530,7 +569,7 @@ python3 run_study.py ... --fee-route direct   # headline on the other account ro
 python3 run_study.py ... --lead-grid 72h,48h,24h,12h,6h,3h --entry-delay-minutes 10
 ```
 
-Tests: `python3 -m unittest discover -s tests -t .` — 345 tests, no network, no
+Tests: `python3 -m unittest discover -s tests -t .` — 360 tests, no network, no
 credentials, and they pass with or without `rapidfuzz`.
 
 Artifacts land in `study_output/`: `report.txt`, `observations.json` (schema 2 —

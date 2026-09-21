@@ -45,7 +45,8 @@ from core.devig import DevigError, devig_american
 from zoneinfo import ZoneInfo
 
 from core.matcher import (
-    EVENT_BODY_TIMEZONE, kalshi_event_ticker, normalise_exchange_code,
+    EVENT_BODY_TIMEZONE, EXCHANGE_CODE_ALIASES, ROSTERS,
+    kalshi_event_ticker, normalise_exchange_code,
     parse_event_body_start, parse_kalshi_game_ticker, resolve_team,
     unknown_exchange_codes,
 )
@@ -630,6 +631,70 @@ class CheckpointMatrix:
             lines.append("    " + f"{checkpoint.label:<14}"
                          + "".join(f"{counts.get(c, 0):>16,}" for c in cols))
         return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class SupportReport:
+    """What this code can and cannot do for one sport, before any paid call.
+
+    Every field is read from the code, not assumed. `ready` is deliberately
+    narrow: it means the JOIN can work, not that the study will find data --
+    listing lead times and historical sharp coverage are separate questions
+    that only a live audit answers.
+    """
+
+    league: str
+    odds_key: str | None
+    roster_teams: int
+    alias_count: int
+    series: str | None
+    fee_schedule: bool
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.odds_key) and self.roster_teams > 0
+
+    def blockers(self) -> list[str]:
+        out: list[str] = []
+        if not self.odds_key:
+            out.append(f"no odds-provider sport key for {self.league!r} "
+                       "(data.odds_history.SPORT_KEYS)")
+        if not self.roster_teams:
+            out.append(f"no team roster for {self.league!r} "
+                       "(core.matcher.ROSTERS) -- every game would fail the "
+                       "join as sharp_teams_unresolvable, AFTER paying for "
+                       "its snapshots")
+        return out
+
+    def caveats(self) -> list[str]:
+        out: list[str] = []
+        if self.roster_teams and not self.alias_count:
+            out.append(f"{self.league} has NO exchange-code aliases recorded. "
+                       "That is an unverified assumption, not evidence there "
+                       "are none: MLB needed AZ->ARI, and a missing alias "
+                       "shows up as a team contributing no data, not as an "
+                       "error. Run the abbreviation audit before budgeting.")
+        if self.series and not self.fee_schedule:
+            out.append(f"no dated fee schedule for series {self.series!r}; "
+                       "the generic Kalshi coefficients would be assumed and "
+                       "every return figure would inherit that. The MLB "
+                       "schedule halved the taker coefficient.")
+        return out
+
+
+def support_report(league: str, series: str | None = None) -> SupportReport:
+    """Read this sport's support out of the code. No network, no assumptions."""
+    from core import fees
+    from data.odds_history import SPORT_KEYS
+    key = (league or "").upper()
+    return SupportReport(
+        league=key,
+        odds_key=SPORT_KEYS.get(key),
+        roster_teams=len(ROSTERS.get(key, {})),
+        alias_count=len(EXCHANGE_CODE_ALIASES.get(key, {})),
+        series=series,
+        fee_schedule=bool(series and fees.series_schedule(series)),
+    )
 
 
 def in_study_window(market: dict, start: datetime, end: datetime,

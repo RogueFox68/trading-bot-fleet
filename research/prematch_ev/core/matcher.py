@@ -133,6 +133,22 @@ def unverified_note() -> str:
 # added on a hunch: `normalise_exchange_code` returns the input unchanged and
 # the join records the unresolved code by name, so one run enumerates the rest
 # rather than a guess hiding them.
+def supported_leagues() -> tuple[str, ...]:
+    """Leagues this code can actually resolve team identity for.
+
+    A league with no roster cannot map a bookmaker's team NAMES onto an
+    exchange's team CODES, which is the whole join. It does not fail at
+    import, at argument parsing, or at preflight -- it fails at join time,
+    after the snapshots have been paid for. `run_study` refuses such a sport
+    before spending anything.
+    """
+    return tuple(sorted(ROSTERS))
+
+
+def league_is_supported(league: str) -> bool:
+    return (league or "").upper() in ROSTERS
+
+
 EXCHANGE_CODE_ALIASES: dict[str, dict[str, str]] = {
     "MLB": {
         "AZ": "ARI",     # observed 2026-09-21, KXMLBGAME-26SEP152140MIAAZ
