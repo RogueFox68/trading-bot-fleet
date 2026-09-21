@@ -89,9 +89,8 @@ class Observation:
     p_exchange: float              # mid at the cutoff -- the FORECAST price
     outcome: int                   # 1 if THIS contract's YES settled true
     yes_participant: str = ""
-    # The EXECUTABLE book. With a reaction delay these are the entry
-    # candle's prices, not the observation candle's: what you could trade at
-    # once you had acted, which is a different number from what you saw.
+    # The book AS SEEN AT THE DECISION. The trigger, the side and the
+    # screen all read these, and only these -- see `entry_bid`/`entry_ask`.
     exchange_bid: float | None = None
     exchange_ask: float | None = None
     sharp_at: datetime | None = None          # when the book moved the price
@@ -104,6 +103,15 @@ class Observation:
     checkpoint_minutes: float | None = None
     entry_at: datetime | None = None           # when the entry was executable
     entry_delay_minutes: float = 0.0
+    # The book AT EXECUTION, t + delay. Separate from the decision book on
+    # purpose: a committed signal freezes its trigger and its side at t and
+    # only then pays whatever the market has become. Letting the execution
+    # price back into the screen would qualify -- or reverse -- a trade using
+    # a price the trader could not have seen, which is lookahead wearing the
+    # costume of a cost model. None means "same as the decision book", which
+    # is exactly true at zero delay.
+    entry_bid: float | None = None
+    entry_ask: float | None = None
     # Pre-game exit, present only when an exit quote was actually found.
     exit_at: datetime | None = None
     exit_bid: float | None = None
@@ -112,6 +120,12 @@ class Observation:
     @property
     def disagreement(self) -> float:
         return self.p_sharp - self.p_exchange
+
+    def execution_book(self) -> tuple[float | None, float | None]:
+        """(bid, ask) at execution, falling back to the decision book."""
+        bid = self.entry_bid if self.entry_bid is not None else self.exchange_bid
+        ask = self.entry_ask if self.entry_ask is not None else self.exchange_ask
+        return bid, ask
 
     @property
     def checkpoint_key(self) -> str:
@@ -317,25 +331,43 @@ class SideQuote:
     """One executable side, priced with its own fee and outcome mapping."""
 
     side: str
-    entry_price: float
-    fee: float
+    entry_price: float         # the DECISION price, seen at t
+    fee: float                 # the fee on the decision price
     win_probability: float     # p_sharp for YES, 1 - p_sharp for NO
     payout: float              # realised: 1.0 or 0.0
     fee_raw: float = 0.0       # the charge BEFORE the account's alignment
     fee_route: str = ""
+    exec_price: float | None = None   # the price actually paid, at t + delay
+    exec_fee: float | None = None
 
     @property
     def cost(self) -> float:
+        """What the screen reasons about: the price and fee visible at t."""
         return self.entry_price + self.fee
 
     @property
+    def paid(self) -> float:
+        """What the trade actually cost. Equals `cost` at zero delay."""
+        price = self.exec_price if self.exec_price is not None else self.entry_price
+        fee = self.exec_fee if self.exec_fee is not None else self.fee
+        return price + fee
+
+    @property
     def predicted_ev(self) -> float:
-        """EV before the outcome is known -- what a screen must select on."""
+        """EV before the outcome is known -- what a screen must select on.
+
+        Priced at the DECISION book. An earlier version priced it at the
+        execution book, so a delayed run selected its side and cleared its
+        threshold using a price from after the decision: the screen could
+        reject a trade the signal had triggered, or flip YES to NO, on
+        information that did not exist at t.
+        """
         return self.win_probability - self.cost
 
     @property
     def profit(self) -> float:
-        return self.payout - self.cost
+        """Realised: settled payout less what was actually paid."""
+        return self.payout - self.paid
 
 
 def side_quotes(o: "Observation", venue: str = "kalshi",
@@ -361,16 +393,24 @@ def side_quotes(o: "Observation", venue: str = "kalshi",
     if o.exchange_bid > o.exchange_ask:
         return []
 
+    exec_bid, exec_ask = o.execution_book()
+
     out: list[SideQuote] = []
-    for side, entry, win_p, payout in (
-        ("YES", o.exchange_ask, o.p_sharp, float(o.outcome)),
-        ("NO", 1.0 - o.exchange_bid, 1.0 - o.p_sharp, float(1 - o.outcome)),
+    for side, entry, exec_entry, win_p, payout in (
+        ("YES", o.exchange_ask, exec_ask, o.p_sharp, float(o.outcome)),
+        ("NO", 1.0 - o.exchange_bid, None if exec_bid is None else 1.0 - exec_bid,
+         1.0 - o.p_sharp, float(1 - o.outcome)),
     ):
         if not 0.0 < entry < 1.0:
             continue
         fee = fee_for(venue, 1.0, entry, role, series, o.decision_at, route)
+        exec_price = exec_fee = None
+        if exec_entry is not None and 0.0 < exec_entry < 1.0 and exec_entry != entry:
+            exec_price = exec_entry
+            exec_fee = fee_for(venue, 1.0, exec_entry, role, series,
+                               o.decision_at, route).dollars
         out.append(SideQuote(side, entry, fee.dollars, win_p, payout,
-                             fee.raw_dollars, fee.route))
+                             fee.raw_dollars, fee.route, exec_price, exec_fee))
     return out
 
 
@@ -380,16 +420,20 @@ class Trade:
 
     game_id: str
     side: str
-    entry_price: float
+    entry_price: float         # the DECISION price
     fee: float
     payout: float
     profit: float
     predicted_ev: float
+    paid: float | None = None  # what execution actually cost, at t + delay
+
+    @property
+    def stake(self) -> float:
+        return self.paid if self.paid is not None else self.entry_price + self.fee
 
     @property
     def return_on_stake(self) -> float:
-        cost = self.entry_price + self.fee
-        return self.profit / cost if cost else 0.0
+        return self.profit / self.stake if self.stake else 0.0
 
 
 def as_trade(o: "Observation", venue: str = "kalshi", role: str = "taker",
@@ -410,7 +454,7 @@ def as_trade(o: "Observation", venue: str = "kalshi", role: str = "taker",
     if best.predicted_ev < threshold:
         return None
     return Trade(o.game_id, best.side, best.entry_price, best.fee,
-                 best.payout, best.profit, best.predicted_ev)
+                 best.payout, best.profit, best.predicted_ev, best.paid)
 
 
 @dataclass
@@ -574,7 +618,7 @@ def realized_return(
                               for o in sample) if t]
         if not trades:
             raise ValueError("no trades in sample")
-        staked = sum(t.entry_price + t.fee for t in trades)
+        staked = sum(t.stake for t in trades)
         return sum(t.profit for t in trades) / staked if staked else 0.0
 
     trades = [t for t in (as_trade(o, venue, role, eligibility, series, route)
@@ -583,7 +627,7 @@ def realized_return(
         return ReturnReport(0, 0, 0.0, 0.0, float("nan"), float("nan"),
                             0, 0, 0.0, eligibility, venue, role)
 
-    staked = sum(t.entry_price + t.fee for t in trades)
+    staked = sum(t.stake for t in trades)
     lo, hi = cluster_bootstrap(eligible, mean_return, bootstrap_rounds)
     return ReturnReport(
         games=len({t.game_id for t in trades}),
@@ -701,12 +745,23 @@ def decay_series(
     observations: list[Observation],
     eligibility: Eligibility | None = None,
     bootstrap_rounds: int = 400,
+    series: str | None = None,
+    route: str = DEFAULT_ROUTE,
+    policy: "EntryPolicy | None" = None,
 ) -> list[DecaySlice]:
     """The comparison by month, WITH uncertainty.
 
     A monthly point estimate drifting toward zero is not evidence the edge was
     arbitraged away: game mix and noise move it too. The interval is what
     distinguishes a trend from a smaller sample.
+
+    `series`, `route` and `policy` are threaded for the same reason they are
+    everywhere else: this is a RETURN breakdown, and without them the monthly
+    figure was priced at the generic fee -- 0.07 where the dated September
+    schedule says 0.035 -- and counted every qualifying checkpoint instead of
+    the one bet the policy would have placed. A number in the same column as
+    the headline return has to be computed the same way as the headline
+    return.
     """
     by_month: dict[str, list[Observation]] = {}
     for o in observations:
@@ -716,7 +771,9 @@ def decay_series(
     for period in sorted(by_month):
         members = by_month[period]
         lo, hi = cluster_bootstrap(members, _brier_delta, bootstrap_rounds)
-        ret = realized_return(members, eligibility, bootstrap_rounds=bootstrap_rounds)
+        ret = realized_return(members, eligibility,
+                              bootstrap_rounds=bootstrap_rounds,
+                              series=series, route=route, policy=policy)
         out.append(DecaySlice(
             period, len(cluster(members)), _brier_delta(members), lo, hi,
             ret.mean_return_on_stake if ret.trades else float("nan"),
@@ -817,8 +874,18 @@ def select_entries(
         if entries_by_game.get(o.game_id, 0) >= policy.max_entries_per_game:
             diag.skipped_game_already_entered += 1
             continue
+        # THE FULL ELIGIBILITY RULE, not just the EV threshold. `as_trade`
+        # checks side prices and the net-EV floor and nothing else -- it does
+        # not know about the price band, the lead bounds or the spread cap. A
+        # selection gated on it alone bought a 40-cent spread that
+        # `Eligibility.admits` rejects, and because the policy path IS the
+        # headline, the screened figure was looser than the unscreened one.
+        if not eligibility.admits(o, venue, role, series, route):
+            diag.skipped_not_qualifying += 1
+            continue
         trade = as_trade(o, venue, role, eligibility, series, route)
         if trade is None:
+            # `admits` already implies this; not assuming it stays that way.
             diag.skipped_not_qualifying += 1
             continue
         entries_by_game[o.game_id] = entries_by_game.get(o.game_id, 0) + 1
@@ -1030,6 +1097,7 @@ def fee_scenarios(
     series: str | None = None,
     bootstrap_rounds: int = DEFAULT_BOOTSTRAP,
     already: "FeeScenario | None" = None,
+    policy: "EntryPolicy | None" = None,
 ) -> list[FeeScenario]:
     """Every account route the fee model knows, each priced in full.
 
@@ -1041,6 +1109,13 @@ def fee_scenarios(
     headline figures are one of these scenarios, and recomputing a 2000-round
     cluster bootstrap to print the same number twice is waste. It is the same
     object, so the table can never disagree with the sections above it.
+
+    A SCENARIO VARIES THE FEE AND NOTHING ELSE. `policy` is threaded through
+    for that reason: without it the headline route applied one entry per game
+    while the other route counted every qualifying checkpoint, so a
+    three-checkpoint game showed 1 trade against 3 -- a policy difference
+    printed in a column headed "route", where it reads as the cheaper account
+    finding three times the opportunities.
     """
     out: list[FeeScenario] = []
     for route in sorted(ROUTE_ALIGNMENT):
@@ -1053,7 +1128,7 @@ def fee_scenarios(
             screen=screen_diagnostics(observations, eligibility, venue, role,
                                       series, route),
             returns=realized_return(observations, eligibility, venue, role,
-                                    bootstrap_rounds, series, route),
+                                    bootstrap_rounds, series, route, policy),
         ))
     return out
 
@@ -1297,7 +1372,8 @@ def build_report(
         conditional=conditional_scores(observations),
         sharp_calibration=calibration([o.p_sharp for o in observations], outcomes),
         exchange_calibration=calibration([o.p_exchange for o in observations], outcomes),
-        decay=decay_series(observations, eligibility),
+        decay=decay_series(observations, eligibility, series=series,
+                           route=route, policy=policy),
         coverage=coverage or Coverage(),
         provenance="; ".join(lines),
         provenance_lines=lines,
@@ -1305,7 +1381,7 @@ def build_report(
         screen=headline_screen,
         scenarios=fee_scenarios(observations, eligibility, series=series,
                                 bootstrap_rounds=bootstrap_rounds,
-                                already=headline),
+                                already=headline, policy=policy),
         route=route,
         slices=checkpoint_slices(observations, eligibility, series=series,
                                  route=route, baseline_minutes=baseline_minutes),

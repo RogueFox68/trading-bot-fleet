@@ -952,9 +952,11 @@ def observation_with_status(
         ledger.reject("cutoff_at_or_after_start", joined.market_ticker, stage=reject_stage)
         return None, "cutoff_at_or_after_start"
 
-    # THE ENTRY IS NOT THE OBSERVATION. Acting on a signal takes time, and the
-    # price you get is the one available once you have acted -- which on a
-    # delayed retail feed is exactly where the measured edge can go.
+    # THE ENTRY IS NOT THE OBSERVATION, and it does not get to change the
+    # DECISION. Acting on a signal takes time, and the price you get is the one
+    # available once you have acted -- but the trigger and the side were fixed
+    # at the decision, on the book visible then. The execution book is recorded
+    # separately (`entry_bid`/`entry_ask`) and never reaches the screen.
     #
     # At ZERO delay the entry IS the observation candle, preserving the
     # existing baseline bit for bit. That is the instantaneous bound and it is
@@ -988,8 +990,10 @@ def observation_with_status(
         p_exchange=candle.mid,
         outcome=joined.outcome,
         yes_participant=joined.yes_participant,
-        exchange_bid=entry_candle.bid_close,
-        exchange_ask=entry_candle.ask_close,
+        exchange_bid=candle.bid_close,
+        exchange_ask=candle.ask_close,
+        entry_bid=entry_candle.bid_close,
+        entry_ask=entry_candle.ask_close,
         sharp_at=quote.last_update,
         sharp_snapshot_at=quote.snapshot,
         exchange_at=candle.ts,

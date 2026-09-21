@@ -30,8 +30,8 @@ from datetime import datetime, timedelta, timezone
 
 from analysis.scoring import (
     DEFAULT_MAX_MINUTES_TO_START, Eligibility, EntryPolicy, Observation,
-    build_report, checkpoint_slices, price_paths, realized_return,
-    select_entries,
+    as_trade, build_report, checkpoint_slices, decay_series, fee_scenarios,
+    price_paths, realized_return, select_entries, side_quotes,
 )
 from collect import (
     BASELINE_LEAD_MINUTES, Checkpoint, CheckpointMatrix, Ledger,
@@ -310,9 +310,15 @@ class DelayedEntryTest(unittest.TestCase):
             Ledger(), checkpoint=Checkpoint(1440))
         self.assertEqual(status, STATUS_OBSERVED)
         self.assertEqual((row.exchange_bid, row.exchange_ask), (0.49, 0.51))
+        self.assertEqual((row.entry_bid, row.entry_ask), (0.49, 0.51),
+                         "at zero delay both books are the same candle")
         self.assertEqual(row.entry_delay_minutes, 0.0)
 
-    def test_a_delay_enters_at_the_first_quote_after_the_delay(self):
+    def test_a_delay_records_both_books_and_keeps_them_apart(self):
+        """The execution quote goes in `entry_bid`/`entry_ask`, NOT in the
+        decision book. An earlier version wrote it into `exchange_bid`/`ask`,
+        which is what the screen and the side selection read -- so a delayed
+        run decided using a price that did not exist at the decision."""
         candles = [Candle(self.CUTOFF - timedelta(minutes=1), 0.49, 0.51),
                    Candle(self.CUTOFF + timedelta(minutes=10), 0.60, 0.62)]
         row, status = observation_with_status(
@@ -320,8 +326,10 @@ class DelayedEntryTest(unittest.TestCase):
             Ledger(), checkpoint=Checkpoint(1440),
             entry_delay=timedelta(minutes=10))
         self.assertEqual(status, STATUS_OBSERVED)
-        self.assertEqual((row.exchange_bid, row.exchange_ask), (0.60, 0.62))
-        # The OBSERVED price is still the one the signal was compared against.
+        self.assertEqual((row.exchange_bid, row.exchange_ask), (0.49, 0.51),
+                         "the decision book must be what was visible at t")
+        self.assertEqual((row.entry_bid, row.entry_ask), (0.60, 0.62),
+                         "the execution book must be the later quote")
         self.assertAlmostEqual(row.p_exchange, 0.50, places=9)
         self.assertEqual(row.entry_at, self.CUTOFF + timedelta(minutes=10))
 
@@ -424,6 +432,222 @@ class RepeatedGameExposureTest(unittest.TestCase):
                                     Eligibility(min_net_ev=0.0),
                                     policy=EntryPolicy(max_entries_per_game=3))
         self.assertEqual(len(entries), 3)
+
+
+class SelectionRespectsFullEligibilityTest(unittest.TestCase):
+    """THE defect: `select_entries` gated on `as_trade` alone.
+
+    `as_trade` checks valid side prices and the net-EV floor. It does not know
+    about the price band, the lead bounds or the spread cap -- those live in
+    `Eligibility.admits`. So selection bought books `admits` rejects, and
+    because the policy path IS the headline return, the SCREENED figure was
+    looser than the unscreened one. Exactly backwards.
+    """
+
+    def test_a_wide_spread_is_refused_by_selection(self):
+        """The reproduction from review: a 40-cent book."""
+        o = Observation("game", "market", datetime(2026, 9, 5, tzinfo=UTC),
+                        4320, 0.9, 0.5, 1, exchange_bid=0.3, exchange_ask=0.7)
+        self.assertFalse(Eligibility().admits(o))
+        entries, diag = select_entries([o], Eligibility())
+        self.assertEqual(entries, [])
+        self.assertEqual(diag.skipped_not_qualifying, 1)
+
+    def test_a_price_outside_the_band_is_refused_by_selection(self):
+        o = obs("G", "M", 1440, p_exch=0.95, p_sharp=0.99, bid=0.94, ask=0.96)
+        self.assertFalse(Eligibility(min_net_ev=0.0).admits(o))
+        self.assertEqual(select_entries([o], Eligibility(min_net_ev=0.0))[0], [])
+
+    def test_a_lead_beyond_the_ceiling_is_refused_by_selection(self):
+        o = obs("G", "M", 4320)
+        tight = Eligibility(min_net_ev=0.0, max_minutes_to_start=1440.0)
+        self.assertFalse(tight.admits(o))
+        self.assertEqual(select_entries([o], tight)[0], [])
+
+    def test_a_rejected_checkpoint_does_not_consume_the_game(self):
+        """The case that makes this more than a counting error: a rejected
+        early look must leave the game open, or one unexecutable 72h quote
+        silently cancels every later chance to trade that game."""
+        looks = [
+            # 72h: unexecutable -- a 40-cent spread
+            obs("G1", "M1", 4320, bid=0.30, ask=0.70),
+            # 24h: a clean, narrow, qualifying book
+            obs("G1", "M1", 1440, bid=0.49, ask=0.51),
+        ]
+        entries, diag = select_entries(looks, Eligibility(min_net_ev=0.0))
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].checkpoint_label, "24h")
+        self.assertEqual(diag.skipped_not_qualifying, 1)
+        self.assertEqual(diag.skipped_game_already_entered, 0,
+                         "the rejected look must not have consumed exposure")
+
+    def test_selection_never_admits_what_the_screen_rejects(self):
+        """The general property, over every condition `admits` enforces."""
+        cases = [
+            obs("A", "A", 1440, bid=0.30, ask=0.70),      # spread
+            obs("B", "B", 1440, p_exch=0.95, bid=0.94, ask=0.96),  # band
+            obs("C", "C", 4320),                           # lead (tight ceiling)
+        ]
+        elig = Eligibility(min_net_ev=0.0, max_minutes_to_start=1440.0)
+        for o in cases:
+            taken = select_entries([o], elig)[0]
+            self.assertEqual(bool(taken), elig.admits(o),
+                             f"{o.game_id}: selection and screen disagree")
+
+
+class ScenariosVaryFeesOnlyTest(unittest.TestCase):
+    """A column headed 'route' must differ by ROUTE.
+
+    `fee_scenarios` recomputed the non-headline route WITHOUT the entry
+    policy, so a three-checkpoint game showed 1 trade on the headline route
+    and 3 on the other -- a policy difference printed where a reader is being
+    invited to compare fees.
+    """
+
+    def _three_looks(self):
+        start = datetime(2026, 9, 5, tzinfo=UTC)
+        return [Observation("G", "M", start - timedelta(minutes=m), float(m),
+                            0.60, 0.50, 1, exchange_bid=0.49, exchange_ask=0.51,
+                            checkpoint_minutes=float(m))
+                for m in (4320, 1440, 180)]
+
+    def test_every_route_applies_the_same_policy(self):
+        scenarios = fee_scenarios(self._three_looks(),
+                                  Eligibility(min_net_ev=0.0),
+                                  bootstrap_rounds=20, policy=EntryPolicy())
+        counts = {s.route: s.returns.trades for s in scenarios}
+        self.assertEqual(set(counts.values()), {1},
+                         f"routes disagree on how many bets exist: {counts}")
+
+    def test_the_report_headline_and_every_scenario_agree(self):
+        report = build_report(self._three_looks(), Coverage(), "t",
+                              eligibility=Eligibility(min_net_ev=0.0),
+                              bootstrap_rounds=20, policy=EntryPolicy())
+        for s in report.scenarios:
+            self.assertEqual(s.returns.trades, report.returns.trades,
+                             f"route {s.route} counted a different number of bets")
+
+    def test_without_a_policy_every_route_still_agrees(self):
+        """The no-policy path must be symmetric too, not merely the policy one."""
+        scenarios = fee_scenarios(self._three_looks(),
+                                  Eligibility(min_net_ev=0.0), bootstrap_rounds=20)
+        counts = {s.route: s.returns.trades for s in scenarios}
+        self.assertEqual(set(counts.values()), {3}, counts)
+
+    def _drifting_looks(self):
+        """One game, three checkpoints, at DIFFERENT prices.
+
+        Identical prices would not catch this: the monthly figure is a ratio,
+        so averaging three copies of one trade gives the same number as taking
+        one. The prices have to move for the count to show up.
+        """
+        start = datetime(2026, 9, 5, tzinfo=UTC)
+        return [Observation("G", "M", start - timedelta(minutes=m), float(m),
+                            0.80, ask - 0.01, 1,
+                            exchange_bid=round(ask - 0.02, 2), exchange_ask=ask,
+                            checkpoint_minutes=float(m))
+                for m, ask in ((4320, 0.51), (1440, 0.60), (180, 0.70))]
+
+    def test_the_monthly_breakdown_is_computed_like_the_headline(self):
+        """`decay_series` prints a net return in the same column family as the
+        headline return, and was computing it with neither the series, the
+        route, nor the policy -- so the month was priced at the generic 0.07
+        where September's dated schedule says 0.035, over every qualifying
+        checkpoint instead of the one bet the policy places."""
+        looks = self._drifting_looks()
+        elig = Eligibility(min_net_ev=0.0)
+        kw = dict(series="KXMLBGAME", route="direct", policy=EntryPolicy())
+
+        month = decay_series(looks, elig, bootstrap_rounds=20, **kw)
+        headline = realized_return(looks, elig, bootstrap_rounds=20, **kw)
+        self.assertEqual(len(month), 1)
+        self.assertAlmostEqual(month[0].mean_return,
+                               headline.mean_return_on_stake, places=12,
+                               msg="the month and the headline disagree")
+
+    def test_dropping_the_policy_changes_the_month(self):
+        """Proof the threading is load-bearing, not decorative."""
+        looks = self._drifting_looks()
+        elig = Eligibility(min_net_ev=0.0)
+        policed = decay_series(looks, elig, bootstrap_rounds=20,
+                               series="KXMLBGAME", policy=EntryPolicy())
+        unpoliced = decay_series(looks, elig, bootstrap_rounds=20,
+                                 series="KXMLBGAME")
+        self.assertNotEqual(policed[0].mean_return, unpoliced[0].mean_return)
+
+    def test_dropping_the_series_changes_the_month(self):
+        """The dated fee reaches the monthly figure too: generic 0.07 against
+        September's 0.035 is a factor of two on every fee in it."""
+        looks = self._drifting_looks()
+        elig = Eligibility(min_net_ev=0.0)
+        dated = decay_series(looks, elig, bootstrap_rounds=20,
+                             series="KXMLBGAME", policy=EntryPolicy())
+        generic = decay_series(looks, elig, bootstrap_rounds=20,
+                               policy=EntryPolicy())
+        self.assertNotEqual(dated[0].mean_return, generic[0].mean_return)
+
+
+class CommittedSignalTest(unittest.TestCase):
+    """A delayed entry pays the later price. It does not DECIDE on it.
+
+    The first version put the execution quote into `exchange_bid`/`ask`, which
+    is what the screen and the side selection read -- so a delayed run could
+    qualify a trade the signal had not triggered, or flip YES to NO, using a
+    price that did not exist at the decision.
+    """
+
+    START = GAME1
+
+    def _committed(self, exec_bid, exec_ask, **kw):
+        return Observation(
+            game_id="G", market_id="M",
+            decision_at=self.START - timedelta(hours=24), minutes_to_start=1440.0,
+            p_sharp=kw.pop("p_sharp", 0.60), p_exchange=0.50, outcome=1,
+            exchange_bid=0.49, exchange_ask=0.51,
+            entry_bid=exec_bid, entry_ask=exec_ask,
+            checkpoint_minutes=1440.0, entry_delay_minutes=10.0, **kw)
+
+    def test_the_side_is_chosen_on_the_decision_book(self):
+        """The market moving against you after t must not flip the side."""
+        moved = self._committed(0.05, 0.07)   # collapsed after the decision
+        quotes = side_quotes(moved)
+        best = max(quotes, key=lambda q: q.predicted_ev)
+        self.assertEqual(best.side, "YES",
+                         "the side was re-chosen using post-decision prices")
+
+    def test_the_screen_qualifies_on_the_decision_book(self):
+        """A trade the signal triggered is not retrospectively disqualified."""
+        moved = self._committed(0.30, 0.70)   # a 40-cent spread AFTER the fact
+        self.assertTrue(Eligibility(min_net_ev=0.0).admits(moved))
+
+    def test_but_the_trade_pays_the_execution_price(self):
+        moved = self._committed(0.60, 0.62)
+        trade = as_trade(moved, eligibility=Eligibility(min_net_ev=0.0))
+        self.assertAlmostEqual(trade.entry_price, 0.51, places=9)
+        self.assertGreater(trade.stake, 0.60, "execution must cost the later price")
+        self.assertLess(trade.profit, 1.0 - 0.51,
+                        "profit must be net of what was actually paid")
+
+    def test_zero_delay_is_unchanged(self):
+        """The instantaneous bound stays bit-for-bit comparable."""
+        plain = obs("G", "M", 1440, bid=0.49, ask=0.51)
+        quotes = side_quotes(plain)
+        for q in quotes:
+            self.assertIsNone(q.exec_price)
+            self.assertAlmostEqual(q.paid, q.cost, places=12)
+
+    def test_an_adverse_move_shows_up_as_a_worse_return_not_a_rejection(self):
+        """The whole point of the delay knob: the cost of being late is a
+        smaller return, not a trade that quietly vanishes from the sample."""
+        flat = self._committed(0.49, 0.51)
+        adverse = self._committed(0.60, 0.62)
+        elig = Eligibility(min_net_ev=0.0)
+        a = as_trade(flat, eligibility=elig)
+        b = as_trade(adverse, eligibility=elig)
+        self.assertIsNotNone(b, "the late trade must still be in the sample")
+        self.assertEqual(a.side, b.side)
+        self.assertEqual(a.predicted_ev, b.predicted_ev, "the screen is identical")
+        self.assertGreater(a.profit, b.profit, "but the outcome is worse")
 
 
 class CheckpointDiagnosticsTest(unittest.TestCase):

@@ -346,12 +346,34 @@ observed price is precisely the error this parameter exists to measure, and it
 would do it at the exact moment the market had moved away from you. The cell
 records `no_entry_quote_after_delay` instead.
 
+**The strategy is a committed signal, and the two books are separate.** The
+trigger and the side are frozen at *t*, on the book visible then
+(`exchange_bid`/`exchange_ask`); execution is then priced at *t + delay*
+(`entry_bid`/`entry_ask`). Nothing downstream of the decision reads the
+execution book except the realised cost.
+
+The first version wrote the execution quote straight into the decision book,
+which is what the screen and the side selection read. That let a delayed run
+**qualify a trade the signal had not triggered**, or **flip YES to NO**, using a
+price that did not exist at *t* — lookahead in the costume of a cost model. The
+cost of being late must show up as a **worse return**, never as a trade that
+quietly leaves the sample or reverses direction. At zero delay the two books are
+the same candle, so the bound is unchanged.
+
 ### Repeated checkpoints are not independent bets
 
 Seven checkpoints on one game are seven looks at **one outcome**. Summing every
 qualifying row books the same settlement repeatedly and hands the bootstrap
 seven times the evidence it has; reading off whichever checkpoint did best is
 retrospective selection. Neither is a policy anyone could have followed.
+
+Selection applies the **full** `Eligibility` rule — price band, lead bounds and
+spread cap, not just the net-EV floor. Gating on `as_trade` alone (which knows
+only about side prices and the threshold) let selection buy books the screen
+rejects, and since the policy path *is* the headline return, the screened figure
+was looser than the unscreened one. A rejected look leaves the game **open**, so
+one unexecutable early quote cannot silently cancel every later chance to trade
+it.
 
 The predeclared baseline: process checkpoints **chronologically** and take the
 **first** that qualifies, then stop looking at that game. Mutually exclusive
@@ -399,6 +421,13 @@ hard upper bound with no collisions at all would be 7×.
 
 `--preflight` reports the real figure for a real window, including how many of
 those snapshots are **already cached** and therefore free.
+
+**The measured figure for Sept 1–15 on the full grid** (run free against the
+real cache): 402 contracts, **2,814 cells**, **732 unique snapshots**, 145
+cached, **587 missing → 5,870 new credits**, worst case 17,610 with retries.
+That validates the structural claim — 732 ÷ 145 = **5.05×** a single checkpoint,
+against 5.04× modelled — while the model's headline understated the existing
+cache by an order of magnitude (14 assumed, 145 real).
 
 ## Fees must carry the series *and the date*
 
@@ -470,7 +499,7 @@ python3 run_study.py ... --fee-route direct   # headline on the other account ro
 python3 run_study.py ... --lead-grid 72h,48h,24h,12h,6h,3h --entry-delay-minutes 10
 ```
 
-Tests: `python3 -m unittest discover -s tests -t .` — 303 tests, no network, no
+Tests: `python3 -m unittest discover -s tests -t .` — 321 tests, no network, no
 credentials, and they pass with or without `rapidfuzz`.
 
 Artifacts land in `study_output/`: `report.txt`, `observations.json` (both
