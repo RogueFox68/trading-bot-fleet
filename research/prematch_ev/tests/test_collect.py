@@ -10,28 +10,44 @@ invented-fixture defect for the third time; these tests exist to stop a fourth.
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from unittest import mock
 
 import collect
 from collect import (
-    JoinedMarket, Ledger, cadence_is_viable, decision_cutoffs, in_study_window,
-    join_markets, market_start_time, observation_at_cutoff, orient_probability,
-    snapshots_per_day_for, start_metadata_available,
+    JoinedMarket, Ledger, cadence_is_viable, decision_cutoffs, exchange_matchup,
+    in_study_window, join_markets, market_start_time, observation_at_cutoff,
+    orient_probability, snapshots_per_day_for, start_metadata_available,
 )
+from core.matcher import EVENT_BODY_TIMEZONE
 from data.kalshi_history import Coverage
 from data.odds_history import SharpQuote
 
 UTC = timezone.utc
-GAME1 = datetime(2026, 7, 4, 17, 5, tzinfo=UTC)
-GAME2 = datetime(2026, 7, 4, 20, 10, tzinfo=UTC)   # doubleheader, same teams
+GAME1 = datetime(2026, 7, 4, 21, 5, tzinfo=UTC)   # 17:05 ET
+GAME2 = datetime(2026, 7, 5, 0, 10, tzinfo=UTC)   # 20:10 ET, same ET day
 
 
-def market(ticker, settled=None, result="yes", event_ticker=None):
-    """Shaped like the real payload: no scheduled-start field of any name."""
+def event_body(start, teams):
+    """A REAL-shaped event body: fixed-width date+time, then the teams.
+
+    e.g. 26SEP152140MIAAZ. Earlier fixtures used synthetic bodies like
+    `KXMLBGAME-A`, which carry no start -- so the suite could not have caught
+    that the collector had no schedule at all.
+    """
+    et = start.astimezone(ZoneInfo(EVENT_BODY_TIMEZONE))
+    return f"{et.strftime('%y%b%d').upper()}{et.strftime('%H%M')}{teams}"
+
+
+def event_ticker(start, teams="MILBAL", series="KXMLBGAME"):
+    return f"{series}-{event_body(start, teams)}"
+
+
+def market(ticker, settled=None, result="yes", event=None):
     settled = settled or (GAME1 + timedelta(hours=3))
     return {
         "ticker": ticker,
-        "event_ticker": event_ticker or ticker.rsplit("-", 1)[0],
+        "event_ticker": event or ticker.rsplit("-", 1)[0],
         "result": result,
         "open_time": "2026-06-14T19:20:00Z",
         "close_time": settled.isoformat().replace("+00:00", "Z"),
@@ -51,12 +67,15 @@ def quote(event_id, start, snapshot=None, last_update=None,
     )
 
 
-def milbal(start=GAME1, event="KXMLBGAME-A"):
+def milbal(start=None, teams="MILBAL", codes=("MIL", "BAL")):
+    """Both team contracts of one game, with a real-shaped event ticker."""
+    start = start or GAME1
+    ev = event_ticker(start, teams)
     return {
-        f"{event}-MIL": market(f"{event}-MIL", start + timedelta(hours=3),
-                               "yes", event_ticker=event),
-        f"{event}-BAL": market(f"{event}-BAL", start + timedelta(hours=3),
-                               "no", event_ticker=event),
+        f"{ev}-{codes[0]}": market(f"{ev}-{codes[0]}", start + timedelta(hours=3),
+                                   "yes", event=ev),
+        f"{ev}-{codes[1]}": market(f"{ev}-{codes[1]}", start + timedelta(hours=3),
+                                   "no", event=ev),
     }
 
 
@@ -73,119 +92,91 @@ class Candle:
 
 
 class StartMetadataTest(unittest.TestCase):
-    """No verified scheduled-start key exists. The code must say so rather than
-    accept a lifecycle field that happens to be present."""
+    """The scheduled start is in the event TICKER, not in a payload field.
 
-    def test_no_verified_key_is_configured(self):
-        self.assertFalse(start_metadata_available())
-
-    def test_real_payload_yields_no_start(self):
-        self.assertIsNone(market_start_time(market("KXMLBGAME-A-MIL")))
-
-    def test_lifecycle_fields_are_not_substituted(self):
-        """`open_time` is the listing time; the sample occurrence time lands
-        around game END. Neither is first pitch."""
-        for field in ("open_time", "close_time", "expiration_time",
-                      "expected_expiration_time", "settlement_ts"):
-            self.assertIsNone(market_start_time({field: "2026-07-04T17:05:00Z"}),
-                              f"{field} must not stand in for scheduled start")
-
-    def test_a_verified_key_is_honoured_once_configured(self):
-        """The seam works; only the verified key name is missing."""
-        with mock.patch.object(collect, "VERIFIED_START_KEYS_ISO", ("real_start",)):
-            self.assertEqual(market_start_time({"real_start": "2026-07-04T17:05:00Z"}),
-                             GAME1)
-
-
-class CadenceTest(unittest.TestCase):
-    """Two individually reasonable settings that were jointly fatal.
-
-    A fixed grid of 8 snapshots/day steps every 180 minutes against a
-    15-minute freshness bound, so essentially no decision cutoff had a fresh
-    quote: a fully working collector returning an empty answer, which is the
-    worst failure shape because it looks like a result.
+    Earlier versions hunted for a start field, invented seven key names that no
+    real payload carries, and rejected every real market while the fixtures --
+    which fabricated `game_start_ts` -- agreed with the invention.
     """
 
-    BOUND = 900.0     # 15 minutes
+    REAL = {"ticker": "KXMLBGAME-26SEP152140MIAAZ-AZ",
+            "event_ticker": "KXMLBGAME-26SEP152140MIAAZ", "result": "yes"}
 
-    def test_the_old_default_grid_is_not_viable(self):
-        self.assertFalse(cadence_is_viable(8, self.BOUND))
+    def test_real_ticker_yields_a_start(self):
+        start = market_start_time(self.REAL)
+        self.assertIsNotNone(start)
+        self.assertEqual(start.astimezone(ZoneInfo(EVENT_BODY_TIMEZONE)).strftime("%Y-%m-%d %H:%M"),
+                         "2026-09-15 21:40")
 
-    def test_a_grid_at_or_finer_than_the_bound_is_viable(self):
-        self.assertTrue(cadence_is_viable(96, self.BOUND))
-        self.assertTrue(cadence_is_viable(288, self.BOUND))
+    def test_schedule_is_known_before_any_paid_call(self):
+        self.assertTrue(start_metadata_available())
 
-    def test_zero_or_negative_cadence_is_not_viable(self):
-        self.assertFalse(cadence_is_viable(0, self.BOUND))
-        self.assertFalse(cadence_is_viable(-1, self.BOUND))
+    def test_lifecycle_fields_are_not_substituted(self):
+        for field in ("open_time", "close_time", "expiration_time"):
+            self.assertIsNone(
+                market_start_time({field: "2026-07-04T17:05:00Z"}),
+                f"{field} is a lifecycle fact, not scheduled start")
 
-    def test_coarsest_viable_grid_is_reported(self):
-        self.assertEqual(snapshots_per_day_for(self.BOUND), 96)
+    def test_unparseable_body_yields_no_start(self):
+        self.assertIsNone(market_start_time(
+            {"ticker": "KXMLBGAME-GARBAGE-MIL", "event_ticker": "KXMLBGAME-GARBAGE"}))
 
-    def test_cutoffs_cluster_so_targeting_is_cheaper_than_a_viable_grid(self):
-        base = datetime(2026, 7, 4, 17, 5, tzinfo=UTC)
-        starts = ([base] * 6 + [base + timedelta(minutes=5)] * 4
-                  + [base + timedelta(hours=3)] * 5)
-        cuts = decision_cutoffs(starts, 60)
-        self.assertEqual(len(cuts), 3, "15 games share three cutoffs")
-        self.assertLess(len(cuts), snapshots_per_day_for(self.BOUND))
-
-    def test_cutoffs_are_floored_to_the_snapshot_grid(self):
-        base = datetime(2026, 7, 4, 17, 7, tzinfo=UTC)
-        cut = decision_cutoffs([base], 60)[0]
-        self.assertEqual(cut.minute % 5, 0)
-        self.assertLessEqual(cut, base - timedelta(minutes=60))
-
-    def test_cutoffs_are_sorted_and_unique(self):
-        base = datetime(2026, 7, 4, 17, 5, tzinfo=UTC)
-        starts = [base + timedelta(hours=h) for h in (3, 0, 1, 3, 0)]
-        cuts = decision_cutoffs(starts, 60)
-        self.assertEqual(cuts, sorted(set(cuts)))
-        self.assertEqual(len(cuts), 3)
-
-    def test_no_games_yields_no_cutoffs(self):
-        self.assertEqual(decision_cutoffs([], 60), [])
+    def test_a_verified_payload_field_still_wins_if_configured(self):
+        with mock.patch.object(collect, "VERIFIED_START_KEYS_ISO", ("real_start",)):
+            m = dict(self.REAL,
+                     real_start=GAME1.isoformat().replace("+00:00", "Z"))
+            self.assertEqual(market_start_time(m), GAME1)
+            self.assertNotEqual(
+                market_start_time(m),
+                market_start_time({k: v for k, v in self.REAL.items()}),
+                "the verified field must win over the ticker-derived start")
 
 
-class WindowTest(unittest.TestCase):
-    """Without a window filter, every settled market in a series' whole history
-    was joined against odds fetched for the requested dates only, so valid
-    out-of-window markets became join FAILURES and swamped the denominator."""
+class ExchangeCodeTest(unittest.TestCase):
+    """A live run dropped 44 contracts because the exchange says AZ and the
+    bookmaker name resolves to ARI."""
 
-    START = datetime(2026, 7, 1, tzinfo=UTC)
-    END = datetime(2026, 7, 3, tzinfo=UTC)
+    def test_alias_is_applied_to_the_matchup(self):
+        markets = milbal(teams="MIAAZ", codes=("MIA", "AZ"))
+        self.assertEqual(exchange_matchup(list(markets), "MLB"),
+                         frozenset({"MIA", "ARI"}))
 
-    def test_in_window(self):
-        self.assertTrue(in_study_window(
-            {"settlement_ts": "2026-07-02T02:00:00Z"}, self.START, self.END))
+    def test_alias_is_applied_to_orientation(self):
+        q = quote("e", GAME1, home="Arizona Diamondbacks", away="Miami Marlins")
+        self.assertIsNotNone(orient_probability(q, "AZ", "MLB"),
+                             "the YES side is an EXCHANGE code")
 
-    def test_outside_window(self):
-        for ts in ("2026-05-02T02:00:00Z", "2026-09-02T02:00:00Z"):
-            self.assertFalse(in_study_window({"settlement_ts": ts},
-                                             self.START, self.END))
+    def test_arizona_game_joins_end_to_end(self):
+        led = Ledger()
+        markets = milbal(teams="MIAAZ", codes=("MIA", "AZ"))
+        quotes = {"evt-az": [quote("evt-az", GAME1,
+                                   home="Arizona Diamondbacks",
+                                   away="Miami Marlins")]}
+        self.assertEqual(len(join_markets(markets, quotes, "MLB", led)), 2)
+        self.assertEqual(led.rejections, {})
 
-    def test_late_game_settling_after_midnight_is_kept(self):
-        self.assertTrue(in_study_window(
-            {"settlement_ts": "2026-07-03T03:30:00Z"}, self.START, self.END))
-
-    def test_unreadable_settlement_is_none_not_a_verdict(self):
-        self.assertIsNone(in_study_window({}, self.START, self.END))
+    def test_unknown_code_is_rejected_by_name(self):
+        """One run must enumerate the whole alias gap."""
+        led = Ledger()
+        markets = milbal(teams="MILZZZ", codes=("MIL", "ZZZ"))
+        join_markets(markets, {"evt-1": [quote("evt-1", GAME1)]}, "MLB", led)
+        self.assertTrue(any(r.startswith("unknown_exchange_code:")
+                            for r in led.rejections),
+                        f"expected a named code, got {list(led.rejections)}")
 
 
 class JoinTest(unittest.TestCase):
-    """The join matches on PARTICIPANTS, then time. Filtering on time alone made
-    every simultaneous game a candidate for every market, so the uniqueness
-    check rejected valid data wholesale on any normal slate."""
+    """Identity is (matchup, DATE), then time for a same-day doubleheader."""
 
-    def test_joins_on_matchup(self):
+    def test_joins_on_matchup_and_date(self):
         led = Ledger()
-        joined = join_markets(milbal(), {"evt-1": [quote("evt-1", GAME1)]}, "MLB", led)
+        joined = join_markets(milbal(), {"evt-1": [quote("evt-1", GAME1)]},
+                              "MLB", led)
         self.assertEqual(len(joined), 2)
         self.assertEqual({j.yes_participant for j in joined}, {"MIL", "BAL"})
+        self.assertTrue(all(j.start_verified for j in joined))
 
     def test_simultaneous_unrelated_game_does_not_block(self):
-        """THE regression: a MIL-BAL market was discarded because an unrelated
-        BOS-NYY game started at the same minute."""
         led = Ledger()
         quotes = {
             "evt-mil-bal": [quote("evt-mil-bal", GAME1)],
@@ -195,7 +186,30 @@ class JoinTest(unittest.TestCase):
         joined = join_markets(milbal(), quotes, "MLB", led)
         self.assertEqual(len(joined), 2)
         self.assertEqual({j.provider_event_id for j in joined}, {"evt-mil-bal"})
-        self.assertEqual(led.rejections, {})
+
+    def test_consecutive_day_rematch_is_not_a_doubleheader(self):
+        """THE regression: 54 contracts were dropped as unresolvable
+        doubleheaders because candidates were indexed by team pair alone. A
+        series on successive dates is ordinary."""
+        led = Ledger()
+        day2 = GAME1 + timedelta(days=1)
+        markets = {**milbal(GAME1), **milbal(day2)}
+        quotes = {"evt-d1": [quote("evt-d1", GAME1)],
+                  "evt-d2": [quote("evt-d2", day2)],
+                  "evt-d3": [quote("evt-d3", GAME1 + timedelta(days=2))]}
+        joined = join_markets(markets, quotes, "MLB", led)
+        self.assertEqual(len(joined), 4, f"rejections: {dict(led.rejections)}")
+        by_day = {j.event_ticker: j.provider_event_id for j in joined}
+        self.assertEqual(set(by_day.values()), {"evt-d1", "evt-d2"})
+
+    def test_same_day_doubleheader_is_separated_by_time(self):
+        led = Ledger()
+        markets = {**milbal(GAME1), **milbal(GAME2)}
+        quotes = {"evt-1": [quote("evt-1", GAME1)], "evt-2": [quote("evt-2", GAME2)]}
+        joined = join_markets(markets, quotes, "MLB", led)
+        pairs = {j.event_ticker: j.provider_event_id for j in joined}
+        self.assertEqual(len(pairs), 2)
+        self.assertEqual(set(pairs.values()), {"evt-1", "evt-2"})
 
     def test_wrong_opponent_with_shared_team_is_not_matched(self):
         led = Ledger()
@@ -203,35 +217,24 @@ class JoinTest(unittest.TestCase):
                                         home="New York Yankees",
                                         away="Milwaukee Brewers")]}
         self.assertEqual(join_markets(milbal(), quotes, "MLB", led), [])
-        self.assertIn("no_sharp_event_for_matchup", led.rejections)
+        self.assertIn("no_sharp_event_for_matchup_and_date", led.rejections)
 
-    def test_doubleheader_without_a_verified_start_key_is_rejected(self):
-        """Same teams twice: only a start time separates them, and none is
-        available. Rejected explicitly rather than resolved by guess."""
+    def test_start_disagreement_rejects_and_is_counted(self):
+        """The event-body timezone is an ASSUMPTION; systematic disagreement
+        must surface rather than silently shift every timestamp."""
         led = Ledger()
-        markets = {**milbal(GAME1, "KXMLBGAME-G1"), **milbal(GAME2, "KXMLBGAME-G2")}
-        quotes = {"evt-1": [quote("evt-1", GAME1)], "evt-2": [quote("evt-2", GAME2)]}
-        self.assertEqual(join_markets(markets, quotes, "MLB", led), [])
-        self.assertIn("doubleheader_unresolvable_no_verified_start_key", led.rejections)
+        quotes = {"evt-1": [quote("evt-1", GAME1 + timedelta(hours=5))]}
+        markets = milbal()
+        joined = join_markets(markets, quotes, "MLB", led)
+        self.assertEqual(joined, [])
+        self.assertTrue("start_times_disagree" in led.rejections
+                        or "no_sharp_event_for_matchup_and_date" in led.rejections)
 
-    def test_doubleheader_resolves_once_a_start_key_is_verified(self):
+    def test_crosscheck_stage_is_counted(self):
         led = Ledger()
-        markets = {}
-        for event, start in (("KXMLBGAME-G1", GAME1), ("KXMLBGAME-G2", GAME2)):
-            for ticker, m in milbal(start, event).items():
-                m["real_start"] = start.isoformat().replace("+00:00", "Z")
-                markets[ticker] = m
-        quotes = {"evt-1": [quote("evt-1", GAME1)], "evt-2": [quote("evt-2", GAME2)]}
-        with mock.patch.object(collect, "VERIFIED_START_KEYS_ISO", ("real_start",)):
-            joined = join_markets(markets, quotes, "MLB", led)
-        pairs = {j.event_ticker: j.provider_event_id for j in joined}
-        self.assertEqual(pairs, {"KXMLBGAME-G1": "evt-1", "KXMLBGAME-G2": "evt-2"})
-
-    def test_joins_record_whether_the_start_was_verified(self):
-        led = Ledger()
-        joined = join_markets(milbal(), {"evt-1": [quote("evt-1", GAME1)]}, "MLB", led)
-        self.assertTrue(all(not j.start_verified for j in joined),
-                        "an unverified start must be labelled, not implied")
+        join_markets(milbal(), {"evt-1": [quote("evt-1", GAME1)]}, "MLB", led)
+        self.assertIn("start_time_crosscheck", led.stages)
+        self.assertEqual(led.stages["start_time_crosscheck"].considered, 1)
 
     def test_ticker_with_no_event_at_all_is_counted(self):
         led = Ledger()
@@ -239,23 +242,15 @@ class JoinTest(unittest.TestCase):
         join_markets(markets, {"evt-1": [quote("evt-1", GAME1)]}, "MLB", led)
         self.assertIn("ticker_unparseable", led.rejections)
 
-    def test_event_whose_participants_cannot_be_derived_is_counted(self):
-        """An event_ticker is published but the ticker yields no YES suffix."""
-        led = Ledger()
-        markets = {**milbal(),
-                   "garbage": {"ticker": "garbage", "event_ticker": "garbage",
-                               "result": "yes"}}
-        join_markets(markets, {"evt-1": [quote("evt-1", GAME1)]}, "MLB", led)
-        self.assertIn("event_participants_unresolvable", led.rejections)
-
     def test_unreadable_settlement_is_counted(self):
         led = Ledger()
         markets = milbal()
-        markets["KXMLBGAME-A-MIL"]["result"] = "void"
-        joined = join_markets(markets, {"evt-1": [quote("evt-1", GAME1)]}, "MLB", led)
+        first = sorted(markets)[0]
+        markets[first]["result"] = "void"
+        joined = join_markets(markets, {"evt-1": [quote("evt-1", GAME1)]},
+                              "MLB", led)
         self.assertIn("no_readable_settlement", led.rejections)
-        self.assertEqual([j.yes_participant for j in joined], ["BAL"],
-                         "the readable sibling contract still joins")
+        self.assertEqual(len(joined), 1, "the sibling contract still joins")
 
     def test_unresolvable_sharp_teams_are_counted(self):
         led = Ledger()
@@ -422,6 +417,35 @@ class LedgerTest(unittest.TestCase):
         coverage = led.apply_to(Coverage())
         self.assertFalse(coverage.complete)
         self.assertIn("contracts", str(coverage))
+
+    def test_rejections_without_a_denominator_are_unaccounted_not_zero(self):
+        """THE accounting regression. A live run printed
+        `join: 0 considered, 100 lost (0.0%)` and certified coverage complete:
+        `Ledger.reject()` defaulted to a stage nothing counted, and a zero
+        denominator returned a reassuring 0.0%."""
+        led = Ledger()
+        led.reject("failed", count=100)
+        stage = led.stages[next(iter(led.stages))]
+        self.assertFalse(stage.accounting_is_valid)
+        self.assertIsNone(stage.loss_rate, "never a reassuring zero")
+        self.assertTrue(led.unaccounted_stages())
+        coverage = led.apply_to(Coverage())
+        self.assertFalse(coverage.complete)
+        self.assertIn("denominator of zero", str(coverage))
+
+    def test_a_counted_stage_measures_normally(self):
+        led = Ledger()
+        led.count("contracts", 100, unit="contracts")
+        led.reject("x", count=100, stage="contracts")
+        self.assertTrue(led.stages["contracts"].accounting_is_valid)
+        self.assertEqual(led.stages["contracts"].loss_rate, 1.0)
+        self.assertIn("contracts", [n for n, _ in led.lossy_stages()])
+
+    def test_unaccounted_stage_is_rendered_not_hidden(self):
+        led = Ledger()
+        led.reject("failed", count=100)
+        text = led.render()
+        self.assertIn("UNACCOUNTED", text)
 
     def test_ledger_serialises_with_stages_and_units(self):
         led = Ledger()

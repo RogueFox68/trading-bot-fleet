@@ -56,44 +56,73 @@ Every item below was a real defect, each with a reproduction.
 Fixtures are now copied from observed responses rather than invented, which is
 what let defects 2 and 3 pass 77 tests.
 
-## Second review round — and one open blocker
+## Live smoke test: 0 observations, and what it found
 
-A replay of two real market payloads found that the first round of fixes still
-could not process real data. Eight further defects, all reproduced:
+A two-day run with working odds access built **nothing**:
 
-| # | Defect | Effect |
-|---|---|---|
-| 1 | **No verified scheduled-start key exists** | `market_start_time` returned `None` for every real market; the tests passed because the fixtures invented `game_start_ts` |
-| 2 | Join filtered candidates on **time alone** | A MIL–BAL market was discarded as "ambiguous" because an unrelated BOS–NYY game started the same minute — it would have voided any busy slate |
-| 3 | Eligibility screened on **midpoint** disagreement | bid .40 / ask .60 / sharp .53 passed, buying YES at .60 + 2¢ fee: predicted **−0.09/contract** |
-| 4 | Only `last_update <= decision` was required | A snapshot **captured after** the decision was accepted — lookahead |
-| 5 | `settlement_ts` read only as a number | Fell through to `close_time`, ~3 min early, mis-routing near the cutoff |
-| 6 | No study-window filter | Every market in a series' whole history became a join failure; a clean one-day run could report catastrophic loss |
-| 7 | Batch rejections counted **once** | 10,000 missing-book events recorded as one rejection, coverage still `complete` |
-| 8 | Global Brier was a mandatory **GO** gate | Contradicted this file's own premise; sample gate counted untraded games |
+```
+kalshi: 9,128 settled markets -> 100 in window (9,028 outside)
+discovery: 20 scheduled starts over 4 snapshots
+targeted: 16 snapshots -> 37 sharp events
+joined: 2 contracts
+built: 0 observations          200 credits spent
+```
 
-### ⚠ Open blocker: scheduled start time
+Six defects, all reproduced. The most damaging was the one that hid the rest:
 
-`VERIFIED_START_KEYS` is **empty**, deliberately. The real market payloads carry
-no field this code has verified as first pitch — `open_time` is the listing
-time and the sample occurrence time lands around game *end*, so neither is a
-substitute. Inventing seven more key names is what produced defect #1, and it
-would be the third time the same mistake was made.
+**The failing stage reported 0% loss.** The ledger printed
+`join: 0 considered, 100 lost (0.0%)` and omitted the stage from
+`lossy_stages` — `reject()` defaulted to a stage nothing ever counted, and a
+zero denominator returned a reassuring zero. A run that dropped *every*
+contract certified coverage complete. A stage with rejections and no
+denominator is now `UNACCOUNTED`, `loss_rate` is `None` rather than `0.0`, and
+coverage fails on it.
 
-Until a field is confirmed from a recorded response, the join **degrades
-explicitly**:
+**The scheduled start was in the ticker all along.** `26SEP152140MIAAZ` is a
+fixed-width date and time followed by the teams. The 11-character prefix is
+unambiguous; only the *team* tail is not (`MIAAZ` = `MIA|AZ` or `MI|AAZ`) — and
+that tail isn't needed, because the YES suffixes already give the
+participants. Earlier rounds hunted for a start *field*, invented seven key
+names, and rejected every real market while the fixtures agreed with the
+invention.
 
-- Matching is on **participants** — the union of an event's YES suffixes *is*
-  the matchup, derived without splitting the ambiguous `MILBAL` event body.
-- Where the matchup is unique, the join succeeds and records
-  `start_verified=False`, using the sharp event's start.
-- **Doubleheaders are rejected**, not guessed, with
-  `doubleheader_unresolvable_no_verified_start_key`.
+The **timezone is a declared assumption**, not a verified fact. It is
+cross-checked per game against the sharp feed's own `commence_time`; agreement
+and disagreement are counted in a `start_time_crosscheck` stage, and a game
+whose sources disagree is rejected rather than silently shifted.
 
-`tests/test_collect.py` proves the seam works once a key is supplied. What is
-missing is the key name, and that needs a recorded payload.
+**Ordinary rematches were called doubleheaders.** 54 contracts dropped:
+candidates were indexed by team pair alone, so a series on successive dates
+produced three candidates and the uniqueness check rejected all of them.
+Identity is now `(matchup, local date)`, with time reserved for a genuine
+same-day doubleheader. The date is taken in the *schedule's* timezone — a
+21:40 ET game is the next day in UTC, which would file the two sources of one
+game under different days.
 
-## Reading the result
+**Exchange codes are not canonical abbreviations.** 44 contracts dropped
+because the exchange says `AZ` and "Arizona Diamondbacks" resolves to `ARI`.
+Only observed codes are aliased; an unknown code is rejected **by name**, so
+one run enumerates the whole gap instead of a guess hiding it.
+
+**Retrieval padding was being used as eligibility.** Sept 13 and Sept 16
+tickers were selected for a Sept 14–15 run. Settlement ±1 day remains the
+*retrieval* filter; the declared **game** window is now a separate eligibility
+filter on the verified start.
+
+**Artifacts are written on zero observations.** The run returned before
+creating the output directory, losing the diagnostics exactly where they were
+most needed. `coverage.json` is now always written, and the failure message
+names the top failing stages instead of suggesting `--probe`.
+
+### A consequence worth noting
+
+The exchange enumeration is free and now yields the schedule, so the discovery
+pass is gone entirely and the targeted cutoffs are derived from the games
+actually being studied. The previous run derived cutoffs from a separate
+discovery grid that never covered the two contracts it managed to join — which
+is why both then failed `no_sharp_quote_available_at_cutoff`.
+
+## Reading the result## Reading the result
 
 Six sections. **No single number is a go signal.**
 

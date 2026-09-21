@@ -122,6 +122,87 @@ def unverified_note() -> str:
     )
 
 
+# --- exchange code aliases --------------------------------------------------
+# The exchange's ticker suffixes are NOT the same vocabulary as the canonical
+# abbreviations resolved from bookmaker team names. A live smoke test dropped
+# 44 contracts under `no_sharp_event_for_matchup` because the Odds API name
+# "Arizona Diamondbacks" resolves to ARI here while the exchange ticker says
+# AZ -- so the two participant sets never compared equal.
+#
+# Only codes OBSERVED in a real response belong here. An unobserved code is not
+# added on a hunch: `normalise_exchange_code` returns the input unchanged and
+# the join records the unresolved code by name, so one run enumerates the rest
+# rather than a guess hiding them.
+EXCHANGE_CODE_ALIASES: dict[str, dict[str, str]] = {
+    "MLB": {
+        "AZ": "ARI",     # observed 2026-09-21, KXMLBGAME-26SEP152140MIAAZ
+    },
+    "NFL": {},
+}
+
+
+def normalise_exchange_code(code: str, league: str) -> str:
+    """Map an exchange ticker suffix to this module's canonical abbreviation."""
+    return EXCHANGE_CODE_ALIASES.get(league.upper(), {}).get(
+        code.strip().upper(), code.strip().upper())
+
+
+def unknown_exchange_codes(codes, league: str) -> list[str]:
+    """Codes that are neither canonical nor aliased -- the audit list."""
+    roster = ROSTERS.get(league.upper(), {})
+    out = []
+    for code in codes:
+        canonical = normalise_exchange_code(code, league)
+        if canonical not in roster:
+            out.append(code)
+    return sorted(set(out))
+
+
+# --- event-body date/time ---------------------------------------------------
+# A real event body is a FIXED-WIDTH date and time followed by the teams:
+#
+#     26SEP152140MIAAZ   ->  26SEP15 | 2140 | MIAAZ
+#     26SEP131920SDSF    ->  26SEP13 | 1920 | SDSF
+#
+# The 11-character prefix is unambiguous. Only the TEAM tail is ambiguous
+# (MIAAZ reads as MIA|AZ or MI|AAZ), and it is not needed: the YES suffixes of
+# an event's markets already give the participants. So the prefix is parsed and
+# the tail is deliberately ignored.
+#
+# THE TIMEZONE IS AN ASSUMPTION, not a verified fact. It is declared here and
+# CROSS-CHECKED per game against the sharp feed's own `commence_time`; the
+# collector records the agreement rate, and a wrong assumption shows up as
+# systematic disagreement rather than as silently shifted timestamps.
+EVENT_BODY_TIMEZONE = "America/New_York"
+
+_EVENT_BODY = re.compile(r"^(?P<date>\d{2}[A-Z]{3}\d{2})(?P<time>\d{4})(?P<teams>[A-Z0-9]+)$")
+
+
+def parse_event_body_start(event_ticker: str, tz_name: str = EVENT_BODY_TIMEZONE):
+    """Scheduled start encoded in an event ticker, or None if it does not fit.
+
+    Returns a timezone-aware datetime under the DECLARED timezone assumption.
+    Callers must treat it as a candidate to be validated, not as ground truth.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    body = event_ticker.strip().upper().split("-", 1)
+    if len(body) != 2:
+        return None
+    m = _EVENT_BODY.match(body[1])
+    if not m:
+        return None
+    try:
+        naive = datetime.strptime(m.group("date") + m.group("time"), "%y%b%d%H%M")
+    except ValueError:
+        return None
+    try:
+        return naive.replace(tzinfo=ZoneInfo(tz_name))
+    except Exception:
+        return None
+
+
 _PUNCT = re.compile(r"[^a-z0-9 ]+")
 
 
@@ -318,7 +399,7 @@ def parse_kalshi_game_ticker(ticker: str) -> dict[str, str] | None:
     return {
         "series": series,
         "event_ticker": f"{series}-{event_body}",
-        "yes_participant": yes,
+        "yes_participant": yes,          # raw exchange code
         "ticker": ticker.strip().upper(),
     }
 

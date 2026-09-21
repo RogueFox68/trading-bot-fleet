@@ -27,8 +27,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from analysis.scoring import Eligibility, Observation, build_report  # noqa: E402
 from collect import (                                              # noqa: E402
-    Ledger, cadence_is_viable, decision_cutoffs, in_study_window, join_markets,
-    observation_at_cutoff, snapshots_per_day_for,
+    Ledger, decision_cutoffs, in_study_window, join_markets,
+    market_start_time, observation_at_cutoff, snapshots_per_day_for,
 )
 from core import fees                                              # noqa: E402
 from core.matcher import match_event, unverified_note              # noqa: E402
@@ -52,9 +52,6 @@ def parse_args(argv=None):
     p.add_argument("--to", dest="end", help="YYYY-MM-DD")
     p.add_argument("--lead-minutes", type=int, default=60,
                    help="observe both predictors this many minutes before start")
-    p.add_argument("--discovery-snapshots-per-day", type=int, default=2,
-                   help="coarse grid used ONLY to learn when the games are; "
-                        "the real fetches are targeted at decision cutoffs")
     p.add_argument("--devig", choices=("shin", "multiplicative"), default="shin")
     p.add_argument("--max-quote-age", type=float, default=MAX_QUOTE_AGE_SECONDS,
                    help="reject a sharp quote older than this at the cutoff")
@@ -79,10 +76,10 @@ def plan(args) -> int:
         print("--plan needs --from and --to")
         return 2
     days = (_date(args.end) - _date(args.start)).days + 1
-    discovery = estimate_credits(days, args.discovery_snapshots_per_day)
-    # Games cluster on common start times; this is a deliberately pessimistic
-    # per-day figure for distinct cutoffs, refined by the discovery pass.
-    assumed_cutoffs = 6
+    # The exchange enumeration is FREE and its tickers carry the scheduled
+    # start, so the schedule is known before any paid call and the cutoffs come
+    # straight from the games being studied. No discovery pass is needed.
+    assumed_cutoffs = 6          # games cluster; refined at run time
     targeted = estimate_credits(days, assumed_cutoffs)
     grid_equivalent = estimate_credits(
         days, snapshots_per_day_for(args.max_quote_age))
@@ -94,11 +91,10 @@ def plan(args) -> int:
     print(f"  freshness bound  {args.max_quote_age:.0f}s at the decision timestamp")
     print(f"  de-vig           {args.devig}")
     print()
-    print(f"  discovery pass   {args.discovery_snapshots_per_day}/day  "
-          f"~{discovery:,} credits (learns the schedule only)")
+    print(f"  exchange side    FREE -- start times come from the event tickers")
     print(f"  targeted pass    ~{assumed_cutoffs}/day at decision cutoffs  "
           f"~{targeted:,} credits")
-    print(f"  ESTIMATED TOTAL  ~{discovery + targeted:,} credits")
+    print(f"  ESTIMATED TOTAL  ~{targeted:,} credits")
     print()
     print(f"  for comparison, a fixed grid fine enough to satisfy the freshness")
     print(f"  bound needs {snapshots_per_day_for(args.max_quote_age)}/day = "
@@ -132,68 +128,98 @@ def probe(args) -> int:
 def collect(args, key: str):
     """Pull both sides, join on identity, and build observations at one cutoff.
 
-    Returns (observations, coverage, credit ledger, collection ledger). Every
-    stage carries its own denominator in its own units and every drop carries a
-    reason and a count -- see collect.Ledger.
+    ORDERING MATTERS. The exchange enumeration is free and its tickers carry
+    the scheduled start, so the schedule is known BEFORE any paid call. That
+    removes the discovery pass entirely and, more importantly, lets the
+    targeted cutoffs be derived from the games actually being studied. A live
+    run previously joined two contracts and then failed both with
+    `no_sharp_quote_available_at_cutoff`, because the cutoffs had been derived
+    from a separate discovery grid that never covered them.
     """
     coverage = Coverage()
     credits = CreditLedger()
     ledger = Ledger()
     start = _date(args.start)
-    # `--to` is INCLUSIVE, so the exclusive bound is the following midnight.
-    # With `cursor <= midnight(end)` the final day got only its midnight
-    # snapshot, silently truncating the last day of every window.
     end_inclusive = _date(args.end)
     end_exclusive = end_inclusive + timedelta(days=1)
 
-    # --- exchange side: BOTH partitions, then restricted to the window ------
+    # --- exchange side, free ------------------------------------------------
     cutoff, cutoff_cov = fetch_historical_cutoff()
     coverage.merge(cutoff_cov)
     all_markets, market_cov = enumerate_settled_markets(args.series)
     coverage.merge(market_cov)
     ledger.count("contracts", len(all_markets), unit="contracts")
 
-    markets: dict[str, dict] = {}
+    # Retrieval filter: settlement +-1 day, deliberately padded.
+    retrieved: dict[str, dict] = {}
     outside = undatable = 0
     for ticker, market in all_markets.items():
         verdict = in_study_window(market, start, end_exclusive)
         if verdict is True:
-            markets[ticker] = market
+            retrieved[ticker] = market
         elif verdict is False:
             outside += 1
         else:
             undatable += 1
     if outside:
-        # A market the study deliberately skipped is not a gap in what it could
-        # see. Counting these as failures made a fully collected one-day run
-        # report massive unexplained loss.
-        ledger.exclude("settled_outside_study_window", count=outside,
+        ledger.exclude("settled_outside_retrieval_window", count=outside,
                        stage="contracts")
     if undatable:
         ledger.reject("settlement_time_unreadable", f"{undatable} markets",
                       count=undatable, stage="contracts")
 
+    # ELIGIBILITY filter: the declared GAME window, on the verified start.
+    # Padding is right for retrieval and wrong for eligibility -- the padded
+    # set previously included Sept 13 and Sept 16 games in a Sept 14-15 run.
+    markets: dict[str, dict] = {}
+    off_window = no_start = 0
+    for ticker, market in retrieved.items():
+        game_start = market_start_time(market)
+        if game_start is None:
+            no_start += 1
+            continue
+        if start <= game_start < end_exclusive:
+            markets[ticker] = market
+        else:
+            off_window += 1
+    if off_window:
+        ledger.exclude("game_outside_declared_window", count=off_window,
+                       stage="contracts")
+    if no_start:
+        ledger.reject("no_readable_start_time", f"{no_start} markets",
+                      count=no_start, stage="contracts")
+
     unroutable = sum(1 for m in markets.values() if uses_archive(m, cutoff) is None)
     if unroutable:
         ledger.reject("candle_partition_unroutable", f"{unroutable} markets",
                       count=unroutable, stage="contracts")
-    print(f"  kalshi: {len(all_markets):,} settled markets -> {len(markets):,} in window "
-          f"({outside:,} outside, cutoff {cutoff.date() if cutoff else 'UNKNOWN'})")
+    print(f"  kalshi: {len(all_markets):,} settled -> {len(retrieved):,} retrieved "
+          f"-> {len(markets):,} in the declared game window")
 
-    # --- sharp side: DISCOVER the schedule, then TARGET the cutoffs ---------
-    #
-    # A fixed grid cannot do this job. At the old default of 8 snapshots a day
-    # the grid steps every 180 minutes against a 15-minute freshness bound, so
-    # essentially no decision cutoff had a fresh quote and the study produced
-    # almost nothing -- a working collector returning an empty answer. A grid
-    # fine enough to satisfy the bound needs 96/day, which is ~121k credits for
-    # a season. Targeting the cutoffs the games actually imply costs ~4k for
-    # the same season, because games cluster on common start times.
+    # --- cutoffs derived from THOSE games -----------------------------------
+    starts = [market_start_time(m) for m in markets.values()]
+    cutoffs = [c for c in decision_cutoffs([s for s in starts if s],
+                                           args.lead_minutes)
+               if start <= c < end_exclusive]
+    print(f"          {len(cutoffs):,} distinct decision cutoffs from "
+          f"{len(markets):,} contracts")
+
+    if not cutoffs and markets:
+        coverage.fail(
+            f"{len(markets):,} contracts are in the window but no decision "
+            f"cutoff falls inside it at a {args.lead_minutes:.0f}-minute lead; "
+            "widen --from or reduce --lead-minutes"
+        )
+
+    # --- sharp side: one fetch per cutoff -----------------------------------
     quotes_by_event: dict[str, list] = {}
     snapshots = 0
-
-    def absorb(snap, at):
-        nonlocal snapshots
+    for at in cutoffs:
+        if credits.exhausted():
+            coverage.fail(f"odds quota exhausted at cutoff {at.isoformat()}; "
+                          "window truncated")
+            break
+        snap = fetch_snapshot(args.sport, at, key, ledger=credits)
         coverage.merge(snap.coverage)
         snapshots += 1
         ledger.count("odds_events", snap.events_seen, unit="event-quotes")
@@ -206,58 +232,17 @@ def collect(args, key: str):
                               stage="odds_events")
         for quote in snap.quotes:
             quotes_by_event.setdefault(quote.provider_event_id, []).append(quote)
-        return snap
+    ledger.count("odds_snapshots", snapshots, unit="snapshots")
+    print(f"  odds:   {snapshots:,} targeted snapshots -> "
+          f"{len(quotes_by_event):,} sharp events ({credits})")
 
-    # Pass 1: a coarse grid, only to learn when the games are.
-    schedule: set = set()
-    cursor = start
-    discovery_step = timedelta(hours=24 / max(1, args.discovery_snapshots_per_day))
-    while cursor < end_exclusive:
-        if credits.exhausted():
-            coverage.fail(f"odds quota exhausted during discovery at {cursor.date()}")
-            break
-        snap = absorb(fetch_snapshot(args.sport, cursor, key, ledger=credits), cursor)
-        schedule.update(q.commence_time for q in snap.quotes)
-        cursor += discovery_step
-    ledger.count("discovery_snapshots", snapshots, unit="snapshots")
-    print(f"  odds:   discovery found {len(schedule):,} scheduled starts "
-          f"over {snapshots:,} snapshots")
-
-    # Pass 2: one fetch per distinct decision cutoff those games imply.
-    cutoffs = [c for c in decision_cutoffs(schedule, args.lead_minutes)
-               if start <= c < end_exclusive]
-    targeted = 0
-    for cutoff in cutoffs:
-        if credits.exhausted():
-            coverage.fail(f"odds quota exhausted at cutoff {cutoff.isoformat()}; "
-                          "window truncated")
-            break
-        absorb(fetch_snapshot(args.sport, cutoff, key, ledger=credits), cutoff)
-        targeted += 1
-    ledger.count("targeted_snapshots", targeted, unit="snapshots")
-    print(f"          {targeted:,} targeted snapshots at decision cutoffs "
-          f"-> {len(quotes_by_event):,} sharp events ({credits})")
-
-    if not cadence_is_viable(args.discovery_snapshots_per_day, args.max_quote_age) \
-            and not cutoffs:
-        coverage.fail(
-            f"no decision cutoffs were derived and the discovery grid "
-            f"({args.discovery_snapshots_per_day}/day) is coarser than the "
-            f"{args.max_quote_age:.0f}s freshness bound, so no fresh quote can "
-            "exist at any cutoff"
-        )
-
-    # --- join on participants, then time ------------------------------------
+    # --- join ----------------------------------------------------------------
     joined = join_markets(markets, quotes_by_event, args.sport, ledger)
-    ledger.count("joined_contracts", len(joined), unit="contracts")
-    unverified_starts = sum(1 for j in joined if not j.start_verified)
-    if unverified_starts:
-        print(f"  NOTE: {unverified_starts:,} joins used the SHARP event's start time; "
-              "no verified exchange start key is configured")
     print(f"  joined: {len(joined):,} contracts matched to a sharp event")
 
     # --- one decision timestamp per game -------------------------------------
     observations: list[Observation] = []
+    ledger.count("observation_build", len(joined), unit="contracts")
     for jm in joined:
         decision_at = jm.start - timedelta(minutes=args.lead_minutes)
         candles, cand_cov = fetch_candlesticks(
@@ -270,7 +255,7 @@ def collect(args, key: str):
         obs = observation_at_cutoff(
             jm, quotes_by_event.get(jm.provider_event_id, []), candles,
             decision_at, args.sport, ledger, method=args.devig,
-            max_quote_age=args.max_quote_age,
+            max_quote_age=args.max_quote_age, reject_stage="observation_build",
         )
         if obs is not None:
             observations.append(obs)
@@ -301,8 +286,47 @@ def main(argv=None) -> int:
 
     print(f"collecting {args.sport} {args.start}..{args.end}")
     observations, coverage, credits, ledger = collect(args, key)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+
+    def write_coverage():
+        """Always written, ESPECIALLY on zero observations.
+
+        A live run that built nothing returned before creating the output
+        directory, so the structured diagnostics were lost exactly where they
+        were most needed. The API key never enters this file.
+        """
+        (out / "coverage.json").write_text(json.dumps({
+            "complete": coverage.complete,
+            "reasons": coverage.reasons,
+            "collection": ledger.as_dict(),
+            "credits": str(credits),
+            "observations_built": len(observations),
+            "run": {
+                "sport": args.sport, "series": args.series,
+                "from": args.start, "to": args.end,
+                "lead_minutes": args.lead_minutes,
+                "devig": args.devig,
+                "max_quote_age_seconds": args.max_quote_age,
+                "min_net_ev": args.min_net_ev,
+                "max_spread": args.max_spread,
+                "fees": fees.describe(args.series),
+                "event_body_timezone": EVENT_BODY_TIMEZONE,
+            },
+        }, indent=2), encoding="utf-8")
+
     if not observations:
-        print("no observations built -- nothing to score. Check --probe first.",
+        write_coverage()
+        worst = sorted(ledger.rejections.items(), key=lambda kv: -kv[1])[:5]
+        print("\nNO OBSERVATIONS BUILT. Diagnose by the failing STAGE, not by "
+              "assuming absent data:", file=sys.stderr)
+        for reason, n in worst:
+            print(f"    {n:>7,}  {reason} "
+                  f"[{ledger.rejection_stage.get(reason, '?')}]", file=sys.stderr)
+        for name, s in ledger.unaccounted_stages():
+            print(f"    !! stage {name!r} rejected {s.rejected:,} against a zero "
+                  "denominator -- its loss is unmeasured", file=sys.stderr)
+        print(f"\n  wrote {out}/coverage.json with the full ledger",
               file=sys.stderr)
         print(ledger.render(), file=sys.stderr)
         return 1
@@ -317,28 +341,8 @@ def main(argv=None) -> int:
     print()
     print(report.render())
 
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
+    write_coverage()
     (out / "report.txt").write_text(report.render(), encoding="utf-8")
-    # The ledger is persisted, not just printed: a reader of the artifacts has
-    # to be able to see what was lost without going back to a terminal buffer.
-    (out / "coverage.json").write_text(json.dumps({
-        "complete": coverage.complete,
-        "reasons": coverage.reasons,
-        "collection": ledger.as_dict(),
-        "credits": str(credits),
-        "run": {
-            "sport": args.sport, "series": args.series,
-            "from": args.start, "to": args.end,
-            "lead_minutes": args.lead_minutes,
-            "discovery_snapshots_per_day": args.discovery_snapshots_per_day,
-            "devig": args.devig,
-            "max_quote_age_seconds": args.max_quote_age,
-            "min_net_ev": args.min_net_ev,
-            "max_spread": args.max_spread,
-            "fees": fees.describe(args.series),
-        },
-    }, indent=2), encoding="utf-8")
     (out / "observations.json").write_text(
         json.dumps([{
             "game_id": o.game_id, "market_id": o.market_id,

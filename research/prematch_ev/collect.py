@@ -42,8 +42,12 @@ from datetime import datetime, timedelta, timezone
 
 from analysis.scoring import Observation
 from core.devig import DevigError, devig_american
+from zoneinfo import ZoneInfo
+
 from core.matcher import (
-    kalshi_event_ticker, parse_kalshi_game_ticker, resolve_team,
+    EVENT_BODY_TIMEZONE, kalshi_event_ticker, normalise_exchange_code,
+    parse_event_body_start, parse_kalshi_game_ticker, resolve_team,
+    unknown_exchange_codes,
 )
 from data.kalshi_history import (
     Coverage, settlement_outcome, settlement_time,
@@ -127,7 +131,22 @@ class Stage:
         return max(0, self.considered - self.excluded)
 
     @property
-    def loss_rate(self) -> float:
+    def accounting_is_valid(self) -> bool:
+        """False when records were rejected against no denominator.
+
+        A stage that lost 100 records while `considered` is 0 has not measured
+        a 0% loss -- it has failed to account. Reporting that as 0.0% and
+        omitting it from `lossy_stages` is how a run that dropped EVERY
+        contract printed `join: 0 considered, 100 lost (0.0%)` and still
+        certified coverage complete.
+        """
+        return not (self.rejected and self.eligible <= 0)
+
+    @property
+    def loss_rate(self) -> float | None:
+        """None when the accounting is invalid -- never a reassuring zero."""
+        if not self.accounting_is_valid:
+            return None
         return self.rejected / self.eligible if self.eligible else 0.0
 
 
@@ -162,7 +181,7 @@ class Ledger:
         self.stage(stage, unit).considered += n
 
     def reject(self, reason: str, example: str = "", count: int = 1,
-               stage: str = "join") -> None:
+               stage: str = "contracts") -> None:
         self.rejections[reason] = self.rejections.get(reason, 0) + count
         self.rejection_stage[reason] = stage
         self.stage(stage).rejected += count
@@ -187,9 +206,20 @@ class Ledger:
     def lossy_stages(self, threshold: float = None) -> list[tuple[str, Stage]]:
         limit = MAX_UNEXPLAINED_LOSS if threshold is None else threshold
         return [(name, s) for name, s in sorted(self.stages.items())
-                if s.eligible and s.loss_rate > limit]
+                if s.loss_rate is not None and s.eligible and s.loss_rate > limit]
+
+    def unaccounted_stages(self) -> list[tuple[str, Stage]]:
+        """Stages that rejected records against no denominator."""
+        return [(name, s) for name, s in sorted(self.stages.items())
+                if not s.accounting_is_valid]
 
     def apply_to(self, coverage: Coverage) -> Coverage:
+        for name, s in self.unaccounted_stages():
+            coverage.fail(
+                f"stage {name!r}: {s.rejected:,} {s.unit} rejected against a "
+                "denominator of zero -- the loss cannot be measured, which is "
+                "not the same as no loss"
+            )
         for name, s in self.lossy_stages():
             coverage.fail(
                 f"stage {name!r}: {s.loss_rate:.1%} of {s.eligible:,} eligible "
@@ -202,7 +232,9 @@ class Ledger:
         return {
             "stages": {n: {"unit": s.unit, "considered": s.considered,
                            "excluded": s.excluded, "rejected": s.rejected,
-                           "loss_rate": round(s.loss_rate, 6)}
+                           "loss_rate": (round(s.loss_rate, 6)
+                                         if s.loss_rate is not None else None),
+                           "accounting_valid": s.accounting_is_valid}
                        for n, s in sorted(self.stages.items())},
             "rejections": {r: {"count": c, "stage": self.rejection_stage.get(r, "?")}
                            for r, c in sorted(self.rejections.items())},
@@ -214,10 +246,11 @@ class Ledger:
     def render(self) -> str:
         lines = ["COLLECTION LEDGER"]
         for name, s in sorted(self.stages.items()):
+            rate = ("UNACCOUNTED" if s.loss_rate is None
+                    else f"{s.loss_rate:.1%}")
             lines.append(
                 f"    {name:26} {s.considered:>8,} {s.unit:<13} "
-                f"excluded {s.excluded:>7,}  lost {s.rejected:>7,}  "
-                f"({s.loss_rate:.1%})")
+                f"excluded {s.excluded:>7,}  lost {s.rejected:>7,}  ({rate})")
         if self.eligibility_exclusions:
             lines.append("  excluded by design (not a gap):")
             for reason, n in sorted(self.eligibility_exclusions.items()):
@@ -229,8 +262,9 @@ class Ledger:
                     f"    {reason:38} {n:>8,}  [{self.rejection_stage.get(reason,'?')}]")
                 for ex in self.examples.get(reason, [])[:2]:
                     lines.append(f"        e.g. {ex}")
-        lossy = self.lossy_stages()
-        lines.append(f"  lossy stages: {[n for n, _ in lossy] or 'none'}")
+        lines.append(f"  lossy stages:       {[n for n, _ in self.lossy_stages()] or 'none'}")
+        lines.append(f"  UNACCOUNTED stages: "
+                     f"{[n for n, _ in self.unaccounted_stages()] or 'none'}")
         return "\n".join(lines)
 
 
@@ -254,31 +288,29 @@ def in_study_window(market: dict, start: datetime, end: datetime,
     return start - buffer <= settled <= end + buffer
 
 
-# NO VERIFIED KEY CARRIES SCHEDULED START. A previous version listed seven
-# candidate field names; a replay of two real market payloads showed that none
-# of them exists, so `market_start_time` returned None for every real market
-# and the collector rejected all of them -- while the tests passed, because the
-# fixtures supplied `game_start_ts`, a name that was invented and never
-# observed. That is the same defect as the invented ticker shape, made twice.
+# THE SCHEDULED START IS IN THE EVENT TICKER. A real event body is a
+# fixed-width date and time followed by the teams (26SEP152140MIAAZ), and the
+# 11-character prefix is unambiguous even though the team tail is not. Earlier
+# versions searched for a start FIELD, invented seven key names that no real
+# payload carries, and rejected every real market while the fixtures agreed
+# with the invention.
 #
-# So this mapping is EMPTY, deliberately. Populate it from a recorded response
-# once a field's semantics are confirmed -- and confirm them: `open_time` is
-# the contract listing time, and the sample's occurrence time lands around game
-# END, so neither is a substitute for first pitch.
+# The timezone is a DECLARED ASSUMPTION (core.matcher.EVENT_BODY_TIMEZONE) and
+# is cross-checked per game against the sharp feed's own `commence_time`. The
+# ledger records agreement and disagreement counts, so a wrong assumption
+# surfaces as systematic disagreement rather than as silently shifted times.
 #
-# Until then the join degrades explicitly rather than guessing: see
-# `join_markets`, which matches on PARTICIPANTS and only needs a start time to
-# separate a doubleheader.
+# A payload FIELD remains preferred if one is ever verified; these stay empty
+# until a real response confirms one.
 VERIFIED_START_KEYS: tuple[str, ...] = ()
 VERIFIED_START_KEYS_ISO: tuple[str, ...] = ()
 
 
 def market_start_time(market: dict) -> datetime | None:
-    """Scheduled start of the underlying game, or None if no verified key.
+    """Scheduled start: a verified payload field if one exists, else the ticker.
 
     Deliberately does NOT fall back to `open_time`, `close_time` or an
-    expiration: those are contract lifecycle facts, not first pitch, and using
-    one would make every start-agreement check pass while meaning nothing.
+    expiration: those are contract lifecycle facts, not first pitch.
     """
     for key in VERIFIED_START_KEYS:
         value = market.get(key)
@@ -291,15 +323,15 @@ def market_start_time(market: dict) -> datetime | None:
                 return datetime.fromisoformat(value.replace("Z", "+00:00"))
             except ValueError:
                 continue
-    return None
+    event = kalshi_event_ticker(market)
+    return parse_event_body_start(event) if event else None
 
 
 def start_metadata_available() -> bool:
-    """Whether any verified scheduled-start key is configured at all."""
-    return bool(VERIFIED_START_KEYS or VERIFIED_START_KEYS_ISO)
+    return True      # via the event body; see market_start_time
 
 
-def exchange_matchup(tickers: list[str]) -> frozenset[str]:
+def exchange_matchup(tickers: list[str], league: str) -> frozenset[str]:
     """The participants of one exchange event, from its markets' YES suffixes.
 
     Kalshi lists one contract per team, so the union of an event's YES
@@ -311,7 +343,7 @@ def exchange_matchup(tickers: list[str]) -> frozenset[str]:
     for ticker in tickers:
         parsed = parse_kalshi_game_ticker(ticker)
         if parsed:
-            out.add(parsed["yes_participant"])
+            out.add(normalise_exchange_code(parsed["yes_participant"], league))
     return frozenset(out)
 
 
@@ -355,12 +387,27 @@ def orient_probability(
 
     home = resolve_team(quote.home_name, league)
     away = resolve_team(quote.away_name, league)
-    target = yes_participant.strip().upper()
+    # The YES side is an EXCHANGE code; compare it canonically or every
+    # Arizona contract silently fails orientation as well as matching.
+    target = normalise_exchange_code(yes_participant, league)
     if home.resolved and home.abbreviation == target:
         return fair[0]
     if away.resolved and away.abbreviation == target:
         return fair[1]
     return None
+
+
+def _local_date(when: datetime, tz_name: str = EVENT_BODY_TIMEZONE):
+    """Calendar date in the schedule's own timezone.
+
+    A UTC date splits a night game from its own start: 2026-09-15 21:40 ET is
+    2026-09-16 01:40 UTC, so a UTC-keyed index would file the two sources of
+    one game under different days.
+    """
+    try:
+        return when.astimezone(ZoneInfo(tz_name)).date()
+    except Exception:
+        return when.date()
 
 
 def join_markets(
@@ -369,31 +416,34 @@ def join_markets(
     league: str,
     ledger: Ledger,
 ) -> list[JoinedMarket]:
-    """Match settled contracts to sharp events on PARTICIPANTS, then time.
+    """Match settled contracts to sharp events on (matchup, DATE), then time.
 
-    The previous version filtered candidates on start time alone, so on any
-    normal slate every simultaneous game was a candidate for every market and
-    the uniqueness check rejected them all as ambiguous: a MIL-BAL market was
-    discarded because an unrelated BOS-NYY game started at the same minute.
-    The safety property was right and the candidate set was wrong, which
-    discarded valid data wholesale rather than mismatching it.
+    Three defects this replaces, each seen in a live run:
 
-    Identity now comes from the matchup. Start time is used only where the
-    matchup alone cannot separate two games -- a doubleheader -- and when no
-    verified start key is configured, those are rejected explicitly instead of
-    being resolved by guess.
+    1. Candidates were indexed by matchup ALONE, so a team pair playing a
+       normal series on consecutive days produced three candidates and the
+       uniqueness check called every one an unresolvable doubleheader. 54
+       contracts were dropped that way (DET-TOR, NYY-MIN). MLB teams playing
+       each other on successive dates is ordinary, not ambiguous.
+    2. Exchange ticker suffixes were compared raw against canonical
+       abbreviations, so every Arizona game missed (`AZ` vs `ARI`).
+    3. Start time was looked for in a payload field that does not exist.
+
+    The date separates rematches; the time separates a genuine same-day
+    doubleheader. A start derived from the ticker is cross-checked against the
+    sharp feed's own `commence_time` and the agreement counted, so the
+    timezone assumption is validated by data rather than asserted.
     """
-    # Group markets into events so an event's participant set can be derived.
     events: dict[str, list[str]] = {}
     for ticker, market in markets.items():
         event = kalshi_event_ticker(market)
         if event is None:
-            ledger.reject("ticker_unparseable", ticker)
+            ledger.reject("ticker_unparseable", ticker, stage="contracts")
             continue
         events.setdefault(event, []).append(ticker)
 
-    # Index sharp events by matchup.
-    by_matchup: dict[frozenset[str], list[tuple[str, SharpQuote]]] = {}
+    # Index sharp events by (matchup, local date).
+    by_key: dict[tuple, list[tuple[str, SharpQuote]]] = {}
     unresolved = 0
     for event_id, quotes in quotes_by_event.items():
         if not quotes:
@@ -402,78 +452,95 @@ def join_markets(
         if matchup is None:
             unresolved += 1
             continue
-        by_matchup.setdefault(matchup, []).append((event_id, quotes[0]))
+        key = (matchup, _local_date(quotes[0].commence_time))
+        by_key.setdefault(key, []).append((event_id, quotes[0]))
     if unresolved:
-        ledger.reject("sharp_teams_unresolvable", f"{unresolved} events", count=unresolved)
+        ledger.reject("sharp_teams_unresolvable", f"{unresolved} events",
+                      count=unresolved, stage="odds_events")
 
     joined: list[JoinedMarket] = []
+    agreed = disagreed = 0
     for event_ticker, tickers in events.items():
-        matchup = exchange_matchup(tickers)
+        matchup = exchange_matchup(tickers, league)
         if not matchup:
             ledger.reject("event_participants_unresolvable", event_ticker,
-                          count=len(tickers))
+                          count=len(tickers), stage="contracts")
             continue
 
-        # Exact matchup when both contracts survived; containment when only one
-        # did, which is weaker but still far stronger than time alone.
-        if len(matchup) == 2:
-            candidates = by_matchup.get(matchup, [])
-        else:
-            candidates = [c for m, cs in by_matchup.items() if matchup <= m for c in cs]
+        unknown = unknown_exchange_codes(
+            [parse_kalshi_game_ticker(x)["yes_participant"] for x in tickers
+             if parse_kalshi_game_ticker(x)], league)
+        if unknown:
+            # Name the code so ONE run enumerates the whole alias gap.
+            ledger.reject(f"unknown_exchange_code:{','.join(unknown)}",
+                          event_ticker, count=len(tickers), stage="contracts")
+            continue
+
+        start = market_start_time(markets[tickers[0]])
+        if start is None:
+            ledger.reject("no_readable_start_time", event_ticker,
+                          count=len(tickers), stage="contracts")
+            continue
+
+        key = (matchup, _local_date(start))
+        candidates = by_key.get(key, [])
+        if not candidates and len(matchup) < 2:
+            candidates = [c for (m, d), cs in by_key.items()
+                          if matchup <= m and d == _local_date(start) for c in cs]
 
         if not candidates:
-            ledger.reject("no_sharp_event_for_matchup",
-                          f"{event_ticker} {sorted(matchup)}", count=len(tickers))
+            ledger.reject("no_sharp_event_for_matchup_and_date",
+                          f"{event_ticker} {sorted(matchup)} {_local_date(start)}",
+                          count=len(tickers), stage="contracts")
             continue
 
         if len(candidates) > 1:
-            # Same teams more than once in the window: a doubleheader or a
-            # reschedule. Only a start time separates them.
-            start = market_start_time(markets[tickers[0]])
-            if start is None:
-                reason = ("doubleheader_needs_start_time"
-                          if start_metadata_available()
-                          else "doubleheader_unresolvable_no_verified_start_key")
-                ledger.reject(reason, f"{event_ticker} matched {len(candidates)}",
-                              count=len(tickers))
-                continue
+            # A genuine same-day doubleheader: the time separates them.
             timed = [c for c in candidates
                      if abs(c[1].commence_time - start) <= START_AGREEMENT]
             if len(timed) != 1:
-                ledger.reject("ambiguous_start_match",
+                ledger.reject("same_day_doubleheader_unresolved",
                               f"{event_ticker} matched {len(timed)} on time",
-                              count=len(tickers))
+                              count=len(tickers), stage="contracts")
                 continue
             candidates = timed
 
         event_id, quote = candidates[0]
-        start = market_start_time(markets[tickers[0]])
-        if start is not None and abs(quote.commence_time - start) > START_AGREEMENT:
-            ledger.reject("start_times_disagree", event_ticker, count=len(tickers))
+        drift = abs(quote.commence_time - start)
+        if drift <= START_AGREEMENT:
+            agreed += 1
+        else:
+            # The ticker's timezone assumption and the feed disagree for this
+            # game. Reject it rather than silently preferring one.
+            disagreed += 1
+            ledger.reject("start_times_disagree",
+                          f"{event_ticker} drift={drift}",
+                          count=len(tickers), stage="contracts")
             continue
-        # With no verified exchange start, the sharp event's scheduled start is
-        # the only one available. It is recorded as unverified so the report can
-        # say so rather than implying the two sources agreed.
-        effective_start = start or quote.commence_time
 
         for ticker in tickers:
             parsed = parse_kalshi_game_ticker(ticker)
             outcome = settlement_outcome(markets[ticker])
             if outcome is None:
-                ledger.reject("no_readable_settlement", ticker)
+                ledger.reject("no_readable_settlement", ticker, stage="contracts")
                 continue
             joined.append(JoinedMarket(
                 market_ticker=ticker,
                 event_ticker=event_ticker,
-                yes_participant=parsed["yes_participant"],
-                start=effective_start,
+                yes_participant=normalise_exchange_code(
+                    parsed["yes_participant"], league),
+                start=start,
                 outcome=outcome,
                 provider_event_id=event_id,
                 settled_at=settlement_time(markets[ticker]),
-                start_verified=start is not None,
+                start_verified=True,
             ))
 
-    ledger.count("markets_joined", len(joined))
+    # The timezone assumption, validated by data.
+    ledger.count("start_time_crosscheck", agreed + disagreed, unit="games")
+    if disagreed:
+        ledger.stage("start_time_crosscheck").rejected += disagreed
+    ledger.count("joined_contracts", len(joined), unit="contracts")
     return joined
 
 
@@ -487,6 +554,7 @@ def observation_at_cutoff(
     method: str = "shin",
     max_lag: timedelta = MAX_SOURCE_LAG,
     max_quote_age: float = MAX_QUOTE_AGE_SECONDS,
+    reject_stage: str = "observation_build",
 ) -> Observation | None:
     """Build one observation from the newest record on EACH side at the cutoff.
 
@@ -508,7 +576,7 @@ def observation_at_cutoff(
         and q.last_update <= q.snapshot <= decision_at
     ]
     if not usable_quotes:
-        ledger.reject("no_sharp_quote_available_at_cutoff", joined.market_ticker)
+        ledger.reject("no_sharp_quote_available_at_cutoff", joined.market_ticker, stage=reject_stage)
         return None
 
     quote = max(usable_quotes, key=lambda q: q.last_update)
@@ -519,29 +587,29 @@ def observation_at_cutoff(
     age_at_decision = (decision_at - quote.last_update).total_seconds()
     if age_at_decision > max_quote_age:
         ledger.reject("sharp_quote_too_old_at_cutoff",
-                      f"{joined.market_ticker} {age_at_decision:.0f}s")
+                      f"{joined.market_ticker} {age_at_decision:.0f}s", stage=reject_stage)
         return None
 
     usable_candles = [c for c in candles if c.mid is not None and c.ts <= decision_at]
     if not usable_candles:
-        ledger.reject("no_exchange_quote_at_cutoff", joined.market_ticker)
+        ledger.reject("no_exchange_quote_at_cutoff", joined.market_ticker, stage=reject_stage)
         return None
     candle = max(usable_candles, key=lambda c: c.ts)
     if decision_at - candle.ts > max_lag:
-        ledger.reject("exchange_quote_too_old_at_cutoff", joined.market_ticker)
+        ledger.reject("exchange_quote_too_old_at_cutoff", joined.market_ticker, stage=reject_stage)
         return None
     if candle.has_malformed_price:
-        ledger.reject("exchange_quote_malformed", joined.market_ticker)
+        ledger.reject("exchange_quote_malformed", joined.market_ticker, stage=reject_stage)
         return None
 
     p_sharp = orient_probability(quote, joined.yes_participant, league, method)
     if p_sharp is None:
-        ledger.reject("yes_side_unresolvable", f"{joined.market_ticker} YES={joined.yes_participant}")
+        ledger.reject("yes_side_unresolvable", f"{joined.market_ticker} YES={joined.yes_participant}", stage=reject_stage)
         return None
 
     lead_minutes = (joined.start - decision_at).total_seconds() / 60.0
     if lead_minutes <= 0:
-        ledger.reject("cutoff_at_or_after_start", joined.market_ticker)
+        ledger.reject("cutoff_at_or_after_start", joined.market_ticker, stage=reject_stage)
         return None
 
     return Observation(
