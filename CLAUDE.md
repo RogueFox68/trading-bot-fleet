@@ -798,7 +798,8 @@ backtest harness. Two dependencies are not installable everywhere: `ta` is sdist
 fails to build on some toolchains (`test_risk_exits` stubs it when absent), and the suites
 need a `config.py` — copy `config.example.py` for a local run.
 
-**CI runs all of this on every push and PR** (`.github/workflows/tests.yml`), which until
+**CI runs all of this on every pull request and every push to `main`**
+(`.github/workflows/tests.yml`), which until
 2026-09-21 nothing did — the suites only ran when someone remembered, including the ones
 written specifically to fail the build on a known defect. `test_bar_freshness` is the clearest
 case: it parses every bar request and fails if `limit` is paired with `start`, a bug that

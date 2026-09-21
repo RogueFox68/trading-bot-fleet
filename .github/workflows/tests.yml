@@ -17,16 +17,24 @@
 # =============================================================================
 name: tests
 
+# `push` is scoped to main rather than '**' on purpose. With both triggers
+# unscoped, a branch with an open PR fires BOTH, and the concurrency group
+# below cannot collapse them: github.ref is refs/heads/<branch> for a push and
+# refs/pull/<n>/merge for a pull_request, so they land in different groups and
+# run twice. Scoping push to main gives one run per commit either way -- via
+# pull_request while a branch is in review, via push once it lands.
 on:
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
-# A superseded run tells you about a commit nobody is looking at any more.
+# A superseded PR run tells you about a commit nobody is looking at any more.
+# Runs on main are not cancelled: each one is the standing record for that
+# commit, and losing it to a fast follow-up leaves main with no result at all.
 concurrency:
   group: tests-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   fleet:
