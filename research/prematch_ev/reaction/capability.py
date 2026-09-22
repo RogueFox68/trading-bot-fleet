@@ -74,7 +74,7 @@ class Resolution(str, Enum):
 # --- the clocks a study has to keep apart ----------------------------------
 
 class Clock(str, Enum):
-    SOURCE_UPDATE = "source_update_time"        # when the SOURCE says the value changed
+    PROVIDER_OBSERVED = "provider_observed_at"        # when the SOURCE says the value changed
     PROVIDER_SNAPSHOT = "provider_snapshot_time"  # when the provider captured/closed it
     LOCAL_RECEIPT = "local_receipt_time"        # when WE actually received it (live only)
     SCHEDULED_START = "scheduled_start"         # kickoff
@@ -158,9 +158,13 @@ SHARP_BOOK_CAPABILITY = SourceCapability(
     resolution_evidence=Evidence.PROVIDER_DOC,
     clocks=(
         ClockCapability(
-            Clock.SOURCE_UPDATE, Evidence.MEASURED, "seconds",
-            "market `last_update`, else bookmaker `last_update`. This is when "
-            "the BOOK moved. It is NOT when a poller could have known."),
+            Clock.PROVIDER_OBSERVED, Evidence.PROVIDER_DOC, "seconds",
+            "market `last_update`: the last time the PROVIDER'S SYSTEM saw "
+            "odds for this market from the bookmaker. It is NOT when the "
+            "bookmaker changed the price, and it is NOT when a poller could "
+            "have known. (Bookmaker-level `last_update` is deprecated.) An "
+            "earlier version of this table claimed it was the book's own "
+            "change time; the change instant is BRACKETED, never a point."),
         ClockCapability(
             Clock.PROVIDER_SNAPSHOT, Evidence.MEASURED, "5 minutes",
             "payload `timestamp`. The archive returns the closest snapshot at "
@@ -182,8 +186,17 @@ SHARP_BOOK_CAPABILITY = SourceCapability(
         "A market absent from a snapshot may be suspended, unlisted, or simply "
         "not carried. The archive does not distinguish those, so a gap is not "
         "evidence of suspension.",
-        "Delivery lag between the book moving and the provider recording it is "
-        "NOT established. `last_update` is the book's own claim.",
+        "THE BOOK'S OWN CHANGE INSTANT IS NOT IN THIS DATA. `last_update` is "
+        "the provider's observation, so a price change can only be BRACKETED "
+        "between the previous observation of the old value and the one "
+        "carrying the new value. Nothing here yields a point.",
+        "Delivery lag from the bookmaker to the provider is NOT established, "
+        "and neither is provider-to-us lag. A historical snapshot time is a "
+        "ZERO-DELIVERY-DELAY REPLAY ASSUMPTION, not a measurement.",
+        "This 5-minute grid is the ARCHIVE's cadence. The live feed's update "
+        "intervals are a separate, better capability and are NOT described by "
+        "this row: "
+        "https://the-odds-api.com/sports-odds-data/update-intervals.html",
     ),
 )
 
@@ -195,7 +208,7 @@ KALSHI_CANDLE_CAPABILITY = SourceCapability(
     resolution_evidence=Evidence.PROVIDER_DOC,
     clocks=(
         ClockCapability(
-            Clock.SOURCE_UPDATE, Evidence.UNKNOWN, "unknown",
+            Clock.PROVIDER_OBSERVED, Evidence.UNKNOWN, "unknown",
             "A candle does not say when inside its period the quote changed."),
         ClockCapability(
             Clock.PROVIDER_SNAPSHOT, Evidence.MEASURED, "1 minute",
@@ -236,27 +249,27 @@ def source(name: str) -> SourceCapability | None:
 # --- the executable clock --------------------------------------------------
 
 def earliest_observable_at(
-    source_update: datetime | None,
+    provider_observed: datetime | None,
     snapshot_times: Sequence[datetime],
 ) -> tuple[datetime | None, str]:
     """When a strategy polling this archive could FIRST have known a move.
 
     THE conversion this module exists for. Returns `(instant, reason)`.
 
-    A book move stamped `source_update` is invisible to a poller until a
+    A book move stamped `provider_observed` is invisible to a poller until a
     snapshot carrying it is taken, so the answer is the earliest snapshot at or
-    after `source_update` -- chosen from the snapshots the replay ACTUALLY has,
+    after `provider_observed` -- chosen from the snapshots the replay ACTUALLY has,
     not from an assumed grid, because a gap in what was fetched is a real gap
     in what a poller would have seen.
 
     Returns (None, reason) rather than guessing when:
-      * there is no `source_update` at all -- unknown is not "now";
+      * there is no `provider_observed` at all -- unknown is not "now";
       * every snapshot predates it, so the move is right-censored: it happened
         after our last look and we cannot say when it became visible.
     """
-    if source_update is None:
-        return None, "no source_update_time: the move instant is unknown"
-    later = sorted(t for t in snapshot_times if t >= source_update)
+    if provider_observed is None:
+        return None, "no provider_observed_at: the move instant is unknown"
+    later = sorted(t for t in snapshot_times if t >= provider_observed)
     if not later:
         return None, (
             "right-censored: no snapshot at or after the move, so the instant "
@@ -265,14 +278,14 @@ def earliest_observable_at(
 
 
 def detection_lag_seconds(
-    source_update: datetime | None,
+    provider_observed: datetime | None,
     snapshot_times: Sequence[datetime],
 ) -> float | None:
     """How long our system was blind to a move. None when not computable."""
-    observable, _ = earliest_observable_at(source_update, snapshot_times)
-    if observable is None or source_update is None:
+    observable, _ = earliest_observable_at(provider_observed, snapshot_times)
+    if observable is None or provider_observed is None:
         return None
-    return (observable - source_update).total_seconds()
+    return (observable - provider_observed).total_seconds()
 
 
 def measure_snapshot_grid(snapshot_times: Iterable[datetime]) -> dict:
@@ -354,15 +367,23 @@ def question_verdicts(
             "two-sided moneyline prices are present in each snapshot and "
             "de-vig within that one contemporaneous quote"),
         QuestionVerdict(
-            "when did the BOOK move",
+            "when did the PROVIDER last observe this price",
             Answerability.ANSWERABLE, None,
-            f"market last_update is {book.clock(Clock.SOURCE_UPDATE).precision}"
-            if book.has_clock(Clock.SOURCE_UPDATE) else "no source update clock"),
+            "market last_update, stamped to the second -- the provider's "
+            "observation, NOT the bookmaker's change"),
         QuestionVerdict(
-            "when could OUR SYSTEM first have known the book moved",
+            "when did the BOOK actually change its price",
+            Answerability.UNANSWERABLE, None,
+            "last_update is when the PROVIDER saw the odds. The change can "
+            "only be BRACKETED between consecutive provider observations; no "
+            "point estimate exists in this data, and an earlier version of "
+            "this table wrongly claimed one did"),
+        QuestionVerdict(
+            "when could OUR SYSTEM first have known",
             Answerability.INTERVAL_CENSORED, grid,
-            f"the archive is sampled on a {grid:.0f}s grid, so detection is "
-            "pinned to a snapshot, never to the book's own update instant"),
+            f"pinned to an archive snapshot on a {grid:.0f}s grid, and only "
+            "under an explicit ZERO-DELIVERY-DELAY assumption -- real "
+            "provider-to-us lag is unmeasurable in replay"),
         QuestionVerdict(
             "when did the Kalshi quote change",
             Answerability.INTERVAL_CENSORED, candle,
@@ -371,15 +392,19 @@ def question_verdicts(
         QuestionVerdict(
             "did the book move BEFORE Kalshi (ordering)",
             Answerability.INTERVAL_CENSORED, coarsest,
-            f"orderings closer together than {coarsest:.0f}s are "
-            "unidentifiable; only gaps wider than the coarser resolution can "
-            "be ranked, and the rest must be reported as indeterminate"),
+            f"a gap wider than {coarsest:.0f}s is NECESSARY but NOT "
+            "SUFFICIENT to rank an ordering: unknown provider lag, missing "
+            "samples and intervening moves all survive it. Intervals must be "
+            "derived from actual consecutive valid observations, never from "
+            "this constant, and anything unresolved is indeterminate"),
         QuestionVerdict(
             "how long an executable discrepancy persisted",
-            Answerability.INTERVAL_CENSORED, candle,
-            f"persistence is observed at candle closes, so a duration is a "
-            f"multiple of {candle:.0f}s with both ends censored; a gap opening "
-            "and closing inside one period is invisible"),
+            Answerability.INTERVAL_CENSORED, grid,
+            f"the COARSER input governs: candles are {candle:.0f}s but the "
+            f"sharp side is sampled every {grid:.0f}s, so a duration computed "
+            "between candle closes holds the sharp value constant across its "
+            "own sampling interval. That is a HELD-SHARP-VALUE calculation "
+            "and must be labelled one, not a fine-grained measurement"),
         QuestionVerdict(
             "was the quoted price fillable in the size we wanted",
             Answerability.UNANSWERABLE, None,
@@ -394,7 +419,14 @@ def question_verdicts(
             "what the provider's delivery lag was",
             Answerability.UNANSWERABLE, None,
             "no local receipt time exists in historical replay; only a "
-            "prospective recorder can measure it"),
+            "prospective recorder can measure it, so every availability "
+            "answer rides on a zero-delay ASSUMPTION"),
+        QuestionVerdict(
+            "what the LIVE feed could do",
+            Answerability.UNANSWERABLE, None,
+            "this table describes the ARCHIVE. Live update intervals are a "
+            "separate and better capability, and presenting the archive's "
+            "grid as a universal limit understates the live feed"),
     ]
     return tuple(out)
 
@@ -439,6 +471,11 @@ def free_verification_commands() -> tuple[str, ...]:
         "#    Confirms the parameter surface only; it returns no odds.",
         "curl -sS -o /dev/null -w '%{http_code}\\n' \\",
         "  'https://api.the-odds-api.com/v4/historical/sports/americanfootball_nfl/odds'",
+        "",
+        "# 2b. The CORRECTED last_update semantics + the archive cadence, and",
+        "#     the LIVE update intervals, which are a different capability.",
+        "curl -sS https://the-odds-api.com/historical-odds-data/",
+        "curl -sS https://the-odds-api.com/sports-odds-data/update-intervals.html",
         "",
         "# 3. Kalshi candlestick period_interval + end_period_ts (public docs, free)",
         "curl -sS https://docs.kalshi.com/api-reference/endpoint/get-market-candlesticks",

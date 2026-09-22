@@ -2,45 +2,82 @@
 
 FOUR CLOCKS, NEVER COLLAPSED
 ----------------------------
-    source_update_time      when the SOURCE says the value changed
+    provider_observed_at    when the PROVIDER last saw this value from the
+                            source. NOT when the source changed it.
     provider_snapshot_time  when the provider captured or closed the record
     local_receipt_time      when WE received it  (live capture only; historical
                             replay has none, and none may be invented)
     scheduled_start         kickoff
 
-A reaction study lives or dies on keeping these apart, because the interesting
-quantity -- how long an executable price stayed behind -- is a difference
-between two of them, and picking the wrong pair silently answers a different
-question. Two specific ways that goes wrong, both guarded here:
+WHAT `last_update` ACTUALLY MEANS  (corrected 2026-09-22, PR #27 review)
+------------------------------------------------------------------------
+The Odds API's market `last_update` is **the last time the provider's system
+saw odds for that market from the bookmaker** -- not the moment the bookmaker
+changed the price. (Bookmaker-level `last_update` is deprecated. Source:
+https://the-odds-api.com/liveapi/guides/v4/, "More info" beneath GET odds.)
 
-1. **Measuring from the source's own update time.** A book move stamped
-   `last_update=T` was knowable to us only once a snapshot carrying it was
-   taken. `available_at()` is the one function that answers "when could our
-   system have acted on this", and it never returns `source_update_time` for a
-   historical record. Using the finer stamp would credit the strategy with
-   information it did not have.
+An earlier version of this module asserted the opposite, inheriting the claim
+from `SharpQuote`'s docstring, and named the detector's output
+`book_moved_at`. That was wrong, and wrong in the direction that matters: it
+put a confident timestamp on an event nobody observed.
 
-2. **Reading a fresh envelope as a fresh price.** The archive returns a
-   snapshot every five minutes whether or not the book moved, so an envelope
-   captured at 14:00 routinely carries a price the book last touched at 11:20.
+**The true book-change instant is not in this data at all.** What IS available
+is a BRACKET: the price changed somewhere after the previous provider
+observation of an unchanged value and at or before the observation that
+carried the new one. `book_change_bracket` reports that interval; nothing
+reports a point.
+
+THREE CLOCKS, THREE DIFFERENT QUESTIONS
+---------------------------------------
+    provider_observed_at -> provider_snapshot_time     capture age
+    provider_observed_at -> available_at               age at the decision
+    previous observation -> provider_observed_at       the change bracket
+
+Collapsing any pair answers a different question than the one asked. The
+interesting quantity -- how long an executable price stayed behind -- is a
+difference between two of them, and picking the wrong pair is silent.
+
+`available_at` IS AN ASSUMPTION, NOT A MEASUREMENT
+--------------------------------------------------
+For a historical record it returns the provider snapshot time, which asserts
+**zero delivery delay**: that a live system polling this archive would have
+had the record the instant the provider stamped it. That is a replay
+assumption, labelled `ZERO_DELIVERY_DELAY_ASSUMED` on every answer, not proof
+of when our system could actually have received anything. Real delivery lag is
+unmeasurable here (see `capability`) and only a prospective recorder with a
+real `local_receipt_time` can bound it.
+
+TWO SPECIFIC FAILURES THIS GUARDS
+---------------------------------
+1. **Reading a fresh envelope as a fresh price.** The archive returns a
+   snapshot every five minutes whether or not the price moved, so an envelope
+   captured at 14:00 routinely carries a value the provider last saw at 11:20.
    That envelope is fresh and its CONTENT is nearly three hours old.
-   `content_age_seconds()` reports the second, `is_new_content_versus()`
-   decides whether anything actually changed, and the detector triggers on
-   content, never on arrival (see `detector`).
+   `content_age_seconds()` reports the latter, `is_new_content_versus()`
+   decides whether anything changed, and the detector triggers on content.
+
+2. **Clocks out of order.** `provider_observed_at` after
+   `provider_snapshot_time` is impossible -- a provider cannot capture a value
+   it has not yet seen -- and it yields a NEGATIVE age that sails through any
+   upper-bound-only freshness test. `clock_order_problem()` names it, and the
+   detector refuses the record rather than triggering on it.
 
 WHAT PROVENANCE IS FOR
 ----------------------
 Every envelope carries the ids and the payload hash needed to re-derive it
 from the source months later. A lag figure whose inputs cannot be located
-again is not a finding, it is an anecdote -- and this study has already had to
-throw away conclusions that came from fixtures nobody could point at.
+again is not a finding, it is an anecdote.
+
+STREAM IDENTITY INCLUDES THE BOOK
+---------------------------------
+`market_id` carries provider, book, event and market, because state keyed on
+the event alone lets two bookmakers' quotes overwrite each other -- and a
+second book's different price then reads as the first book moving.
 
 UNKNOWN STAYS UNKNOWN
 ---------------------
 `local_receipt_time=None` means we were not listening. It is not zero, not the
-snapshot time, and not "close enough". Anything that needs a receipt time and
-does not have one must say so and stop, which is the same rule the fleet
-applies to a failed position read (rule 17).
+snapshot time, and not "close enough" (rule 17).
 """
 
 from __future__ import annotations
@@ -80,6 +117,52 @@ class ReceiptTimeUnknown(RuntimeError):
     """Something needed a local receipt time that historical data cannot have."""
 
 
+# The label every historical availability answer carries. It is an ASSUMPTION
+# -- that a live poller would have held the record the instant the provider
+# stamped it -- and it is stated on the answer so no reader can mistake it for
+# a measurement of delivery lag, which this data cannot provide.
+ZERO_DELIVERY_DELAY_ASSUMED = (
+    "provider snapshot that carried this record; ZERO DELIVERY DELAY ASSUMED "
+    "(historical replay has no receipt time, so real delivery lag is "
+    "unmeasurable here)")
+
+# A provider cannot capture a value it has not yet seen, so
+# provider_observed_at must not follow provider_snapshot_time. A small
+# tolerance is allowed for clock skew between the provider's own systems;
+# beyond it the record is refused rather than trusted, because the resulting
+# age is NEGATIVE and a negative age passes every upper-bound freshness test
+# ever written.
+CLOCK_SKEW_TOLERANCE = timedelta(seconds=2)
+
+
+def clock_order_problem(envelope: "SourceEnvelope",
+                        tolerance: timedelta = CLOCK_SKEW_TOLERANCE
+                        ) -> str | None:
+    """Name an impossible clock ordering, or None when the record is coherent.
+
+    Checked BEFORE any freshness bound, because an out-of-order pair produces
+    a negative age that an upper-bound test reads as extremely fresh.
+    """
+    observed = envelope.provider_observed_at
+    snapshot = envelope.provider_snapshot_time
+    if observed is not None and observed > snapshot + tolerance:
+        drift = (observed - snapshot).total_seconds()
+        return (f"provider_observed_at is {drift:.0f}s AFTER "
+                f"provider_snapshot_time: a provider cannot capture a value it "
+                f"has not yet seen, and the resulting age is negative")
+    receipt = envelope.local_receipt_time
+    if receipt is not None and receipt + tolerance < snapshot:
+        drift = (snapshot - receipt).total_seconds()
+        return (f"local_receipt_time is {drift:.0f}s BEFORE "
+                f"provider_snapshot_time: we cannot have received a record "
+                f"before it was captured")
+    if (envelope.request_sent_at and envelope.response_received_at
+            and envelope.response_received_at + tolerance
+            < envelope.request_sent_at):
+        return "response_received_at precedes request_sent_at"
+    return None
+
+
 @dataclass(frozen=True)
 class Provenance:
     """Everything needed to find this record again at the source."""
@@ -114,14 +197,14 @@ class SourceEnvelope:
     origin: Origin
     provider_snapshot_time: datetime
     payload: Any
-    source_update_time: datetime | None = None
+    provider_observed_at: datetime | None = None
     local_receipt_time: datetime | None = None
     request_sent_at: datetime | None = None
     response_received_at: datetime | None = None
     resolution_seconds: float | None = None
 
     def __post_init__(self) -> None:
-        for name in ("provider_snapshot_time", "source_update_time",
+        for name in ("provider_snapshot_time", "provider_observed_at",
                      "local_receipt_time", "request_sent_at",
                      "response_received_at"):
             value = getattr(self, name)
@@ -145,7 +228,7 @@ class SourceEnvelope:
         LIVE capture: the receipt time. That is literally when we had it.
 
         HISTORICAL replay: the snapshot that carried it -- never
-        `source_update_time`, however finely that is stamped. `snapshot_times`
+        `provider_observed_at`, however finely that is stamped. `snapshot_times`
         is accepted for signature symmetry with the series-level helpers and
         does not change this answer; see `earliest_availability` for "when did
         we FIRST see this value", which is a different question.
@@ -161,9 +244,7 @@ class SourceEnvelope:
         # that snapshot, and `earliest_availability` is what finds it. Folding
         # both questions into one method is how a per-record answer starts
         # depending on which other records happen to be in scope.
-        return self.provider_snapshot_time, (
-            "provider snapshot that carried this record (historical replay "
-            "has no receipt time)")
+        return self.provider_snapshot_time, ZERO_DELIVERY_DELAY_ASSUMED
 
     def require_receipt_time(self) -> datetime:
         if self.local_receipt_time is None:
@@ -179,10 +260,30 @@ class SourceEnvelope:
         None when the source published no update time: unknown, which is not
         fresh and must not be read as fresh.
         """
-        if self.source_update_time is None:
+        if self.provider_observed_at is None:
             return None
         return (self.provider_snapshot_time
-                - self.source_update_time).total_seconds()
+                - self.provider_observed_at).total_seconds()
+
+    def age_at_decision_seconds(self,
+                                snapshot_times: Sequence[datetime] | None = None
+                                ) -> float | None:
+        """How old the VALUE was when our system could act on it.
+
+        THE freshness clock. `content_age_seconds` measures to the provider's
+        CAPTURE, which for a live record can be long before we received it: a
+        record captured at 12:05 and received at 12:25 is 20 minutes old when
+        it becomes actionable, and a capture-age test calls it fresh. The
+        bound belongs on the clock the decision runs on.
+
+        None when either end is unknown -- which is not fresh (rule 17).
+        """
+        if self.provider_observed_at is None:
+            return None
+        available, _ = self.available_at(snapshot_times)
+        if available is None:
+            return None
+        return (available - self.provider_observed_at).total_seconds()
 
     def content_key(self) -> str:
         """Identity of the CONTENT, so one value seen twice is seen once.
@@ -193,8 +294,8 @@ class SourceEnvelope:
         update stamp, and the payload hash -- is what lets a reconnect be
         recognised instead of counted as a move.
         """
-        stamp = (self.source_update_time.isoformat()
-                 if self.source_update_time else "unknown")
+        stamp = (self.provider_observed_at.isoformat()
+                 if self.provider_observed_at else "unknown")
         return "|".join([
             self.provenance.source, self.provenance.market_id, stamp,
             self.provenance.payload_sha256,
@@ -213,7 +314,7 @@ class SourceEnvelope:
     def clocks_as_dict(self) -> dict:
         return {
             "origin": self.origin.value,
-            "source_update_time": _iso(self.source_update_time),
+            "provider_observed_at": _iso(self.provider_observed_at),
             "provider_snapshot_time": _iso(self.provider_snapshot_time),
             "local_receipt_time": _iso(self.local_receipt_time),
             "request_sent_at": _iso(self.request_sent_at),
@@ -317,18 +418,18 @@ def detection_blindness_seconds(envelope: SourceEnvelope,
                                 ) -> float | None:
     """How long we were blind to this value after the source changed it.
 
-    `source_update_time` -> first snapshot that carried it. None when the
+    `provider_observed_at` -> first snapshot that carried it. None when the
     source published no update stamp, because the interval is then unknown
     rather than zero.
     """
-    if envelope.source_update_time is None:
+    if envelope.provider_observed_at is None:
         return None
     first = (earliest or {}).get(envelope.content_key())
     if first is None:
         first, _ = envelope.available_at()
     if first is None:
         return None
-    return (first - envelope.source_update_time).total_seconds()
+    return (first - envelope.provider_observed_at).total_seconds()
 
 
 def latest_usable(decision_at: datetime,
@@ -369,6 +470,24 @@ def first_usable_at_or_after(decision_at: datetime,
 
 # --- builders ---------------------------------------------------------------
 
+def orientation_key(away_name: str, home_name: str) -> str:
+    """Away/home orientation, as part of identity.
+
+    A quote whose sides are swapped relative to the baseline is not the same
+    stream: comparing them would read a re-labelling as a large price move.
+    """
+    return f"{(away_name or '?').strip()}@{(home_name or '?').strip()}"
+
+
+def stream_id(*, source: str, book: str, event_id: str, market: str,
+              orientation: str = "") -> str:
+    """The identity a detector keys its state on. Book included, always."""
+    parts = [source, book.lower(), event_id, market]
+    if orientation:
+        parts.append(orientation)
+    return "|".join(parts)
+
+
 def envelope_for_sharp_quote(quote: Any, *, request_url: str = "",
                              sequence: int | None = None) -> SourceEnvelope:
     """Wrap a `data.odds_history.SharpQuote` with its clocks kept apart.
@@ -391,14 +510,25 @@ def envelope_for_sharp_quote(quote: Any, *, request_url: str = "",
         provenance=Provenance(
             source="the_odds_api_historical",
             event_id=str(getattr(quote, "provider_event_id", "")),
-            market_id=f"{getattr(quote, 'provider_event_id', '')}:h2h",
+            # STREAM IDENTITY INCLUDES THE BOOK. Keyed on the event alone, two
+            # bookmakers' quotes overwrite each other in the detector's state
+            # and the second book's different price reads as the first book
+            # moving. Provider + book + event + market is the stream.
+            market_id=stream_id(
+                source="the_odds_api_historical",
+                book=str(getattr(quote, "book", "") or "unknown"),
+                event_id=str(getattr(quote, "provider_event_id", "")),
+                market="h2h",
+                orientation=orientation_key(
+                    getattr(quote, "away_name", ""),
+                    getattr(quote, "home_name", ""))),
             payload_sha256=payload_hash(payload),
             request_url=request_url,
             sequence=sequence,
         ),
         origin=Origin.HISTORICAL_REPLAY,
         provider_snapshot_time=getattr(quote, "snapshot"),
-        source_update_time=getattr(quote, "last_update", None),
+        provider_observed_at=getattr(quote, "last_update", None),
         payload=quote,
         resolution_seconds=(capability.resolution_seconds if capability else None),
     )
@@ -410,7 +540,7 @@ def envelope_for_candle(candle: Any, market_ticker: str, *,
     """Wrap a `data.kalshi_history.Candle`.
 
     A candle's `ts` is its period CLOSE, so it is the provider snapshot time.
-    `source_update_time` stays None: the candle does not say when inside its
+    `provider_observed_at` stays None: the candle does not say when inside its
     period the quote moved, and inventing a point inside would manufacture the
     very precision this study is trying not to claim.
     """
@@ -431,7 +561,7 @@ def envelope_for_candle(candle: Any, market_ticker: str, *,
         ),
         origin=Origin.HISTORICAL_REPLAY,
         provider_snapshot_time=getattr(candle, "ts"),
-        source_update_time=None,
+        provider_observed_at=None,
         payload=candle,
         resolution_seconds=(capability.resolution_seconds if capability else None),
     )
