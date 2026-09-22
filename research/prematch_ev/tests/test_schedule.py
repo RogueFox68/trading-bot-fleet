@@ -861,6 +861,73 @@ class NflSurveyIntegrationTest(unittest.TestCase):
         self.assertIn("no contract survived to be studied", str(result.coverage))
         self.assertIn("4 were rejected", str(result.coverage))
 
+    def test_an_unknown_exchange_code_blames_our_map_not_the_provider(self):
+        """The live 2026-09-22 run's finding, generalised.
+
+        Kalshi spells Jacksonville `JAC`; the roster and ESPN both say `JAX`.
+        With no alias the matchup reads {CLE, JAC}, nothing matches, and the
+        run reported `schedule_no_event_for_matchup` -- "not in the retrieved
+        schedule" -- on a day when the schedule carried that exact game. The
+        diagnosis pointed at the schedule provider for a one-line gap in our
+        own mapping, which is the most expensive kind of wrong answer: it
+        sends the next person to audit the wrong system.
+
+        `unknown_exchange_codes` already knew. `join_markets` already calls
+        it. But the join never sees a contract that resolution dropped, so
+        the check had to move to where the record dies.
+
+        Uses a code that is not real and never will be aliased, so this test
+        cannot be quietly disarmed by the production alias map changing --
+        the same reason the empty-alias caveat test patches its own map.
+        """
+        espn = mutate(OBSERVED_DEN_KC, id="401899001")
+        snap = snapshot(("20260914", board(espn)))
+        event = "KXNFLGAME-26SEP14DENZZZ"
+        resolver_markets = {
+            f"{event}-DEN": {"ticker": f"{event}-DEN", "event_ticker": event},
+            f"{event}-ZZZ": {"ticker": f"{event}-ZZZ", "event_ticker": event},
+        }
+        from collect import StartResolver
+        resolver = StartResolver(league="NFL", schedule=snap)
+        resolver.prime(resolver_markets)
+        resolution = resolver.resolution(resolver_markets[f"{event}-ZZZ"])
+
+        self.assertFalse(resolution.resolved)
+        self.assertEqual(resolution.reason, "unknown_exchange_code:ZZZ")
+        self.assertIn("EXCHANGE_CODE_ALIASES", resolution.detail)
+        self.assertIn("not a missing game", resolution.detail)
+        self.assertNotEqual(resolution.reason, es.FAIL_NO_MATCH,
+                            "a mapping gap must not read as missing data")
+
+    def test_an_alias_makes_the_same_event_resolve(self):
+        """The other half: with the code mapped, the game resolves.
+
+        Patches an explicit alias map rather than reading the production one,
+        so this asserts the MECHANISM composes and stays true whatever codes
+        are recorded later.
+        """
+        from unittest.mock import patch
+        from collect import StartResolver
+        from core import matcher
+
+        espn = mutate(OBSERVED_DEN_KC, id="401899002")
+        snap = snapshot(("20260914", board(espn)))
+        event = "KXNFLGAME-26SEP14DENKCX"
+        markets = {
+            f"{event}-DEN": {"ticker": f"{event}-DEN", "event_ticker": event},
+            f"{event}-KCX": {"ticker": f"{event}-KCX", "event_ticker": event},
+        }
+        with patch.dict(matcher.EXCHANGE_CODE_ALIASES,
+                        {"NFL": {"KCX": "KC"}}, clear=False):
+            resolver = StartResolver(league="NFL", schedule=snap)
+            resolver.prime(markets)
+            resolution = resolver.resolution(markets[f"{event}-KCX"])
+
+        self.assertTrue(resolution.resolved, resolution.detail)
+        self.assertEqual(resolution.kickoff,
+                         datetime(2026, 9, 15, 0, 15, tzinfo=timezone.utc))
+        self.assertEqual(resolution.event.provider_event_id, "401899002")
+
     def test_mlb_is_untouched_by_any_of_this(self):
         """The regression that would matter most: MLB must not need a schedule."""
         from collect import StartResolver

@@ -940,6 +940,31 @@ class StartResolver:
             return StartResolution(
                 None, None, "event_participants_unresolvable",
                 f"{event} yielded {sorted(matchup)} from its YES suffixes")
+
+        # A CODE WE DO NOT KNOW IS OUR FAULT, NOT THE SCHEDULE PROVIDER'S.
+        # Kalshi spells Jacksonville JAC; the roster and ESPN both say JAX. With
+        # no alias the matchup reads {CLE, JAC}, nothing in the schedule matches
+        # it, and the run reported `schedule_no_event_for_matchup` --
+        # "CLE/JAC ... is not in the retrieved schedule" -- on a day when the
+        # schedule carried that exact game as CLE/JAX. A diagnosis pointing at
+        # the wrong component sends the next person to audit ESPN coverage for
+        # a one-line alias gap.
+        #
+        # `unknown_exchange_codes` already answers this, and `join_markets`
+        # already calls it -- but the JOIN never sees this contract, because
+        # resolution dropped it first. The check has to run where the record
+        # dies, not downstream of it. Naming the codes means ONE run enumerates
+        # the whole alias gap rather than one code per run (the same discipline
+        # the join's own message uses).
+        unknown = unknown_exchange_codes(sorted(matchup), self.league)
+        if unknown:
+            return StartResolution(
+                None, None, f"unknown_exchange_code:{','.join(unknown)}",
+                f"{event}: {'/'.join(unknown)} is not in the {self.league} "
+                "roster and has no alias in EXCHANGE_CODE_ALIASES, so no "
+                "schedule entry can match it. This is a gap in our mapping, "
+                "not a missing game")
+
         return self.schedule.resolve(matchup, parse_event_body_date(event))
 
     def resolution(self, market: dict) -> StartResolution:
