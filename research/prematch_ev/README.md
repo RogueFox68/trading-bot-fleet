@@ -959,11 +959,24 @@ that could fetch would eventually fetch. The budget RAISES at its bound,
 credentials, and `CapturePlan.budget()` derives the enforced bound from the
 approved plan so it cannot be run wider than approved.
 
-`REACTION_PILOT.md` proposes a **feasibility probe, not an edge study**: if
-the exchange typically reacts inside five minutes, these sources cannot see
-the effect at all, and that is answerable far more cheaply than an edge
-estimate. Its cost figures are pinned to `estimate_credits` by tests, so the
-document cannot drift from the code.
+`REACTION_PILOT.md` proposes a **feasibility probe, not an edge study**,
+over the horizon the thesis is actually about: **T-72h through kickoff**,
+not a few hours before the whistle. Whether these sources can resolve the
+lag at all is answerable far more cheaply than an edge estimate, and it
+decides whether the expensive question can be answered.
+
+The cadence is the measurement, not a cost knob: the interval between paid
+snapshots **is** the book bracket, so it sets the shortest lag that can be
+resolved. That cuts a useful way at this horizon — the exchange side is free
+and 1-minute, only the book side is paid and coarse, so a coarse grid loses
+only reactions faster than its own spacing and still measures a long one.
+Uniform cadence beats fine bursts for the same money, because bursts resolve
+only the moves that happen to land inside them and moves days out are sparse.
+The proposal recommends a **30-minute uniform grid**, gated behind a
+**30-credit** probe of whether the sharp book is quoted at T-72h at all —
+unverified for NFL, and MLB failed at 48h. Its cost figures, its bracket
+arithmetic and its decision rule are pinned to `estimate_credits` and the
+audit's own constants by tests, so the document cannot drift from the code.
 
 ### Status
 

@@ -317,59 +317,101 @@ class PilotProposalTest(unittest.TestCase):
     option in its cost table, so a change to `estimate_credits` -- or a typo
     in the table -- fails the build instead of quietly mispricing a decision
     someone is about to make.
+
+    They also pin the HORIZON. An earlier version recommended three-hour
+    pre-kickoff windows while the thesis is about moves days out; that is a
+    different study with a different answer, and substituting it is the kind
+    of change a cost table alone would not catch.
     """
 
     PROPOSAL = (Path(__file__).resolve().parent.parent / "REACTION_PILOT.md")
 
     # (label, days, snapshots_per_day) as the table's rows describe them.
     OPTIONS = {
-        "A": (1, 108), "B": (1, 36), "C": (1, 216),
-        "D": (3, 108), "E": (10, 108),
+        "0": (1, 3), "A": (3, 48), "B": (3, 24),
+        "C": (3, 96), "D": (3, 288), "E": (6, 48),
     }
+    RECOMMENDED = "A"
+    TRAP = "B"
+    #: the measurement cadences. "0" is the coverage probe and deliberately
+    #: has no cadence or bracket -- it answers whether the book is quoted at
+    #: all, which is not a timing measurement.
+    CADENCES = ("A", "B", "C", "D", "E")
 
     def setUp(self):
         self.raw = self.PROPOSAL.read_text()
         # Assert the CLAIM, not the typography. Prose carries en-dashes,
-        # markdown emphasis and sentence capitals, and a test that breaks on
-        # a dash style gets "fixed" by loosening it until it checks nothing.
-        self.text = (self.raw.lower()
-                     .replace("\u2013", "-").replace("\u2014", "-")
-                     .replace("*", "").replace("`", ""))
+        # markdown emphasis, sentence capitals AND LINE WRAPPING, and a test
+        # that breaks on any of those gets "fixed" by loosening it until it
+        # checks nothing. Whitespace is collapsed for the same reason a dash
+        # is normalised: a reflowed paragraph is not a changed claim.
+        text = (self.raw.lower()
+                .replace("\u2013", "-").replace("\u2014", "-")
+                .replace("*", "").replace("`", ""))
+        self.text = " ".join(text.split())
 
     def assertClaim(self, needle: str, where: str | None = None):
         """assertIn without dumping the whole document on failure."""
         haystack = self.text if where is None else where
-        if needle.lower() not in haystack:
+        if " ".join(needle.lower().split()) not in haystack:
             self.fail(f"the proposal does not claim {needle!r}")
+
+    def _row(self, label: str) -> str:
+        rows = [line for line in self.raw.splitlines()
+                if line.startswith(f"| **{label}**")
+                or line.startswith(f"| {label} |")]
+        self.assertEqual(len(rows), 1,
+                         f"option {label} is not a single table row")
+        return rows[0]
 
     def test_every_cost_table_row_matches_the_shared_cost_model(self):
         from data.odds_history import estimate_credits
         for label, (days, snaps) in self.OPTIONS.items():
             with self.subTest(option=label):
-                requests = days * snaps
-                credits = estimate_credits(days, snaps, 1, 1)
-                row = [line for line in self.raw.splitlines()
-                       if line.startswith(f"| **{label}**")
-                       or line.startswith(f"| {label} |")]
-                self.assertEqual(len(row), 1,
-                                 f"option {label} is not a single table row")
-                self.assertIn(f"| {requests:,} |", row[0].replace(",", ","),
+                row = self._row(label)
+                self.assertIn(f"| {days * snaps:,} |", row,
                               f"option {label}: request count")
-                self.assertIn(f"**{credits:,}**", row[0],
-                              f"option {label}: credit figure")
+                self.assertIn(f"**{estimate_credits(days, snaps, 1, 1):,}**",
+                              row, f"option {label}: credit figure")
+
+    def test_each_brackets_column_is_its_own_cadence(self):
+        """The bracket IS the interval between paid snapshots, and the whole
+        argument for a coarse grid turns on that identity. A bracket column
+        that disagreed with its cadence would make the case for the
+        recommendation out of arithmetic that is not true."""
+        self.assertEqual(set(self.CADENCES) | {"0"}, set(self.OPTIONS),
+                         "an option is neither a cadence nor the probe")
+        for label in self.CADENCES:
+            _, snaps = self.OPTIONS[label]
+            with self.subTest(option=label):
+                self.assertIn(f"| {86400 // snaps:,}s |", self._row(label))
 
     def test_the_recommended_option_is_the_one_the_text_argues_for(self):
         """And its figure is the derived one, not a restated one."""
         from data.odds_history import estimate_credits
-        days, snaps = self.OPTIONS["A"]
+        days, snaps = self.OPTIONS[self.RECOMMENDED]
         credits = estimate_credits(days, snaps, 1, 1)
-        self.assertClaim(f"recommendation: option a, {credits:,} credits")
-        self.assertClaim(f"option a = {credits:,} credits")
+        self.assertClaim(f"recommendation: option "
+                         f"{self.RECOMMENDED.lower()}, {credits:,} credits")
+        self.assertClaim(f"option {self.RECOMMENDED.lower()} = "
+                         f"{credits:,} credits")
+
+    def test_the_recommendation_covers_the_whole_multi_day_horizon(self):
+        """The finding that produced this rewrite: a three-hour pre-kickoff
+        window measures a different thing from a 72-hour one, and is not a
+        cheaper version of it."""
+        row = self._row(self.RECOMMENDED).lower()
+        self.assertIn("72h", row)
+        self.assertIn("kickoff", row)
+        self.assertClaim("t-72h through kickoff")
+        self.assertNotIn("three-hour pre-kickoff windows.", self.text,
+                         "the near-kickoff design is being recommended again")
 
     def test_the_cheap_option_is_marked_as_unable_to_answer(self):
         """A table whose cheapest row is not flagged invites the wrong pick."""
-        self.assertClaim("option b is a trap")
-        self.assertClaim("900s")
+        _, snaps = self.OPTIONS[self.TRAP]
+        self.assertClaim(f"option {self.TRAP.lower()} is a trap")
+        self.assertClaim(f"{86400 // snaps:,}s")
 
     def test_the_proposal_states_it_is_not_authorised(self):
         status = self.text.split("---", 1)[0]
@@ -385,33 +427,50 @@ class PilotProposalTest(unittest.TestCase):
         )
         self.assertEqual(ODDS_SNAPSHOT_GRID_SECONDS, 300.0)
         self.assertEqual(KALSHI_CANDLE_FLOOR_SECONDS, 60.0)
-        self.assertClaim("300-second grid")
+        self.assertClaim("300-second archive floor")
         self.assertClaim("1-minute")
-        self.assertClaim("beyond 300s")
 
     def test_the_proposal_declares_its_decision_rule_before_any_data(self):
         """Otherwise it is a rationalisation written after the fact."""
+        _, snaps = self.OPTIONS[self.RECOMMENDED]
         self.assertClaim("declared now")
         self.assertClaim("one third")
         self.assertClaim("before any data")
+        # The rule's threshold must be the recommended option's OWN bracket.
+        # A rule quoting some other number would be unmeasurable by the run
+        # it governs.
+        self.assertClaim(f"beyond {86400 // snaps:,}s")
+
+    def test_the_null_result_is_scoped_rather_than_read_as_no_edge(self):
+        """rule 24 in prose: an unresolvable lag is not a measured absence."""
+        self.assertClaim("does not mean there is no edge")
+        self.assertClaim("shorter than 30 minutes")
+
+    def test_a_cheap_coverage_probe_gates_the_measurement_spend(self):
+        """72h sharp availability is UNVERIFIED for NFL and MLB failed at
+        48h. Buying a 72-hour horizon before checking the book is quoted
+        there is buying a window that may not exist."""
+        from data.odds_history import estimate_credits
+        days, snaps = self.OPTIONS["0"]
+        self.assertClaim(f"{estimate_credits(days, snaps, 1, 1):,} credits")
+        self.assertClaim("unverified for nfl")
+        self.assertClaim("mlb was measured and failed at 48h")
+
+    def test_the_operational_bounds_the_review_asked_for_are_stated(self):
+        """Cache reuse, baseline snapshots and a retry allowance each change
+        what the quoted price actually buys."""
+        for claim in ("one snapshot is the whole sport's slate",
+                      "duplicate at full price",
+                      "is a baseline, not a measurement",
+                      "allow 10% for retries"):
+            with self.subTest(claim=claim):
+                self.assertClaim(claim)
 
     def test_the_holdout_section_matches_the_code(self):
         from reaction.episodes import DEVELOPMENT_WINDOW
         self.assertClaim("september 1-16 2026")
         self.assertEqual(DEVELOPMENT_WINDOW[0].isoformat(), "2026-09-01")
         self.assertEqual(DEVELOPMENT_WINDOW[1].isoformat(), "2026-09-16")
-        self.assertClaim("holdoutviolation")
-        self.assertClaim("holdout_available")
-
-    def test_every_documented_cli_flag_exists(self):
-        """A proposal that tells the reader to run something it cannot."""
-        import run_reaction
-        for flag in ("--capability", "--capability-verify", "--policy",
-                     "--replay"):
-            self.assertClaim(flag)
-            parsed = run_reaction.parse_args(
-                [flag, "x"] if flag == "--replay" else [flag])
-            self.assertIsNotNone(parsed)
 
 
 class ReadmeCurrencyTest(unittest.TestCase):
