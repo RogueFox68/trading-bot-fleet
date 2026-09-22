@@ -142,17 +142,51 @@ def unverified_note() -> str:
 #   MLB  26SEP152140MIAAZ   date + HHMM + teams   -> the start is in the ticker
 #   NFL  26SEP14DENKC       date + teams, NO TIME -> the ticker cannot say when
 #
-# NFL is deliberately ABSENT rather than mapped to a guess. A date-only body
-# gives a day, not a kickoff, and the checkpoint grid is measured in hours.
+# NFL's kickoff is NOT invented from its date-only body, and NOT inferred from
+# `close_time`, `expected_expiration_time` or `settlement_ts`: on the sampled
+# KC contract those are 03:15:19Z, 03:15:00Z and 03:21:19Z on the day AFTER the
+# game -- they describe the end of the contract, not the start of the match. A
+# study whose lead times are measured backwards from the final whistle is
+# measuring the wrong thing precisely.
 #
-# It must NOT be inferred from `close_time`, `expected_expiration_time` or
-# `settlement_ts`: on the sampled KC contract those are 03:15:19Z, 03:15:00Z
-# and 03:21:19Z on the day AFTER the game -- they describe the end of the
-# contract, not the start of the match. A study whose lead times are measured
-# backwards from the final whistle is measuring the wrong thing precisely.
+# It comes from an EXTERNAL schedule instead (`data.espn_schedule`), which is a
+# different KIND of source with a different warranty: the ticker's time is a
+# fact about the contract, available at decision time; a schedule fetched today
+# is the CURRENT schedule and does not establish what a kickoff was believed to
+# be 72 hours earlier. `START_SOURCE_KINDS` keeps the two apart so the weaker
+# warranty cannot be read as the stronger one.
+START_SOURCE_TICKER = "event_ticker"
+START_SOURCE_EXTERNAL = "external_schedule"
+
 START_SOURCES: dict[str, str] = {
-    "MLB": "event_ticker",
+    "MLB": START_SOURCE_TICKER,
+    "NFL": START_SOURCE_EXTERNAL,
 }
+
+# source -> (kind, historical provenance). "verified_at_decision_time" means
+# the value was published by the exchange itself on the contract; "unverified"
+# means it was retrieved later and may not be what was known at the decision.
+START_SOURCE_KINDS: dict[str, tuple[str, str]] = {
+    START_SOURCE_TICKER: ("ticker", "verified_at_decision_time"),
+    START_SOURCE_EXTERNAL: ("external", "unverified"),
+}
+
+
+def start_source_kind(league: str) -> str | None:
+    source = start_source(league)
+    return START_SOURCE_KINDS.get(source, (None, None))[0] if source else None
+
+
+def start_source_provenance(league: str) -> str | None:
+    """How far a league's kickoffs can be trusted BACKWARDS in time.
+
+    Reported separately from "can we get a kickoff at all" because they are
+    different questions and only one of them is about whether the study can
+    run. An external schedule makes NFL collectable and leaves every run over
+    it exploratory.
+    """
+    source = start_source(league)
+    return START_SOURCE_KINDS.get(source, (None, None))[1] if source else None
 
 
 def start_source(league: str) -> str | None:
@@ -224,6 +258,14 @@ EVENT_BODY_TIMEZONE = "America/New_York"
 
 _EVENT_BODY = re.compile(r"^(?P<date>\d{2}[A-Z]{3}\d{2})(?P<time>\d{4})(?P<teams>[A-Z0-9]+)$")
 
+# A DATE-ONLY body: the NFL shape. The team tail is letters only, which is what
+# keeps this from also matching an MLB body -- `26SEP152140MIAAZ` leaves the
+# tail `2140MIAAZ`, and the digits refuse it. The tail is still NOT decoded:
+# `DALNYG` splits as DAL|NYG, DA|LNYG and DALN|YG with nothing in the string to
+# choose between them, so participants keep coming from the YES suffixes.
+_EVENT_BODY_DATE_ONLY = re.compile(
+    r"^(?P<date>\d{2}[A-Z]{3}\d{2})(?P<teams>[A-Z]+)$")
+
 
 def parse_event_body_start(event_ticker: str, tz_name: str = EVENT_BODY_TIMEZONE):
     """Scheduled start encoded in an event ticker, or None if it does not fit.
@@ -247,6 +289,33 @@ def parse_event_body_start(event_ticker: str, tz_name: str = EVENT_BODY_TIMEZONE
     try:
         return naive.replace(tzinfo=ZoneInfo(tz_name))
     except Exception:
+        return None
+
+
+def parse_event_body_date(event_ticker: str):
+    """The LOCAL calendar day an event body names, or None if it has none.
+
+    Both body shapes carry a day, so this answers for MLB and NFL alike. It is
+    a DAY, never a kickoff: returning a date rather than a midnight datetime is
+    deliberate, because a caller cannot then accidentally use it as a start
+    time. The checkpoint grid is measured in hours and a day is not one.
+
+    The day is read under the declared `EVENT_BODY_TIMEZONE` assumption, and
+    that assumption is what makes `26SEP14DENKC` the right label for a game
+    kicking off at 2026-09-15T00:15Z -- 20:15 the previous evening in New York.
+    """
+    from datetime import datetime as _dt
+
+    body = event_ticker.strip().upper().split("-", 1)
+    if len(body) != 2:
+        return None
+    text = body[1]
+    m = _EVENT_BODY.match(text) or _EVENT_BODY_DATE_ONLY.match(text)
+    if not m:
+        return None
+    try:
+        return _dt.strptime(m.group("date"), "%y%b%d").date()
+    except ValueError:
         return None
 
 

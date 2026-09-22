@@ -427,13 +427,13 @@ those snapshots are **already cached** and therefore free.
 `python3 run_study.py --support --sport NFL --series KXNFLGAME` reads this out
 of the code. No network, no key, no cost.
 
-| league | odds key | roster | start source | roster-ready | schedule-ready | collectable |
-|---|---|---|---|---|---|---|
-| MLB | `baseball_mlb` | 30 | `event_ticker` | yes | yes | **yes** |
-| NFL | `americanfootball_nfl` | 32 | **none** | yes | **no** | **no** |
-| NBA | `basketball_nba` | **0** | none | no | no | **no** |
-| NHL | `icehockey_nhl` | **0** | none | no | no | **no** |
-| NCAAF | **none** | **0** | none | no | no | **no** |
+| league | odds key | roster | start source | roster-ready | schedule-ready | collectable | point-in-time |
+|---|---|---|---|---|---|---|---|
+| MLB | `baseball_mlb` | 30 | `event_ticker` | yes | yes | **yes** | **yes** |
+| NFL | `americanfootball_nfl` | 32 | `external_schedule` | yes | yes | **yes** | **NO** |
+| NBA | `basketball_nba` | **0** | none | no | no | **no** | no |
+| NHL | `icehockey_nhl` | **0** | none | no | no | **no** | no |
+| NCAAF | **none** | **0** | none | no | no | **no** | no |
 
 **Roster-ready and schedule-ready are different questions, and NFL is why they
 are reported apart.** Structural ticker parsing *is* league-agnostic — series,
@@ -444,16 +444,81 @@ MLB  26SEP152140MIAAZ   date + HHMM + teams   -> the start is in the ticker
 NFL  26SEP14DENKC       date + teams, NO TIME -> the ticker cannot say when
 ```
 
-NFL has 32 teams and a valid odds key, and every one of its contracts fails on
-`no_readable_start_time`. A single "ready" flag said yes.
+NFL has 32 teams and a valid odds key, and before the external schedule landed
+every one of its contracts failed on `no_readable_start_time`. A single "ready"
+flag said yes.
 
-`START_SOURCES` therefore declares per league where a start comes from, and NFL
-is **deliberately absent** rather than mapped to a guess: a date-only body gives
-a day, and the checkpoint grid is measured in hours. It must not be inferred
-from `close_time`, `expected_expiration_time` or `settlement_ts` — on the
-sampled KC contract those are 03:15:19Z, 03:15:00Z and 03:21:19Z on the day
-*after* the game. A study whose lead times count back from the final whistle is
-measuring the wrong thing precisely.
+`START_SOURCES` therefore declares per league where a start comes from. It must
+never be inferred from `close_time`, `expected_expiration_time` or
+`settlement_ts` — on the sampled KC contract those are 03:15:19Z, 03:15:00Z and
+03:21:19Z on the day *after* the game. A study whose lead times count back from
+the final whistle is measuring the wrong thing precisely.
+
+### NFL: the kickoff comes from outside, and that changes what a run may claim
+
+NFL's missing kickoff is supplied by `data/espn_schedule.py`, an isolated
+adapter over the **free, public** ESPN NFL scoreboard. It is injectable
+(transport, cached raw JSON, or an offline directory of payloads), costs no
+credits, and holds no credential.
+
+**The ticker day is not the UTC kickoff day**, and the adapter is built around
+that:
+
+```
+KXNFLGAME-26SEP13DALNYG  ticker day 2026-09-13  ESPN 401872930  kickoff 2026-09-14T00:20Z
+KXNFLGAME-26SEP14DENKC   ticker day 2026-09-14  ESPN 401872931  kickoff 2026-09-15T00:15Z
+```
+
+Both are US evening games whose UTC instant lands after midnight. Candidates
+are compared on the **local (US Eastern) day**, identity comes from the YES
+suffixes — never from splitting `DALNYG`, which has several readings — and the
+match must be **unique**. The day offset actually used is recorded on every
+resolution, so a wrong timezone assumption shows up as a population of non-zero
+offsets rather than as quietly shifted timestamps.
+
+Everything else is a **named failure, never an inferred kickoff**: missing or
+TBD time (a missing `timeValid` is a rejection, not an assumed-valid kickoff),
+naive timestamp, event/competition date disagreement, wrong competitor count,
+unknown team, ambiguous matchup, cancellation, a kickoff that changes between
+buckets, and a provider failure — which is a *loss*, not an empty slate. Scores
+are never carried: the endpoint serves results and the study must not see one.
+
+**Three questions are now reported apart, because collapsing any two of them is
+how NFL read "ready" while producing no observation:**
+
+| question | what it means | where it is answered |
+|---|---|---|
+| **schedule-ready** | an adapter *can* derive a kickoff | `--support`, static |
+| **runtime coverage** | one *was* derived, for this run's contracts | preflight, per run |
+| **point-in-time** | it is what was known *at the decision* | `--support`, and **NO** for NFL |
+
+**A schedule fetched now does not prove what was known 72h before kickoff.** A
+flexed or rescheduled game carries its *final* time here. Every snapshot,
+manifest and observation therefore carries
+`historical_schedule_as_of = "unverified"`. That is a scope limit, not a
+footnote: an NFL run can size availability and cost, and it **cannot certify a
+point-in-time backtest or a live strategy**. A prospective or holdout run needs
+schedule snapshots recorded *before* the decisions they date.
+
+Provenance is persisted and **joinable**: `coverage.json` carries the source
+URL, ESPN event id, retrieval timestamp, raw-payload SHA-256 and resolved
+kickoff per game, plus the Kalshi-event → provider-event map that links them to
+the observations.
+
+The free command, end to end:
+
+```bash
+python3 run_study.py --support  --sport NFL --series KXNFLGAME
+python3 run_study.py --preflight --sport NFL --series KXNFLGAME \
+  --from 2026-09-01 --to 2026-09-15 --lead-grid 72h,48h,24h,12h,6h,3h
+```
+
+**`--from`/`--to` are UTC bounds**, so a US evening game on the last day of the
+window starts on the *next* UTC day and falls outside it. Those semantics are
+deliberately unchanged — they define the existing MLB baseline's universe — but
+the run now counts and names that exclusion
+(`game_outside_window_utc_boundary`) and says which way to widen `--to`, rather
+than quietly returning a thinner final slate.
 
 **An empty universe is not a free study.** The live NFL preflight went
 826 settled → 32 retrieved → **0 eligible**, all 32 rejected as
@@ -487,8 +552,11 @@ Two caveats the report raises for NFL specifically:
 
 The ticker parser and the identity path are league-agnostic — identity comes
 from the YES suffixes rather than splitting the concatenated team tail — so an
-NFL or NCAA-shaped ticker parses correctly today. The roster is the gap, not
-the shape.
+NFL or NCAA-shaped ticker parses **structurally** today. Deriving a start is a
+separate question with a separate answer per league, and running the two
+together is how an invented fixture (`KXNFLGAME-26SEP211300BUFKC`, whose `1300`
+was composed rather than observed) came to support a claim that NFL was ready.
+The fixtures are now copied from real contracts.
 
 ### What the first multi-day run found
 
@@ -656,6 +724,18 @@ in the return figure; include them separately before calling anything viable.
   study, establish which balance precision the account actually settles at.
 - **Roster abbreviations are unverified** against live Kalshi tickers. Run the
   audit; a mismatch shows up as a team contributing no data, not as an error.
+- **The ESPN payload shapes were transcribed, not fetched in-session.**
+  `site.api.espn.com` is refused by the egress proxy from the sessions this was
+  written in (the gateway answers 403 to `CONNECT`), exactly as
+  `api.elections.kalshi.com` is. The fixtures in `tests/test_schedule.py` are
+  copied verbatim from two responses the repository owner fetched on
+  2026-09-21; the acceptance run against the live endpoint belongs to whoever
+  can reach it. Treat the endpoint as a **version-sensitive dependency**: it is
+  undocumented and public, and the schema tests are what turn a shape change
+  into a named failure instead of a plausible wrong kickoff.
+- **An NFL run is exploratory by construction.** Its kickoffs were retrieved
+  after the fact (`historical_schedule_as_of = unverified`), so no NFL result
+  may be quoted as a point-in-time backtest, however green its coverage is.
 
 ## Relationship to the fleet
 

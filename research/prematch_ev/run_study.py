@@ -22,6 +22,7 @@ import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -32,9 +33,10 @@ from analysis.scoring import (                                     # noqa: E402
 from collect import (                                              # noqa: E402
     BASELINE_LEAD_MINUTES, MAX_SOURCE_LAG, Checkpoint, CheckpointMatrix, Ledger,
     STATUS_NOT_YET_LISTED, STATUS_OBSERVED, STATUS_UNJOINED,
-    checkpoint_targets, record_cell_outcome,
+    StartResolver, checkpoint_targets, record_cell_outcome,
     decision_cutoffs, default_lead_grid, grid_reach, in_study_window,
-    join_markets, listing_status, market_start_time, observation_with_status,
+    join_markets, kalshi_event_ticker, listing_status, market_start_time,
+    observation_with_status, parse_event_body_date,
     parse_lead_grid, snapshots_per_day_for, support_report,
 )
 from core import fees
@@ -99,6 +101,17 @@ def parse_args(argv=None):
     p.add_argument("--max-credits", type=int, default=None,
                    help="hard paid-request budget; collection stops and keeps "
                         "partial diagnostics rather than exceeding it")
+    p.add_argument("--schedule-cache", default="study_output/schedule_cache",
+                   help="directory for RAW schedule payloads (free endpoint, "
+                        "no credential). Re-read on a later run so a study can "
+                        "be rebuilt, and debugged, without the network")
+    p.add_argument("--schedule-dir", default=None,
+                   help="build the schedule ONLY from this directory of "
+                        "YYYYMMDD.json payloads; never touches the network. "
+                        "For replaying a schedule captured elsewhere")
+    p.add_argument("--no-schedule-fetch", action="store_true",
+                   help="do not fetch a schedule. A league that needs one then "
+                        "resolves no kickoff and fails coverage by name")
     p.add_argument("--cache-dir", default="study_output/cache",
                    help="replay cache for paid responses; the credential never "
                         "enters a key, a path or a log. Empty string disables")
@@ -130,7 +143,27 @@ LEAD_CEILING_SLACK = 60.0
 # `observations.json` layout. Bumped when a field CHANGES MEANING, not just
 # when one is added: schema 1 called the decision book `bid`/`ask` and
 # documented it as the entry book.
-OBSERVATION_SCHEMA = 2
+OBSERVATION_SCHEMA = 3
+
+
+class SurveyResult(NamedTuple):
+    """What the free half of a run establishes, by NAME.
+
+    A plain tuple grew to eight positional members, and a mis-ordered unpack
+    is exactly the kind of defect this study keeps finding in itself: it does
+    not raise, it just puts a coverage object where a grid should be. Named
+    fields also let a caller take the two it needs without spelling out six
+    underscores that silently absorb a new one.
+    """
+
+    markets: dict
+    cutoffs: list
+    cutoff: object
+    coverage: object
+    ledger: object
+    grid: tuple
+    matrix: object
+    resolver: object
 
 
 def lead_grid_for(args) -> tuple[Checkpoint, ...]:
@@ -271,14 +304,18 @@ def support(args) -> int:
     print(f"  roster teams         {report.roster_teams}")
     print(f"  exchange aliases     {report.alias_count}")
     print(f"  dated fee schedule   {'yes' if report.fee_schedule else 'NO (generic rates)'}")
-    print(f"  start source         {report.start_source or 'NONE'}")
+    print(f"  start source         {report.start_source or 'NONE'}"
+          f"{f' ({report.start_source_kind})' if report.start_source_kind else ''}")
+    print(f"  schedule provenance  {report.schedule_provenance or 'n/a'}")
     print()
     print(f"  roster-ready         {'yes' if report.roster_ready else 'NO'}"
           "   (team identity resolves)")
     print(f"  schedule-ready       {'yes' if report.schedule_ready else 'NO'}"
-          "   (a kickoff time can be derived)")
+          "   (an ADAPTER can derive a kickoff)")
     print(f"  COLLECTABLE          {'yes' if report.ready else 'NO'}"
           "   (needs BOTH)")
+    print(f"  point-in-time        {'yes' if report.point_in_time_capable else 'NO'}"
+          "   (the kickoff is what was known at the decision)")
     for blocker in report.blockers():
         print(f"  !! BLOCKER  {blocker}")
     for caveat in report.caveats():
@@ -286,10 +323,18 @@ def support(args) -> int:
     print()
     print("  Roster-ready and schedule-ready are DIFFERENT questions, and NFL")
     print("  is the reason they are reported apart: 32 teams and a valid odds")
-    print("  key, yet every contract fails on no_readable_start_time because an")
-    print("  NFL event body carries a date and no kickoff.")
+    print("  key, yet its event body carries a date and no kickoff, so it took")
+    print("  an external schedule to make a single observation possible.")
     print()
-    print("  Even COLLECTABLE does not mean data exists at any given lead time.")
+    print("  COLLECTABLE is adapter support. It is NOT runtime coverage -- a")
+    print("  run's own resolved/unresolved counts say whether the schedule")
+    print("  actually covered its contracts, and an empty universe still fails.")
+    print()
+    print("  POINT-IN-TIME is a third question again. An external schedule is")
+    print("  retrieved now and cannot say what a kickoff was believed to be")
+    print("  before a flex or a reschedule, so runs over it are EXPLORATORY.")
+    print()
+    print("  And none of the three means data EXISTS at any given lead time.")
     print("  Listing lead times and historical sharp coverage are separate")
     print("  questions again, which only a live audit answers.")
     print()
@@ -297,12 +342,17 @@ def support(args) -> int:
     return 0 if report.ready else 1
 
 
-def survey(args):
+def survey(args, schedule=None):
     """The FREE half: enumerate the exchange, filter, derive the cutoffs.
 
     Shared by `--preflight` and the real run so the two cannot disagree about
     how many paid requests a window needs. A preflight that estimated its own
     way would eventually differ from the run it is meant to predict.
+
+    `schedule`, when supplied, replaces the retrieval -- the injection point
+    for a captured snapshot and for tests. THE SCHEDULE FETCH IS FREE: it is a
+    public unauthenticated endpoint and costs no credits, so it happens in the
+    free half by right, not by exception.
     """
     coverage = Coverage()
     ledger = Ledger()
@@ -316,7 +366,9 @@ def survey(args):
     for blocker in report.blockers():
         coverage.fail(blocker)
     if not report.ready:
-        return {}, [], None, coverage, ledger, lead_grid_for(args), CheckpointMatrix()
+        return SurveyResult({}, [], None, coverage, ledger, lead_grid_for(args),
+                            CheckpointMatrix(),
+                            StartResolver(league=args.sport.upper()))
 
     start = _date(args.start)
     end_inclusive = _date(args.end)
@@ -347,13 +399,31 @@ def survey(args):
         ledger.reject("settlement_time_unreadable", f"{undatable} markets",
                       count=undatable, stage="contracts")
 
-    # ELIGIBILITY filter: the declared GAME window, on the verified start.
+    # --- kickoffs, resolved ONCE, BEFORE any eligibility question ---------
+    # Game-window eligibility, listing eligibility and every lead-grid cutoff
+    # are all measured from the kickoff, so the kickoff has to be settled
+    # first and settled once. `resolver` is the single mapping the rest of the
+    # run reads -- targeting, collection and the join alike -- because a study
+    # whose stages date the same game differently has no lead time at all.
+    resolver = StartResolver(
+        league=args.sport.upper(),
+        schedule=schedule if schedule is not None else _build_schedule(
+            args, report, start, end_inclusive, coverage, ledger),
+    )
+    resolver.prime(retrieved)
+    # In CONTRACTS, because that is the stage's unit. See failure_counts().
+    for reason, count in resolver.failure_counts(per="contracts").items():
+        ledger.reject(reason, f"{count} contracts", count=count,
+                      stage="contracts")
+
+    # ELIGIBILITY filter: the declared GAME window, on the resolved start.
     # Padding is right for retrieval and wrong for eligibility -- the padded
     # set previously included Sept 13 and Sept 16 games in a Sept 14-15 run.
     markets: dict[str, dict] = {}
     off_window = no_start = 0
+    off_window_by_timezone = 0
     for ticker, market in retrieved.items():
-        game_start = market_start_time(market)
+        game_start = market_start_time(market, resolver)
         if game_start is None:
             no_start += 1
             continue
@@ -361,10 +431,35 @@ def survey(args):
             markets[ticker] = market
         else:
             off_window += 1
+            # THE CROSS-MIDNIGHT EDGE, counted rather than left to be noticed.
+            # --from/--to are UTC bounds, but a US evening kickoff lands on the
+            # NEXT UTC day: the `26SEP14` slate starts at 00:15Z on the 15th.
+            # So `--to 2026-09-14` silently drops the Monday night game, and
+            # `--from` silently admits the previous evening's. The window
+            # semantics are deliberately NOT changed here -- they define the
+            # existing MLB baseline's universe, and redefining them would move
+            # that result without saying so -- but an operator sizing a window
+            # should be told, not left to infer it from a thinner slate.
+            local_day = parse_event_body_date(kalshi_event_ticker(market) or ticker)
+            if local_day and start.date() <= local_day <= end_inclusive.date():
+                off_window_by_timezone += 1
     if off_window:
         ledger.exclude("game_outside_declared_window", count=off_window,
                        stage="contracts")
-    if no_start:
+    if off_window_by_timezone:
+        ledger.exclude("game_outside_window_utc_boundary",
+                       count=off_window_by_timezone, stage="contracts")
+        print(f"          {off_window_by_timezone:,} contract(s) name a day "
+              "INSIDE the window but kick off outside it in UTC")
+        print("          (a US evening game starts on the next UTC day; "
+              "--from/--to are UTC bounds)")
+        print(f"          extend --to past {end_inclusive.date().isoformat()} "
+              "to include that evening's slate")
+    if no_start and not resolver.needs_schedule:
+        # An externally scheduled league already filed its reasons BY NAME
+        # above (no match, ambiguous, TBD, provider failure). Counting them a
+        # second time here as a generic `no_readable_start_time` would double
+        # the rejection and replace a diagnosis with a symptom.
         ledger.reject("no_readable_start_time", f"{no_start} markets",
                       count=no_start, stage="contracts")
 
@@ -383,7 +478,7 @@ def survey(args):
     # 23:30 snapshot. Widening --from instead would change the study universe,
     # which is a different thing from fetching the inputs that universe needs.
     grid = lead_grid_for(args)
-    starts = [market_start_time(m) for m in markets.values()]
+    starts = [market_start_time(m, resolver) for m in markets.values()]
     cutoffs = decision_cutoffs([s for s in starts if s], grid)
 
     # RETRIEVAL reaches back further than the STUDY WINDOW, deliberately. A
@@ -403,7 +498,7 @@ def survey(args):
           f"{len(markets):,} contracts x {len(grid)} checkpoints "
           f"({grid_describe(grid)})")
 
-    targets = checkpoint_targets(markets, grid, ledger)
+    targets = checkpoint_targets(markets, grid, ledger, resolver)
     matrix = CheckpointMatrix()
     matrix.expect(targets)
     ledger.count("checkpoint_cells", len(targets), unit="game-checkpoints")
@@ -423,19 +518,136 @@ def survey(args):
     # this; the FREE path never did, so the cheapest way to run the study was
     # also the only way to have it certify itself.
     ledger.apply_to(coverage)
-    if not markets and ledger.total_rejected:
+    # COUNT THE POPULATION THE SENTENCE NAMES. `total_rejected` spans every
+    # stage, diagnostic ones included, so with the exchange unreachable and
+    # ZERO contracts ever enumerated this read "17 were rejected" -- the
+    # number of failed schedule buckets. It also fired where no contract had
+    # been rejected at all, adding a second, wrong explanation beside the
+    # real one (the enumeration failure, already in coverage).
+    lost_contracts = ledger.rejected_in_stage("contracts")
+    if not markets and lost_contracts:
         coverage.fail(
-            f"no contract survived to be studied: {ledger.total_rejected:,} "
+            f"no contract survived to be studied: {lost_contracts:,} "
             "were rejected. A zero-cost run over an empty universe is a "
             "failure that happens to be cheap, not a success."
         )
 
-    return markets, cutoffs, cutoff, coverage, ledger, grid, matrix
+    return SurveyResult(markets, cutoffs, cutoff, coverage, ledger, grid,
+                        matrix, resolver)
+
+
+def _build_schedule(args, report, start, end, coverage, ledger):
+    """Retrieve the external schedule a league needs, or say why there is none.
+
+    FREE: a public unauthenticated endpoint, no credential, no credits. It is
+    deliberately allowed to run inside the free half for that reason -- and it
+    is the only network call in `survey`, so an operator can see exactly what
+    a preflight touches.
+
+    A league whose kickoffs come from its own tickers needs nothing here and
+    gets None. A league that needs a schedule and cannot have one does NOT get
+    a silent empty snapshot: it gets None too, and every one of its contracts
+    then fails resolution by name, which fails coverage. An unreachable
+    provider and an empty slate must not look alike (the fleet's rule 17).
+    """
+    from data import espn_schedule
+
+    if not report.schedule_is_external:
+        return None
+    if args.schedule_dir:
+        return espn_schedule.snapshot_from_directory(args.sport, args.schedule_dir)
+    if args.no_schedule_fetch:
+        # The SCHEDULE stage, not the contracts stage. This is a fact about
+        # the run's configuration, and filing it against contracts made an
+        # empty run report one rejected contract it had never seen.
+        ledger.reject("schedule_fetch_disabled",
+                      "--no-schedule-fetch was set and this league needs a "
+                      "schedule", count=1, stage="schedule_entries",
+                      diagnostic=True)
+        ledger.count("schedule_entries", 1, unit="schedule-entries",
+                     diagnostic=True)
+        return None
+    try:
+        snapshot = espn_schedule.fetch_schedule(
+            args.sport, start.date(), end.date(),
+            cache_dir=args.schedule_cache or None)
+    except Exception as exc:                      # transport-shaped, by contract
+        coverage.fail(f"schedule retrieval failed for {args.sport}: {exc}. "
+                      "A league whose kickoffs come from an external schedule "
+                      "cannot be studied without one, and an unreachable "
+                      "provider is not an empty slate.")
+        return None
+    print(f"  schedule: {len(snapshot.events):,} games over "
+          f"{espn_schedule.describe_buckets(snapshot.buckets)} "
+          f"({espn_schedule.SCHEDULE_SOURCE}, free)")
+    # COUNT THE DENOMINATOR FIRST. A stage that only ever receives rejections
+    # reports 100% loss out of zero considered -- the zero-denominator shape a
+    # rename produced in round 6. Schedule entries are a DIAGNOSTIC stage: a
+    # provider listing games this study never asked about is not a loss, and
+    # only the contracts that fail to resolve are.
+    ledger.count("schedule_entries", len(snapshot.events) + len(snapshot.failures),
+                 unit="schedule-entries", diagnostic=True)
+    for reason, count in snapshot.failure_counts().items():
+        ledger.reject(reason, f"{count} schedule entries", count=count,
+                      stage="schedule_entries", diagnostic=True)
+    return snapshot
+
+
+def _print_schedule_block(resolver) -> None:
+    """Where this run's kickoffs came from, and how far they cover it.
+
+    THREE facts, printed apart because they answer different questions and
+    reading one as another is how NFL came to look ready while producing no
+    observation:
+
+      adapter        -- can a kickoff be derived at all? (static, from code)
+      coverage       -- did one actually resolve, for THIS run's contracts?
+      provenance     -- is it what was known at the decision it dates?
+    """
+    if resolver is None or resolver.source is None:
+        return
+    resolved, unresolved = resolver.coverage_counts()
+    print(f"  start source         {resolver.source} ({resolver.kind})")
+    if not resolver.needs_schedule:
+        print("  schedule coverage    n/a -- the kickoff is on the contract")
+        print("  historical as-of     verified_at_decision_time")
+        return
+    total = resolved + unresolved
+    pct = (100.0 * resolved / total) if total else 0.0
+    print(f"  schedule coverage    {resolved:,}/{total:,} events resolved "
+          f"({pct:.1f}%)")
+    if resolver.schedule is not None:
+        snapshot = resolver.schedule
+        print(f"  schedule games       {len(snapshot.events):,} over "
+              f"{len(snapshot.buckets)} daily bucket(s), free endpoint")
+        if snapshot.offsets_used:
+            offsets = ", ".join(f"{k:+d}d x{v}" for k, v
+                                in sorted(snapshot.offsets_used.items()))
+            print(f"  ticker-day offsets   {offsets}")
+            if any(k != 0 for k in snapshot.offsets_used):
+                print("                       a non-zero population means the "
+                      "declared ticker timezone")
+                print("                       disagrees with the schedule -- "
+                      "check it before budgeting")
+        if snapshot.resolved_by_name:
+            print(f"  resolved by name     {snapshot.resolved_by_name:,} "
+                  "(provider code is not canonical; enumerate into "
+                  "ESPN_CODE_ALIASES)")
+    for reason, count in resolver.failure_counts().items():
+        print(f"  !! unresolved        {reason}: {count:,}")
+    print("  historical as-of     UNVERIFIED -- the schedule was retrieved now,")
+    print("                       not as it stood before each decision. This run")
+    print("                       is EXPLORATORY: it can size availability and")
+    print("                       cost; it cannot certify a point-in-time")
+    print("                       backtest or a live strategy.")
 
 
 def preflight(args) -> int:
     """Enumerate the real work before any paid call. Costs nothing."""
-    markets, cutoffs, cutoff, coverage, ledger, grid, matrix = survey(args)
+    result = survey(args)
+    markets, cutoffs, coverage, ledger, grid, matrix, resolver = (
+        result.markets, result.cutoffs, result.coverage, result.ledger,
+        result.grid, result.matrix, result.resolver)
     per_call = estimate_credits(1, 1)
 
     # WHAT IS ACTUALLY MISSING, not what a run would request. The cache already
@@ -448,6 +660,7 @@ def preflight(args) -> int:
 
     print()
     print("PREFLIGHT (no paid requests made)")
+    _print_schedule_block(resolver)
     print(f"  eligible contracts   {len(markets):,}")
     print(f"  lead grid            {grid_describe(grid)}  ({len(grid)} checkpoints)")
     print(f"  checkpoint cells     {len(matrix.statuses):,}  "
@@ -490,7 +703,8 @@ def preflight(args) -> int:
 
 def collect(args, key: str):
     """Pull both sides, join on identity, and build observations at one cutoff."""
-    markets, cutoffs, cutoff, coverage, ledger, grid, matrix = survey(args)
+    result = survey(args)
+    markets, cutoffs, cutoff, coverage, ledger, grid, matrix, resolver = result
     credits = CreditLedger(cap=args.max_credits)
     cache = ResponseCache(Path(args.cache_dir) if args.cache_dir else None)
 
@@ -533,7 +747,7 @@ def collect(args, key: str):
           f"sharp events ({credits}; {cache})")
 
     # --- join ----------------------------------------------------------------
-    joined = join_markets(markets, quotes_by_event, args.sport, ledger)
+    joined = join_markets(markets, quotes_by_event, args.sport, ledger, resolver)
     print(f"  joined: {len(joined):,} contracts matched to a sharp event")
 
     # AN UNJOINED CONTRACT IS NOT AN UNREPORTED CELL. The loop below only
@@ -610,7 +824,7 @@ def collect(args, key: str):
           f"{len(matrix.statuses):,} cells "
           f"({matrix.source_failures():,} source failures, "
           f"{matrix.unreported():,} unreported)")
-    return observations, coverage, credits, ledger, grid, matrix
+    return observations, coverage, credits, ledger, grid, matrix, resolver
 
 
 def main(argv=None) -> int:
@@ -654,7 +868,7 @@ def main(argv=None) -> int:
         print(f"CONFIGURATION: {exc}", file=sys.stderr)
         return 2
 
-    observations, coverage, credits, ledger, grid, matrix = collect(args, key)
+    observations, coverage, credits, ledger, grid, matrix, resolver = collect(args, key)
     out.mkdir(parents=True, exist_ok=True)
 
     def write_coverage():
@@ -670,6 +884,14 @@ def main(argv=None) -> int:
             "collection": ledger.as_dict(),
             "credits": str(credits),
             "observations_built": len(observations),
+            # WHERE EVERY KICKOFF CAME FROM. Source url, provider event id,
+            # retrieval time, payload hash and the resolved kickoff, per game,
+            # plus the kalshi-event -> provider-event mapping that links them
+            # to the observations. A lead-time study whose start times cannot
+            # be re-derived later is not auditable, and the `historical
+            # schedule as of` label rides here so no reader of this file can
+            # mistake a retrospective schedule for a point-in-time one.
+            "schedule": resolver.manifest() if resolver is not None else None,
             "run": {
                 "sport": args.sport, "series": args.series,
                 "from": args.start, "to": args.end,

@@ -40,7 +40,8 @@ from analysis.scoring import (
 from collect import (
     BASELINE_LEAD_MINUTES, BENIGN_GROUPS, Checkpoint, CheckpointMatrix, Ledger,
     STATUS_LISTING_UNKNOWN, STATUS_NOT_YET_LISTED, STATUS_OBSERVED,
-    STATUS_UNJOINED, cell_is_benign, checkpoint_targets, decision_cutoffs,
+    STATUS_UNJOINED, StartResolver, cell_is_benign, checkpoint_targets,
+    decision_cutoffs,
     default_lead_grid, grid_reach, in_study_window, listing_status,
     observation_with_status, parse_lead_grid, record_cell_outcome,
 )
@@ -799,7 +800,8 @@ class ArtifactRoundTripTest(unittest.TestCase):
         with mock.patch.object(
             run_study, "collect",
             return_value=(obs_rows, Coverage(), CreditLedger(), Ledger(),
-                          default_lead_grid(), CheckpointMatrix())
+                          default_lead_grid(), CheckpointMatrix(),
+                          StartResolver(league="MLB"))
         ):
             run_study.main([
                 "--sport", "MLB", "--series", "KXMLBGAME",

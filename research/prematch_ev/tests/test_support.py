@@ -89,11 +89,29 @@ class NflTickerHasNoKickoffTest(unittest.TestCase):
         self.assertIsNone(market_start_time(market),
                           "a start was inferred from an end-of-contract field")
 
-    def test_nfl_declares_no_start_source(self):
-        self.assertIsNone(start_source("NFL"))
-        self.assertFalse(league_has_schedule("NFL"))
+    def test_nfl_start_source_is_external_not_the_ticker(self):
+        """The ticker still carries no kickoff. An EXTERNAL source supplies it.
+
+        This test used to assert NFL had no start source at all, which was
+        true of the code and never of the world. What has to stay pinned is
+        the underlying fact -- the body has a date and no time -- and that the
+        two sources are kept apart, because they carry different warranties.
+        """
+        self.assertEqual(start_source("NFL"), "external_schedule")
+        self.assertTrue(league_has_schedule("NFL"))
         self.assertEqual(start_source("MLB"), "event_ticker")
         self.assertTrue(league_has_schedule("MLB"))
+        # the reason the external source is needed at all
+        self.assertIsNone(parse_event_body_start("KXNFLGAME-26SEP14DENKC"))
+
+    def test_the_two_start_sources_carry_different_warranties(self):
+        """An external schedule cannot date a decision; a ticker can."""
+        from core.matcher import start_source_kind, start_source_provenance
+        self.assertEqual(start_source_kind("MLB"), "ticker")
+        self.assertEqual(start_source_provenance("MLB"),
+                         "verified_at_decision_time")
+        self.assertEqual(start_source_kind("NFL"), "external")
+        self.assertEqual(start_source_provenance("NFL"), "unverified")
 
 
 class SupportedLeagueTest(unittest.TestCase):
@@ -124,20 +142,51 @@ class SupportedLeagueTest(unittest.TestCase):
 
 
 class SupportReportTest(unittest.TestCase):
-    def test_nfl_is_roster_ready_but_not_schedule_ready(self):
-        """THE distinction. These were one flag, and NFL passed it -- 32 teams,
-        a valid odds key -- while every contract failed on
-        no_readable_start_time. A report saying "ready" over a sport that
-        cannot produce one observation is worse than no report."""
+    def test_nfl_is_collectable_through_an_external_schedule(self):
+        """Both halves, from different sources -- and the distinction kept.
+
+        These were one flag, and NFL passed it on 32 teams and a valid odds
+        key while every contract failed on no_readable_start_time. The flags
+        stayed separate; what changed is that the schedule half is now
+        satisfied, by an ADAPTER rather than by the ticker.
+        """
         report = support_report("NFL", "KXNFLGAME")
         self.assertTrue(report.roster_ready)
-        self.assertFalse(report.schedule_ready)
-        self.assertFalse(report.ready, "collectable needs BOTH")
+        self.assertTrue(report.schedule_ready)
+        self.assertTrue(report.ready)
+        self.assertTrue(report.schedule_is_external)
         self.assertEqual(report.odds_key, "americanfootball_nfl")
         self.assertEqual(report.roster_teams, 32)
 
-    def test_the_nfl_blocker_names_the_schedule_and_warns_off_the_shortcut(self):
-        blockers = " ".join(support_report("NFL", "KXNFLGAME").blockers())
+    def test_nfl_is_collectable_but_NOT_point_in_time_capable(self):
+        """The third question, and the one an exit code cannot carry.
+
+        A run over NFL can size availability and cost. It cannot certify a
+        backtest, because the schedule it dated its decisions with was fetched
+        afterwards. COLLECTABLE says nothing about that, so the report says it
+        separately rather than letting readiness imply it.
+        """
+        report = support_report("NFL", "KXNFLGAME")
+        self.assertTrue(report.ready)
+        self.assertFalse(report.point_in_time_capable)
+        self.assertTrue(support_report("MLB", "KXMLBGAME").point_in_time_capable)
+
+    def test_the_nfl_caveat_states_the_exploratory_limit_and_the_two_confusions(self):
+        caveats = " ".join(support_report("NFL", "KXNFLGAME").caveats()).lower()
+        self.assertIn("historical_schedule_as_of=unverified", caveats)
+        self.assertIn("cannot certify", caveats)
+        self.assertIn("point-in-time", caveats)
+        # adapter support is not runtime coverage
+        self.assertIn("runtime coverage", caveats)
+
+    def test_an_unscheduled_league_still_names_the_shortcut_it_refuses(self):
+        """The end-of-contract warning belongs to leagues with NO source.
+
+        NFL no longer carries it, because NFL now has a real one. NCAAF does,
+        and the three field names stay in the blocker so the shortcut is
+        visibly closed rather than merely unused.
+        """
+        blockers = " ".join(support_report("NCAAF", "KXNCAAFGAME").blockers())
         self.assertIn("scheduled-start source", blockers)
         for field in ("close_time", "expected_expiration_time", "settlement_ts"):
             self.assertIn(field, blockers)
@@ -186,24 +235,18 @@ class RefusedBeforeSpendTest(unittest.TestCase):
             "--from", "2026-09-01", "--to", "2026-09-02", "--cache-dir", ""])
         return run_study.survey(args)
 
-    def test_nfl_is_refused_before_spend_for_its_missing_schedule(self):
-        """The live preflight bought nothing and still reported exit 0."""
-        markets, cutoffs, _, coverage, _, _, _ = self._survey("NFL", "KXNFLGAME")
-        self.assertFalse(coverage.complete)
-        self.assertEqual(cutoffs, [])
-        self.assertIn("scheduled-start source", str(coverage))
-
     def test_a_roster_less_sport_fails_coverage_with_no_cutoffs(self):
-        markets, cutoffs, _, coverage, _, _, matrix = self._survey("NBA", "KXNBAGAME")
-        self.assertFalse(coverage.complete)
-        self.assertEqual(markets, {})
-        self.assertEqual(cutoffs, [], "nothing may be queued for purchase")
-        self.assertEqual(len(matrix.statuses), 0)
-        self.assertIn("roster", str(coverage))
+        result = self._survey("NBA", "KXNBAGAME")
+        self.assertFalse(result.coverage.complete)
+        self.assertEqual(result.markets, {})
+        self.assertEqual(result.cutoffs, [],
+                         "nothing may be queued for purchase")
+        self.assertEqual(len(result.matrix.statuses), 0)
+        self.assertIn("roster", str(result.coverage))
 
     def test_the_refusal_names_the_cost_it_prevents(self):
-        _, _, _, coverage, _, _, _ = self._survey("NBA", "KXNBAGAME")
-        self.assertIn("AFTER paying", str(coverage))
+        result = self._survey("NBA", "KXNBAGAME")
+        self.assertIn("AFTER paying", str(result.coverage))
 
     def test_support_exits_nonzero_for_an_unsupported_sport(self):
         code = run_study.main(["--support", "--sport", "NBA", "--series", "KXNBAGAME"])
@@ -213,12 +256,21 @@ class RefusedBeforeSpendTest(unittest.TestCase):
         code = run_study.main(["--support", "--sport", "MLB", "--series", "KXMLBGAME"])
         self.assertEqual(code, 0)
 
-    def test_support_exits_nonzero_for_nfl_until_it_has_a_schedule(self):
-        """Roster-ready is not collectable. This test was written against NFL
-        as the READY example, and it is the one that broke when the two were
-        separated -- which is the whole point of separating them."""
+    def test_support_exits_zero_for_nfl_now_that_it_has_a_schedule(self):
+        """Roster-ready is still not collectable on its own.
+
+        This assertion has now moved twice: NFL was the READY example, then
+        the NOT-ready example when the flags were separated, and now it is
+        ready again on the strength of an external adapter. The flag that
+        matters did not move -- COLLECTABLE still needs both halves -- and the
+        exploratory limit rides in the caveats, where an exit code cannot
+        flatten it into pass or fail.
+        """
         code = run_study.main(["--support", "--sport", "NFL", "--series", "KXNFLGAME"])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 0)
+        report = support_report("NFL", "KXNFLGAME")
+        self.assertTrue(report.caveats(),
+                        "a collectable-but-exploratory league must say so")
 
     def test_support_costs_nothing_and_needs_no_window(self):
         """It reads the code. No api key, no dates, no network."""

@@ -46,9 +46,14 @@ from zoneinfo import ZoneInfo
 
 from core.matcher import (
     EVENT_BODY_TIMEZONE, EXCHANGE_CODE_ALIASES, ROSTERS,
+    START_SOURCE_EXTERNAL, START_SOURCE_TICKER,
     kalshi_event_ticker, normalise_exchange_code, start_source,
-    parse_event_body_start, parse_kalshi_game_ticker, resolve_team,
-    unknown_exchange_codes,
+    start_source_kind, start_source_provenance,
+    parse_event_body_date, parse_event_body_start, parse_kalshi_game_ticker,
+    resolve_team, unknown_exchange_codes,
+)
+from data.espn_schedule import (
+    FAIL_NO_SNAPSHOT, SCHEDULE_SOURCE, ScheduleSnapshot, StartResolution,
 )
 from data.kalshi_history import (
     Coverage, market_open_time, settlement_outcome, settlement_time,
@@ -324,6 +329,20 @@ class Ledger:
     def total_rejected(self) -> int:
         return sum(self.rejections.values())
 
+    def rejected_in_stage(self, stage: str) -> int:
+        """Rejections filed against ONE stage.
+
+        `total_rejected` sums every stage, including the diagnostic ones, so
+        a sentence about contracts that quotes it reports a number from a
+        different population. With Kalshi unreachable and zero contracts ever
+        enumerated, the empty-universe message read "17 were rejected" -- the
+        count of failed SCHEDULE buckets. A specific, credible number produced
+        by code that never looked at the thing it names is the same defect as
+        `fleet_doctor`'s "2 bars" on a healthy feed.
+        """
+        return sum(count for reason, count in self.rejections.items()
+                   if self.rejection_stage.get(reason) == stage)
+
     @property
     def total_excluded(self) -> int:
         return sum(self.eligibility_exclusions.values())
@@ -497,6 +516,7 @@ def checkpoint_targets(
     markets: dict[str, dict],
     lead_grid: Iterable[Checkpoint],
     ledger: "Ledger | None" = None,
+    resolver: "StartResolver | None" = None,
 ) -> list[CheckpointTarget]:
     """Every (contract, checkpoint) the enumeration says should exist.
 
@@ -513,7 +533,7 @@ def checkpoint_targets(
     out: list[CheckpointTarget] = []
     undatable = 0
     for ticker, market in markets.items():
-        start = market_start_time(market)
+        start = market_start_time(market, resolver)
         if start is None:
             undatable += 1
             continue
@@ -650,6 +670,8 @@ class SupportReport:
     series: str | None
     fee_schedule: bool
     start_source: str | None = None
+    start_source_kind: str | None = None
+    schedule_provenance: str | None = None
 
     @property
     def roster_ready(self) -> bool:
@@ -658,8 +680,38 @@ class SupportReport:
 
     @property
     def schedule_ready(self) -> bool:
-        """A scheduled START can be derived. A DIFFERENT question."""
+        """An ADAPTER exists that can derive a scheduled start.
+
+        Three different questions live around this one flag, and collapsing
+        them is how NFL came to read "ready" while producing no observation:
+
+          1. ADAPTER SUPPORT -- this property. Static, read from the code.
+          2. RUNTIME SCHEDULE COVERAGE -- how many of a particular run's
+             contracts actually resolved a kickoff. Per-run, reported by the
+             preflight from `StartResolver.coverage_counts`, and not knowable
+             from here.
+          3. HISTORICAL PROVENANCE -- whether that kickoff is what was known
+             at the decision it dates. `schedule_provenance`, below.
+
+        An adapter that exists and resolves nothing still fails the run, and
+        an adapter whose answers are retrospective still cannot certify a
+        backtest. Neither is visible in this flag, so neither is implied by it.
+        """
         return self.start_source is not None
+
+    @property
+    def schedule_is_external(self) -> bool:
+        return self.start_source_kind == "external"
+
+    @property
+    def point_in_time_capable(self) -> bool:
+        """Can a run over this league date its own decisions honestly?
+
+        False for an externally scheduled league: the kickoff was retrieved
+        after the fact. Such a run is exploratory by construction, which is a
+        limit on what its OUTPUT may claim, not on whether it may run.
+        """
+        return self.schedule_provenance == "verified_at_decision_time"
 
     @property
     def ready(self) -> bool:
@@ -684,7 +736,7 @@ class SupportReport:
                        "join as sharp_teams_unresolvable, AFTER paying for "
                        "its snapshots")
         if not self.schedule_ready:
-            out.append(f"no verified scheduled-start source for {self.league!r} "
+            out.append(f"no scheduled-start source for {self.league!r} "
                        "(core.matcher.START_SOURCES). Real event bodies for "
                        "this league carry a DATE and no kickoff time, so every "
                        "contract fails on no_readable_start_time and the "
@@ -707,6 +759,24 @@ class SupportReport:
                        "the generic Kalshi coefficients would be assumed and "
                        "every return figure would inherit that. The MLB "
                        "schedule halved the taker coefficient.")
+        if self.schedule_is_external:
+            out.append(
+                f"{self.league} kickoffs come from an EXTERNAL schedule "
+                f"({SCHEDULE_SOURCE}), retrieved at run time, so "
+                "historical_schedule_as_of=unverified. A schedule fetched now "
+                "does not establish what a kickoff was believed to be 72h "
+                "earlier: a flexed or rescheduled game carries its FINAL time. "
+                "Runs over this league are EXPLORATORY: good for an "
+                "availability and cost assessment, and they cannot certify a "
+                "point-in-time backtest or a live strategy. A prospective or "
+                "holdout run needs schedule snapshots recorded BEFORE the "
+                "decisions they date.")
+            out.append(
+                f"{self.league} adapter support is not runtime coverage. This "
+                "says a kickoff CAN be derived, not that one was: a run's own "
+                "resolved/unresolved counts are what say whether the schedule "
+                "actually covered its contracts, and an empty universe still "
+                "fails coverage.")
         return out
 
 
@@ -723,6 +793,8 @@ def support_report(league: str, series: str | None = None) -> SupportReport:
         series=series,
         fee_schedule=bool(series and fees.series_schedule(series)),
         start_source=start_source(key),
+        start_source_kind=start_source_kind(key),
+        schedule_provenance=start_source_provenance(key),
     )
 
 
@@ -764,12 +836,22 @@ VERIFIED_START_KEYS: tuple[str, ...] = ()
 VERIFIED_START_KEYS_ISO: tuple[str, ...] = ()
 
 
-def market_start_time(market: dict) -> datetime | None:
-    """Scheduled start: a verified payload field if one exists, else the ticker.
+def market_start_time(market: dict,
+                      resolver: "StartResolver | None" = None) -> datetime | None:
+    """Scheduled start: a verified payload field, the ticker, or the resolver.
 
     Deliberately does NOT fall back to `open_time`, `close_time` or an
     expiration: those are contract lifecycle facts, not first pitch.
+
+    `resolver`, when supplied, is AUTHORITATIVE -- it is the one mapping the
+    whole run shares (see `StartResolver`). When it is absent this falls back
+    to the ticker, which is right for MLB and yields None for a league whose
+    body carries no time. That default is safe in the direction that matters:
+    forgetting to thread the resolver costs a loud `no_readable_start_time`
+    rejection, never a plausible wrong kickoff.
     """
+    if resolver is not None:
+        return resolver.start(market)
     for key in VERIFIED_START_KEYS:
         value = market.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -783,6 +865,161 @@ def market_start_time(market: dict) -> datetime | None:
                 continue
     event = kalshi_event_ticker(market)
     return parse_event_body_start(event) if event else None
+
+
+@dataclass
+class StartResolver:
+    """THE mapping from contract to kickoff for one run. Built once, reused.
+
+    Targeting, eligibility, collection and the join must all agree about when
+    a game started, or the study has no single answer to the question its
+    whole lead-time grid is measured against. So the resolution happens once,
+    up front, and every later consumer reads the SAME memo -- rather than each
+    site re-deriving it and drifting (the fleet's rule 26, pointed at a study).
+
+    Two sources, kept apart on purpose:
+
+      * `event_ticker` (MLB): the exchange published the time on the contract.
+        Available at decision time, so it dates a decision honestly.
+      * `external_schedule` (NFL): a schedule retrieved at run time. It
+        supplies the kickoff the ticker lacks, and it CANNOT say what that
+        kickoff was believed to be earlier. Everything derived from it is
+        exploratory; `provenance` carries that label into the manifest.
+    """
+
+    league: str
+    schedule: ScheduleSnapshot | None = None
+    _by_event: dict[str, StartResolution] = field(default_factory=dict)
+    _contracts_per_event: dict[str, int] = field(default_factory=dict)
+    _primed: bool = False
+
+    @property
+    def source(self) -> str | None:
+        return start_source(self.league)
+
+    @property
+    def kind(self) -> str | None:
+        return start_source_kind(self.league)
+
+    @property
+    def provenance(self) -> str | None:
+        return start_source_provenance(self.league)
+
+    @property
+    def needs_schedule(self) -> bool:
+        return self.source == START_SOURCE_EXTERNAL
+
+    def prime(self, markets: dict[str, dict]) -> None:
+        """Resolve every event's kickoff ONCE, before eligibility is applied.
+
+        An external schedule is matched on the event's MATCHUP, which is the
+        union of its contracts' YES suffixes -- so it needs every contract of
+        an event at once, not one at a time. That is why this is a priming
+        step rather than a lazy per-market lookup, and why the result is a
+        memo the rest of the run reads instead of recomputing.
+        """
+        self._primed = True
+        if not self.needs_schedule:
+            return
+        events: dict[str, list[str]] = {}
+        for ticker, market in markets.items():
+            event = kalshi_event_ticker(market) or ticker
+            events.setdefault(event, []).append(ticker)
+        for event, tickers in events.items():
+            self._by_event[event] = self._resolve_event(event, tickers)
+            self._contracts_per_event[event] = len(tickers)
+
+    def _resolve_event(self, event: str, tickers: list[str]) -> StartResolution:
+        if self.schedule is None:
+            return StartResolution(
+                None, None, FAIL_NO_SNAPSHOT,
+                f"{self.league} kickoffs come from {SCHEDULE_SOURCE} and no "
+                "schedule snapshot was supplied to this run")
+        matchup = exchange_matchup(tickers, self.league)
+        if len(matchup) < 2:
+            return StartResolution(
+                None, None, "event_participants_unresolvable",
+                f"{event} yielded {sorted(matchup)} from its YES suffixes")
+        return self.schedule.resolve(matchup, parse_event_body_date(event))
+
+    def resolution(self, market: dict) -> StartResolution:
+        """The full outcome -- kickoff AND reason -- for one contract."""
+        if not self.needs_schedule:
+            start = market_start_time(market)
+            if start is None:
+                return StartResolution(None, None, "no_readable_start_time",
+                                       "the event body carries no kickoff")
+            return StartResolution(start, None, None)
+        if not self._primed:
+            return StartResolution(
+                None, None, "schedule_resolver_not_primed",
+                "prime(markets) must run before any kickoff is read")
+        event = kalshi_event_ticker(market) or str(market.get("ticker", ""))
+        return self._by_event.get(event, StartResolution(
+            None, None, "schedule_event_not_primed", event))
+
+    def start(self, market: dict) -> datetime | None:
+        return self.resolution(market).kickoff
+
+    def failure_counts(self, per: str = "events") -> dict[str, int]:
+        """Unresolved events by reason, counted in EVENTS or in CONTRACTS.
+
+        The unit matters because the caller files these against the
+        `contracts` stage, whose denominator is contracts. Counting events
+        there under-reports by the number of contracts per event -- a
+        two-way market is two contracts -- and a run where nothing survived
+        reported "50.0% of 4 eligible contracts lost". A coverage figure
+        that flatters itself is the failure this ledger exists to prevent.
+        """
+        out: dict[str, int] = {}
+        for event, resolution in self._by_event.items():
+            if resolution.resolved or not resolution.reason:
+                continue
+            weight = (self._contracts_per_event.get(event, 1)
+                      if per == "contracts" else 1)
+            out[resolution.reason] = out.get(resolution.reason, 0) + weight
+        return dict(sorted(out.items()))
+
+    def coverage_counts(self) -> tuple[int, int]:
+        """(events with a kickoff, events without). RUNTIME coverage.
+
+        A different fact from "this league has an adapter", which is static.
+        An adapter that exists and resolves nothing is exactly the shape that
+        reported NFL ready while producing no observation at all.
+        """
+        resolved = sum(1 for r in self._by_event.values() if r.resolved)
+        return resolved, len(self._by_event) - resolved
+
+    def manifest(self) -> dict:
+        resolved, unresolved = self.coverage_counts()
+        out = {
+            "league": self.league,
+            "start_source": self.source,
+            "start_source_kind": self.kind,
+            "historical_schedule_as_of": self.provenance,
+            "events_resolved": resolved,
+            "events_unresolved": unresolved,
+            "resolution_failures": self.failure_counts(),
+            # The link from an observation back to the schedule entry that
+            # dated it. Observations carry the Kalshi event ticker; the
+            # schedule block is keyed by provider event id. Without this map
+            # the two halves of the provenance cannot be joined after the
+            # fact, which is the whole point of recording them.
+            "resolutions": {
+                event: {
+                    "provider_event_id": (resolution.event.provider_event_id
+                                          if resolution.event else None),
+                    "kickoff": (resolution.kickoff.isoformat()
+                                if resolution.kickoff else None),
+                    "ticker_day_offset": resolution.day_offset,
+                    "failure": resolution.reason,
+                }
+                for event, resolution in sorted(self._by_event.items())
+            },
+        }
+        if self.schedule is not None:
+            out["schedule"] = self.schedule.manifest()
+        return out
 
 
 def start_metadata_available() -> bool:
@@ -873,6 +1110,7 @@ def join_markets(
     quotes_by_event: dict[str, list[SharpQuote]],
     league: str,
     ledger: Ledger,
+    resolver: "StartResolver | None" = None,
 ) -> list[JoinedMarket]:
     """Match settled contracts to sharp events on (matchup, DATE), then time.
 
@@ -943,10 +1181,21 @@ def join_markets(
                           event_ticker, count=len(tickers), stage="contracts")
             continue
 
-        start = market_start_time(markets[tickers[0]])
+        # THE SAME resolved mapping the eligibility filter used. Re-deriving
+        # it here would let the join date a game differently from the run that
+        # selected it, which is the one disagreement a lead-time study cannot
+        # survive.
+        resolution = (resolver.resolution(markets[tickers[0]])
+                      if resolver is not None else None)
+        start = (resolution.kickoff if resolution is not None
+                 else market_start_time(markets[tickers[0]]))
         if start is None:
-            ledger.reject("no_readable_start_time", event_ticker,
-                          count=len(tickers), stage="contracts")
+            reason = (resolution.reason if resolution is not None
+                      and resolution.reason else "no_readable_start_time")
+            detail = (f"{event_ticker} {resolution.detail}"
+                      if resolution is not None and resolution.detail
+                      else event_ticker)
+            ledger.reject(reason, detail, count=len(tickers), stage="contracts")
             continue
 
         key = (matchup, _local_date(start))
