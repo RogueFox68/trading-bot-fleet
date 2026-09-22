@@ -1225,6 +1225,52 @@ class ReactionCliTest(unittest.TestCase):
         self.assertIn("not built, not faked", text)
         self.assertIn("No orders", text)
 
+    def test_the_cli_does_not_call_a_built_layer_unbuilt(self):
+        """The footer is a claim, and a stale claim is a wrong one.
+
+        It listed the reaction measurement as "next increment" after the
+        measurement shipped. A line saying less exists than does is the same
+        class of error as one saying more does -- both are read.
+        """
+        _, text = self._run(["--capability"])
+        head, _, tail = text.partition("not built, not faked")
+        self.assertNotIn("reaction measurement", tail,
+                         "the built measurement is listed as unbuilt")
+        self.assertIn("BUILT AND TESTED", text)
+
+    def test_policy_prints_every_declared_threshold_and_spends_nothing(self):
+        """`--policy` is the audit trail for "declared, not fitted"."""
+        code, text = self._run(["--policy"])
+        self.assertEqual(code, 0)
+        for threshold in ("min_move", "max_age_at_decision_seconds",
+                          "devig_method", "min_response", "max_wait_seconds",
+                          "lookback_seconds", "candle_period_seconds"):
+            self.assertIn(threshold, text)
+        self.assertIn("shin", text)
+        self.assertIn("never serve as a holdout", text)
+        self.assertNotIn("apiKey=", text)
+
+    def test_policy_json_carries_both_policies_and_the_not_tuned_flag(self):
+        import json as _json
+        from unittest import mock
+        import run_reaction
+        chunks: list[str] = []
+        with mock.patch("builtins.print", side_effect=lambda *a, **k:
+                        chunks.append(" ".join(str(x) for x in a))):
+            code = run_reaction.main(["--policy", "--json"])
+        self.assertEqual(code, 0)
+        payload = _json.loads("\n".join(chunks))
+        self.assertEqual(set(payload),
+                         {"move_detection", "reaction_measurement"})
+        for section in payload.values():
+            self.assertFalse(section["tuned_on_outcomes"])
+        self.assertEqual(payload["move_detection"]["devig_method"], "shin")
+        self.assertEqual(
+            payload["move_detection"]["min_move"],
+            payload["reaction_measurement"]["min_response"],
+            "a reaction threshold looser than the trigger threshold would "
+            "count noise as a follow")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -486,6 +486,24 @@ def free_verification_commands() -> tuple[str, ...]:
         "/markets/KXNFLGAME-26SEP14DENKC-KC/candlesticks"
         "?start_ts=1789000000&end_ts=1789086400&period_interval=1' | head -c 2000",
         "",
+        "# 4b. DOES A QUIET MINUTE GET A CANDLE? This decides a default, and",
+        "#     the two readings give opposite answers: if every minute in a",
+        "#     market's lifetime has a candle, a missing one is MISSING DATA;",
+        "#     if candles are only emitted on activity, a missing one is an",
+        "#     UNCHANGED QUOTE. `reaction.measure` currently assumes the",
+        "#     first (BLIND_INTERVAL, the conservative reading) because this",
+        "#     session cannot check. Count the candles against the wall-clock",
+        "#     minutes the window spans -- equal means every minute is",
+        "#     emitted, fewer means activity-gated:",
+        "curl -sS 'https://api.elections.kalshi.com/trade-api/v2/series/KXNFLGAME"
+        "/markets/KXNFLGAME-26SEP14DENKC-KC/candlesticks"
+        "?start_ts=1789000000&end_ts=1789003600&period_interval=1' \\",
+        "  | python3 -c 'import json,sys; c=json.load(sys.stdin)"
+        "[\"candlesticks\"]; print(len(c), \"candles for 60 minutes\")'",
+        "#     If they are activity-gated, set",
+        "#     ReactionPolicy(treat_missing_candles_as_unchanged=True) and say",
+        "#     so in the run manifest. Do NOT flip it on an assumption.",
+        "",
         "# 5. Then re-run the audit and confirm it reports no disagreement:",
         "python3 run_reaction.py --capability",
     )

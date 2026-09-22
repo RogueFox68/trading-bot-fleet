@@ -3,6 +3,7 @@
     python3 run_reaction.py --capability          # the source timing audit (FREE)
     python3 run_reaction.py --capability-verify    # free commands to re-check it
     python3 run_reaction.py --capability --json    # machine-readable, for a manifest
+    python3 run_reaction.py --policy --json        # the DECLARED thresholds (FREE)
 
 A SEPARATE ENTRY POINT ON PURPOSE
 ---------------------------------
@@ -26,11 +27,19 @@ would have produced numbers nobody should read.
   unanswerable        fillable size (no depth), suspension vs absence,
                       provider delivery lag (no receipt time in replay)
 
+DECLARE THE THRESHOLDS BEFORE YOU LOOK
+--------------------------------------
+`--policy` prints every declared threshold in both policies, with nothing
+fitted to any outcome. It costs nothing and touches no network, so it can be
+run and its output committed BEFORE any data is collected -- which is the
+only thing that makes "declared, not fitted" checkable later rather than
+merely asserted. The 16 development games must never be used to tune these.
+
 NOT BUILT YET, AND NOT FAKED
 ----------------------------
-Reaction measurement, the executable-opportunity screen, the episode ledger
-and the paper replay. The detector and the clock contracts they will sit on
-are in `reaction/`, tested, and reachable from here. No orders, no live
+The executable-opportunity screen, the episode ledger and the paper replay.
+The clock contracts, the move detector and the reaction measurement they sit
+on are in `reaction/`, tested, and reachable from here. No orders, no live
 capture, no paid requests -- none of those is authorised and none is
 implemented.
 """
@@ -45,6 +54,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from reaction import capability                                  # noqa: E402
+from reaction.detector import MovePolicy                        # noqa: E402
+from reaction.measure import ReactionPolicy                     # noqa: E402
 
 
 def parse_args(argv=None):
@@ -57,6 +68,11 @@ def parse_args(argv=None):
     parser.add_argument("--capability-verify", action="store_true",
                         help="print the exact FREE commands that re-verify the "
                              "transcribed rows, to run where egress works")
+    parser.add_argument("--policy", action="store_true",
+                        help="print the declared detection and reaction "
+                             "thresholds. FREE. Run this BEFORE collecting, "
+                             "and keep the output, so 'declared not fitted' "
+                             "is checkable rather than asserted")
     parser.add_argument("--json", action="store_true",
                         help="machine-readable output")
     return parser.parse_args(argv)
@@ -80,14 +96,38 @@ def main(argv=None) -> int:
                 print(f"  {line}")
         return 0
 
+    if args.policy:
+        declared = {"move_detection": MovePolicy().as_dict(),
+                    "reaction_measurement": ReactionPolicy().as_dict()}
+        if args.json:
+            print(json.dumps(declared, indent=2))
+            return 0
+        print("DECLARED THRESHOLDS (nothing here is fitted to an outcome)")
+        print()
+        for section, values in declared.items():
+            print(f"  {section}")
+            for key, value in values.items():
+                if key == "note":
+                    continue
+                print(f"    {key:<42} {value}")
+            print(f"    -- {values['note']}")
+            print()
+        print("  Run this before collecting and keep the output. A threshold")
+        print("  tuned after seeing outcomes makes every figure downstream a")
+        print("  selection artifact, and the 16 development games are")
+        print("  DEVELOPMENT data -- they can never serve as a holdout.")
+        return 0
+
     if args.capability:
         if args.json:
             print(json.dumps(capability.as_dict(), indent=2))
             return 0
         print(capability.render())
         print()
-        print("  NEXT INCREMENT (not built, not faked): reaction measurement,")
-        print("  executable-opportunity screen, episode ledger, paper replay.")
+        print("  BUILT AND TESTED: the clock contracts, the move detector,")
+        print("  the reaction measurement (--policy prints their thresholds).")
+        print("  NEXT INCREMENT (not built, not faked): the executable-")
+        print("  opportunity screen, the episode ledger, the paper replay.")
         print("  No orders. No live capture. No paid requests.")
         # EXIT ZERO even though several questions are unanswerable. Those are
         # PERMANENT properties of these two sources, and the design already
