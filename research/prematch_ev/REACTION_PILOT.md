@@ -355,7 +355,10 @@ notice a move, look at Kalshi at once, and record what a bot would have done.
    receipt time. The monitor measures it (how old each new provider
    observation was when it reached us), measures the provider's actual
    refresh, and times Kalshi's follow at the spacing of its own reads — 10
-   seconds after a move, finer than the archive's 300-second floor.
+   seconds after a move, finer than the archive's 300-second floor — with
+   the replay's own measurement: a change located only across the moment
+   the move became actionable is not counted as a follow, and a window the
+   reads did not cover is blind, not quiet.
 2. **The decision-clock bound, on live records — exercised.** The detector
    runs on the receipt clock, so a record captured at 12:05 and received at
    12:25 is judged 20 minutes old when it could be acted on.

@@ -1,6 +1,6 @@
 """Shadow monitor: watch the sharp book live, decide as a bot would, place nothing.
 
-    python3 shadow_monitor.py --hours 72                       # plan and price, free
+    python3 shadow_monitor.py --hours 72                       # plan, price, one real book: free
     python3 shadow_monitor.py --hours 72 --spend 4321          # run
     python3 shadow_monitor.py --report study_output/shadow/<session>.jsonl
 
@@ -30,14 +30,19 @@ EACH TICK, IN THIS ORDER
    books: fetched BEFORE the odds poll, they are what a bot held when the
    move arrived.
 2. The sharp book (paid, one attempt). Every quote goes through the study's
-   own detector, on the clock the decision runs on: when WE received it.
+   own detector, on the clock the decision runs on: when the WHOLE answer
+   had arrived and been read. Headers, body and readiness are recorded
+   apart, and the reading time is a delay, not time to trade.
 3. For each move on a watched game, that game's books again (free). These are
    the EXECUTION books, and how long they took is the entry delay, measured.
    Then the study's own screen -- the checkpoint study's eligibility and fee
    model, unchanged -- and the decision is written down before anything that
    follows is known.
 4. A moved game is then followed every few seconds, free, for the declared
-   response window.
+   response window. `--report` measures Kalshi's response from those reads
+   with the replay's own `measure_response`: only a change located after
+   the move was actionable is a response, and a window the reads did not
+   cover to its end is blind, not quiet.
 
 WHAT IT CANNOT DO
 -----------------
@@ -48,11 +53,12 @@ request in the process has to match `ALLOWED_ENDPOINTS` or the run stops.
 SPENDING
 --------
 Plan first, like the collector: without `--spend` it prices the session and
-stops, having made only free requests. The price per call is transcribed
-(1 credit: one market from one book), so the provider's own
-`x-requests-last` is checked against it on the first answer and a
-disagreement stops the run -- a cap priced at the wrong unit cost is not a
-cap. The cap enforced is the quoted price.
+stops, having made only free requests -- including one real order-book read,
+so the book's transcribed shape is checked before anything is paid for. The
+price per call is transcribed (1 credit: one market from one book), so the
+provider's own `x-requests-last` is checked against it on the first answer
+and a disagreement stops the run -- a cap priced at the wrong unit cost is
+not a cap. The cap enforced is the quoted price.
 
 STOPS, AND WHY EACH IS ONE
 --------------------------
@@ -127,7 +133,9 @@ from data.odds_live import (                                       # noqa: E402
 from reaction.capture import CaptureRefused                        # noqa: E402
 from reaction.clocks import envelope_for_live_sharp_quote          # noqa: E402
 from reaction.detector import MoveDetector, MovePolicy, MoveTrigger  # noqa: E402
-from reaction.measure import ReactionPolicy                        # noqa: E402
+from reaction.measure import (                                     # noqa: E402
+    Bracket, ReactionOutcome, ReactionPolicy, measure_response,
+)
 from reaction.screen import screen_live                            # noqa: E402
 
 # --- declared operating values --------------------------------------------
@@ -142,8 +150,16 @@ DEFAULT_CADENCE = timedelta(seconds=60)
 MIN_CADENCE = timedelta(seconds=10)
 #: How often a moved game's books are re-read while it is being followed.
 FOLLOW_EVERY = timedelta(seconds=10)
+#: The longest a followed contract may go unseen before its response window
+#: has a HOLE in it: three follow intervals, so one lost read is inside it
+#: and two in a row are not. Recorded on every session.
+MAX_UNOBSERVED = 3 * FOLLOW_EVERY
+#: The study's declared reaction measurement -- the replay's thresholds,
+#: unchanged -- with the hole limit set by this monitor's own reads rather
+#: than by a candle period it does not have.
+REACTION_POLICY = ReactionPolicy(max_unobserved=MAX_UNOBSERVED)
 #: How long a moved game is followed: the study's declared response window.
-FOLLOW_FOR = ReactionPolicy().max_wait
+FOLLOW_FOR = REACTION_POLICY.max_wait
 #: Decision books are read only for games this close to kickoff: beyond the
 #: screen's own ceiling no entry can be admitted, so a book there could only
 #: ever produce a refusal.
@@ -238,6 +254,22 @@ class Stop:
     reason: str
     detail: str = ""
     ok: bool = False
+
+
+def read_one_book(ticker: str, now: Callable[[], datetime]
+                  ) -> tuple[BookQuote | None, Coverage, Any]:
+    """Read one real order book and parse it: whether the book's TRANSCRIBED
+    shape is the real one. Free -- public market data -- and the one check
+    both the plan and a paid session's preflight run, so they cannot
+    disagree about what "readable" means."""
+    sent = now()
+    payload, coverage = kalshi_history.fetch_orderbook_payload(ticker)
+    book = None
+    if payload is not None:
+        book, parsed = parse_orderbook(payload, ticker=ticker,
+                                       received_at=now(), sent_at=sent)
+        coverage.merge(parsed)
+    return book, coverage, payload
 
 
 def live_slate(today: date, *, league: str, series: str,
@@ -382,14 +414,7 @@ class ShadowMonitor:
         # THE BOOK SHAPE IS TRANSCRIBED, so read one real book before paying
         # for anything. A shape the parser refuses stops the run here, free.
         ticker = sorted(slate.markets)[0]
-        sent = self.clock.now()
-        payload, coverage = kalshi_history.fetch_orderbook_payload(ticker)
-        book = None
-        if payload is not None:
-            book, parsed = parse_orderbook(payload, ticker=ticker,
-                                           received_at=self.clock.now(),
-                                           sent_at=sent)
-            coverage.merge(parsed)
+        book, coverage, payload = read_one_book(ticker, self.clock.now)
         self.recorder.write("shape_check", ticker=ticker,
                             payload=payload, coverage=coverage.reasons,
                             levels=(None if book is None else
@@ -415,8 +440,11 @@ class ShadowMonitor:
                             f"this session was priced at "
                             f"{CREDITS_PER_LIVE_CALL}")
             self.cost_verified = True
-        if live.provider_date is not None and live.received_at is not None:
-            skew = live.received_at - live.provider_date
+        # Against the HEADERS' arrival: `Date` marks the response starting,
+        # so a slow body is not clock disagreement.
+        arrived = live.headers_at or live.received_at
+        if live.provider_date is not None and arrived is not None:
+            skew = arrived - live.provider_date
             # The Date header is truncated to the second, so a synchronised
             # clock reads up to ~1s AHEAD of it; the bound is on the size.
             if abs(skew) > MAX_CLOCK_SKEW:
@@ -472,14 +500,24 @@ class ShadowMonitor:
 
         live = fetch_live_odds(self.sport, self.api_key, ledger=self.ledger,
                                now=self.clock.now)
+        parsed = parse_snapshot(live.snapshot_body()) if live.ok else None
+        # DECISION READINESS: the answer has arrived in full AND been read.
+        # Moves are dated here, never earlier. The time between the body
+        # arriving and this is recorded as processing, not credited to the
+        # opportunity as though a bot could have traded during it.
+        ready_at = self.clock.now()
         self.counts["polls"] += 1
         self.recorder.write(
             "odds", url=recorded_url(live_odds_url(self.sport, "")),
-            sent_at=live.sent_at, received_at=live.received_at,
+            sent_at=live.sent_at, headers_at=live.headers_at,
+            received_at=live.received_at, ready_at=ready_at,
+            processing_seconds=(
+                (ready_at - live.received_at).total_seconds()
+                if live.received_at else None),
             provider_date=live.provider_date, status=live.status,
             charged=live.charged, used=live.used, remaining=live.remaining,
             payload=live.payload, coverage=live.coverage.reasons)
-        stop = self.absorb(live, now)
+        stop = self.absorb(live, parsed, ready_at, now)
         # WHY NOTHING TRIGGERED, for THIS answer: recorded once its quotes
         # have been through the detector, so every count sits beside the
         # poll it belongs to -- and a detector that refuses everything shows
@@ -488,9 +526,9 @@ class ShadowMonitor:
                             rejections=self._drain_rejections())
         return stop
 
-    def absorb(self, live: LiveOdds, now: datetime) -> Stop | None:
+    def absorb(self, live: LiveOdds, parsed: Any, ready_at: datetime,
+               now: datetime) -> Stop | None:
         """One answer through the stops, the join and the detector."""
-        parsed = parse_snapshot(live.snapshot_body()) if live.ok else None
         if parsed is None or not parsed.coverage.complete:
             self.counts["polls_failed"] += 1
             self.failed_polls += 1
@@ -523,6 +561,7 @@ class ShadowMonitor:
         for quote in parsed.quotes:
             envelope = envelope_for_live_sharp_quote(
                 quote, received_at=live.received_at, sent_at=live.sent_at,
+                ready_at=ready_at,
                 request_url=recorded_url(live_odds_url(self.sport, "")),
                 resolution_seconds=self.cadence.total_seconds())
             stream = envelope.provenance.market_id
@@ -664,7 +703,7 @@ class ShadowMonitor:
             credit_cap=self.ledger.cap,
             credits_per_call=CREDITS_PER_LIVE_CALL,
             move_policy=self.detector.policy.as_dict(),
-            reaction_policy=ReactionPolicy().as_dict(),
+            reaction_policy=REACTION_POLICY.as_dict(),
             eligibility=vars(Eligibility()))
         try:
             with only_declared_endpoints():
@@ -755,16 +794,9 @@ def report(rows: Sequence[dict], *, min_response: float | None = None,
     the same parsers the monitor used, so a report can be re-run after a
     parser fix without re-collecting anything.
     """
-    min_response = (ReactionPolicy().min_response if min_response is None
-                    else min_response)
     out: dict[str, Any] = {}
     start = next((r for r in rows if r["kind"] == "session_start"), {})
-    if window is None:
-        # The window the SESSION followed for, not today's default: a report
-        # re-run after the default changes must still judge the session by
-        # the window it actually watched.
-        window = timedelta(seconds=start.get("follow_for_seconds")
-                           or FOLLOW_FOR.total_seconds())
+    policy = _session_policy(start, min_response=min_response, window=window)
     end = next((r for r in reversed(rows) if r["kind"] == "session_end"), None)
     out["session"] = {"started": start.get("at"),
                       "ended": end.get("at") if end else None,
@@ -775,14 +807,17 @@ def report(rows: Sequence[dict], *, min_response: float | None = None,
                       if end else None}
 
     odds = [r for r in rows if r["kind"] == "odds"]
-    skews, ages, refresh = [], [], []
+    skews, ages, refresh, processing = [], [], [], []
     sightings: Counter = Counter()
     last_seen: dict[tuple[str, str], datetime] = {}
     for row in odds:
         received, provider = _time(row.get("received_at")), _time(
             row.get("provider_date"))
-        if received and provider:
-            skews.append((received - provider).total_seconds())
+        headers = _time(row.get("headers_at")) or received
+        if headers and provider:
+            skews.append((headers - provider).total_seconds())
+        if isinstance(row.get("processing_seconds"), (int, float)):
+            processing.append(float(row["processing_seconds"]))
         parsed = None
         if row.get("payload") is not None and received and not row.get(
                 "coverage"):
@@ -829,7 +864,8 @@ def report(rows: Sequence[dict], *, min_response: float | None = None,
     out["polls"] = {"total": len(odds),
                     "answered": sum(1 for r in odds if r.get("payload")
                                     is not None and not r.get("coverage")),
-                    "clock_skew": _quantiles(skews)}
+                    "clock_skew": _quantiles(skews),
+                    "processing": _quantiles(processing)}
     out["age_when_received"] = _quantiles(ages)
     out["provider_refresh"] = _quantiles(refresh)
     out["sightings"] = {k: sightings.get(k, 0) for k in (
@@ -862,9 +898,16 @@ def report(rows: Sequence[dict], *, min_response: float | None = None,
                        "predicted": d.get("predicted"),
                        "entry_delay_seconds": d.get("entry_delay_seconds")}
                       for d in decisions if d.get("entered")]
-    out["responses"] = [_response(d, books, min_response, window)
-                        for d in decisions if d.get("market_ticker")
-                        and d.get("book_move_for_yes") is not None]
+    reads = _book_reads(books)
+    by_move = {(t.get("stream_id"), _time(t.get("detected_at"))): t
+               for t in triggers}
+    ended = _time(end.get("at")) if end else None
+    out["responses"] = [
+        _response(d, by_move.get((d.get("stream_id"),
+                                  _time(d.get("decision_at")))),
+                  reads.get(d["market_ticker"], []), policy, ended)
+        for d in decisions if d.get("market_ticker")
+        and d.get("book_move_for_yes") is not None]
     return out
 
 
@@ -897,62 +940,110 @@ def _refresh_verdict(seen: dict, cadence: float | None) -> list[str]:
             "re-observes buys more of those)"]
 
 
-def _book_mid(row: dict) -> float | None:
-    received = _time(row.get("received_at"))
-    if received is None or row.get("payload") is None:
-        return None
-    book, coverage = parse_orderbook(row["payload"], ticker=row["ticker"],
-                                     received_at=received)
-    if book is None or not coverage.complete:
-        return None
-    return book.mid
+def _session_policy(start: dict, *, min_response: float | None,
+                    window: timedelta | None) -> ReactionPolicy:
+    """The reaction measurement as the SESSION recorded it.
+
+    Not today's defaults: a report re-run after a default changes must still
+    judge the session by the thresholds and the window it actually used.
+    `min_response` and `window` override for a what-if.
+    """
+    declared = start.get("reaction_policy") or {}
+
+    def span(value: Any, fallback: timedelta) -> timedelta:
+        return (timedelta(seconds=value)
+                if isinstance(value, (int, float)) and value > 0 else fallback)
+
+    followed = span(start.get("follow_for_seconds"),
+                    span(declared.get("max_wait_seconds"),
+                         REACTION_POLICY.max_wait))
+    return ReactionPolicy(
+        min_response=(min_response if min_response is not None
+                      else declared.get("min_response",
+                                        REACTION_POLICY.min_response)),
+        max_wait=window or followed,
+        lookback=span(declared.get("lookback_seconds"),
+                      REACTION_POLICY.lookback),
+        max_unobserved=span(declared.get("max_unobserved_seconds"),
+                            MAX_UNOBSERVED))
 
 
-def _response(decision: dict, books: Sequence[dict], min_response: float,
-              window: timedelta) -> dict:
-    """When Kalshi followed ONE move on ONE contract, as polled.
+def _book_reads(books: Sequence[dict]
+                ) -> dict[str, list[tuple[datetime, BookQuote | None]]]:
+    """Every read of every contract, in answer order: (when it answered, the
+    book -- or None when the read gave nothing a price can be read from).
 
-    The baseline is the decision book -- the newest read at or before the
-    move. The response is the first later read INSIDE THE FOLLOW WINDOW whose
-    mid has moved at least `min_response`, and it is reported as a BRACKET
-    between the read before it and itself: a poll locates a change no more
-    finely than its own spacing. Past the window the answer is censored, not
-    "never", and the number of reads inside it is reported beside it so a
-    blind window cannot pass for a quiet one.
+    Failed reads are KEPT, as None: they are not observations, but a window
+    is only as watched as its reads were, and the count of the ones that
+    failed is reported beside every outcome.
+    """
+    out: dict[str, list[tuple[datetime, BookQuote | None]]] = {}
+    for row in books:
+        ticker, received = row.get("ticker"), _time(row.get("received_at"))
+        if not ticker or received is None:
+            continue
+        book = None
+        if row.get("payload") is not None and not row.get("coverage"):
+            parsed, coverage = parse_orderbook(
+                row["payload"], ticker=ticker, received_at=received,
+                sent_at=_time(row.get("sent_at")))
+            if (parsed is not None and coverage.complete
+                    and parsed.mid is not None):
+                book = parsed
+        out.setdefault(ticker, []).append((received, book))
+    for series in out.values():
+        series.sort(key=lambda item: item[0])
+    return out
+
+
+def _response(decision: dict, trigger: dict | None,
+              reads: Sequence[tuple[datetime, BookQuote | None]],
+              policy: ReactionPolicy, ended: datetime | None) -> dict:
+    """What Kalshi did after ONE move, on ONE contract -- measured by the
+    replay's own `measure_response`, over this session's reads.
+
+    One rule for both paths (rule 19). Each read describes the book somewhere
+    between its request and its answer, so a change is bracketed by
+    `sent_at` as well as the receipt; a change located only across the
+    trigger is `moved_around_trigger`, not a reaction; a move before it is
+    `exchange_moved_before_trigger`; and a window the reads did not cover
+    to its end -- reads that failed, stopped, or never came -- is
+    `blind_interval`, never a quiet market. Coverage rides along: the reads
+    inside the window, the ones that failed, and whether the session itself
+    ended before the window did.
     """
     ticker = decision["market_ticker"]
     decided = _time(decision.get("decision_at"))
-    direction = decision["book_move_for_yes"]
+    bracket = (trigger or {}).get("book_change_bracket") or {}
+    reaction = measure_response(
+        event_id=str(decision.get("event_id") or ""),
+        stream_id=str(decision.get("stream_id") or ""),
+        market_ticker=ticker, detected_at=decided,
+        book_delta=decision["book_move_for_yes"],
+        book_change=Bracket(_time(bracket.get("earliest")),
+                            _time(bracket.get("latest"))),
+        readings=[book for _, book in reads if book is not None],
+        policy=policy)
     row = {"ticker": ticker, "decision_at": decision.get("decision_at"),
-           "outcome": "no_baseline", "lag_seconds": None}
-    if decided is None or not direction:
-        return row
-    series = sorted(((t, m) for t, m in
-                     ((_time(b.get("received_at")), _book_mid(b))
-                      for b in books if b.get("ticker") == ticker)
-                     if t is not None and m is not None), key=lambda x: x[0])
-    before = [(t, m) for t, m in series if t <= decided]
-    if not before:
-        return row
-    base_at, base = before[-1]
-    previous = base_at
-    inside = [(at, mid) for at, mid in series
-              if decided < at <= decided + window]
-    row["reads_in_window"] = len(inside)
-    for at, mid in inside:
-        moved = (mid - base) * (1 if direction > 0 else -1)
-        if moved >= min_response:
-            row.update(outcome="followed", lag_seconds=[
-                max(0.0, (previous - decided).total_seconds()),
-                (at - decided).total_seconds()])
-            return row
-        if moved <= -min_response:
-            row.update(outcome="moved_against", lag_seconds=[
-                max(0.0, (previous - decided).total_seconds()),
-                (at - decided).total_seconds()])
-            return row
-        previous = at
-    row["outcome"] = "not_followed_within_window"
+           "outcome": reaction.outcome.value,
+           "ordering": reaction.ordering.value,
+           "lag_seconds": ([reaction.lag_earliest_seconds,
+                            reaction.lag_latest_seconds]
+                           if reaction.lag_earliest_seconds is not None
+                           else None),
+           "blind": ({"from": _iso(reaction.blind_from),
+                      "to": _iso(reaction.blind_to)}
+                     if reaction.blind_from else None),
+           "detail": reaction.detail}
+    if decided is not None:
+        deadline = decided + policy.max_wait
+        inside = [book for at, book in reads if decided < at <= deadline]
+        row.update(
+            window_ends=_iso(deadline),
+            reads_in_window=sum(1 for book in inside if book is not None),
+            unreadable_in_window=sum(1 for book in inside if book is None),
+            session_ended_inside_window=(None if ended is None
+                                         else ended < deadline))
     return row
 
 
@@ -967,6 +1058,10 @@ def render_report(figures: dict) -> str:
     lines += [f"  polls              {polls['total']} "
               f"({polls['answered']} answered)",
               f"  clock skew         {polls['clock_skew']}",
+              f"  processing         {polls['processing']}",
+              "                     (body in hand to decision-ready: a delay "
+              "every move carries,",
+              "                      never counted as time to trade)",
               f"  age when received  {figures['age_when_received']}",
               "                     (how old a NEW provider observation "
               "already was when it reached us:",
@@ -993,17 +1088,26 @@ def render_report(figures: dict) -> str:
             f"{predicted.get('predicted_ev_per_contract'):+.4f}), would have "
             f"paid {'n/a' if paid is None else f'{paid:.4f}'} after "
             f"{entry['entry_delay_seconds']:.1f}s")
-    outcomes: dict[str, int] = {}
-    for response in figures["responses"]:
-        outcomes[response["outcome"]] = outcomes.get(response["outcome"], 0) + 1
+    responses = figures["responses"]
+    outcomes = Counter(r["outcome"] for r in responses)
     lines.append("  Kalshi after each move, per contract:")
     for key, count in sorted(outcomes.items()):
         lines.append(f"    {key:<34} {count}")
-    lags = [r["lag_seconds"] for r in figures["responses"]
-            if r["outcome"] == "followed"]
+    lines.append("    (only `responded` came demonstrably after we could act; "
+                 "the others are why not)")
+    lags = [r["lag_seconds"] for r in responses
+            if r["outcome"] == ReactionOutcome.RESPONDED.value]
     if lags:
-        lines.append(f"    followed within    "
+        lines.append(f"    responded within   "
                      f"{', '.join(f'{a:.0f}-{b:.0f}s' for a, b in lags[:12])}")
+    cut = sum(1 for r in responses if r.get("session_ended_inside_window"))
+    if cut:
+        lines.append(f"    {cut} window(s) outlived the session: censored "
+                     f"there, not answered")
+    unreadable = sum(r.get("unreadable_in_window", 0) for r in responses)
+    if unreadable:
+        lines.append(f"    {unreadable} read(s) inside the windows gave no "
+                     f"usable book")
     lines.append("  quotes the detector did not count as a move, by reason:")
     refused = figures["detector"]
     for key, count in sorted(refused.items(), key=lambda kv: (-kv[1], kv[0])):
@@ -1100,11 +1204,37 @@ def main(argv: Sequence[str] | None = None, *, clock: Any = None,
           f"then every {FOLLOW_EVERY.total_seconds():g}s for "
           f"{FOLLOW_FOR.total_seconds() / 60:g} minutes after a move.")
 
+    # THE FREE HALF OF THE PREFLIGHT, in the plan. The book's shape is
+    # transcribed from documentation; a plan reads one real book so that can
+    # be checked before anything is paid for. A paid session reads it again
+    # in its own preflight, through the same function, and stops there.
+    shape_ok = True
+    if args.spend is None and slate.coverage.complete and slate.markets:
+        ticker = sorted(slate.markets)[0]
+        with only_declared_endpoints():
+            book, coverage, _ = read_one_book(ticker, clock.now)
+        if book is None or not coverage.complete:
+            shape_ok = False
+            print(f"\n  *** Kalshi's order book for {ticker} could not be "
+                  f"read ({coverage}). The parser's shape is transcribed "
+                  f"from documentation; a paid session would stop here, "
+                  f"before its first poll.", file=sys.stderr)
+        else:
+            print(f"\n  Kalshi order book, read free for {ticker}: "
+                  f"{book.yes_levels} YES / {book.no_levels} NO level(s), "
+                  f"YES {book.bid_close} bid / {book.ask_close} ask -- the "
+                  f"transcribed shape parses.")
+
     if not slate.coverage.complete:
         print("\n  The slate did not fully answer; nothing was bought. Run "
               "again.", file=sys.stderr)
         return EXIT_STOPPED
     if args.spend is None:
+        if not shape_ok:
+            print("\n  Nothing was spent. The book parser has to read the "
+                  "real shape before a session is worth running.",
+                  file=sys.stderr)
+            return EXIT_STOPPED
         print(f"\n  Nothing was spent. To run, re-run with --spend {price}.")
         return EXIT_OK
     if args.spend < price:

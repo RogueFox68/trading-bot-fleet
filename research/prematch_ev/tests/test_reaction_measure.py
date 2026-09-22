@@ -47,7 +47,7 @@ from reaction.detector import (                                 # noqa: E402
 from reaction.measure import (                                  # noqa: E402
     CANDLE_PERIOD, Bracket, Ordering, ReactionOutcome, ReactionPolicy,
     candle_bracket, measure_all, measure_candle_cadence, measure_reaction,
-    order_brackets,
+    measure_response, order_brackets,
 )
 
 UTC = timezone.utc
@@ -560,6 +560,162 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(row["label"], "exploratory-v1")
         self.assertFalse(row["tuned_on_outcomes"])
         self.assertEqual(row["candle_period_seconds"], 60.0)
+        self.assertEqual(row["max_unobserved_seconds"], 60.0,
+                         "the hole threshold in force is recorded, and "
+                         "defaults to one candle period")
+
+    def test_a_non_positive_or_non_duration_hole_limit_is_refused(self):
+        for value in (timedelta(0), timedelta(seconds=-1), 30):
+            with self.subTest(max_unobserved=value):
+                with self.assertRaises(ValueError):
+                    ReactionPolicy(max_unobserved=value)
+
+
+class AroundTriggerTest(unittest.TestCase):
+    """A response located only across the trigger is not a demonstrated one.
+
+    The lag's lower end used to be clamped at zero. A trigger half a minute
+    into a candle, and the exchange's new price first seen on that candle's
+    close: the change lies anywhere from 30s before the trigger to 30s
+    after it, and the clamp reported "responded, 0-30s" -- a reaction we
+    could have traded ahead of, on evidence that it may have come first.
+    """
+
+    MID_MINUTE = dict(baseline_snapshot=at(200.5), baseline_observed=at(201),
+                      moved_snapshot=at(195.5), moved_observed=at(196))
+
+    def test_a_change_in_the_minute_around_the_trigger_is_not_a_reaction(self):
+        trigger = make_trigger(**self.MID_MINUTE)
+        reaction = measure(step(210, 160, EXCHANGE_BEFORE, EXCHANGE_AFTER,
+                                switch_at=195), trigger)
+        self.assertIs(reaction.outcome, ReactionOutcome.AROUND_TRIGGER)
+        self.assertEqual(reaction.lag_earliest_seconds, -30.0)
+        self.assertEqual(reaction.lag_latest_seconds, 30.0)
+        self.assertFalse(reaction.is_measured)
+        self.assertIsNot(reaction.discrepancy_survives(timedelta(0)), True)
+
+    def test_a_change_first_possible_after_the_trigger_is_a_reaction(self):
+        trigger = make_trigger(**self.MID_MINUTE)
+        reaction = measure(step(210, 160, EXCHANGE_BEFORE, EXCHANGE_AFTER,
+                                switch_at=194), trigger)
+        self.assertIs(reaction.outcome, ReactionOutcome.RESPONDED)
+        self.assertEqual(reaction.lag_earliest_seconds, 30.0)
+        self.assertEqual(reaction.lag_latest_seconds, 90.0)
+
+    def test_a_candle_closing_on_the_trigger_leaves_nothing_before_it(self):
+        """The trigger on a candle close: the old price held at the trigger,
+        so a change first seen a minute later is after it."""
+        reaction = measure(step(210, 160, EXCHANGE_BEFORE, EXCHANGE_AFTER,
+                                switch_at=194))
+        self.assertIs(reaction.outcome, ReactionOutcome.RESPONDED)
+        self.assertEqual(reaction.lag_earliest_seconds, 0.0)
+
+
+def read(at_, mid, *, took=timedelta(milliseconds=200)):
+    """A live order-book read: requested `took` before it answered at `at_`.
+    SYNTHETIC mids; the type is the monitor's own."""
+    from data.kalshi_history import BookQuote
+    return BookQuote(ticker=TICKER, ts=at_, bid_close=mid - 0.01,
+                     ask_close=mid + 0.01, bid_size=100.0, ask_size=100.0,
+                     yes_levels=1, no_levels=1, sent_at=at_ - took)
+
+
+class LiveReadingTest(unittest.TestCase):
+    """The monitor's reads through the same measurement as the candles.
+
+    A read describes the book somewhere between its request and its answer,
+    so a slow request widens the bracket instead of dating the change by the
+    receipt alone, and the hole threshold is the monitor's own declared one.
+    """
+
+    T = START - timedelta(hours=3)
+    POLICY = ReactionPolicy(max_wait=timedelta(minutes=2),
+                            max_unobserved=timedelta(seconds=30))
+
+    def measure(self, readings, policy=None):
+        return measure_response(
+            event_id=EVENT, stream_id="s", market_ticker=TICKER,
+            detected_at=self.T, book_delta=+0.07,
+            book_change=Bracket(self.T - timedelta(seconds=60),
+                                self.T - timedelta(seconds=20)),
+            readings=readings, policy=policy or self.POLICY)
+
+    def at(self, seconds):
+        return self.T + timedelta(seconds=seconds)
+
+    def followed_every(self, step, *, until=130, change_at=None, skip=()):
+        out = [read(self.at(-5), 0.57)]
+        second = step
+        while second <= until:
+            if second not in skip:
+                moved = change_at is not None and second >= change_at
+                out.append(read(self.at(second), 0.64 if moved else 0.57))
+            second += step
+        return out
+
+    def test_a_slow_read_widens_the_bracket_to_its_request(self):
+        readings = [read(self.at(-5), 0.57), read(self.at(5), 0.57),
+                    read(self.at(24), 0.64, took=timedelta(seconds=10))]
+        reaction = self.measure(readings)
+        self.assertIs(reaction.outcome, ReactionOutcome.RESPONDED)
+        self.assertAlmostEqual(reaction.lag_earliest_seconds, 4.8, places=6)
+        self.assertAlmostEqual(reaction.lag_latest_seconds, 24.0, places=6)
+
+    def test_a_read_in_flight_at_the_trigger_can_not_order_the_change(self):
+        """Sent before the trigger, answered after: the unchanged book it
+        shows may be from before the trigger, so the change after it may be
+        too."""
+        readings = [read(self.at(-5), 0.57),
+                    read(self.at(0.2), 0.57, took=timedelta(seconds=1.2)),
+                    read(self.at(10), 0.64)]
+        reaction = self.measure(readings)
+        self.assertIs(reaction.outcome, ReactionOutcome.AROUND_TRIGGER)
+        self.assertAlmostEqual(reaction.lag_earliest_seconds, -1.0, places=6)
+
+    def test_the_owners_first_reproduction_is_not_a_reaction(self):
+        """Unchanged at -60s, changed at +1s: the change straddles the
+        trigger, and the minute without a read is a hole besides."""
+        readings = [read(self.at(-60), 0.57), read(self.at(1), 0.64)]
+        reaction = self.measure(readings)
+        self.assertIsNot(reaction.outcome, ReactionOutcome.RESPONDED)
+        self.assertIs(reaction.outcome, ReactionOutcome.BLIND_INTERVAL)
+        wide = ReactionPolicy(max_wait=timedelta(minutes=2),
+                              max_unobserved=timedelta(seconds=120))
+        unwatched = self.measure(readings, wide)
+        self.assertIs(unwatched.outcome, ReactionOutcome.AROUND_TRIGGER)
+        self.assertAlmostEqual(unwatched.lag_earliest_seconds, -60.2,
+                               places=6)
+
+    def test_the_owners_second_reproduction_is_blind_not_quiet(self):
+        """A baseline and no read after it: nothing was watched."""
+        reaction = self.measure([read(self.at(-5), 0.57)])
+        self.assertIs(reaction.outcome, ReactionOutcome.BLIND_INTERVAL)
+        self.assertEqual(reaction.blind_to, self.at(120))
+
+    def test_a_window_watched_to_its_end_without_a_move_is_no_response(self):
+        reaction = self.measure(self.followed_every(10))
+        self.assertIs(reaction.outcome, ReactionOutcome.NO_RESPONSE)
+
+    def test_failed_reads_leave_a_hole_not_a_quiet_market(self):
+        """Three reads in a row lost: forty seconds nobody saw."""
+        reaction = self.measure(self.followed_every(10, skip=(40, 50, 60)))
+        self.assertIs(reaction.outcome, ReactionOutcome.BLIND_INTERVAL)
+
+    def test_one_lost_read_is_inside_the_declared_limit(self):
+        reaction = self.measure(self.followed_every(10, skip=(50,)))
+        self.assertIs(reaction.outcome, ReactionOutcome.NO_RESPONSE)
+
+    def test_reads_that_stop_early_do_not_watch_the_window(self):
+        """An interrupted session: reads end at +60s of a 120s window."""
+        reaction = self.measure(self.followed_every(10, until=60))
+        self.assertIs(reaction.outcome, ReactionOutcome.BLIND_INTERVAL)
+        self.assertEqual(reaction.blind_to, self.at(120))
+
+    def test_a_demonstrated_reaction_survives_all_of_it(self):
+        reaction = self.measure(self.followed_every(10, change_at=50))
+        self.assertIs(reaction.outcome, ReactionOutcome.RESPONDED)
+        self.assertAlmostEqual(reaction.lag_earliest_seconds, 39.8, places=6)
+        self.assertAlmostEqual(reaction.lag_latest_seconds, 50.0, places=6)
 
 
 class BatchTest(unittest.TestCase):

@@ -933,6 +933,19 @@ them is the temptation and "the book led by 90 seconds" is neither:
 search sees the exchange already adjusted and reports `NO_RESPONSE` — filing
 the thesis being falsified under the same name as the thesis holding.
 
+**A response located only across the trigger is not a reaction.** The lag's
+lower end used to be clamped at zero, on the reasoning that a candle period
+straddling the trigger "cannot imply a negative wait". It can: the change
+lies anywhere in that period, including before the instant we could act, and
+the clamp turned "moved somewhere between 30s before and 30s after" into
+"responded within 30s". That is `AROUND_TRIGGER` now — screened like every
+other observation, and never counted as a reaction. With 1-minute candles it
+is what any response seen in the minute containing the trigger becomes,
+which is the honest resolution of that data. Every reading carries the
+interval it can describe the book in — a candle's close is an instant, a
+live read spans its request — and a change is bracketed from the earliest
+the reading before it can describe to the latest its own can.
+
 A **missing candle is not a flat price**. Whether a quiet minute gets a candle
 is the audit's suspension-versus-absence question one layer down, so the
 conservative reading ships (`BLIND_INTERVAL` — we could not see, not nothing
@@ -1100,15 +1113,16 @@ actually re-observes a game, how fast Kalshi follows at the spacing of its
 own reads, and what the book held at the moment of a move, with depth.
 
 ```
-python3 shadow_monitor.py --hours 72                   # the price, free
+python3 shadow_monitor.py --hours 72                   # the price + one real book, free
 python3 shadow_monitor.py --hours 72 --spend 4321      # a live, read-only session
 python3 shadow_monitor.py --report study_output/shadow/<session>.jsonl
 ```
 
 - **Each tick, in order:** Kalshi's book for every watched contract (free —
   the *decision* books, what a bot held when a move arrived); one sharp-book
-  poll (paid); the study's own detector on every quote, clocked by our
-  receipt; for a move on a watched game, that game's books again (the
+  poll (paid); the study's own detector on every quote, clocked by when
+  the answer was complete *and read* (below); for a move on a watched
+  game, that game's books again (the
   *execution* books — how long they took is the entry delay, measured
   rather than assumed); the checkpoint study's own screen, reached through
   `reaction.screen.screen_live`, the same observation path the replay uses;
@@ -1125,13 +1139,38 @@ python3 shadow_monitor.py --report study_output/shadow/<session>.jsonl
 - **What a live feed can fake is refused.** A game missing from a poll is a
   hole, not a move; a game already under way is never a move; the detector
   runs on the clock the decision would have run on.
+- **Three clocks per poll, and a move is dated by the last.** Headers
+  arriving, the whole body arriving, and the body read and parsed are
+  recorded apart. The receipt used to be stamped when `urlopen` returned,
+  before the body was read, so an eight-second body was credited to us
+  eight seconds early and every lag measured from it ran long by that much.
+  A move is now dated when the answer was ready to act on; the time spent
+  reading it is recorded as `processing`, a delay every move carries,
+  never time to trade. Clock skew is judged against the headers, which is
+  what the provider's `Date` marks, so a slow body is not a skewed clock.
+- **Kalshi's response is measured by the replay's own rule.** The report
+  hands its reads to `reaction.measure.measure_response`, the function the
+  replay's candles go through, so the two cannot disagree about what a
+  response is. A read describes the book somewhere between its request and
+  its answer, so a change is bracketed from the request of the last read
+  that did not show it. Only a bracket that opens after the move was
+  actionable is `responded`; one that straddles it is
+  `moved_around_trigger` — Kalshi may have moved first — and a move in the
+  half hour before is `exchange_moved_before_trigger`. A window the reads
+  did not cover to its end — reads that failed, a session interrupted or
+  ended inside it, no reads at all — is `blind_interval`, never a quiet
+  market; the limit is three follow intervals, one lost read, recorded on
+  every session. Beside each outcome: the reads inside the window, the ones
+  that failed, and whether the session outlived it.
 - **It stops, and says why,** on the credit cap, three failed polls in a
   row, a price per call other than quoted (checked against the provider's
   own `x-requests-last` on the first answer), a clock more than 5s off the
   provider's, a nearly empty account, or a request outside the allow-list.
   Kalshi's book shape is transcribed rather than observed, so one real book
   is read — free — before the first paid poll, and a shape the parser
-  refuses stops the session with nothing bought. The provider's observation
+  refuses stops the session with nothing bought. The plan reads one too,
+  through the same function, so the shape can be checked without buying
+  anything: a plan whose book does not parse exits 1. The provider's observation
   stamp is transcribed too, and the detector refuses a price without one, so
   a first answer in which no pre-match quote carries a stamp stops the
   session after one credit instead of paying for one that could never

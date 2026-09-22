@@ -470,5 +470,17 @@ class ProvenanceTest(unittest.TestCase):
         self.assertIn("never reads settlement", row["predicted"]["note"])
 
 
+class ScreenableOutcomeTest(unittest.TestCase):
+    def test_a_response_around_the_trigger_is_still_screened(self):
+        """It may have come first, which makes its EV small, not unreal:
+        dropping it would take exactly the rows that argue against the
+        thesis out of the denominator, as `exchange_moved_before_trigger`'s
+        own note says."""
+        from reaction.measure import ReactionOutcome
+        from reaction.screen import SCREENABLE
+        self.assertIn(ReactionOutcome.AROUND_TRIGGER, SCREENABLE)
+        self.assertIn(ReactionOutcome.ALREADY_PRICED, SCREENABLE)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

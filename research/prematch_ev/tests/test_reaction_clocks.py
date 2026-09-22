@@ -715,6 +715,24 @@ class ClockOrderTest(unittest.TestCase):
     once. So the ordering is checked first, and separately.
     """
 
+    def test_a_live_record_cannot_be_acted_on_before_it_arrived(self):
+        """Readiness before the response was complete is impossible, and on
+        our own clock, so no skew allowance applies."""
+        from reaction.clocks import envelope_for_live_sharp_quote
+        sample = quote(at(200), 120, -140, last_update=at(201))
+        received = at(200) + timedelta(seconds=9)
+        fine = envelope_for_live_sharp_quote(
+            sample, sent_at=at(200), received_at=received,
+            ready_at=received + timedelta(seconds=1))
+        self.assertIsNone(clock_order_problem(fine))
+        self.assertEqual(fine.local_receipt_time,
+                         received + timedelta(seconds=1))
+        self.assertEqual(fine.response_received_at, received)
+        early = envelope_for_live_sharp_quote(
+            sample, sent_at=at(200), received_at=received,
+            ready_at=received - timedelta(milliseconds=1))
+        self.assertIn("fully arrived", clock_order_problem(early))
+
     def test_a_stamp_after_its_own_capture_is_named(self):
         problem = clock_order_problem(env(at(200), 120, -140,
                                           last_update=at(195)))

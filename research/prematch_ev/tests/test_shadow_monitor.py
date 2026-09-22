@@ -91,12 +91,18 @@ def _open_markets() -> list[dict]:
 
 
 class Response:
-    def __init__(self, body, headers=None):
+    """`on_read`, when given, runs as the body is read: a slow body is one
+    whose reading moves the clock."""
+
+    def __init__(self, body, headers=None, on_read=None):
         self._body = json.dumps(body).encode("utf-8")
         self.status = 200
         self.headers = headers or {}
+        self._on_read = on_read
 
     def read(self):
+        if self._on_read is not None:
+            self._on_read()
         return self._body
 
     def __enter__(self):
@@ -135,6 +141,11 @@ class LiveNetwork:
                        made before the move: the old price, an older stamp
       refresh_every    the provider re-observes on this grid rather than on
                        every request, so polls in between repeat it
+      follow_at        when Kalshi re-prices (default FOLLOW_AT); None:
+                       never
+      odds_body_delay  each odds body takes this long to arrive after its
+                       headers; `odds_bodies_done` records when each did
+      book_body_delay  the same for every order-book body
     """
 
     def __init__(self, clock: FakeClock, **knobs):
@@ -156,6 +167,11 @@ class LiveNetwork:
         self.undated_at = knobs.get("undated_at")
         self.older_copy_at = knobs.get("older_copy_at")
         self.refresh_every = knobs.get("refresh_every")
+        self.follow_at = knobs.get("follow_at", FOLLOW_AT)
+        self.odds_body_delay = knobs.get("odds_body_delay")
+        self.book_body_delay = knobs.get("book_body_delay")
+        self.odds_bodies_done: list[datetime] = []
+        self.book_bodies_done: list[tuple[str, datetime]] = []
         self.listings_served = 0
         self.extra_in_play = knobs.get("extra_in_play", False)
         self.extra_pre_match = knobs.get("extra_pre_match", False)
@@ -240,7 +256,12 @@ class LiveNetwork:
                    "x-requests-remaining": str(self.remaining)}
         if self.charged is not None:
             headers["x-requests-last"] = str(self.charged)
-        return Response(events, headers)
+        return Response(events, headers, on_read=self._odds_body)
+
+    def _odds_body(self):
+        if self.odds_body_delay:
+            self.clock.t += self.odds_body_delay
+        self.odds_bodies_done.append(self.clock.t)
 
     def _book(self, url, ticker, at):
         self.book_calls.append((ticker, at))
@@ -255,8 +276,8 @@ class LiveNetwork:
             raise urllib.error.HTTPError(url, 500, "Error", {}, None)
         if not self.book_shape_ok:
             return Response({"book": {"bids": [[56, 100]]}})
-        followed = at >= FOLLOW_AT or (self.follow_on_execution
-                                       and self.moved_served)
+        followed = ((self.follow_at is not None and at >= self.follow_at)
+                    or (self.follow_on_execution and self.moved_served))
         yes_bid, no_bid = (0.70, 0.28) if followed else (0.56, 0.42)
         if ticker == DAL:
             yes_bid, no_bid = no_bid, yes_bid
@@ -264,7 +285,13 @@ class LiveNetwork:
         return Response({"orderbook_fp": {
             "yes_dollars": [[f"{yes_bid - 0.02:.4f}", "40.00"],
                             [f"{yes_bid:.4f}", "100.00"]],
-            "no_dollars": [[f"{no_bid:.4f}", "150.00"]]}})
+            "no_dollars": [[f"{no_bid:.4f}", "150.00"]]}},
+            on_read=lambda: self._book_body(ticker))
+
+    def _book_body(self, ticker):
+        if self.book_body_delay:
+            self.clock.t += self.book_body_delay
+        self.book_bodies_done.append((ticker, self.clock.t))
 
 
 class MonitorHarness(unittest.TestCase):
@@ -315,6 +342,36 @@ class PlanFirstTest(MonitorHarness):
         self.assertIn("31 poll(s), 31 credit(s)", text)
         self.assertIn(f"--spend {PRICE}", text)
         self.assertFalse(list(self.tmp.glob("*.jsonl")))
+
+    def test_the_plan_reads_one_real_book_for_free(self):
+        """The book's shape is transcribed. The plan -- free -- reads one
+        real book through the preflight's own reader, so the shape can be
+        checked without buying anything."""
+        code, text, net = self.run_monitor()
+        self.assertEqual(code, 0, text)
+        self.assertEqual(net.odds_calls, [])
+        self.assertEqual(len(net.book_calls), 1)
+        self.assertIn("the transcribed shape parses", text)
+
+    def test_a_book_the_parser_refuses_fails_the_plan(self):
+        code, text, net = self.run_monitor(book_shape_ok=False)
+        self.assertEqual(code, 1, text)
+        self.assertEqual(net.odds_calls, [])
+        self.assertIn("could not be read", text)
+        self.assertIn("Nothing was spent", text)
+
+    def test_a_paid_session_reads_the_shape_once_in_its_preflight(self):
+        """Not twice: the plan's read is for a plan; a session's preflight
+        is the one that stops it."""
+        code, text, net = self.paid()
+        self.assertEqual(code, 0, text)
+        shape = self.kinds(self.records(), "shape_check")
+        self.assertEqual(len(shape), 1)
+        first_odds = net.odds_calls[0]
+        # The preflight's read and nothing else: the plan's own read is not
+        # repeated, and the first tick has joined nothing yet to read.
+        self.assertEqual(sum(1 for _, at in net.book_calls if at < first_odds),
+                         1)
 
     def test_a_spend_below_the_price_is_refused(self):
         code, text, net = self.run_monitor("--spend", str(PRICE - 1),
@@ -431,7 +488,8 @@ class SessionTest(MonitorHarness):
         followed = [r for r in figures["responses"] if r["ticker"] == NYG]
         self.assertEqual(len(followed), 1)
         low, high = followed[0]["lag_seconds"]
-        self.assertEqual(followed[0]["outcome"], "followed")
+        self.assertEqual(followed[0]["outcome"], "responded")
+        self.assertFalse(followed[0]["session_ended_inside_window"] is None)
         # Kalshi moved at 20:08:00, 179.4s after the 20:05:00.6 detection.
         self.assertLessEqual(low, 179.4)
         self.assertGreaterEqual(high, 179.4)
@@ -655,6 +713,97 @@ class HonestyTest(MonitorHarness):
         self.assertGreater(self.end(rows)["counts"]["in_play_skipped"], 0)
 
 
+class ReceiptClockTest(MonitorHarness):
+    """A move is dated by when its answer was usable, never before.
+
+    Three clocks per poll: the headers arriving, the whole body arriving,
+    and the body read and parsed. The first used to be the only one: the
+    receipt was stamped when `urlopen` returned, before the body was read,
+    so a body that took eight seconds was credited to us eight seconds
+    early -- and every lag measured from that instant ran eight seconds
+    long, as time a bot could have traded in.
+    """
+
+    BODY = timedelta(seconds=8)
+
+    def carrying(self, net):
+        """The odds call that first served the move, and when its body was
+        all in."""
+        index = next(i for i, at in enumerate(net.odds_calls) if at >= MOVE_AT)
+        return net.odds_calls[index], net.odds_bodies_done[index]
+
+    def test_a_move_is_dated_after_its_body_has_arrived(self):
+        code, text, net = self.paid(odds_body_delay=self.BODY)
+        self.assertEqual(code, 0, text)
+        rows = self.records()
+        _, done = self.carrying(net)
+        trigger = self.kinds(rows, "trigger")[0]
+        self.assertGreaterEqual(datetime.fromisoformat(trigger["detected_at"]),
+                                done)
+        for decision in self.kinds(rows, "decision"):
+            if decision.get("decision_at"):
+                self.assertGreaterEqual(
+                    datetime.fromisoformat(decision["decision_at"]), done)
+        poll = next(r for r in self.kinds(rows, "odds")
+                    if datetime.fromisoformat(r["received_at"]) == done)
+        headers = datetime.fromisoformat(poll["headers_at"])
+        self.assertGreaterEqual(done - headers, self.BODY)
+        self.assertLessEqual(done, datetime.fromisoformat(poll["ready_at"]))
+
+    def test_a_slow_body_is_not_clock_skew(self):
+        """`Date` marks the response STARTING, so skew is measured against
+        the headers. Against the finished body, eight seconds of transfer
+        would read as a clock eight seconds off and stop the session."""
+        code, text, _ = self.paid(odds_body_delay=self.BODY)
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.end(self.records())["reason"], "end_of_session")
+
+    def test_processing_is_recorded_and_not_credited(self):
+        """Two seconds spent reading the answer: the move is dated after
+        them, and they are recorded as processing."""
+        real = shadow_monitor.parse_snapshot
+
+        def slow(body):
+            self.clock.t += timedelta(seconds=2)
+            return real(body)
+
+        with mock.patch.object(shadow_monitor, "parse_snapshot",
+                               side_effect=slow):
+            code, text, net = self.paid()
+        self.assertEqual(code, 0, text)
+        rows = self.records()
+        trigger = self.kinds(rows, "trigger")[0]
+        detected = datetime.fromisoformat(trigger["detected_at"])
+        poll = next(r for r in self.kinds(rows, "odds")
+                    if datetime.fromisoformat(r["ready_at"]) == detected)
+        self.assertEqual(poll["processing_seconds"], 2.0)
+        received = datetime.fromisoformat(poll["received_at"])
+        self.assertEqual(detected - received, timedelta(seconds=2))
+        after = trigger["after"]
+        self.assertEqual(datetime.fromisoformat(after["response_received_at"]),
+                         received)
+        self.assertEqual(datetime.fromisoformat(after["local_receipt_time"]),
+                         detected)
+        figures = shadow_monitor.report(rows)
+        self.assertIn("median 2.0s", figures["polls"]["processing"])
+
+    def test_a_slow_book_read_is_dated_by_its_completion(self):
+        """The execution book is the book when its answer was complete; the
+        entry delay runs to there."""
+        code, text, net = self.paid(book_body_delay=timedelta(seconds=3))
+        self.assertEqual(code, 0, text)
+        rows = self.records()
+        executions = [b for b in self.kinds(rows, "book")
+                      if b["purpose"] == "execution"]
+        self.assertTrue(executions)
+        for book in executions:
+            sent = datetime.fromisoformat(book["sent_at"])
+            received = datetime.fromisoformat(book["received_at"])
+            self.assertGreaterEqual(received - sent, timedelta(seconds=3))
+        entered = [d for d in self.kinds(rows, "decision") if d["entered"]]
+        self.assertGreaterEqual(entered[0]["entry_delay_seconds"], 3.0)
+
+
 class LongSessionTest(MonitorHarness):
     """What a session left running for days must not do."""
 
@@ -807,8 +956,128 @@ class ReportTest(MonitorHarness):
         rows = self.records()
         figures = shadow_monitor.report(rows, window=timedelta(seconds=60))
         nyg = [r for r in figures["responses"] if r["ticker"] == NYG][0]
-        self.assertEqual(nyg["outcome"], "not_followed_within_window")
+        self.assertEqual(nyg["outcome"], "no_response_in_window")
         self.assertGreater(nyg["reads_in_window"], 0)
+        self.assertFalse(nyg["session_ended_inside_window"])
+
+
+class ResponseCoverageTest(MonitorHarness):
+    """What the report may call Kalshi's response, and what it may not.
+
+    The report is the replay's own `measure_response` over the session's
+    reads. A response is `responded` only when it is located entirely after
+    the move was actionable; a window is `no_response_in_window` only when
+    the reads covered it to its end. Everything short of that says why.
+    """
+
+    def responses(self, rows, **overrides):
+        figures = shadow_monitor.report(rows, **overrides)
+        return {r["ticker"]: r for r in figures["responses"]}, figures
+
+    def test_a_window_watched_to_its_end_without_a_move(self):
+        """The successful non-response: reads every 10s to the window's end."""
+        code, text, _ = self.paid(follow_at=None)
+        self.assertEqual(code, 0, text)
+        rows = self.records()
+        by, _ = self.responses(rows, window=timedelta(minutes=5))
+        self.assertEqual(by[NYG]["outcome"], "no_response_in_window")
+        self.assertFalse(by[NYG]["session_ended_inside_window"])
+        self.assertEqual(by[NYG]["unreadable_in_window"], 0)
+
+    def test_a_window_the_session_ended_inside_is_censored_not_quiet(self):
+        """The move at 20:05 has a window to 20:35; the session ends at
+        20:30. Five minutes nobody watched is not five minutes of nothing."""
+        code, text, _ = self.paid(follow_at=None)
+        self.assertEqual(code, 0, text)
+        rows = self.records()
+        by, figures = self.responses(rows)
+        self.assertEqual(by[NYG]["outcome"], "blind_interval")
+        self.assertTrue(by[NYG]["session_ended_inside_window"])
+        self.assertIn("outlived the session",
+                      shadow_monitor.render_report(figures))
+
+    def test_an_interrupted_session_is_censored_not_quiet(self):
+        code, text, _ = self.paid(follow_at=None, interrupt_on_poll=8)
+        self.assertEqual(code, 1, text)
+        rows = self.records()
+        self.assertEqual(self.end(rows)["reason"], "interrupted")
+        by, _ = self.responses(rows, window=timedelta(minutes=5))
+        self.assertEqual(by[NYG]["outcome"], "blind_interval")
+        self.assertTrue(by[NYG]["session_ended_inside_window"])
+
+    def test_failed_reads_inside_the_window_leave_a_hole(self):
+        """A minute of follow reads lost: the window was not watched."""
+        window = (MOVE_AT + timedelta(seconds=60),
+                  MOVE_AT + timedelta(seconds=120))
+        code, text, _ = self.paid(follow_at=None, fail_books_during=window)
+        self.assertEqual(code, 0, text)
+        by, figures = self.responses(self.records(),
+                                     window=timedelta(minutes=5))
+        self.assertEqual(by[NYG]["outcome"], "blind_interval")
+        self.assertGreater(by[NYG]["unreadable_in_window"], 0)
+        self.assertIn("gave no usable book",
+                      shadow_monitor.render_report(figures))
+
+    def test_a_slow_read_widens_the_response_to_its_request(self):
+        """Each book takes three seconds to answer. The change is bracketed
+        from the REQUEST of the last read that did not show it: the book it
+        reported may be from anywhere after that request went out."""
+        code, text, _ = self.paid(book_body_delay=timedelta(seconds=3))
+        self.assertEqual(code, 0, text)
+        rows = self.records()
+        by, _ = self.responses(rows)
+        low, high = by[NYG]["lag_seconds"]
+        detected = datetime.fromisoformat(by[NYG]["decision_at"])
+        reads = [b for b in self.kinds(rows, "book") if b["ticker"] == NYG
+                 and datetime.fromisoformat(b["received_at"]) > detected]
+        # The first read whose book shows Kalshi's new price (a 0.70 bid).
+        changed = next(i for i, b in enumerate(reads) if b["payload"]
+                       and b["payload"]["orderbook_fp"]["yes_dollars"][-1][0]
+                       == "0.7000")
+        before = reads[changed - 1]
+        self.assertAlmostEqual(
+            low, (datetime.fromisoformat(before["sent_at"])
+                  - detected).total_seconds(), places=6)
+        self.assertAlmostEqual(
+            high, (datetime.fromisoformat(reads[changed]["received_at"])
+                   - detected).total_seconds(), places=6)
+
+    def test_the_session_is_judged_by_the_limit_it_recorded(self):
+        """The same lost minute, under a session that declared it could go
+        200s unseen: then it is inside the limit, and the window was watched.
+        A report must use the policy the session ran with, not today's."""
+        window = (MOVE_AT + timedelta(seconds=60),
+                  MOVE_AT + timedelta(seconds=120))
+        self.paid(follow_at=None, fail_books_during=window)
+        rows = self.records()
+        start = self.kinds(rows, "session_start")[0]
+        self.assertEqual(
+            start["reaction_policy"]["max_unobserved_seconds"],
+            shadow_monitor.MAX_UNOBSERVED.total_seconds())
+        start["reaction_policy"]["max_unobserved_seconds"] = 200.0
+        by, _ = self.responses(rows, window=timedelta(minutes=5))
+        self.assertEqual(by[NYG]["outcome"], "no_response_in_window")
+
+    def test_kalshi_moving_before_the_move_was_actionable_is_already_priced(
+            self):
+        """Kalshi re-prices at 20:03, two minutes before the sharp move
+        reached us: the decision books already show it."""
+        code, text, _ = self.paid(follow_at=MOVE_AT - timedelta(minutes=2))
+        self.assertEqual(code, 0, text)
+        by, _ = self.responses(self.records())
+        self.assertEqual(by[NYG]["outcome"], "exchange_moved_before_trigger")
+
+    def test_a_change_first_seen_after_detection_is_not_a_reaction(self):
+        """Kalshi re-prices as the move is served: after the decision read,
+        before we could act, first seen on the execution read. Clamped, that
+        read as a follow within a second."""
+        code, text, _ = self.paid(follow_on_execution=True)
+        self.assertEqual(code, 0, text)
+        by, figures = self.responses(self.records())
+        self.assertEqual(by[NYG]["outcome"], "moved_around_trigger")
+        low, high = by[NYG]["lag_seconds"]
+        self.assertLess(low, 0)
+        self.assertGreater(high, 0)
 
 
 class LiveOddsUrlTest(unittest.TestCase):
@@ -832,6 +1101,28 @@ class LiveOddsUrlTest(unittest.TestCase):
             build_snapshot_url("NFL", T0, KEY)).query)
         for field in ("bookmakers", "markets", "oddsFormat"):
             self.assertEqual(live[field], archive[field], field)
+
+
+class LiveFetchClockTest(unittest.TestCase):
+    """`fetch_live_odds` keeps the request's clocks apart."""
+
+    def test_the_receipt_waits_for_the_body(self):
+        from data import odds_live
+        clock = FakeClock()
+
+        def slow():
+            clock.t += timedelta(seconds=8)
+
+        headers = {"Date": email.utils.format_datetime(T0, usegmt=True),
+                   "x-requests-last": "1"}
+        response = Response([], headers, on_read=slow)
+        with mock.patch("urllib.request.urlopen", return_value=response):
+            live = odds_live.fetch_live_odds(
+                "NFL", KEY, ledger=CreditLedger(cap=1), now=clock.now)
+        self.assertTrue(live.ok, live.coverage.reasons)
+        self.assertLessEqual(live.sent_at, live.headers_at)
+        self.assertEqual(live.received_at - live.headers_at,
+                         timedelta(seconds=8))
 
 
 class OrderBookParserTest(unittest.TestCase):

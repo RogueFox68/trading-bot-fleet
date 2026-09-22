@@ -17,6 +17,19 @@ provider's own charge in `x-requests-last`; the shadow monitor compares it to
 `CREDITS_PER_LIVE_CALL` on the first answer and stops if they disagree,
 because a cap priced at the wrong unit cost is not a cap.
 
+THREE CLOCKS PER POLL, NOT ONE
+------------------------------
+`headers_at` is when the status line and headers arrived -- the clock the
+provider's `Date` header is compared with, since both mark the response
+STARTING. `received_at` is when the whole body had arrived: nothing in a
+response can be acted on before it is complete, so this, not the headers, is
+the first instant the quotes existed for us. It used to be stamped the moment
+`urlopen` returned, before the body was read: a body that took eight seconds
+to arrive was credited to us eight seconds early, and every opportunity
+measured from it was eight seconds longer than it was. What the monitor then
+does with the body -- decoding, parsing -- ends at its own `ready_at`, which
+is what a decision is dated by.
+
 ONE ATTEMPT PER CALL
 --------------------
 The archive fetcher retries three times, because a missed snapshot is a hole
@@ -105,7 +118,8 @@ class LiveOdds:
     """One live poll: the raw body and every clock around it."""
 
     sent_at: datetime
-    received_at: datetime | None = None
+    headers_at: datetime | None = None        # status and headers arrived
+    received_at: datetime | None = None       # the WHOLE body had arrived
     payload: Any = None
     provider_date: datetime | None = None     # the provider's `Date` header
     charged: int | None = None                # `x-requests-last`
@@ -150,7 +164,7 @@ def fetch_live_odds(sport: str, api_key: str, *, ledger: CreditLedger,
         request = urllib.request.Request(url,
                                          headers={"Accept": "application/json"})
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
-            result.received_at = now()
+            result.headers_at = now()
             headers = resp.headers
             ledger.observe(headers)
             result.status = getattr(resp, "status", None)
@@ -159,9 +173,13 @@ def fetch_live_odds(sport: str, api_key: str, *, ledger: CreditLedger,
             result.used = _header_int(headers, "x-requests-used")
             result.remaining = _header_int(headers, "x-requests-remaining")
             if result.status not in (None, 200):
+                result.received_at = now()
                 result.coverage.fail(f"HTTP {result.status}")
                 return result
-            payload = json.loads(resp.read().decode("utf-8"))
+            body = resp.read()
+            # Not before: a response is not in hand until all of it is.
+            result.received_at = now()
+        payload = json.loads(body.decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError,
             OSError, ValueError) as exc:
         result.received_at = result.received_at or now()

@@ -54,6 +54,27 @@ rather than as a quietly different result.
 verifies the cadence contract against the live API. It defaults to False and
 the verification command is in `capability.free_verification_commands`.
 
+A READING DESCRIBES AN INTERVAL, NOT AN INSTANT
+-----------------------------------------------
+A candle's close is an instant. A live read of the order book is not: the
+exchange answered somewhere between our request leaving and its answer
+arriving, and the book it reports may be from anywhere inside that. So every
+reading carries a SPAN -- `(sent_at, ts)`, or `(ts, ts)` for a candle -- and a
+change between two readings is bracketed from the earliest the first can
+describe to the latest the second can. Read as its receipt alone, a slow
+request would place a change later than it can be shown to be.
+
+A RESPONSE AROUND THE TRIGGER IS NOT A DEMONSTRATED ONE
+-------------------------------------------------------
+The lag's lower end used to be clamped at zero ("a candle period straddling
+the trigger cannot imply a negative wait"). That clamp was the defect: when
+the bracket straddles the instant we could act, the exchange may have moved
+BEFORE it, and clamping the negative half away turned "moved somewhere
+between a minute before and a minute after" into "followed within a
+minute". Such a response is `MOVED_AROUND_TRIGGER`: neither a reaction we
+could have traded ahead of nor demonstrated pre-pricing. Only a bracket that
+opens at or after the trigger is `RESPONDED`.
+
 DIRECTION IS PART OF THE DEFINITION
 -----------------------------------
 A reaction is the exchange moving the SAME WAY as the book. An exchange price
@@ -98,6 +119,7 @@ class ReactionOutcome(str, Enum):
     """
 
     RESPONDED = "responded"                      # moved the same way, in window
+    AROUND_TRIGGER = "moved_around_trigger"      # ...located only across the trigger
     ALREADY_PRICED = "exchange_moved_before_trigger"   # nothing left to react to
     OPPOSITE_DIRECTION = "opposite_direction"    # moved AGAINST the book
     NO_RESPONSE = "no_response_in_window"        # right-censored at max_wait
@@ -138,6 +160,11 @@ class ReactionPolicy:
                       conservative reading; flip it only against a verified
                       cadence contract, and the flip is recorded on the
                       output.
+      max_unobserved  None = one candle period. The longest stretch the
+                      book may go unseen between two readings before it is a
+                      HOLE. A source read on its own schedule -- the shadow
+                      monitor's polls -- declares its own, and the value in
+                      force is recorded on every output.
     """
 
     min_response: float = 0.01
@@ -146,6 +173,7 @@ class ReactionPolicy:
     candle_period: timedelta = CANDLE_PERIOD
     require_direction: bool = True
     treat_missing_candles_as_unchanged: bool = False
+    max_unobserved: timedelta | None = None
     label: str = "exploratory-v1"
 
     def __post_init__(self) -> None:
@@ -157,6 +185,16 @@ class ReactionPolicy:
             if not isinstance(value, timedelta) or value <= timedelta(0):
                 raise ValueError(f"{name} must be a positive timedelta, "
                                  f"got {value!r}")
+        if self.max_unobserved is not None and (
+                not isinstance(self.max_unobserved, timedelta)
+                or self.max_unobserved <= timedelta(0)):
+            raise ValueError(f"max_unobserved must be a positive timedelta "
+                             f"or None, got {self.max_unobserved!r}")
+
+    @property
+    def unobserved_limit(self) -> timedelta:
+        """The hole threshold actually in force."""
+        return self.max_unobserved or self.candle_period
 
     @property
     def max_reportable_lag_seconds(self) -> float:
@@ -185,6 +223,7 @@ class ReactionPolicy:
             "max_reportable_lag_seconds": self.max_reportable_lag_seconds,
             "lookback_seconds": self.lookback.total_seconds(),
             "candle_period_seconds": self.candle_period.total_seconds(),
+            "max_unobserved_seconds": self.unobserved_limit.total_seconds(),
             "require_direction": self.require_direction,
             "treat_missing_candles_as_unchanged":
                 self.treat_missing_candles_as_unchanged,
@@ -461,21 +500,47 @@ def usable_candle(candle) -> bool:
             and not getattr(candle, "has_malformed_price", False))
 
 
-def _first_hole(timestamps: Sequence[datetime], start: datetime,
-                end: datetime, period: timedelta
-                ) -> tuple[datetime, datetime] | None:
-    """The first interval inside `(start, end]` with no usable candle.
+def reading_span(reading) -> tuple[datetime, datetime]:
+    """The interval a reading can describe the book in: `(earliest, latest)`.
 
-    Includes the leading edge: if the first usable candle after `start` is
-    more than one period later, the hole starts at `start`.
+    A candle's close is an exact instant (`ts`). A live order-book read is
+    known only to describe the book somewhere between our request leaving
+    (`sent_at`) and its answer arriving (`ts`, the receipt). PUBLIC, because
+    the shadow monitor's report reads its books through it.
     """
-    inside = [ts for ts in sorted(timestamps) if start < ts <= end]
-    cursor = start
-    for ts in inside:
-        if ts - cursor > period:
-            return cursor, ts
-        cursor = ts
-    if end - cursor > period:
+    latest = reading.ts
+    sent = getattr(reading, "sent_at", None)
+    return (sent if sent is not None and sent <= latest else latest), latest
+
+
+def _change_bracket(before, after) -> Bracket:
+    """Where a value that differs between two consecutive readings changed:
+    after the earliest instant the first can describe, and at or before the
+    latest the second can. For consecutive one-minute candles this is the
+    candle period; for live reads it is widened by each request's own
+    duration, so a slow read cannot place a change later than it can be
+    shown to be."""
+    return Bracket(earliest=reading_span(before)[0],
+                   latest=reading_span(after)[1])
+
+
+def _first_hole(start, readings: Sequence, end: datetime | None,
+                limit: timedelta) -> tuple[datetime, datetime] | None:
+    """The first stretch after `start` that no reading can vouch for.
+
+    Between two consecutive readings the book went unseen for at most the
+    time from the earliest instant the first can describe to the latest the
+    second can; a stretch longer than `limit` is a hole. `readings` follow
+    `start`, in order. With `end`, the trailing edge up to it counts too:
+    a window no reading reaches the end of was not watched to its end.
+    """
+    cursor = reading_span(start)[0]
+    for reading in readings:
+        earliest, latest = reading_span(reading)
+        if latest - cursor > limit:
+            return cursor, latest
+        cursor = earliest
+    if end is not None and end - cursor > limit:
         return cursor, end
     return None
 
@@ -490,14 +555,34 @@ def measure_reaction(trigger: MoveTrigger, candles: Iterable,
     measurement that ignored the orientation would score half its reactions
     as divergences.
     """
-    policy = policy or ReactionPolicy()
-    book_bracket = Bracket(trigger.book_change_earliest,
-                           trigger.book_change_latest)
-    base = dict(event_id=trigger.event_id, stream_id=trigger.stream_id,
-                market_ticker=market_ticker, policy=policy,
-                detected_at=trigger.detected_at, book_change=book_bracket)
+    return measure_response(
+        event_id=trigger.event_id, stream_id=trigger.stream_id,
+        market_ticker=market_ticker, detected_at=trigger.detected_at,
+        book_delta=trigger.delta_for(participant_is_home=yes_is_home),
+        book_change=Bracket(trigger.book_change_earliest,
+                            trigger.book_change_latest),
+        readings=candles, policy=policy)
 
-    decided_at = trigger.detected_at
+
+def measure_response(*, event_id: str, stream_id: str, market_ticker: str,
+                     detected_at: datetime | None, book_delta: float,
+                     book_change: Bracket, readings: Iterable,
+                     policy: ReactionPolicy | None = None) -> Reaction:
+    """The exchange's response to one book move, from any readings of it.
+
+    A reading has a `ts`, a `mid` and the malformed-price flag -- a candle,
+    or a live order-book read that also carries its `sent_at`. The replay
+    passes candles and the shadow monitor passes its reads, so the two are
+    measured by one rule rather than two that drift (rule 19).
+    `book_delta` is already oriented to the contract's YES side.
+    """
+    policy = policy or ReactionPolicy()
+    base = dict(event_id=event_id, stream_id=stream_id,
+                market_ticker=market_ticker, policy=policy,
+                detected_at=detected_at, book_change=book_change)
+    book_bracket = book_change
+
+    decided_at = detected_at
     if decided_at is None:
         return Reaction(outcome=ReactionOutcome.NO_TRIGGER_CLOCK,
                         ordering=Ordering.UNKNOWN,
@@ -505,14 +590,14 @@ def measure_reaction(trigger: MoveTrigger, candles: Iterable,
                         detail="the trigger carries no executable clock",
                         **base)
 
-    book_delta = trigger.delta_for(participant_is_home=yes_is_home)
-    usable = sorted((c for c in candles if usable_candle(c)),
-                    key=lambda c: c.ts)
+    usable = sorted((r for r in readings if usable_candle(r)),
+                    key=lambda r: (r.ts, reading_span(r)[0]))
 
     # THE BASELINE. The exchange price we could have seen at the instant the
     # book move became known to us. Strictly at or before; a candle closing
-    # after the trigger reports a period that includes post-trigger activity.
-    before = [c for c in usable if c.ts <= decided_at]
+    # after the trigger reports a period that includes post-trigger activity,
+    # and a read still in flight at the trigger answered after it.
+    before = [r for r in usable if r.ts <= decided_at]
     if not before:
         return Reaction(outcome=ReactionOutcome.NO_BASELINE,
                         ordering=Ordering.UNKNOWN,
@@ -540,49 +625,52 @@ def measure_reaction(trigger: MoveTrigger, candles: Iterable,
     # That is not the same as the exchange leading the book, and reporting
     # outcome and ordering separately is what keeps them apart.
     lookback_start = decided_at - policy.lookback
-    prior = [c for c in before if c.ts > lookback_start]
+    prior = [r for r in before if r.ts > lookback_start]
     if len(prior) >= 2:
         pre = prior[0]
-        for candle in prior[1:]:
-            delta = candle.mid - pre.mid
+        for previous, reading in zip(prior, prior[1:]):
+            delta = reading.mid - pre.mid
             if abs(delta) < policy.min_response:
                 continue
             if (delta > 0) != (book_delta > 0):
                 # A prior move the OTHER way is not pre-pricing. It leaves the
                 # discrepancy wider, not narrower.
                 continue
-            exchange_bracket = candle_bracket(candle.ts, policy.candle_period)
+            exchange_bracket = _change_bracket(previous, reading)
             return Reaction(
                 outcome=ReactionOutcome.ALREADY_PRICED,
                 ordering=order_brackets(book_bracket, exchange_bracket),
                 exchange_change=exchange_bracket,
                 book_delta=book_delta, exchange_before=pre.mid,
-                exchange_after=candle.mid, exchange_delta=delta,
+                exchange_after=reading.mid, exchange_delta=delta,
                 detail=(f"the exchange moved {delta:+.4f} the book's way "
-                        f"{(decided_at - candle.ts).total_seconds():.0f}s "
+                        f"{(decided_at - reading.ts).total_seconds():.0f}s "
                         f"BEFORE the book move became actionable to us: there "
                         f"was no discrepancy left to trade"),
                 **base)
 
     deadline = decided_at + policy.max_wait
+    limit = policy.unobserved_limit
 
-    # THE SEARCH. First candle inside the window whose mid has moved far
+    # THE SEARCH. First reading inside the window whose mid has moved far
     # enough. Direction is checked against the book's oriented delta.
-    window = [c for c in usable if decided_at < c.ts <= deadline]
-    for candle in window:
-        delta = candle.mid - baseline.mid
+    window = [r for r in usable
+              if r.ts > decided_at and reading_span(r)[0] <= deadline]
+    previous = baseline
+    for index, reading in enumerate(window):
+        delta = reading.mid - baseline.mid
         if abs(delta) < policy.min_response:
+            previous = reading
             continue
+        exchange_bracket = _change_bracket(previous, reading)
         aligned = (delta > 0) == (book_delta > 0)
         if policy.require_direction and not aligned:
             return Reaction(
                 outcome=ReactionOutcome.OPPOSITE_DIRECTION,
-                ordering=order_brackets(
-                    book_bracket, candle_bracket(candle.ts,
-                                                 policy.candle_period)),
-                exchange_change=candle_bracket(candle.ts, policy.candle_period),
+                ordering=order_brackets(book_bracket, exchange_bracket),
+                exchange_change=exchange_bracket,
                 book_delta=book_delta, exchange_before=baseline.mid,
-                exchange_after=candle.mid, exchange_delta=delta,
+                exchange_after=reading.mid, exchange_delta=delta,
                 detail=(f"exchange moved {delta:+.4f} against a book move of "
                         f"{book_delta:+.4f}: a divergence, not a reaction"),
                 **base)
@@ -593,46 +681,52 @@ def measure_reaction(trigger: MoveTrigger, candles: Iterable,
         # lag.
         hole = None
         if not policy.treat_missing_candles_as_unchanged:
-            hole = _first_hole([c.ts for c in usable], baseline.ts, candle.ts,
-                               policy.candle_period)
+            hole = _first_hole(baseline, window[:index + 1], None, limit)
         if hole:
             return Reaction(
                 outcome=ReactionOutcome.BLIND_INTERVAL,
                 ordering=Ordering.UNKNOWN,
                 exchange_change=Bracket(None, None),
                 book_delta=book_delta, exchange_before=baseline.mid,
-                exchange_after=candle.mid, exchange_delta=delta,
+                exchange_after=reading.mid, exchange_delta=delta,
                 blind_from=hole[0], blind_to=hole[1],
                 detail=(f"the exchange moved, but a "
                         f"{(hole[1] - hole[0]).total_seconds():.0f}s hole in "
-                        f"the candle series precedes it: the response may have "
+                        f"its readings precedes it: the response may have "
                         f"happened inside the hole, so the lag is not bounded"),
                 **base)
 
-        exchange_bracket = candle_bracket(candle.ts, policy.candle_period)
         # The lag runs from when WE could have known the book moved to when
-        # the exchange's new price came into being -- an interval, because the
-        # candle only locates that within its own period. Clamped at zero: a
-        # candle period straddling the trigger cannot imply a negative wait.
-        earliest = max(0.0,
-                       (exchange_bracket.earliest - decided_at).total_seconds())
+        # the exchange's new price came into being -- an interval, located
+        # only between the last reading that did not show it and the first
+        # that did. NOT clamped: if that interval opens before the trigger,
+        # the exchange may have moved before we could act, and that is a
+        # different finding from a reaction.
+        earliest = (exchange_bracket.earliest - decided_at).total_seconds()
         latest = (exchange_bracket.latest - decided_at).total_seconds()
-        return Reaction(
-            outcome=ReactionOutcome.RESPONDED,
-            ordering=order_brackets(book_bracket, exchange_bracket),
-            exchange_change=exchange_bracket,
-            lag_earliest_seconds=earliest, lag_latest_seconds=latest,
-            book_delta=book_delta, exchange_before=baseline.mid,
-            exchange_after=candle.mid, exchange_delta=delta,
-            **base)
+        found = dict(ordering=order_brackets(book_bracket, exchange_bracket),
+                     exchange_change=exchange_bracket,
+                     lag_earliest_seconds=earliest,
+                     lag_latest_seconds=latest,
+                     book_delta=book_delta, exchange_before=baseline.mid,
+                     exchange_after=reading.mid, exchange_delta=delta)
+        if earliest < 0:
+            return Reaction(
+                outcome=ReactionOutcome.AROUND_TRIGGER,
+                detail=(f"the exchange moved {delta:+.4f} the book's way "
+                        f"somewhere from {earliest:+.0f}s to {latest:+.0f}s "
+                        f"of the trigger: that interval contains the instant "
+                        f"we could act, so it may have moved first -- not a "
+                        f"demonstrated reaction"),
+                **found, **base)
+        return Reaction(outcome=ReactionOutcome.RESPONDED, **found, **base)
 
     # NOTHING CLEARED THE THRESHOLD. Before calling that a non-response, ask
     # whether we could actually see the whole window: a hole means we could
     # not, and "no response" would be a claim about data we do not have.
     hole = None
     if not policy.treat_missing_candles_as_unchanged:
-        hole = _first_hole([c.ts for c in usable], baseline.ts, deadline,
-                           policy.candle_period)
+        hole = _first_hole(baseline, window, deadline, limit)
     if hole:
         return Reaction(
             outcome=ReactionOutcome.BLIND_INTERVAL,
@@ -642,8 +736,8 @@ def measure_reaction(trigger: MoveTrigger, candles: Iterable,
             blind_from=hole[0], blind_to=hole[1],
             detail=(f"no qualifying move found, but a "
                     f"{(hole[1] - hole[0]).total_seconds():.0f}s hole in the "
-                    f"candle series falls inside the window: this is not "
-                    f"evidence of no response"),
+                    f"exchange's readings falls inside the window: this is "
+                    f"not evidence of no response"),
             **base)
     return Reaction(
         outcome=ReactionOutcome.NO_RESPONSE,

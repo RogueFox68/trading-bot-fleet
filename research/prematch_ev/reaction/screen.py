@@ -103,9 +103,11 @@ class ScreenRefusal(str, Enum):
 # Reaction outcomes that can be screened at all. `ALREADY_PRICED` is
 # deliberately screenable: the exchange having moved first does not make the
 # observation unreal, it makes its EV small, and dropping it would remove
-# exactly the rows that falsify the thesis from the denominator.
+# exactly the rows that falsify the thesis from the denominator. The same goes
+# for `AROUND_TRIGGER`, a response that may have come first.
 SCREENABLE = frozenset({
     ReactionOutcome.RESPONDED,
+    ReactionOutcome.AROUND_TRIGGER,
     ReactionOutcome.NO_RESPONSE,
     ReactionOutcome.BLIND_INTERVAL,
     ReactionOutcome.OPPOSITE_DIRECTION,

@@ -160,6 +160,12 @@ def clock_order_problem(envelope: "SourceEnvelope",
             and envelope.response_received_at + tolerance
             < envelope.request_sent_at):
         return "response_received_at precedes request_sent_at"
+    # Both of these are OUR clock, so no skew allowance: acting on a response
+    # before the whole of it has arrived is impossible, not imprecise.
+    if (receipt is not None and envelope.response_received_at is not None
+            and receipt < envelope.response_received_at):
+        return ("local_receipt_time precedes response_received_at: a record "
+                "cannot be acted on before its response has fully arrived")
     return None
 
 
@@ -514,32 +520,38 @@ LIVE_SHARP_SOURCE = "the_odds_api_live"
 
 def envelope_for_live_sharp_quote(quote: Any, *, received_at: datetime,
                                   sent_at: datetime | None = None,
+                                  ready_at: datetime | None = None,
                                   request_url: str = "",
                                   resolution_seconds: float | None = None,
                                   sequence: int | None = None
                                   ) -> SourceEnvelope:
-    """Wrap a quote from a LIVE poll. The executable clock is OUR RECEIPT.
+    """Wrap a quote from a LIVE poll. The executable clock is OUR READINESS.
 
     `quote.snapshot` is the provider's own clock for the response (its HTTP
     `Date`) when it sent one; `last_update` is still the provider's
-    observation, never the book's change. `received_at` is when we had it,
-    which is the first instant a live system could act -- the clock the
-    archive can only assume. `resolution_seconds` is the POLL cadence: the
-    archive's five-minute grid does not describe a live poll, and borrowing
-    it would understate what the live feed can resolve.
+    observation, never the book's change. `received_at` is when the WHOLE
+    response had arrived, and `ready_at` when it had been read and parsed:
+    the first instant a live system could act on it -- the clock the archive
+    can only assume. They are kept apart (`response_received_at` and
+    `local_receipt_time`), so the time spent on the body is recorded as a
+    delay rather than credited as time available to trade. Without
+    `ready_at` the receipt is both. `resolution_seconds` is the POLL cadence:
+    the archive's five-minute grid does not describe a live poll, and
+    borrowing it would understate what the live feed can resolve.
     """
     return _sharp_envelope(
         quote, source=LIVE_SHARP_SOURCE, origin=Origin.LIVE_CAPTURE,
         request_url=request_url, sequence=sequence,
         resolution_seconds=resolution_seconds, received_at=received_at,
-        sent_at=sent_at)
+        sent_at=sent_at, ready_at=ready_at)
 
 
 def _sharp_envelope(quote: Any, *, source: str, origin: Origin,
                     request_url: str, sequence: int | None,
                     resolution_seconds: float | None,
                     received_at: datetime | None = None,
-                    sent_at: datetime | None = None) -> SourceEnvelope:
+                    sent_at: datetime | None = None,
+                    ready_at: datetime | None = None) -> SourceEnvelope:
     """The one body both sharp-quote envelopes are built from, so live and
     archived quotes cannot differ in stream identity or payload hashing."""
     payload = {
@@ -573,7 +585,7 @@ def _sharp_envelope(quote: Any, *, source: str, origin: Origin,
         origin=origin,
         provider_snapshot_time=getattr(quote, "snapshot"),
         provider_observed_at=getattr(quote, "last_update", None),
-        local_receipt_time=received_at,
+        local_receipt_time=ready_at or received_at,
         request_sent_at=sent_at,
         response_received_at=received_at,
         payload=quote,
