@@ -202,7 +202,10 @@ class SupportReportTest(unittest.TestCase):
         """MLB needed AZ->ARI. An empty alias map is an unverified assumption,
         not evidence there are none -- and a missing alias shows up as a team
         contributing no data, never as an error."""
-        caveats = " ".join(support_report("NFL", "KXNFLGAME").caveats())
+        from unittest.mock import patch
+        from core.matcher import EXCHANGE_CODE_ALIASES
+        with patch.dict(EXCHANGE_CODE_ALIASES, {"NFL": {}}):
+            caveats = " ".join(support_report("NFL", "KXNFLGAME").caveats())
         self.assertIn("NO exchange-code aliases", caveats)
         self.assertIn("AZ->ARI", caveats)
 

@@ -218,7 +218,9 @@ EXCHANGE_CODE_ALIASES: dict[str, dict[str, str]] = {
     "MLB": {
         "AZ": "ARI",     # observed 2026-09-21, KXMLBGAME-26SEP152140MIAAZ
     },
-    "NFL": {},
+    "NFL": {
+        "JAC": "JAX",    # observed 2026-09-21, KXNFLGAME-26SEP13CLEJAC-JAC
+    },
 }
 
 
