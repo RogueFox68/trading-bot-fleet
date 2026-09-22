@@ -160,14 +160,38 @@ book, market), and `redact()` scrubs anything destined for a message. Only
 successful, parseable responses are stored — caching a failure would make a
 transient outage permanent on replay.
 
-**A cache key names one instant.** Its stamp is UTC, explicitly. It used to
-be the machine's local time with a literal `Z`, so on a machine observing DST
-the two instants of the autumn fall-back hour shared a key, and the second
-request silently returned the first one's snapshot (06:30Z and 07:30Z on
-2026-11-01, under US Central). An NFL Sunday straddles that change. Keys
-written before the fix are still read, except inside a fold, where they are
-ambiguous by construction; `resolve_key` is the one function both the fetch
-and `--preflight` use, so the two cannot disagree about what is cached.
+**A cache key names one instant.** Its stamp is UTC and it lives in its own
+namespace (`v2-…` in the digest and the filename). Two older schemes wrote
+unprefixed keys into one shared digest space: first the machine's LOCAL time
+with a literal `Z` — which gave the two instants of the autumn fall-back hour
+one key — and then UTC. Reading the first as a fallback for the second made
+every machine not on UTC serve one instant's snapshot for another: on a UTC-5
+clock the local key for 17:00Z *is* the UTC key for 12:00Z, and a request for
+17:00Z got the 12:00Z snapshot. Namespacing makes that impossible for new
+entries. An unprefixed entry is still read, because every one was paid for,
+but only once `answer_problem` shows its own stamps answer the request: the
+archive answers with its latest snapshot at or before the instant asked for,
+so a body answers when `timestamp <= request < next_timestamp`, or, lacking
+`next_timestamp`, when its snapshot is at most ten minutes before the
+request — closer than any two instants a legacy key can confuse. Anything
+else misses and is bought again. `resolve_key` is the one function both the
+fetch and every preflight use, so the plan and the purchase cannot disagree
+about what is cached; the collector's suite runs on a UTC-5 clock so that
+they are checked where the collision exists.
+
+**If a collector from `ac00e4c`–`e4d8bf5` ran on a machine not on UTC**, its
+cache and bundles may hold that substitution. Cache: every unprefixed `*.json`
+under the cache directory predates the namespace; the fixed code verifies each
+before serving it, so nothing must be deleted — to discard them instead,
+delete every file whose name does not start with `v2-`, and the next plan
+prices what has to be bought again. Bundles: a bundle now records the instant
+behind each snapshot (`odds_snapshot_requested_at`), and the replay refuses
+any snapshot that does not answer its instant, as a counted loss. An older
+bundle has no such list, so the replay checks its pool's order instead — the
+archive's answers never go backwards — and reports a snapshot out of order as
+a coverage failure; it cannot see a stranger at either end of the pool, so
+re-collect any bundle those revisions wrote on such a machine. Results
+replayed from one are suspect until then.
 
 **Cutoffs are not clipped to the study window.** A 00:30 UTC game at a
 60-minute lead needs the previous day's 23:30 snapshot. Widening `--from`

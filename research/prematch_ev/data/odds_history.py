@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .cache import (
-    CreditCapReached, ResponseCache, key_for, redact, resolve_key,
+    CreditCapReached, ResponseCache, key_for, parse_stamp, redact, resolve_key,
 )
 from .kalshi_history import Coverage
 
@@ -224,13 +224,9 @@ def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _parse_time(value: Any) -> datetime | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
+#: The archive's timestamp reader is the cache's, so an entry is verified
+#: with exactly the reading its snapshot is parsed with.
+_parse_time = parse_stamp
 
 
 def parse_snapshot(payload: Any, book: str = SHARP_BOOK) -> SnapshotResult:

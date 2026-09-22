@@ -617,21 +617,98 @@ class CacheKeyTimezoneTest(unittest.TestCase):
         self.assertTrue(result.coverage.complete)
         self.assertEqual(result.raw["timestamp"], "2026-09-27T17:00:00Z")
 
-    def test_inside_the_fold_an_old_entry_is_never_trusted(self):
-        """The old key there names two instants and may hold the other one.
-        A miss costs a credit; serving the wrong snapshot costs the study."""
-        from data.cache import legacy_key_for, resolve_key
-        self.assertIsNone(legacy_key_for("NFL", self.FIRST, "pinnacle", "h2h"))
-        self.assertIsNone(legacy_key_for("NFL", self.SECOND, "pinnacle", "h2h"))
+    def _interim_key(self, at):
+        """Exactly how the interim cache built its keys: a UTC stamp, in the
+        SAME unprefixed digest space as `_old_key`."""
+        from data.cache import STAMP, _digest
+        return _digest("NFL", at.astimezone(UTC).strftime(STAMP), "pinnacle",
+                       "h2h")
+
+    def test_inside_the_fold_an_old_entry_answers_only_its_own_instant(self):
+        """The old key there names two instants. Its entry is served for the
+        one its snapshot answers and refused for the other: a miss costs a
+        credit, serving the wrong snapshot costs the study."""
+        from data.cache import resolve_key
+        self.assertEqual(self._old_key(self.FIRST), self._old_key(self.SECOND))
         with tempfile.TemporaryDirectory() as d:
             cache = ResponseCache(Path(d))
             cache.put(self._old_key(self.FIRST),
                       {"timestamp": "2026-11-01T06:30:00Z", "data": []})
             self.assertEqual(
-                resolve_key(cache, "NFL", self.SECOND, "pinnacle", "h2h"),
-                key_for("NFL", self.SECOND, "pinnacle", "h2h"))
+                resolve_key(cache, "NFL", self.FIRST, "pinnacle", "h2h"),
+                self._old_key(self.FIRST))
+            second = resolve_key(cache, "NFL", self.SECOND, "pinnacle", "h2h")
+            self.assertEqual(second,
+                             key_for("NFL", self.SECOND, "pinnacle", "h2h"))
+            self.assertFalse(cache.has(second))
+
+    def test_a_utc_entry_is_never_served_for_another_instant(self):
+        """The owner's reproduction on a UTC-5 clock. An entry written for
+        12:00Z sat under the key a 17:00Z request fell back to, and was
+        served for it."""
+        from data.cache import resolve_key
+        noon = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
+        five = datetime(2026, 9, 20, 17, 0, tzinfo=UTC)
+        self.assertEqual(self._old_key(five), self._interim_key(noon),
+                         "the premise: on UTC-5 these are one key")
+        body = {"timestamp": "2026-09-20T12:00:00Z", "data": []}
+        with tempfile.TemporaryDirectory() as d:
+            cache = ResponseCache(Path(d))
+            cache.put(self._interim_key(noon), body)
+            cache.put(key_for("NFL", noon, "pinnacle", "h2h"), body)
+            key = resolve_key(cache, "NFL", five, "pinnacle", "h2h")
+            self.assertEqual(key, key_for("NFL", five, "pinnacle", "h2h"))
+            self.assertFalse(cache.has(key))
+            # and the fetch agrees: it has to buy, so a zero cap stops it
+            with self.assertRaises(CreditCapReached):
+                run_study.fetch_snapshot("NFL", five, "K",
+                                         ledger=CreditLedger(cap=0),
+                                         cache=cache)
+
+    def test_a_namespaced_key_shares_no_name_with_either_old_scheme(self):
+        """Every 15 minutes across the fall-back weekend: one key per
+        instant, and none of them a name an older scheme could have used."""
+        from data.cache import KEY_NAMESPACE
+        start = datetime(2026, 10, 31, 0, 0, tzinfo=UTC)
+        new, old = set(), set()
+        for step in range(72 * 4):
+            at = start + timedelta(minutes=15 * step)
+            key = key_for("NFL", at, "pinnacle", "h2h")
+            self.assertTrue(key.startswith(f"{KEY_NAMESPACE}-"), key)
+            new.add(key)
+            old.update({self._old_key(at), self._interim_key(at)})
+        self.assertEqual(len(new), 72 * 4, "one key per instant")
+        self.assertFalse(new & old)
+
+    def test_a_mixed_cache_serves_only_what_answers_the_request(self):
+        """A namespaced entry, an original-scheme entry holding its own
+        snapshot, and an interim entry sitting under another request's
+        fallback key -- side by side, as a real cache directory has them."""
+        from data.cache import resolve_key
+        fresh = datetime(2026, 9, 20, 17, 0, tzinfo=UTC)
+        paid_before = datetime(2026, 9, 20, 17, 5, tzinfo=UTC)
+        collides = datetime(2026, 9, 20, 22, 10, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as d:
+            cache = ResponseCache(Path(d))
+            cache.put(key_for("NFL", fresh, "pinnacle", "h2h"),
+                      {"timestamp": "2026-09-20T16:59:21Z", "data": []})
+            cache.put(self._old_key(paid_before),
+                      {"timestamp": "2026-09-20T17:04:21Z", "data": []})
+            # the interim entry for 17:10Z is under 22:10Z's local key
+            self.assertEqual(self._old_key(collides),
+                             self._interim_key(collides - timedelta(hours=5)))
+            cache.put(self._interim_key(collides - timedelta(hours=5)),
+                      {"timestamp": "2026-09-20T17:09:21Z", "data": []})
+            self.assertEqual(
+                resolve_key(cache, "NFL", fresh, "pinnacle", "h2h"),
+                key_for("NFL", fresh, "pinnacle", "h2h"))
+            self.assertEqual(
+                resolve_key(cache, "NFL", paid_before, "pinnacle", "h2h"),
+                self._old_key(paid_before))
             self.assertFalse(cache.has(
-                resolve_key(cache, "NFL", self.SECOND, "pinnacle", "h2h")))
+                resolve_key(cache, "NFL", collides, "pinnacle", "h2h")))
+            self.assertEqual((cache.hits, cache.misses), (0, 0))
+
 
     def test_resolving_a_key_moves_no_statistics(self):
         """The preflight asks this to cost a run; it must not look like one."""
@@ -665,6 +742,56 @@ class CacheKeyTimezoneTest(unittest.TestCase):
                                               ledger=CreditLedger(cap=10))
         self.assertFalse(result.coverage.complete)
         self.assertEqual(result.raw, body)
+
+
+class AnswerProblemTest(unittest.TestCase):
+    """Does a snapshot body answer a request? The archive's rule, not equality.
+
+    The archive answers with its latest snapshot AT OR BEFORE the request, so
+    a body's timestamp routinely precedes the instant asked for; demanding
+    equality would miss every legitimate entry. Shapes are the archive's
+    documented envelope (`timestamp`, `next_timestamp`), transcribed.
+    """
+
+    AT = datetime(2026, 9, 20, 17, 0, tzinfo=UTC)
+
+    def problem(self, taken, following=None):
+        from data.cache import answer_problem
+        body = {"timestamp": taken, "data": []}
+        if following is not None:
+            body["next_timestamp"] = following
+        return answer_problem(body, self.AT)
+
+    def test_the_latest_snapshot_before_the_request_answers_it(self):
+        self.assertIsNone(self.problem("2026-09-20T16:55:39Z"))
+        self.assertIsNone(self.problem("2026-09-20T17:00:00Z"))
+
+    def test_a_snapshot_later_than_the_request_is_another_instants(self):
+        self.assertIn("LATER", self.problem("2026-09-20T17:00:01Z"))
+
+    def test_without_next_timestamp_an_old_snapshot_is_not_trusted(self):
+        from data.cache import MAX_UNPROVEN_SNAPSHOT_AGE
+        edge = self.AT - MAX_UNPROVEN_SNAPSHOT_AGE
+        self.assertIsNone(self.problem(edge.strftime("%Y-%m-%dT%H:%M:%SZ")))
+        older = edge - timedelta(seconds=1)
+        self.assertIn("before the request",
+                      self.problem(older.strftime("%Y-%m-%dT%H:%M:%SZ")))
+
+    def test_next_timestamp_proves_one_across_an_archive_gap(self):
+        self.assertIsNone(self.problem("2026-09-20T16:30:00Z",
+                                       "2026-09-20T17:02:00Z"))
+
+    def test_a_next_snapshot_at_or_before_the_request_would_have_answered(self):
+        self.assertIn("would have answered",
+                      self.problem("2026-09-20T16:55:00Z",
+                                   "2026-09-20T17:00:00Z"))
+
+    def test_an_unreadable_body_answers_nothing(self):
+        from data.cache import answer_problem
+        self.assertIsNotNone(answer_problem("not a body", self.AT))
+        self.assertIsNotNone(answer_problem({"data": []}, self.AT))
+        self.assertIsNotNone(answer_problem(
+            {"timestamp": "2026-09-20T16:59:00", "data": []}, self.AT))
 
 
 if __name__ == "__main__":

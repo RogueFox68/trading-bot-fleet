@@ -760,6 +760,9 @@ def main(argv: Sequence[str] | None = None,
     bundle = {
         "schema": BUNDLE_SCHEMA_POOLED,
         "odds_snapshots": pool,
+        # The instant each snapshot was bought for, position for position, so
+        # the replay can check that every one of them answers it.
+        "odds_snapshot_requested_at": [_iso(at) for at in manifest.timestamps],
         "games": assembly.games,
         "collection": {
             "day": day.isoformat(),

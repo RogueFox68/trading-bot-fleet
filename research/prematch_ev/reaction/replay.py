@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -57,6 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from analysis.scoring import Eligibility, EntryPolicy             # noqa: E402
 from core.matcher import START_SOURCE_KINDS                      # noqa: E402
 from data.kalshi_history import parse_candles                    # noqa: E402
+from data.cache import answer_problem                            # noqa: E402
 from data.odds_history import parse_snapshot                     # noqa: E402
 from .clocks import envelope_for_sharp_quote                     # noqa: E402
 from .detector import MoveDetector, MovePolicy                   # noqa: E402
@@ -128,6 +129,12 @@ class BundleReport:
     games_without_settlement: list[str] = field(default_factory=list)
     start_sources: dict[str, int] = field(default_factory=dict)
     point_in_time_unverified: list[str] = field(default_factory=list)
+    #: Snapshots that break the pool's request order, in a bundle that did
+    #: not record what each was bought for (see `_pool_order_violations`).
+    pool_out_of_order: list[str] = field(default_factory=list)
+    #: False for a pooled bundle whose snapshots could not be checked
+    #: against their request instants, because it did not record them.
+    pool_identity_checked: bool = True
 
     @property
     def complete(self) -> bool:
@@ -148,7 +155,8 @@ class BundleReport:
         """
         return not (self.incomplete_snapshots or self.incomplete_candles
                     or self.games_without_target_quotes
-                    or self.contracts_without_usable_candles)
+                    or self.contracts_without_usable_candles
+                    or self.pool_out_of_order)
 
     def coverage_failures(self) -> list[str]:
         """The named reasons `complete` is False, for a CLI to print."""
@@ -167,6 +175,11 @@ class BundleReport:
             out.append(f"{len(self.contracts_without_usable_candles)} "
                        f"contract(s) carry NO usable exchange quote: "
                        f"{', '.join(self.contracts_without_usable_candles[:5])}")
+        if self.pool_out_of_order:
+            out.append(f"{len(self.pool_out_of_order)} pooled snapshot(s) "
+                       f"break the pool's request order, so one answers "
+                       f"another instant; re-collect this bundle: "
+                       f"{'; '.join(self.pool_out_of_order[:3])}")
         return out
 
     def as_dict(self) -> dict:
@@ -194,6 +207,8 @@ class BundleReport:
             "games_without_settlement": self.games_without_settlement,
             "start_sources": dict(sorted(self.start_sources.items())),
             "point_in_time_unverified": self.point_in_time_unverified,
+            "pool_identity_checked": self.pool_identity_checked,
+            "pool_out_of_order": self.pool_out_of_order,
             "note": ("an incomplete parse is a LOSS: it reads downstream as "
                      "a market with less activity, which is the opposite of "
                      "what it means. A snapshot that PARSED but did not "
@@ -277,27 +292,76 @@ def _time(value: Any, what: str) -> datetime:
     return parsed
 
 
-def _parse_pool(bodies: Sequence[Any], report: BundleReport, label: str
+def _parse_pool(bodies: Sequence[Any], report: BundleReport, label: str,
+                requested: Sequence[datetime] | None = None
                 ) -> list[tuple[int, Any, str]]:
     """Parse each snapshot payload ONCE: (index, result, unreadable-reason).
 
     Payload-level facts -- how many arrived, how many parsed, which could not
     be read -- are counted here and only here, so a pooled payload that eight
     games share is one payload in the report, not eight.
+
+    A SNAPSHOT MUST ANSWER THE INSTANT IT WAS BOUGHT FOR. With `requested`
+    (the instant behind each body, position for position) every readable
+    body is checked by `data.cache.answer_problem` -- the same question the
+    cache asks before serving an entry. A cache once served one instant's
+    snapshot for another's on any machine not on UTC; such a body parses
+    perfectly, so the parser alone would count it as data. It is a LOSS, and
+    a hole at the instant it was meant to fill.
     """
     out: list[tuple[int, Any, str]] = []
     for index, body in enumerate(bodies):
         report.snapshot_payloads += 1
         result = parse_snapshot(body)
-        if result.coverage.complete:
-            report.snapshots_parsed += 1
-            out.append((index, result, ""))
+        if not result.coverage.complete:
+            detail = "; ".join(result.coverage.reasons) or "incomplete"
+            report.incomplete_snapshots.append(f"{label} snapshot[{index}]: "
+                                               f"{detail}")
+            out.append((index, result, f"the parser could not read this "
+                                       f"snapshot payload: {detail}"))
             continue
-        detail = "; ".join(result.coverage.reasons) or "incomplete"
-        report.incomplete_snapshots.append(f"{label} snapshot[{index}]: "
-                                           f"{detail}")
-        out.append((index, result, f"the parser could not read this "
-                                   f"snapshot payload: {detail}"))
+        problem = (answer_problem(body, requested[index])
+                   if requested is not None else None)
+        if problem:
+            at = requested[index]
+            detail = (f"does not answer the instant it was bought for, "
+                      f"{at.isoformat()}: {problem}")
+            report.incomplete_snapshots.append(f"{label} snapshot[{index}] "
+                                               f"{detail}")
+            # The hole sits where the data is missing -- the requested
+            # instant -- not where the wrong snapshot says it was taken.
+            out.append((index, replace(result, snapshot=at, quotes=[]),
+                        f"this snapshot {detail}"))
+            continue
+        report.snapshots_parsed += 1
+        out.append((index, result, ""))
+    return out
+
+
+def _pool_order_violations(pool: Sequence[tuple[int, Any, str]]
+                           ) -> list[str]:
+    """Readable snapshots earlier than one before them in a request-ordered pool.
+
+    For a bundle that did not record the instant behind each snapshot. The
+    collector buys a pool in increasing request order and the archive's
+    answer -- its latest snapshot at or before the request -- never goes
+    backwards as the request moves forward, so a readable snapshot earlier
+    than one before it was served for some other instant. Which of the two
+    is the stranger cannot be told without the request instants, so both
+    are named. Silent on the ends of the pool, where an order has no
+    neighbour to break: re-collecting is the only complete answer.
+    """
+    out: list[str] = []
+    latest: tuple[int, datetime] | None = None
+    for index, result, unreadable in pool:
+        if unreadable or result.snapshot is None:
+            continue
+        if latest is not None and result.snapshot < latest[1]:
+            out.append(f"snapshot[{index}] @ {result.snapshot.isoformat()} "
+                       f"precedes snapshot[{latest[0]}] @ "
+                       f"{latest[1].isoformat()}")
+            continue
+        latest = (index, result.snapshot)
     return out
 
 
@@ -384,7 +448,21 @@ def load_bundle(path: str | Path) -> tuple[list[ReplayGame], BundleReport]:
         if not isinstance(bodies, list):
             raise BundleError("a pooled bundle needs a root 'odds_snapshots' "
                               "list; an absent pool is a collection failure")
-        shared_pool = _parse_pool(bodies, report, "pool")
+        raw_requested = payload.get("odds_snapshot_requested_at")
+        requested = None
+        if raw_requested is not None:
+            if (not isinstance(raw_requested, list)
+                    or len(raw_requested) != len(bodies)):
+                raise BundleError(
+                    "'odds_snapshot_requested_at' must name one instant per "
+                    "pooled snapshot; a partial list cannot say which "
+                    "snapshot answers which request")
+            requested = [_time(value, f"odds_snapshot_requested_at[{i}]")
+                         for i, value in enumerate(raw_requested)]
+        shared_pool = _parse_pool(bodies, report, "pool", requested)
+        if requested is None:
+            report.pool_identity_checked = False
+            report.pool_out_of_order = _pool_order_violations(shared_pool)
 
     games: list[ReplayGame] = []
     for index, raw in enumerate(raw_games):
@@ -668,6 +746,16 @@ def render_report(report: BundleReport,
         for reason in (report.incomplete_snapshots
                        + report.incomplete_candles)[:10]:
             lines.append(f"        {reason}")
+        lines.append("")
+    if not report.pool_identity_checked:
+        lines.append("    This bundle did not record the instant behind each "
+                     "snapshot, so only")
+        lines.append("    their ORDER could be checked. One collected on a "
+                     "machine not on UTC")
+        lines.append("    before cache keys were namespaced may hold a "
+                     "snapshot served for")
+        lines.append("    another instant at either end of its pool; "
+                     "re-collect it to be sure.")
         lines.append("")
     for source, count in sorted(report.start_sources.items()):
         lines.append(f"    kickoff from {source:<16} {count:>7,}")

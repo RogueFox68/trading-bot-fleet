@@ -22,7 +22,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -30,20 +30,48 @@ STAMP = "%Y-%m-%dT%H:%M:%SZ"
 
 _SECRET = re.compile(r"(apiKey|api_key|token|secret)=([^&\s\"']+)", re.I)
 
+#: The namespace every key is now written in, in its digest AND its filename.
+#: Keys from before it are LEGACY, and a legacy key cannot say which instant
+#: it holds -- see `legacy_keys_for`.
+KEY_NAMESPACE = "v2"
+
+#: How far before its request a snapshot may be when the body carries no
+#: `next_timestamp` to prove it is the one the archive would answer with.
+#: The archive answers with its latest snapshot AT OR BEFORE the request, on
+#: a 5-minute grid; ten minutes allows one missing snapshot. It must stay
+#: under the smallest gap between two instants one legacy key can confuse --
+#: the difference between two UTC offsets, 15 minutes at the least (+5:30 and
+#: +5:45) and usually an hour or more -- and it does.
+MAX_UNPROVEN_SNAPSHOT_AGE = timedelta(minutes=10)
+
 
 def redact(text: str) -> str:
     """Scrub credentials from anything destined for a log or an error."""
     return _SECRET.sub(lambda m: f"{m.group(1)}=REDACTED", str(text))
 
 
-def _digest(sport: str, stamp: str, bookmakers: str, markets: str) -> str:
-    canonical = "|".join([sport.upper(), stamp, (bookmakers or "").lower(),
-                          (markets or "").lower()])
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+def parse_stamp(value: Any) -> datetime | None:
+    """An archive timestamp, or None. The ONE parser for them: the cache
+    verifies an entry with the same reading the snapshot parser uses."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _digest(sport: str, stamp: str, bookmakers: str, markets: str,
+            namespace: str = "") -> str:
+    fields = [sport.upper(), stamp, (bookmakers or "").lower(),
+              (markets or "").lower()]
+    if namespace:
+        fields.insert(0, namespace)
+    return hashlib.sha256("|".join(fields).encode("utf-8")).hexdigest()[:32]
 
 
 def key_for(sport: str, at: datetime, bookmakers: str, markets: str) -> str:
-    """A stable key for one request's MEANING, stamped in UTC.
+    """The key for one request's MEANING: namespaced, and stamped in UTC.
 
     Deliberately takes the fields, not a URL: a URL carries the credential and
     a hash of it would silently bind the cache to one key while also embedding
@@ -54,49 +82,103 @@ def key_for(sport: str, at: datetime, bookmakers: str, markets: str) -> str:
     observes DST the two instants of the autumn fall-back hour render as the
     same wall clock, so they shared a key and the second request silently
     returned the FIRST one's snapshot: on US Central time, 06:30Z and 07:30Z on
-    2026-11-01 hashed identically. An NFL Sunday straddles that change, and a
-    5-minute collector puts twelve requests inside the hour. A cache key that
-    can name two instants is a cache that can serve the wrong one.
+    2026-11-01 hashed identically.
+
+    AND THE KEY IS NAMESPACED, because stamping in UTC was not enough. The
+    UTC keys went into the SAME digest space as the local-time keys before
+    them, and a local key read as a fallback then found UTC entries: on a
+    UTC-5 machine the local key for 17:00Z is exactly the UTC key for 12:00Z,
+    and a request for 17:00Z was served the 12:00Z snapshot. That is every
+    request on a machine not on UTC, not only the DST hour. A namespaced key
+    shares no digest and no filename with either scheme before it.
     """
-    return _digest(sport, at.astimezone(timezone.utc).strftime(STAMP),
-                   bookmakers, markets)
+    stamp = at.astimezone(timezone.utc).strftime(STAMP)
+    return (f"{KEY_NAMESPACE}-"
+            f"{_digest(sport, stamp, bookmakers, markets, KEY_NAMESPACE)}")
 
 
-def legacy_key_for(sport: str, at: datetime, bookmakers: str,
-                   markets: str) -> str | None:
-    """The key a pre-UTC cache stored this instant under, IF that is safe.
+def legacy_keys_for(sport: str, at: datetime, bookmakers: str,
+                    markets: str) -> list[str]:
+    """Every pre-namespace key this instant may have been stored under.
 
-    Existing caches were written with local-time stamps, and every entry in
-    them was paid for. Orphaning them would re-spend credits on a machine
-    that is not on UTC. So an instant may still be READ from its legacy key --
-    but never when that key is ambiguous: inside a fall-back fold the legacy
-    stamp names two instants and the entry may belong to the other one. There
-    the answer is None, the read misses, and the request is made again. A
-    wasted credit is recoverable; a silently substituted snapshot is not.
+    The original scheme's (this machine's LOCAL time with a literal "Z") and
+    the interim one's (UTC). Every entry under them was paid for, so they are
+    still read -- but a file under one is a CANDIDATE, never an answer. The
+    two schemes share one digest space, so the file may be another instant's
+    snapshot: the local key for 17:00Z on a UTC-5 machine is the interim key
+    for 12:00Z, and inside a fall-back hour a local stamp names two instants.
+    `resolve_key` serves a candidate only once `answer_problem` finds
+    that its own snapshot stamps answer this request.
     """
-    local = at.astimezone()
-    wall = local.replace(tzinfo=None)
-    if (wall.replace(fold=0).astimezone(timezone.utc)
-            != wall.replace(fold=1).astimezone(timezone.utc)):
-        return None                        # a fold: the stamp names two instants
-    legacy = _digest(sport, local.strftime(STAMP), bookmakers, markets)
-    return None if legacy == key_for(sport, at, bookmakers, markets) else legacy
+    utc = at.astimezone(timezone.utc).strftime(STAMP)
+    local = at.astimezone().strftime(STAMP)
+    keys = [_digest(sport, utc, bookmakers, markets)]
+    original = _digest(sport, local, bookmakers, markets)
+    if original not in keys:
+        keys.append(original)
+    return keys
+
+
+def answer_problem(payload: Any, at: datetime) -> str | None:
+    """Why a snapshot body does NOT verifiably answer a request for `at`, or
+    None when it does. The cache asks it of a legacy entry before serving
+    one, and the replay asks it of every snapshot a bundle recorded the
+    request instant of: one question, one answer (rule 19).
+
+    The archive answers a request with its latest snapshot at or before it,
+    so a body answers `at` exactly when `timestamp <= at < next_timestamp`.
+    Equality with the request is NOT required -- the snapshot routinely
+    precedes it -- and demanding it would miss every legitimate entry. A
+    body without `next_timestamp` cannot prove the second half, and is held
+    instead to at most `MAX_UNPROVEN_SNAPSHOT_AGE` before the request, which
+    no other instant a legacy key can be confused with can satisfy. (An
+    archive gap longer than that fails it too, and costs a re-purchase: the
+    price of never serving a snapshot that cannot be shown to be the one.)
+
+    Anything else is refused: a miss costs one credit, a snapshot served for
+    the wrong instant costs the study.
+    """
+    if not isinstance(payload, dict):
+        return "unreadable cache entry"
+    taken = parse_stamp(payload.get("timestamp"))
+    if taken is None or taken.tzinfo is None:
+        return "no readable snapshot timestamp"
+    if taken > at:
+        return (f"snapshot {taken.isoformat()} is LATER than the request "
+                f"{at.isoformat()}: another instant's")
+    following = parse_stamp(payload.get("next_timestamp"))
+    if following is not None and following.tzinfo is not None:
+        if at >= following:
+            return (f"the archive's next snapshot, {following.isoformat()}, "
+                    f"is at or before the request {at.isoformat()}, so it "
+                    f"would have answered instead")
+        return None
+    if at - taken > MAX_UNPROVEN_SNAPSHOT_AGE:
+        return (f"snapshot {taken.isoformat()} is "
+                f"{(at - taken).total_seconds():,.0f}s before the request, "
+                f"beyond the {MAX_UNPROVEN_SNAPSHOT_AGE.total_seconds():.0f}s "
+                f"a snapshot without next_timestamp may be trusted across")
+    return None
 
 
 def resolve_key(cache: "ResponseCache", sport: str, at: datetime,
                 bookmakers: str, markets: str) -> str:
-    """THE key to read this instant from: current if present, else legacy.
+    """THE key to read this instant from.
 
-    The fetch and the preflight both go through here, so the run and the
-    estimate of what it will cost cannot disagree about what is cached
-    (rule 19). Uses `has()`, which moves no statistics.
+    The namespaced key if it is on disk; else a legacy key whose entry
+    VERIFIABLY answers this instant; else the namespaced key again, which
+    then misses and is bought and stored there. The fetch and the preflight
+    both go through here, so the run and the estimate of what it will cost
+    cannot disagree about what is cached (rule 19). Reads with `has()` and
+    `peek()`, which move no statistics.
     """
     key = key_for(sport, at, bookmakers, markets)
     if cache.has(key):
         return key
-    legacy = legacy_key_for(sport, at, bookmakers, markets)
-    if legacy is not None and cache.has(legacy):
-        return legacy
+    for legacy in legacy_keys_for(sport, at, bookmakers, markets):
+        if (cache.has(legacy)
+                and answer_problem(cache.peek(legacy), at) is None):
+            return legacy
     return key
 
 
@@ -125,6 +207,17 @@ class ResponseCache:
         run that happens.
         """
         return bool(self.enabled and self._path(key).exists())
+
+    def peek(self, key: str) -> Any | None:
+        """The stored body, read WITHOUT counting a hit or a miss -- for
+        verifying an entry before deciding to serve it. None when absent or
+        unreadable."""
+        if not self.enabled:
+            return None
+        try:
+            return json.loads(self._path(key).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
 
     def get(self, key: str) -> Any | None:
         if not self.enabled:

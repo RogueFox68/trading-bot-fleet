@@ -50,6 +50,7 @@ from data.kalshi_history import parse_candles                      # noqa: E402
 from reaction.capture import CaptureRefused, endpoint_allowed      # noqa: E402
 from reaction.measure import ReactionPolicy                        # noqa: E402
 from reaction.replay import load_bundle, replay                    # noqa: E402
+from tests import machine_timezone                                 # noqa: E402
 from tests.test_reaction_replay import (                           # noqa: E402
     EVENT, START, candle_payload, odds_payload,
 )
@@ -180,9 +181,18 @@ class FakeNetwork:
 
 
 class CollectorHarness(unittest.TestCase):
-    """Run `collect_reaction.main` in-process with the fake network."""
+    """Run `collect_reaction.main` in-process with the fake network.
+
+    ON A UTC-5 CLOCK, always. The cache's legacy fallback read local-time
+    keys, and on any machine not on UTC one request's fallback key WAS
+    another instant's key -- a defect every run on a UTC machine passed.
+    Pinning the zone here makes this suite fail on it wherever it runs.
+    """
 
     def setUp(self):
+        zone = machine_timezone("America/Chicago")
+        zone.__enter__()
+        self.addCleanup(zone.__exit__, None, None, None)
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.cache = self.tmp / "odds"
@@ -643,6 +653,105 @@ class ReplayHorizonTest(unittest.TestCase):
     def test_a_coarse_grid_widens_it_to_one_interval(self):
         self.assertEqual(collect_reaction.replay_max_wait_seconds(
             timedelta(minutes=60)), 3600)
+
+
+class CacheIdentityTest(CollectorHarness):
+    """The plan, the purchase and the bundle agree on WHICH instant is held.
+
+    Two entries written by older caches sit in the directory: one holding
+    its own instant's snapshot under the original local-time key, and one
+    the interim UTC scheme wrote for 18:25Z -- which, on this UTC-5 clock,
+    is also the key 23:25Z's fallback reads.
+    """
+
+    OWN = datetime(2026, 9, 13, 23, 20, tzinfo=UTC)          # reusable
+    CROSSED = datetime(2026, 9, 13, 23, 25, tzinfo=UTC)      # must be bought
+
+    def seed(self):
+        from data.cache import STAMP, ResponseCache, _digest
+        cache = ResponseCache(self.cache)
+
+        def legacy(stamp_at, body):
+            cache.put(_digest("NFL", stamp_at.strftime(STAMP), "pinnacle",
+                              "h2h"), body)
+
+        def body(at):
+            payload = odds_payload(at, 120, -140, at - timedelta(minutes=1),
+                                   event_id=EVENT)
+            payload["data"][0]["commence_time"] = (
+                KICKOFF.strftime("%Y-%m-%dT%H:%M:%SZ"))
+            return payload
+
+        # the original scheme: this machine's LOCAL time, a literal Z
+        legacy(self.OWN.astimezone().replace(tzinfo=None), body(self.OWN))
+        # the interim scheme: UTC, for 18:25Z -- 23:25Z's local wall clock
+        other = self.CROSSED - timedelta(hours=5)
+        self.assertEqual(self.CROSSED.astimezone().strftime(STAMP),
+                         other.strftime(STAMP), "the premise: one key")
+        legacy(other, body(other))
+
+    def test_the_plan_counts_only_what_answers_the_request(self):
+        self.seed()
+        code, text = self.run_collector()
+        self.assertEqual(code, 0, text)
+        self.assertRegex(text, r"already cached\s+1\s")
+        self.assertRegex(text, r"to buy\s+12\s")
+
+    def test_the_purchase_buys_exactly_what_the_plan_priced(self):
+        self.seed()
+        code, text, out = self.collect()
+        self.assertEqual(code, 0, text)
+        self.assertEqual(len(self.net.odds_calls), 12)
+        self.assertNotIn(self.OWN, self.net.odds_calls)
+        self.assertIn(self.CROSSED, self.net.odds_calls)
+        raw = json.loads(out.read_text())
+        instants = raw["odds_snapshot_requested_at"]
+        self.assertEqual(len(instants), len(raw["odds_snapshots"]))
+        at = instants.index("2026-09-13T23:25:00Z")
+        self.assertEqual(raw["odds_snapshots"][at]["timestamp"],
+                         "2026-09-13T23:25:00Z")
+
+    def test_the_replay_refuses_a_snapshot_for_another_instant(self):
+        """What an affected bundle looks like to the replay: a perfectly
+        parseable snapshot, bought for one instant, holding another's."""
+        code, text, out = self.collect()
+        self.assertEqual(code, 0, text)
+        raw = json.loads(out.read_text())
+        at = raw["odds_snapshot_requested_at"].index("2026-09-13T23:25:00Z")
+        stranger = json.loads(json.dumps(raw["odds_snapshots"][0]))
+        stranger["timestamp"] = "2026-09-13T18:25:00Z"
+        raw["odds_snapshots"][at] = stranger
+        out.write_text(json.dumps(raw))
+        games, report = load_bundle(out)
+        self.assertFalse(report.complete)
+        self.assertTrue(any("does not answer the instant it was bought for"
+                            in reason for reason in report.incomplete_snapshots),
+                        report.incomplete_snapshots)
+        # AND a hole where the data is missing. Placed where the stranger
+        # claims to be from -- 18:25Z, before this game's window -- it would
+        # drop out of the game entirely, and 23:20Z to 23:30Z would read as
+        # continuous.
+        holes = [o for o in games[0].snapshots
+                 if o.snapshot == self.CROSSED and o.absence]
+        self.assertEqual(len(holes), 1, games[0].snapshots)
+
+    def test_an_older_bundle_is_checked_for_order(self):
+        """Without the request instants the replay can still see a stranger
+        in the middle of the pool: the archive's answers never go back."""
+        code, text, out = self.collect()
+        raw = json.loads(out.read_text())
+        del raw["odds_snapshot_requested_at"]
+        out.write_text(json.dumps(raw))
+        _, clean = load_bundle(out)
+        self.assertTrue(clean.complete, clean.coverage_failures())
+        self.assertFalse(clean.pool_identity_checked)
+        stranger = json.loads(json.dumps(raw["odds_snapshots"][0]))
+        stranger["timestamp"] = "2026-09-13T18:25:00Z"
+        raw["odds_snapshots"][5] = stranger
+        out.write_text(json.dumps(raw))
+        _, report = load_bundle(out)
+        self.assertFalse(report.complete)
+        self.assertTrue(report.pool_out_of_order)
 
 
 class ProbeTest(CollectorHarness):

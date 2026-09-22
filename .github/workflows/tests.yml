@@ -148,9 +148,18 @@ jobs:
       # it can run anywhere, including inside the fleet container without
       # widening that image's dependency surface. An untested claim of that
       # kind quietly stops being true on the first convenient import.
-      - name: suite on a bare interpreter (difflib backend)
+      #
+      # And on a clock that is NOT UTC. A runner is UTC, so anything reading
+      # the machine's zone passes here whatever it does elsewhere: a cache
+      # that served 12:00Z for a 17:00Z request on a UTC-5 Mac passed every
+      # run in this job. The rapidfuzz run below stays on UTC, so both clocks
+      # are exercised.
+      - name: suite on a bare interpreter (difflib backend), on US Central time
+        env:
+          TZ: America/Chicago
         run: |
           python -c "from core.matcher import FUZZY_BACKEND; assert FUZZY_BACKEND == 'difflib', FUZZY_BACKEND"
+          python -c "import time; assert time.localtime().tm_gmtoff != 0, 'the clock is UTC'"
           python -m unittest discover -s tests -t .
 
       # Then again with rapidfuzz, which scores team names differently from
