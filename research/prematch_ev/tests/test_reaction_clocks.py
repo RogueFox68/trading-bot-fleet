@@ -1219,24 +1219,132 @@ class ReactionCliTest(unittest.TestCase):
         code, _ = self._run([])
         self.assertEqual(code, 2)
 
-    def test_the_cli_declares_what_is_not_built(self):
-        """An increment has to say what it does not cover."""
+    # --- the CLI's own claims, checked against what shipped ---------------
+    #
+    # A README can be correct while the command contradicts it, because
+    # nothing compared them. That is exactly what happened: the README was
+    # rewritten when the screen, ledger and replay shipped, and
+    # `run_reaction.py` went on saying "only the capability audit", listing
+    # those three as the unbuilt next increment, and describing the BOOK's
+    # move instant as answerable -- a semantic the code had already
+    # corrected. Three stale claims in the file a person reads first.
+    #
+    # So these assertions derive what is true from the modules and the
+    # capability verdicts, rather than from a phrase typed next to them.
+
+    #: the reaction layers that exist as importable modules
+    SHIPPED_LAYERS = ("clocks", "detector", "measure", "screen", "episodes",
+                      "replay")
+
+    #: how the CLI's prose names each of them
+    LAYER_PROSE = {
+        "detector": "move detector",
+        "measure": "reaction measurement",
+        "screen": "opportunity screen",
+        "episodes": "episode ledger",
+        "replay": "replay",
+    }
+
+    @staticmethod
+    def _unbuilt_section(text: str) -> str:
+        """Everything the CLI presents as NOT built, however it is worded."""
+        import re
+        marker = re.search(r"not built[^.]{0,20}not faked", text, re.I)
+        return text[marker.start():] if marker else ""
+
+    def test_every_shipped_layer_really_is_importable(self):
+        """The premise of the claim tests below, asserted rather than assumed."""
+        import importlib
+        for layer in self.SHIPPED_LAYERS:
+            with self.subTest(layer=layer):
+                self.assertTrue(importlib.import_module(f"reaction.{layer}"))
+
+    def test_no_shipped_layer_is_presented_as_unbuilt(self):
+        """A line saying LESS exists than does is read exactly as one saying
+        more does. Both are claims, and this one was wrong for three layers."""
         _, text = self._run(["--capability"])
-        self.assertIn("not built, not faked", text)
-        self.assertIn("No orders", text)
+        unbuilt = self._unbuilt_section(text)
+        self.assertTrue(unbuilt, "the CLI no longer says what is NOT built")
+        for layer, prose in self.LAYER_PROSE.items():
+            with self.subTest(layer=layer):
+                self.assertNotIn(prose.lower(), unbuilt.lower(),
+                                 f"{layer} shipped but is listed as unbuilt")
 
-    def test_the_cli_does_not_call_a_built_layer_unbuilt(self):
-        """The footer is a claim, and a stale claim is a wrong one.
+    def test_collection_is_still_declared_unbuilt(self):
+        """The one thing that genuinely is not built, and must stay said."""
+        _, text = self._run(["--capability"])
+        unbuilt = self._unbuilt_section(text).lower()
+        self.assertIn("collection", unbuilt)
+        self.assertIn("no orders", text.lower())
+        self.assertIn("no live capture", text.lower())
+        self.assertIn("no paid requests", text.lower())
 
-        It listed the reaction measurement as "next increment" after the
-        measurement shipped. A line saying less exists than does is the same
-        class of error as one saying more does -- both are read.
+    def test_the_cli_does_not_claim_the_books_move_instant_is_answerable(self):
+        """`last_update` is the PROVIDER's observation, not the book's change.
+
+        The docstring listed "when the BOOK moved" as answerable long after
+        `capability.question_verdicts()` had been corrected to UNANSWERABLE.
+        Both halves are asserted here so they cannot drift apart again.
         """
+        import run_reaction
+        from reaction.capability import Answerability, question_verdicts
+        book_change = [v for v in question_verdicts()
+                       if "BOOK actually change" in v.question]
+        self.assertEqual(len(book_change), 1)
+        self.assertIs(book_change[0].answerability,
+                      Answerability.UNANSWERABLE)
+
+        doc = run_reaction.__doc__.lower()
+        self.assertNotIn("when the book moved", doc)
+        self.assertIn("not when the bookmaker changed", doc)
+
         _, text = self._run(["--capability"])
-        head, _, tail = text.partition("not built, not faked")
-        self.assertNotIn("reaction measurement", tail,
-                         "the built measurement is listed as unbuilt")
-        self.assertIn("BUILT AND TESTED", text)
+        self.assertIn("[ NO     ] when did the BOOK actually change", text)
+
+    def test_the_docstring_restates_no_verdict_count(self):
+        """A copied count drifts the same way a copied verdict does.
+
+        It said "two of them turn out to be unsupportable" while the audit
+        graded five. The number belongs in one place; the CLI prints it.
+        """
+        import re
+        import run_reaction
+        from reaction.capability import unanswerable_questions
+        doc = run_reaction.__doc__.lower()
+        for word in ("one", "two", "three", "four", "five", "six"):
+            self.assertNotIn(f"{word} of them", doc)
+        self.assertFalse(re.search(r"\b\d+ of (them|the study)", doc))
+        _, text = self._run(["--capability"])
+        self.assertIn(f"{len(unanswerable_questions())} of the study's "
+                      f"questions are UNANSWERABLE", text)
+
+    def test_the_usage_line_names_every_mode_the_parser_accepts(self):
+        """Adding a mode and leaving it out of the usage line hides it.
+
+        The line still read "pass --capability or --capability-verify" after
+        --policy and --replay shipped, so the two most useful free commands
+        were invisible to anyone who ran the tool with no arguments.
+        """
+        import run_reaction
+        # Every option the parser accepts is either a MODE or a MODIFIER.
+        # A new option that is neither fails here, which is the only way a
+        # usage line stays complete without someone remembering.
+        declared = set(run_reaction.MODES) | set(run_reaction.MODIFIERS)
+        for action in run_reaction.build_parser()._actions:
+            for option in action.option_strings:
+                if option.startswith("--"):
+                    with self.subTest(option=option):
+                        self.assertIn(option, declared,
+                                      f"{option} is neither a MODE nor a "
+                                      f"MODIFIER; classify it")
+        code, text = self._run([])
+        self.assertEqual(code, 2)
+        usage = [line for line in text.splitlines()
+                 if "nothing to do" in line]
+        self.assertEqual(len(usage), 1, "no single usage line")
+        for mode in run_reaction.MODES:
+            with self.subTest(mode=mode):
+                self.assertIn(mode, usage[0])
 
     def test_policy_prints_every_declared_threshold_and_spends_nothing(self):
         """`--policy` is the audit trail for "declared, not fitted"."""

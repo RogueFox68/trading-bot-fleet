@@ -434,7 +434,7 @@ class MoveDetector:
         return str(getattr(envelope.payload, "book", "") or "").lower()
 
     # --- explicit absence, which observe() cannot discover ---
-    def note_gap(self, stream_id: str, at: datetime,
+    def note_gap(self, stream_id: str, at: datetime | None,
                  reason: str = "market absent from the provider response"
                  ) -> None:
         """Declare that a stream had NO record for an interval.
@@ -446,9 +446,20 @@ class MoveDetector:
         so: this marks the baseline unusable and advances continuity to `at`,
         so the next valid quote anchors a fresh baseline rather than closing a
         delta across the hole.
+
+        `at` MAY BE None, and that is not the same as no gap. A payload whose
+        own capture stamp is unreadable is still a hole -- we know the
+        interval was not observed, we just cannot say when. Comparability
+        breaks either way, so the baseline is invalidated; continuity is left
+        standing at the last thing actually seen, because advancing it to an
+        invented instant would suppress the `gap_in_input` rejection that the
+        unread interval may genuinely deserve. Inventing the stamp is the one
+        option that is wrong in both directions (rule 17).
         """
         self._reject(stream_id, Rejection.DECLARED_GAP, at, reason)
         self._invalidate(stream_id, reason, at)
+        if at is None:
+            return
         previous = self._last_seen_at.get(stream_id)
         if previous is None or at > previous:
             self._last_seen_at[stream_id] = at

@@ -98,28 +98,33 @@ def flat_candles(first=210.0, last=160.0, bid=0.56, ask=0.58):
     return [(at(m), bid, ask) for m in range(int(first), int(last) - 1, -1)]
 
 
+def _base_game() -> dict:
+    """The one healthy game every bundle here is built from."""
+    return {
+        "provider_event_id": EVENT,
+        "event_ticker": TICKER,
+        "start": iso(START),
+        "start_source": "external_schedule",
+        "historical_schedule_as_of": "unverified",
+        "odds_snapshots": [
+            odds_payload(at(200), 120, -140, at(201)),
+            odds_payload(at(195), 160, -190, at(196)),
+        ],
+        "contracts": [
+            {"market_ticker": f"{TICKER}-NYG", "yes_is_home": True,
+             "settled_yes": 1,
+             "candlesticks": [candle_payload(flat_candles())]},
+            {"market_ticker": f"{TICKER}-DAL", "yes_is_home": False,
+             "settled_yes": 0,
+             "candlesticks": [candle_payload(flat_candles())]},
+        ],
+    }
+
+
 def bundle(*, games=None, schema=BUNDLE_SCHEMA, **game_overrides) -> dict:
     """A minimal valid bundle: one game, two contracts, one detected move."""
     if games is None:
-        game = {
-            "provider_event_id": EVENT,
-            "event_ticker": TICKER,
-            "start": iso(START),
-            "start_source": "external_schedule",
-            "historical_schedule_as_of": "unverified",
-            "odds_snapshots": [
-                odds_payload(at(200), 120, -140, at(201)),
-                odds_payload(at(195), 160, -190, at(196)),
-            ],
-            "contracts": [
-                {"market_ticker": f"{TICKER}-NYG", "yes_is_home": True,
-                 "settled_yes": 1,
-                 "candlesticks": [candle_payload(flat_candles())]},
-                {"market_ticker": f"{TICKER}-DAL", "yes_is_home": False,
-                 "settled_yes": 0,
-                 "candlesticks": [candle_payload(flat_candles())]},
-            ],
-        }
+        game = _base_game()
         game.update(game_overrides)
         games = [game]
     return {"schema": schema, "games": games}
@@ -277,7 +282,7 @@ class LossReportingTest(unittest.TestCase):
         games, report = load_bundle(write(payload))
         self.assertFalse(report.complete)
         self.assertEqual(len(report.incomplete_candles), 1)
-        self.assertIn("*** PARSE INCOMPLETE", render_report(report))
+        self.assertIn("*** COVERAGE INCOMPLETE", render_report(report))
         self.assertIn("not quiet", render_report(report))
 
     def test_an_unparseable_snapshot_is_recorded_and_not_counted_as_parsed(
@@ -295,7 +300,7 @@ class LossReportingTest(unittest.TestCase):
         """Or the warning is noise on every run (rule 10)."""
         _, report = load_bundle(write(bundle()))
         self.assertTrue(report.complete)
-        self.assertNotIn("*** PARSE INCOMPLETE", render_report(report))
+        self.assertNotIn("*** COVERAGE INCOMPLETE", render_report(report))
 
 
 class PointInTimeTest(unittest.TestCase):
@@ -422,12 +427,8 @@ class ReplayWiringTest(unittest.TestCase):
         self.assertFalse(declared["reaction_measurement"]["tuned_on_outcomes"])
 
 
-class ReplayCliTest(unittest.TestCase):
-    """Drive the real entry point.
-
-    Round 5 shipped two crashes in entry points nothing drove, while 171
-    tests passed. An exit code nothing exercises is a decoration.
-    """
+class _CliDriver:
+    """Run the real CLI in-process and capture everything it printed."""
 
     def _run(self, argv):
         from unittest import mock
@@ -437,6 +438,14 @@ class ReplayCliTest(unittest.TestCase):
                         chunks.append(" ".join(str(x) for x in a))):
             code = run_reaction.main(argv)
         return code, "\n".join(chunks)
+
+
+class ReplayCliTest(_CliDriver, unittest.TestCase):
+    """Drive the real entry point.
+
+    Round 5 shipped two crashes in entry points nothing drove, while 171
+    tests passed. An exit code nothing exercises is a decoration.
+    """
 
     def test_a_clean_replay_exits_zero(self):
         code, text = self._run(["--replay", str(write(bundle()))])
@@ -476,7 +485,7 @@ class ReplayCliTest(unittest.TestCase):
             {"error": "unauthorized"}]
         code, text = self._run(["--replay", str(write(payload))])
         self.assertEqual(code, 1)
-        self.assertIn("PARSE INCOMPLETE", text)
+        self.assertIn("COVERAGE INCOMPLETE", text)
 
     def test_json_output_carries_the_bundle_report_and_the_ledger(self):
         from unittest import mock
@@ -490,7 +499,7 @@ class ReplayCliTest(unittest.TestCase):
         payload = json.loads("\n".join(chunks))
         self.assertEqual(payload["ledger"]["schema"],
                          "reaction_episode_ledger/1")
-        self.assertTrue(payload["bundle"]["parse_complete"])
+        self.assertTrue(payload["bundle"]["coverage_complete"])
         self.assertTrue(payload["ledger"]["all_stages_reconcile"])
         self.assertFalse(payload["ledger"]["window"]["holdout_available"])
 
@@ -516,3 +525,263 @@ class ReplayCliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class MissingTargetObservationTest(unittest.TestCase):
+    """A snapshot that came back WITHOUT our event is a hole, not a non-event.
+
+    `load_bundle` used to flatten every parsed quote into one list and filter
+    it to the target event. A snapshot the provider genuinely returned, in
+    which our event does not appear, then left NO trace at all -- so the two
+    surviving quotes either side of it looked adjacent, sat inside
+    `max_gap`, and the detector closed a delta across an interval nobody had
+    observed. The trigger, the bracket and every lag derived from it were
+    measured over a window containing an unread hole.
+
+    `MoveDetector.note_gap` existed for exactly this and nothing called it.
+
+    These drive the RAW BUNDLE, not the detector, because that is the layer
+    the defect lived in: the detector was already correct and the caller
+    never told it.
+    """
+
+    def _replay(self, snapshots, **overrides):
+        games, report = load_bundle(write(bundle(odds_snapshots=snapshots,
+                                                 **overrides)))
+        ledger = replay(games)
+        stages = {stage.stage: stage for stage in ledger.stages}
+        return ledger, report, stages
+
+    # the reviewer's own reproduction, verbatim
+    HOLE = [
+        lambda: odds_payload(at(200), 120, -140, at(201)),
+        lambda: {"timestamp": iso(at(195)), "data": []},
+        lambda: odds_payload(at(190), 160, -190, at(191)),
+    ]
+
+    def test_a_move_is_not_attributed_across_a_missing_snapshot(self):
+        ledger, report, stages = self._replay([f() for f in self.HOLE])
+        self.assertEqual(stages["moves detected"].total, 0,
+                         "a move was closed across an interval in which the "
+                         "target event was explicitly absent")
+
+    def test_the_hole_is_named_in_the_detector_outcomes(self):
+        """Invisible correctness is indistinguishable from a quiet market."""
+        _, _, stages = self._replay([f() for f in self.HOLE])
+        breakdown = stages["detector outcomes"].breakdown
+        self.assertEqual(breakdown.get("declared_gap"), 1)
+        self.assertEqual(breakdown.get("baseline_invalidated"), 1)
+
+    def test_the_ledger_still_reconciles_with_a_declared_gap_in_it(self):
+        """A gap has no observation behind it, so the outcome total exceeds
+        the envelope count -- by exactly the number of declared absences."""
+        ledger, _, stages = self._replay([f() for f in self.HOLE])
+        self.assertTrue(ledger.reconciles)
+        self.assertEqual(stages["detector outcomes"].total,
+                         stages["provider observations fed"].total + 1)
+
+    def test_the_absence_is_counted_in_the_bundle_report(self):
+        _, report, _ = self._replay([f() for f in self.HOLE])
+        self.assertEqual(report.snapshots_with_target, 2)
+        self.assertEqual(len(report.snapshots_without_target), 1)
+        self.assertIn("snapshot[1]", report.snapshots_without_target[0])
+
+    def test_a_missing_snapshot_is_not_a_coverage_failure(self):
+        """rule 27: the design exists to survive a briefly absent market.
+
+        Failing the run on it would fail every real run for doing exactly
+        what it was built to do. It is counted and rendered, not graded."""
+        _, report, _ = self._replay([f() for f in self.HOLE])
+        self.assertTrue(report.complete)
+        self.assertEqual(report.coverage_failures(), [])
+        self.assertIn("did NOT carry the target event", render_report(report))
+
+    def test_the_returning_quote_rebaselines_and_the_next_move_triggers(self):
+        """The acceptance criterion's second half: suppression must not be
+        permanent. A hole costs the move that spans it, and nothing after."""
+        ledger, _, stages = self._replay([
+            odds_payload(at(200), 120, -140, at(201)),
+            {"timestamp": iso(at(195)), "data": []},
+            odds_payload(at(190), 160, -190, at(191)),   # re-baseline
+            odds_payload(at(185), 260, -320, at(186)),   # a real move off it
+        ])
+        self.assertEqual(stages["moves detected"].total, 1)
+        self.assertTrue(ledger.reconciles)
+
+    def test_the_same_quotes_with_no_hole_do_trigger(self):
+        """The control. Without it, a change that broke detection outright
+        would pass every assertion above."""
+        _, _, stages = self._replay([
+            odds_payload(at(200), 120, -140, at(201)),
+            odds_payload(at(190), 160, -190, at(191)),
+        ])
+        self.assertEqual(stages["moves detected"].total, 1)
+
+    def test_a_snapshot_the_parser_could_not_read_is_also_a_hole(self):
+        """An unreadable payload is BOTH a parse loss and a break in
+        continuity. Recording only the first left the second invisible."""
+        ledger, report, stages = self._replay([
+            odds_payload(at(200), 120, -140, at(201)),
+            {"timestamp": iso(at(195)), "data": "not a list"},
+            odds_payload(at(190), 160, -190, at(191)),
+        ])
+        self.assertEqual(stages["moves detected"].total, 0)
+        self.assertEqual(
+            stages["detector outcomes"].breakdown.get("declared_gap"), 1)
+        self.assertFalse(report.complete)          # the parse loss, separately
+        self.assertTrue(ledger.reconciles)
+
+    def test_an_undateable_hole_keeps_its_place_in_the_sequence(self):
+        """A hole with no readable timestamp must not be sorted to the end.
+
+        The first version of the fix ordered snapshots by
+        `(snapshot is None, snapshot, index)`, which is not a neutral
+        tie-break: it moved every undateable record PAST the quote that
+        closes the delta across it, so the gap was declared after the move
+        it existed to prevent and the trigger came back anyway. The fix was
+        reintroducing its own bug through the sort meant to tidy it.
+        """
+        ledger, report, stages = self._replay([
+            odds_payload(at(200), 120, -140, at(201)),
+            {"timestamp": "not-a-time", "data": []},
+            odds_payload(at(190), 160, -190, at(191)),
+        ])
+        self.assertEqual(stages["moves detected"].total, 0)
+        self.assertEqual(
+            stages["detector outcomes"].breakdown.get("declared_gap"), 1)
+        self.assertTrue(ledger.reconciles)
+
+    def test_another_games_absence_does_not_invalidate_this_games_stream(self):
+        """Gaps are scoped to the game whose snapshots they came from.
+
+        A provider response is per-sport, so one game's market vanishing says
+        nothing about another's. Invalidating every stream on any absence
+        would suppress real moves across a whole slate.
+        """
+        other_id, other_ticker = "evt-nfl-2", "KXNFLGAME-26SEP13SEASF"
+        healthy = dict(_base_game())
+        broken = dict(_base_game())
+        broken.update({
+            "provider_event_id": other_id,
+            "event_ticker": other_ticker,
+            "odds_snapshots": [
+                odds_payload(at(200), 120, -140, at(201), event_id=other_id),
+                {"timestamp": iso(at(195)), "data": []},
+                odds_payload(at(190), 160, -190, at(191), event_id=other_id),
+            ],
+            "contracts": [
+                {"market_ticker": f"{other_ticker}-SF", "yes_is_home": True,
+                 "settled_yes": 1,
+                 "candlesticks": [candle_payload(flat_candles())]},
+            ],
+        })
+        games, _ = load_bundle(write(bundle(games=[healthy, broken])))
+        ledger = replay(games)
+        stages = {stage.stage: stage for stage in ledger.stages}
+        # The healthy game's move survives; only the holed game loses its.
+        self.assertEqual(stages["moves detected"].total, 1)
+        self.assertEqual(
+            stages["detector outcomes"].breakdown.get("declared_gap"), 1)
+        self.assertTrue(ledger.reconciles)
+
+
+class EmptyTargetCollectionTest(unittest.TestCase):
+    """No target data is a COLLECTION FAILURE, never a quiet market.
+
+    `load_bundle(bundle(odds_snapshots=[]))` parsed cleanly, reported
+    `complete=True`, and replayed to zero quotes and zero moves -- which is
+    byte-for-byte what a real slate with no qualifying move looks like. The
+    study's whole coverage ledger exists to stop exactly that confusion, and
+    the replay had a hole in it.
+
+    Syntactic parse success and usable target coverage are different facts.
+    """
+
+    def _report(self, **overrides):
+        _, report = load_bundle(write(bundle(**overrides)))
+        return report
+
+    def test_an_empty_snapshot_collection_fails_coverage(self):
+        report = self._report(odds_snapshots=[])
+        self.assertFalse(report.complete)
+        self.assertTrue(any("NO usable sharp quote" in reason
+                            for reason in report.coverage_failures()))
+
+    def test_snapshots_that_never_carry_the_target_fail_coverage(self):
+        """Well-formed, parseable, and empty of the thing being studied."""
+        report = self._report(odds_snapshots=[
+            {"timestamp": iso(at(200)), "data": []},
+            {"timestamp": iso(at(195)), "data": []},
+        ])
+        self.assertFalse(report.complete)
+        self.assertEqual(report.snapshots_with_target, 0)
+        self.assertIn(EVENT, report.games_without_target_quotes)
+
+    def test_a_contract_with_no_usable_candle_fails_coverage(self):
+        """Every reaction on it would read BLIND_INTERVAL -- the same false
+        quiet, one source over."""
+        report = self._report(contracts=[
+            {"market_ticker": f"{TICKER}-NYG", "yes_is_home": True,
+             "settled_yes": 1, "candlesticks": []},
+        ])
+        self.assertFalse(report.complete)
+        self.assertIn(f"{TICKER}-NYG", report.contracts_without_candles)
+
+    def test_a_healthy_bundle_reports_complete(self):
+        """The control: none of the above may fire on a good bundle."""
+        report = self._report()
+        self.assertTrue(report.complete)
+        self.assertEqual(report.coverage_failures(), [])
+
+
+class EmptyTargetCollectionCliTest(_CliDriver, unittest.TestCase):
+    """The exit code is the part a human or a CI job actually reads."""
+
+    @staticmethod
+    def _failure_block(text: str) -> str:
+        """Only what the CLI itself said, after its own failure header.
+
+        The bundle report prints the same reasons earlier in the run, so an
+        assertion over the WHOLE output cannot tell whether the CLI named
+        the failure or merely let the report do it. A first version of this
+        test could not, and a mutation that deleted the CLI's own loop
+        survived it.
+        """
+        _, marker, tail = text.partition("coverage is incomplete")
+        return tail if marker else ""
+
+    def test_an_empty_target_collection_exits_nonzero_and_names_itself(self):
+        code, text = self._run(
+            ["--replay", str(write(bundle(odds_snapshots=[])))])
+        self.assertEqual(code, 1)
+        block = self._failure_block(text)
+        self.assertTrue(block, "the CLI printed no failure header")
+        self.assertIn("NOT be read as a quiet market", block)
+        self.assertIn("NO usable sharp quote", block)
+
+    def test_a_contract_with_no_candles_exits_nonzero_and_names_itself(self):
+        code, text = self._run(["--replay", str(write(bundle(contracts=[
+            {"market_ticker": f"{TICKER}-NYG", "yes_is_home": True,
+             "settled_yes": 1, "candlesticks": []}])))])
+        self.assertEqual(code, 1)
+        self.assertIn("NO usable candle", self._failure_block(text))
+
+    def test_a_genuine_zero_trigger_run_still_exits_zero(self):
+        """rule 27. A run with real observations and no qualifying move is a
+        RESULT, and it must not be dragged into the failure bucket by the
+        checks above -- that would burn the exit code a real defect needs."""
+        code, text = self._run(["--replay", str(write(bundle(odds_snapshots=[
+            odds_payload(at(200), 120, -140, at(201)),
+            odds_payload(at(195), 120, -140, at(196)),   # unchanged: no move
+        ])))])
+        self.assertEqual(code, 0)
+        self.assertIn("REACTION EPISODE LEDGER", text)
+
+    def test_a_run_with_a_missing_snapshot_still_exits_zero(self):
+        """The hole is a tolerated condition, so it may not fail the run."""
+        code, _ = self._run(["--replay", str(write(bundle(odds_snapshots=[
+            odds_payload(at(200), 120, -140, at(201)),
+            {"timestamp": iso(at(195)), "data": []},
+            odds_payload(at(190), 160, -190, at(191)),
+        ])))])
+        self.assertEqual(code, 0)

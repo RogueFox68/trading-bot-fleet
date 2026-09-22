@@ -65,6 +65,7 @@ from .measure import ReactionPolicy, measure_reaction            # noqa: E402
 from .screen import ScreenResult, screen_reaction                # noqa: E402
 
 BUNDLE_SCHEMA = "reaction_replay_bundle/1"
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 class BundleError(ValueError):
@@ -88,16 +89,55 @@ class BundleReport:
     candle_payloads: int = 0
     quotes: int = 0
     candles: int = 0
+    snapshots_with_target: int = 0
+    snapshots_without_target: list[str] = field(default_factory=list)
     incomplete_snapshots: list[str] = field(default_factory=list)
     incomplete_candles: list[str] = field(default_factory=list)
+    games_without_target_quotes: list[str] = field(default_factory=list)
+    contracts_without_candles: list[str] = field(default_factory=list)
     games_without_settlement: list[str] = field(default_factory=list)
     start_sources: dict[str, int] = field(default_factory=dict)
     point_in_time_unverified: list[str] = field(default_factory=list)
 
     @property
     def complete(self) -> bool:
-        """A parser that could not read a payload is a LOSS, not a quiet zero."""
-        return not self.incomplete_snapshots and not self.incomplete_candles
+        """Did the bundle deliver USABLE TARGET COVERAGE, not merely valid JSON?
+
+        Syntactic parse success and target coverage are different facts, and
+        the second is the one a result depends on. A bundle of perfectly
+        well-formed snapshots that never once carry the target event parses
+        cleanly and produces zero moves -- which reads as a quiet market and
+        is actually a collection failure.
+
+        What does NOT belong here: a target absent from SOME snapshots. That
+        is an ordinary, expected condition -- a suspended or briefly
+        uncarried market -- and the detector handles it by re-baselining
+        across the hole. Failing the run on it would fail every real run for
+        doing exactly what it was designed to do (rule 27). It is counted and
+        rendered instead.
+        """
+        return not (self.incomplete_snapshots or self.incomplete_candles
+                    or self.games_without_target_quotes
+                    or self.contracts_without_candles)
+
+    def coverage_failures(self) -> list[str]:
+        """The named reasons `complete` is False, for a CLI to print."""
+        out: list[str] = []
+        if self.incomplete_snapshots:
+            out.append(f"{len(self.incomplete_snapshots)} odds snapshot "
+                       f"payload(s) could not be parsed")
+        if self.incomplete_candles:
+            out.append(f"{len(self.incomplete_candles)} candlestick "
+                       f"payload(s) could not be parsed")
+        if self.games_without_target_quotes:
+            out.append(f"{len(self.games_without_target_quotes)} game(s) "
+                       f"carry NO usable sharp quote for the target event: "
+                       f"{', '.join(self.games_without_target_quotes[:5])}")
+        if self.contracts_without_candles:
+            out.append(f"{len(self.contracts_without_candles)} contract(s) "
+                       f"carry NO usable candle: "
+                       f"{', '.join(self.contracts_without_candles[:5])}")
+        return out
 
     def as_dict(self) -> dict:
         return {
@@ -108,16 +148,49 @@ class BundleReport:
             "candle_payloads": self.candle_payloads,
             "quotes_parsed": self.quotes,
             "candles_parsed": self.candles,
-            "parse_complete": self.complete,
+            "coverage_complete": self.complete,
+            "coverage_failures": self.coverage_failures(),
+            "snapshots_with_target": self.snapshots_with_target,
+            "snapshots_without_target": self.snapshots_without_target,
             "incomplete_snapshots": self.incomplete_snapshots,
             "incomplete_candles": self.incomplete_candles,
+            "games_without_target_quotes": self.games_without_target_quotes,
+            "contracts_without_candles": self.contracts_without_candles,
             "games_without_settlement": self.games_without_settlement,
             "start_sources": dict(sorted(self.start_sources.items())),
             "point_in_time_unverified": self.point_in_time_unverified,
             "note": ("an incomplete parse is a LOSS: it reads downstream as "
                      "a market with less activity, which is the opposite of "
-                     "what it means"),
+                     "what it means. A snapshot that PARSED but did not "
+                     "carry the target is counted separately -- it is a hole "
+                     "in continuity, not a parse failure"),
         }
+
+
+@dataclass(frozen=True)
+class SnapshotObservation:
+    """ONE provider snapshot, and what it held for ONE game.
+
+    The flattened quote list that used to stand in for this could not express
+    the difference that matters: a snapshot the provider returned in which
+    our event does not appear. Flattening makes that snapshot leave no trace,
+    so two quotes either side of the hole look adjacent, and a move gets
+    attributed across an interval nobody observed.
+
+    `absence` is the NAMED reason the target was not in this snapshot, and ""
+    when it was. `snapshot` is the parser's own capture stamp and may be None
+    when the payload's timestamp was itself unreadable -- an absence we
+    cannot place in time is still an absence.
+    """
+
+    index: int
+    snapshot: datetime | None
+    quotes: tuple
+    absence: str = ""
+
+    @property
+    def has_target(self) -> bool:
+        return not self.absence
 
 
 @dataclass(frozen=True)
@@ -137,6 +210,7 @@ class ReplayGame:
     historical_schedule_as_of: str
     quotes: tuple
     contracts: tuple[ReplayContract, ...]
+    snapshots: tuple[SnapshotObservation, ...] = ()
 
     @property
     def point_in_time(self) -> bool:
@@ -208,17 +282,39 @@ def load_bundle(path: str | Path) -> tuple[list[ReplayGame], BundleReport]:
         as_of = raw.get("historical_schedule_as_of", "unverified")
 
         quotes: list = []
+        observations: list[SnapshotObservation] = []
         for snap_index, body in enumerate(raw.get("odds_snapshots") or []):
             report.snapshot_payloads += 1
             result = parse_snapshot(body)
             if not result.coverage.complete:
+                detail = ('; '.join(result.coverage.reasons) or 'incomplete')
                 report.incomplete_snapshots.append(
-                    f"{event_id} snapshot[{snap_index}]: "
-                    f"{'; '.join(result.coverage.reasons) or 'incomplete'}")
+                    f"{event_id} snapshot[{snap_index}]: {detail}")
+                # An unreadable payload is BOTH a parse loss and a hole in
+                # this game's continuity. Recording only the first left the
+                # second invisible, and the second is what lets a move be
+                # attributed across the interval.
+                observations.append(SnapshotObservation(
+                    snap_index, result.snapshot, (),
+                    f"the parser could not read this snapshot payload: "
+                    f"{detail}"))
                 continue
             report.snapshots_parsed += 1
-            quotes.extend(q for q in result.quotes
-                          if q.provider_event_id == event_id)
+            mine = tuple(q for q in result.quotes
+                         if q.provider_event_id == event_id)
+            if mine:
+                report.snapshots_with_target += 1
+            else:
+                report.snapshots_without_target.append(
+                    f"{event_id} snapshot[{snap_index}]"
+                    + (f" @ {result.snapshot.isoformat()}"
+                       if result.snapshot else " (no usable timestamp)"))
+            observations.append(SnapshotObservation(
+                snap_index, result.snapshot, mine,
+                "" if mine else ("the target event is absent from this "
+                                 "provider snapshot")))
+            quotes.extend(mine)
+        observations = _in_availability_order(observations)
 
         contracts: list[ReplayContract] = []
         for contract_index, raw_contract in enumerate(
@@ -253,6 +349,12 @@ def load_bundle(path: str | Path) -> tuple[list[ReplayGame], BundleReport]:
             candles.sort(key=lambda c: c.ts)
             report.candles += len(candles)
             report.contracts += 1
+            if not candles:
+                # Every reaction on this contract would measure
+                # BLIND_INTERVAL, which reads as "the exchange did not
+                # respond". It is the same false quiet as an empty odds
+                # collection, one source over.
+                report.contracts_without_candles.append(market_ticker)
             contracts.append(ReplayContract(market_ticker, yes_is_home,
                                             tuple(candles), settled))
 
@@ -262,17 +364,66 @@ def load_bundle(path: str | Path) -> tuple[list[ReplayGame], BundleReport]:
                               f"reported as one, not dropped")
         quotes.sort(key=lambda q: q.snapshot)
         report.quotes += len(quotes)
+        if not quotes:
+            # No usable sharp quote at all: nothing could have triggered, so
+            # "zero moves" says nothing about the market. Named here rather
+            # than raised, so a multi-game bundle still reports every other
+            # game -- and `complete` is False, so the run cannot be read as
+            # a clean one.
+            report.games_without_target_quotes.append(event_id)
         report.games += 1
         report.start_sources[start_source] = (
             report.start_sources.get(start_source, 0) + 1)
         game = ReplayGame(event_id, ticker, start, start_source, as_of,
-                          tuple(quotes), tuple(contracts))
+                          tuple(quotes), tuple(contracts),
+                          tuple(observations))
         if not game.point_in_time:
             report.point_in_time_unverified.append(event_id)
         if all(c.settled_yes is None for c in contracts):
             report.games_without_settlement.append(event_id)
         games.append(game)
     return games, report
+
+
+def _in_availability_order(observations: Sequence[SnapshotObservation]
+                           ) -> list[SnapshotObservation]:
+    """Order snapshots for the detector WITHOUT relocating an undateable one.
+
+    A first version sorted `(snapshot is None, snapshot, index)`, which sends
+    every unreadable-timestamp record to the END of the game. That is not a
+    neutral tie-break: it moves a HOLE out of the interval it happened in,
+    past the quote that closes the delta across it -- so the gap was declared
+    after the move it was supposed to prevent, and an unreadable payload
+    still bought a trigger it had not earned. It was the same defect this
+    module was being fixed for, reintroduced by the sort meant to tidy it.
+
+    An observation with no readable stamp keeps its ARRAY position relative
+    to its neighbours, which is the only ordering evidence a bundle has for
+    it: it inherits the last known time and sorts immediately after it.
+    Guessing a position is as wrong as guessing the stamp (rule 17).
+    """
+    carried: datetime | None = None
+    keyed = []
+    for observation in observations:
+        if observation.snapshot is not None:
+            carried = observation.snapshot
+        keyed.append(((carried is None, carried or _EPOCH, observation.index),
+                      observation))
+    keyed.sort(key=lambda pair: pair[0])
+    return [observation for _, observation in keyed]
+
+
+def _as_snapshots(quotes: Sequence) -> list[SnapshotObservation]:
+    """One pseudo-snapshot per quote, for a game built without them.
+
+    `load_bundle` always supplies real snapshot records. This keeps a
+    hand-built `ReplayGame` working, and it is deliberately the NO-GAP
+    reading: a caller that never recorded snapshot-level availability has not
+    told us about any absence, and inventing one would be as wrong as
+    ignoring a real one.
+    """
+    return [SnapshotObservation(i, getattr(q, "snapshot", None), (q,))
+            for i, q in enumerate(quotes)]
 
 
 def replay(games: Sequence[ReplayGame], *,
@@ -299,13 +450,33 @@ def replay(games: Sequence[ReplayGame], *,
     screen_result = ScreenResult()
 
     for game in games:
-        envelopes = [envelope_for_sharp_quote(q) for q in game.quotes]
-        observation_count += len(envelopes)
         triggers = []
-        for envelope in envelopes:
-            trigger = detector.observe(envelope)
-            if trigger is not None:
-                triggers.append(trigger)
+        # WALK SNAPSHOTS, NOT QUOTES. A snapshot that carried no quote for
+        # this game is the whole point: it is an interval the feed was read
+        # and the target was not in it. Walking the flattened quote list
+        # cannot see that, so two quotes either side of a hole look adjacent
+        # and a move gets closed across an interval nobody observed.
+        seen_streams: set[str] = set()
+        for observation in game.snapshots or _as_snapshots(game.quotes):
+            envelopes = [envelope_for_sharp_quote(q)
+                         for q in observation.quotes]
+            present = {e.provenance.market_id for e in envelopes}
+            # Only streams THIS GAME has already shown are invalidated. An
+            # unrelated provider event going missing says nothing about a
+            # healthy target stream, and a stream that has not appeared yet
+            # has no baseline to break.
+            for stream in sorted(seen_streams - present):
+                detector.note_gap(
+                    stream, observation.snapshot,
+                    observation.absence or
+                    "this stream had no quote in a snapshot that did carry "
+                    "the target event")
+            observation_count += len(envelopes)
+            for envelope in envelopes:
+                trigger = detector.observe(envelope)
+                if trigger is not None:
+                    triggers.append(trigger)
+            seen_streams |= present
         for trigger in triggers:
             for contract in game.contracts:
                 reaction = measure_reaction(
@@ -344,13 +515,32 @@ def render_report(report: BundleReport,
     lines.append(f"    contracts                   {report.contracts:>7,}")
     lines.append(f"    odds snapshots parsed       {report.snapshots_parsed:>7,}"
                  f" / {report.snapshot_payloads:,}")
+    lines.append(f"    snapshots carrying target   "
+                 f"{report.snapshots_with_target:>7,}"
+                 f" / {report.snapshots_parsed:,}")
     lines.append(f"    sharp quotes                {report.quotes:>7,}")
     lines.append(f"    candles                     {report.candles:>7,}")
     lines.append("")
+    if report.snapshots_without_target:
+        lines.append(f"    {len(report.snapshots_without_target)} parsed "
+                     f"snapshot(s) did NOT carry the target event.")
+        lines.append("    Each is a hole in that game's continuity, not a "
+                     "quiet market: the")
+        lines.append("    baseline is invalidated and the returning quote "
+                     "re-anchors, so no")
+        lines.append("    move is attributed across an interval nobody "
+                     "observed. This is an")
+        lines.append("    expected condition, NOT a coverage failure.")
+        for reason in report.snapshots_without_target[:10]:
+            lines.append(f"        {reason}")
+        lines.append("")
     if not report.complete:
-        lines.append("    *** PARSE INCOMPLETE. These are LOSSES, not quiet")
-        lines.append("    *** zeros: unread payloads read downstream as a")
+        lines.append("    *** COVERAGE INCOMPLETE. These are LOSSES, not quiet")
+        lines.append("    *** zeros: unread or absent payloads read "
+                     "downstream as a")
         lines.append("    *** market with less activity.")
+        for reason in report.coverage_failures():
+            lines.append(f"        {reason}")
         for reason in (report.incomplete_snapshots
                        + report.incomplete_candles)[:10]:
             lines.append(f"        {reason}")

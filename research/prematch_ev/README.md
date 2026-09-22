@@ -929,6 +929,29 @@ kickoff with no declared source, an unoriented contract — because a silently
 skipped game reports thinner coverage, and thinner coverage reads as a market
 with less activity.
 
+**A snapshot the provider returned WITHOUT our event is a hole, not a
+non-event.** The reader keeps one record per snapshot rather than flattening
+every quote into one list, so an interval in which the feed was read and the
+target was absent leaves a trace. `replay` declares it to the detector
+(`note_gap`), which invalidates that stream's baseline, so the returning
+quote re-anchors instead of closing a delta across an interval nobody
+observed. Flattening hid exactly that: two quotes either side of a hole sat
+inside `max_gap` and produced a trigger, a bracket and a lag measured over an
+unread gap. A hole costs the move that spans it and nothing after, and it is
+**counted, not graded** — a briefly absent market is what the design exists
+to survive (rule 27). An absence with no readable timestamp keeps its place
+in the sequence: ordering it to the end would move the hole past the quote it
+was meant to stop, which is how the first version of this fix reintroduced
+the bug it was fixing.
+
+**Coverage and parse success are different facts, and the second one is not
+the one a result depends on.** A bundle whose snapshots are all well-formed
+and none of which carries the target parses cleanly and replays to zero
+moves, which is byte-for-byte what a quiet slate looks like. So a game with
+no usable sharp quote, and a contract with no usable candle, are named
+coverage failures with a non-zero exit — while a run with real observations
+and no qualifying move still exits 0, because zero entries is a result.
+
 `reaction/capture.py` declares the bounded read-only interface a collection
 machine must satisfy, and deliberately contains **no HTTP client**: a module
 that could fetch would eventually fetch. The budget RAISES at its bound,
