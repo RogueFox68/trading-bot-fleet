@@ -371,8 +371,11 @@ notice a move, look at Kalshi at once, and record what a bot would have done.
 monitor polls, at 1 credit a poll — transcribed, and checked against the
 provider's own `x-requests-last` on the first answer. Polling faster than
 the provider refreshes buys the same answer twice, which is why the report
-prints the refresh it measured: a first session is how the cadence gets set
-from evidence.
+prints the refresh it measured — and a first session is how the cadence gets
+set from evidence, **provided it polls faster than the provider refreshes**.
+If no poll finds a game unchanged, the report says the figure is only a
+ceiling set by the poll spacing; an hour at 15 seconds (241 credits) measures
+any refresh slower than that.
 
 | session | every 60s | every 120s | every 300s |
 |---|---|---|---|

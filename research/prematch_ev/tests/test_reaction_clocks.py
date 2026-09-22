@@ -1024,6 +1024,92 @@ class ContinuityVersusGapTest(unittest.TestCase):
         self.assertNotIn(Rejection.BASELINE_INVALIDATED.value, counts)
 
 
+class RegressedContentTest(unittest.TestCase):
+    """An older copy, re-served, is not news.
+
+    A response served from a lagging copy carries what the provider saw
+    BEFORE an observation already in hand. It is new content -- a different
+    stamp -- so deduplication lets it through, and against the baseline it
+    reads as a move back. The newer price arriving again a poll later is then
+    a second move, measured from the stale copy. SYNTHETIC trajectories; the
+    shape is what a live feed behind a lagging cache would serve.
+    """
+
+    def moved(self):
+        """Baseline, then a real move: (detector, first trigger)."""
+        detector = MoveDetector(MovePolicy())
+        detector.observe(env(at(200), 120, -140, last_update=at(201)))
+        trigger = detector.observe(env(at(195), 160, -190,
+                                       last_update=at(196)))
+        self.assertIsNotNone(trigger)
+        return detector, trigger
+
+    def test_an_older_copy_re_served_is_not_a_move_back(self):
+        detector, _ = self.moved()
+        # A minute later the feed answers with the PRE-move copy: fresh
+        # enough to act on (seven minutes old), but stamped before the
+        # observation already seen. Then a second older copy, newer than the
+        # first but still older than the move -- an older copy must not
+        # lower the bar for the next one.
+        detector.observe(env(at(194), 120, -140, last_update=at(201)))
+        detector.observe(env(at(193), 120, -140, last_update=at(198)))
+        # and the newer copy again: the same content already in hand
+        detector.observe(env(at(190), 160, -190, last_update=at(196)))
+        counts = detector.result.counts()
+        self.assertEqual(len(detector.result.triggers), 1,
+                         "one book move is one trigger")
+        self.assertEqual(counts[Rejection.REGRESSED_CONTENT.value], 2)
+        self.assertEqual(counts[Rejection.UNCHANGED_CONTENT.value], 1,
+                         "the newer copy is a repeat of the newest content, "
+                         "not a change from the older one")
+        self.assertNotIn(Rejection.BASELINE_INVALIDATED.value, counts)
+
+    def test_the_next_move_is_measured_from_the_newest_observation(self):
+        detector, first = self.moved()
+        detector.observe(env(at(194), 120, -140, last_update=at(201)))
+        second = detector.observe(env(at(190), 260, -330, last_update=at(191)))
+        self.assertIsNotNone(second)
+        self.assertAlmostEqual(second.fair_before_home, first.fair_after_home,
+                               places=12)
+        self.assertEqual(second.book_change_earliest, at(196),
+                         "the bracket opens at the newest observation, not "
+                         "at the stale copy's")
+
+    def test_an_older_copy_still_counts_as_the_feed_answering(self):
+        """Continuity, exactly as for an unchanged re-serve: the feed did
+        answer, so a later move is not refused as a gap. The bracket stays
+        honest instead -- it opens at the newest observation, 40 minutes
+        before the move, because nothing newer was seen in between."""
+        detector, _ = self.moved()
+        detector.observe(env(at(185), 120, -140, last_update=at(197)))
+        later = detector.observe(env(at(155), 260, -330, last_update=at(156)))
+        self.assertIsNotNone(later, "30 minutes after the last answer is "
+                                    "inside max_gap")
+        self.assertNotIn(Rejection.GAP.value, detector.result.counts())
+        self.assertEqual(later.book_change_bracket_seconds, 2400.0)
+
+    def test_the_same_stamp_is_not_a_regression(self):
+        """Only an OLDER stamp is. A price that changed inside the provider's
+        one-second stamp is new content at the same instant."""
+        detector = MoveDetector(MovePolicy())
+        detector.observe(env(at(200), 120, -140, last_update=at(201)))
+        trigger = detector.observe(env(at(199), 160, -190,
+                                       last_update=at(201)))
+        self.assertIsNotNone(trigger)
+        self.assertNotIn(Rejection.REGRESSED_CONTENT.value,
+                         detector.result.counts())
+
+    def test_a_stale_older_copy_says_stale_first(self):
+        """The regression test runs AFTER the freshness checks, so a copy
+        that is both older and too old to act on reports the latter -- and
+        breaks comparability, as a stale record always has."""
+        detector, _ = self.moved()
+        detector.observe(env(at(194), 120, -140, last_update=at(260)))
+        counts = detector.result.counts()
+        self.assertEqual(counts[Rejection.STALE_AT_DECISION.value], 1)
+        self.assertNotIn(Rejection.REGRESSED_CONTENT.value, counts)
+
+
 class StreamIdentityTest(unittest.TestCase):
     """A stream is provider + book + event + market + orientation.
 

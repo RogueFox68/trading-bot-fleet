@@ -33,6 +33,11 @@ way this detector could report a move that never happened:
   every five minutes and a live feed re-sends on reconnect. Both look like
   fresh arrivals. `is_new_content_versus` decides on CONTENT, so a reconnect
   cannot masquerade as a move -- the failure the owner named explicitly.
+  Its mirror is a response served from an OLDER copy: different content, so
+  it passes that test, but it carries what the provider saw before an
+  observation already in hand. Read as content it is a move back, and the
+  newer price's return is a second move. The provider's own stamp orders
+  them (`REGRESSED_CONTENT`).
 
 WHAT IS NOT A TRIGGER, BY NAME
 ------------------------------
@@ -147,6 +152,7 @@ class Rejection(str, Enum):
 
     FIRST_OBSERVATION = "first_observation"        # baseline, nothing to move from
     UNCHANGED_CONTENT = "unchanged_content"        # re-served/reconnect, same value
+    REGRESSED_CONTENT = "regressed_content"        # older than one already seen
     MISSING_SIDE = "missing_side"                  # one-sided quote
     UNDEVIGGABLE = "undeviggable"                  # prices will not de-vig
     UNKNOWN_CONTENT_AGE = "unknown_content_age"    # no last_update: not "fresh"
@@ -389,7 +395,7 @@ class DetectorResult:
 class MoveDetector:
     """Feed it envelopes in availability order; it yields triggers.
 
-    FOUR PIECES OF STATE PER STREAM, and the reason each is separate:
+    FIVE PIECES OF STATE PER STREAM, and the reason each is separate:
 
       _baseline       the last quote a move may be measured FROM
       _baseline_ok    False once an unusable interval intervened, so the next
@@ -397,6 +403,9 @@ class MoveDetector:
                       attributed as a move across the hole
       _last_seen_at   the last VALID observation, changed or not. Continuity.
       _last_content   the last record of any kind. Deduplication.
+      _newest_observed  the latest PROVIDER stamp seen, by the provider's own
+                      clock. Arrival order is ours; this is the provider's,
+                      and a record older by it is not news.
 
     `_last_seen_at` and `_baseline` were one field, and that was wrong in both
     directions. An unchanged price polled every five minutes advanced neither,
@@ -413,6 +422,7 @@ class MoveDetector:
         self._baseline_ok: dict[str, bool] = {}
         self._last_seen_at: dict[str, datetime] = {}
         self._last_content: dict[str, SourceEnvelope] = {}
+        self._newest_observed: dict[str, datetime] = {}
         self._last_trigger_at: dict[str, datetime] = {}
         self.result = DetectorResult()
 
@@ -507,6 +517,14 @@ class MoveDetector:
                          f"observation at {previous_seen.isoformat()}")
             return None
 
+        # The provider's newest stamp BEFORE this record, for the regression
+        # test below; this record may raise it but never lower it.
+        stamp = envelope.provider_observed_at
+        newest_before = self._newest_observed.get(stream)
+        if stamp is not None and (newest_before is None
+                                  or stamp > newest_before):
+            self._newest_observed[stream] = stamp
+
         # UNCHANGED CONTENT. A re-served price and a reconnect both arrive
         # looking fresh. This ADVANCES CONTINUITY -- the feed did not stop --
         # while leaving the baseline where it is, because nothing moved.
@@ -573,6 +591,27 @@ class MoveDetector:
                    and capture_age <= self.policy.max_age_at_decision
                    .total_seconds() else ""))
             self._invalidate(stream, "stale at decision", available)
+            self._last_seen_at[stream] = available
+            return None
+
+        # AN OLDER COPY, RE-SERVED, IS NOT NEWS. A live response served from
+        # a lagging copy carries what the provider saw BEFORE an observation
+        # already in hand: new content, so deduplication lets it through, and
+        # a move back once compared. The newer price arriving again a poll
+        # later would then be a second move. Judged after the checks above,
+        # so a record that is also stale or unusable keeps the rejection
+        # that says so. Continuity advances -- the feed answered -- while the
+        # baseline, and the content later records are deduplicated against,
+        # stay with the newest observation.
+        if (stamp is not None and newest_before is not None
+                and stamp < newest_before):
+            self._reject(stream, Rejection.REGRESSED_CONTENT, available,
+                         f"the provider observed this at {stamp.isoformat()},"
+                         f" before an observation already seen at "
+                         f"{newest_before.isoformat()}: an older copy "
+                         f"re-served, not a move")
+            if last_content is not None:
+                self._last_content[stream] = last_content
             self._last_seen_at[stream] = available
             return None
 

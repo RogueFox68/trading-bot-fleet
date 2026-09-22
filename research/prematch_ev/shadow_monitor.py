@@ -14,10 +14,12 @@ Nothing is sent to Kalshi except reads of its public book.
 
 It measures what no archive can:
 
-  * how old a sharp price is by the time it reaches us -- the delivery delay
-    every replay has to assume is zero;
-  * how often the provider actually refreshes, so a poll cadence can be set
-    from evidence instead of bought on a guess;
+  * how old the provider's observation of a price already is when it
+    reaches us -- the delivery delay every replay has to assume is zero;
+  * how often the provider actually re-observes a game, so a poll cadence
+    can be set from evidence instead of bought on a guess. That is only
+    measurable by polling faster than it: when every poll finds something
+    new, the report says the figure is a ceiling set by the poll spacing;
   * how fast Kalshi follows, at the resolution of this machine's polls
     rather than the exchange's one-minute candles;
   * and what the executable book was at the moment of a move, with depth.
@@ -68,15 +70,22 @@ STOPS, AND WHY EACH IS ONE
                          one real book is read -- free -- before the first
                          paid poll; a shape the parser refuses stops the run
                          before anything is bought
+  undated quotes         the provider's observation stamp is transcribed too.
+                         The detector refuses a price with no stamp, so a
+                         first answer in which no pre-match quote carries one
+                         stops the run after one credit rather than paying
+                         for a session that could never trigger
   undeclared request     a request outside ALLOWED_ENDPOINTS, refused before
                          it was sent
 
 RECORDS
 -------
 One append-only JSONL file per session under `study_output/shadow/`: every
-raw response with the clocks around it, every move, every decision, every gap
-and the reason the session ended. `--report` reads it. The API key is in no
-record: a recorded URL is its path, never its query.
+raw response with the clocks around it, every move, every decision, every gap,
+the detector's refusals for each poll by reason, and the reason the session
+ended. `--report` reads it, and prints "0 moves" beside those refusals, so a
+detector that could not see is never mistaken for a quiet market. The API key
+is in no record: a recorded URL is its path, never its query.
 """
 
 from __future__ import annotations
@@ -317,6 +326,7 @@ class ShadowMonitor:
         self.started: set[str] = set()
         self.failed_polls = 0
         self.cost_verified = False
+        self.dates_verified = False
         self.next_rejoin: datetime | None = None
         self.counts = {"polls": 0, "polls_failed": 0, "triggers": 0,
                        "decisions": 0, "entries": 0, "book_reads": 0,
@@ -421,6 +431,30 @@ class ShadowMonitor:
                         f"left, at or below the floor of {QUOTA_FLOOR}")
         return None
 
+    def check_dates(self, quotes: Sequence[Any],
+                    received_at: datetime) -> Stop | None:
+        """The provider's observation stamp is transcribed too.
+
+        The detector refuses a price with no observation time -- unknown age
+        is not fresh -- so a feed that sends none would be watched, and paid
+        for, with nothing able to trigger. Checked on the first answer that
+        carries a pre-match quote; after that, a missing stamp is counted by
+        the detector like any other refusal.
+        """
+        if self.dates_verified:
+            return None
+        upcoming = [q for q in quotes if q.commence_time > received_at]
+        if not upcoming:
+            return None
+        if all(q.last_update is None for q in upcoming):
+            return Stop("undated_quotes",
+                        f"none of the {len(upcoming)} pre-match quote(s) in "
+                        f"the first answer carries the provider's observation "
+                        f"time; the detector refuses an undated price, so "
+                        f"nothing this session watched could trigger")
+        self.dates_verified = True
+        return None
+
     # --- one tick ----------------------------------------------------------
 
     def tick(self) -> Stop | None:
@@ -444,8 +478,18 @@ class ShadowMonitor:
             sent_at=live.sent_at, received_at=live.received_at,
             provider_date=live.provider_date, status=live.status,
             charged=live.charged, used=live.used, remaining=live.remaining,
-            payload=live.payload, coverage=live.coverage.reasons,
-            detector=self._drain_rejections())
+            payload=live.payload, coverage=live.coverage.reasons)
+        stop = self.absorb(live, now)
+        # WHY NOTHING TRIGGERED, for THIS answer: recorded once its quotes
+        # have been through the detector, so every count sits beside the
+        # poll it belongs to -- and a detector that refuses everything shows
+        # it on the poll where it started.
+        self.recorder.write("detector", received_at=live.received_at,
+                            rejections=self._drain_rejections())
+        return stop
+
+    def absorb(self, live: LiveOdds, now: datetime) -> Stop | None:
+        """One answer through the stops, the join and the detector."""
         parsed = parse_snapshot(live.snapshot_body()) if live.ok else None
         if parsed is None or not parsed.coverage.complete:
             self.counts["polls_failed"] += 1
@@ -463,7 +507,8 @@ class ShadowMonitor:
                             f"{'; '.join(reasons) or 'no response'}")
             return None
         self.failed_polls = 0
-        stop = self.check_answer(live)
+        stop = self.check_answer(live) or self.check_dates(parsed.quotes,
+                                                           live.received_at)
         if stop:
             return stop
 
@@ -638,6 +683,7 @@ class ShadowMonitor:
         self.recorder.write("session_end", at=self.clock.now(),
                             reason=stop.reason, detail=stop.detail,
                             ok=stop.ok, counts=self.counts,
+                            detector=self._drain_rejections(),
                             ledger=str(self.ledger),
                             credits_reserved=self.ledger.spent_this_run,
                             account_remaining=self.ledger.remaining)
@@ -730,35 +776,76 @@ def report(rows: Sequence[dict], *, min_response: float | None = None,
 
     odds = [r for r in rows if r["kind"] == "odds"]
     skews, ages, refresh = [], [], []
-    last_seen: dict[str, datetime] = {}
+    sightings: Counter = Counter()
+    last_seen: dict[tuple[str, str], datetime] = {}
     for row in odds:
         received, provider = _time(row.get("received_at")), _time(
             row.get("provider_date"))
         if received and provider:
             skews.append((received - provider).total_seconds())
-        if row.get("payload") is None or not received:
+        parsed = None
+        if row.get("payload") is not None and received and not row.get(
+                "coverage"):
+            stamp = provider or received
+            parsed = parse_snapshot({"timestamp": stamp.strftime(
+                "%Y-%m-%dT%H:%M:%SZ"), "data": row["payload"]})
+        if parsed is None or not parsed.coverage.complete:
+            # A POLL THAT DID NOT ANSWER IS A HOLE, here as in the monitor.
+            # Observations may have come and gone inside it, so the next one
+            # of any game is a first sighting again: it measures neither how
+            # stale a new observation is nor how long the last one took.
+            last_seen.clear()
+            sightings["unanswered_polls"] += 1
             continue
-        stamp = provider or received
-        parsed = parse_snapshot({"timestamp": stamp.strftime(
-            "%Y-%m-%dT%H:%M:%SZ"), "data": row["payload"]})
+        present: set[tuple[str, str]] = set()
         for quote in parsed.quotes:
             if quote.last_update is None or quote.commence_time <= received:
-                continue
-            previous = last_seen.get(quote.provider_event_id)
-            if previous is not None and quote.last_update == previous:
-                continue
-            # A NEW provider observation: how old it was when it reached us,
-            # and how long the provider took to produce it after the last.
-            ages.append((received - quote.last_update).total_seconds())
-            if previous is not None:
+                continue          # undated, or in play: not a sighting
+            key = (quote.provider_event_id, quote.book)
+            present.add(key)
+            previous = last_seen.get(key)
+            if previous is None:
+                # Its first appearance may predate our watching, so its age
+                # is not a delivery delay and there is no interval to time.
+                sightings["first"] += 1
+                last_seen[key] = quote.last_update
+            elif quote.last_update == previous:
+                sightings["repeat"] += 1
+            elif quote.last_update < previous:
+                # An older copy, as the detector judges it: not news, and
+                # not allowed to lower the newest stamp seen.
+                sightings["older_copy"] += 1
+            else:
+                # A NEW observation, first seen on this poll: how old it
+                # already was when it reached us, and how long after the
+                # previous one the provider made it.
+                sightings["new"] += 1
+                ages.append((received - quote.last_update).total_seconds())
                 refresh.append((quote.last_update - previous).total_seconds())
-            last_seen[quote.provider_event_id] = quote.last_update
+                last_seen[key] = quote.last_update
+        # A GAME MISSING FROM AN ANSWER IS A HOLE for that game.
+        for key in [k for k in last_seen if k not in present]:
+            del last_seen[key]
     out["polls"] = {"total": len(odds),
                     "answered": sum(1 for r in odds if r.get("payload")
                                     is not None and not r.get("coverage")),
                     "clock_skew": _quantiles(skews)}
     out["age_when_received"] = _quantiles(ages)
     out["provider_refresh"] = _quantiles(refresh)
+    out["sightings"] = {k: sightings.get(k, 0) for k in (
+        "first", "new", "repeat", "older_copy", "unanswered_polls")}
+    out["cadence_seconds"] = start.get("cadence_seconds")
+
+    # Every refusal the detector made, summed from the per-poll records and
+    # the remainder the session_end carries. "0 moves" means nothing until
+    # this says whether the detector could see.
+    refused: Counter = Counter()
+    for row in rows:
+        if row["kind"] == "detector":
+            refused.update(row.get("rejections") or {})
+        elif row["kind"] == "session_end":
+            refused.update(row.get("detector") or {})
+    out["detector"] = dict(refused)
 
     triggers = [r for r in rows if r["kind"] == "trigger"]
     decisions = [r for r in rows if r["kind"] == "decision"]
@@ -779,6 +866,35 @@ def report(rows: Sequence[dict], *, min_response: float | None = None,
                         for d in decisions if d.get("market_ticker")
                         and d.get("book_move_for_yes") is not None]
     return out
+
+
+def _refresh_verdict(seen: dict, cadence: float | None) -> list[str]:
+    """Whether the refresh figure measured the provider or this session.
+
+    A poll can only see an observation that exists when it lands. If every
+    poll found a new one, the provider re-observed at least once between
+    every pair of polls, and the intervals timed are this session's spacing
+    with the provider's hidden inside it: a ceiling on its interval, not a
+    measurement of it. Only polls that found nothing new show the provider
+    being slower than the session.
+    """
+    compared = seen["new"] + seen["repeat"]
+    if not compared:
+        return ["                     (no game was seen twice without a "
+                "hole between: nothing to time)"]
+    spacing = f"{cadence:g}s" if cadence else "session's"
+    if not seen["repeat"]:
+        return ["  *** no poll found a game unchanged, so the provider "
+                "re-observed between",
+                f"      every pair of polls and the refresh figure is set by "
+                f"the {spacing} poll spacing:",
+                "      a ceiling on the provider's interval, not a "
+                "measurement of it. Only a",
+                "      faster session can measure it."]
+    return [f"                     ({seen['repeat']} of {compared} later "
+            f"sightings of a game found it unchanged;",
+            "                      polling faster than the provider "
+            "re-observes buys more of those)"]
 
 
 def _book_mid(row: dict) -> float | None:
@@ -847,16 +963,24 @@ def render_report(figures: dict) -> str:
              f"  ended              {s['ended']}   ({s['stop']})",
              f"  credits reserved   {s['credits_reserved']}", ""]
     polls = figures["polls"]
+    seen = figures["sightings"]
     lines += [f"  polls              {polls['total']} "
               f"({polls['answered']} answered)",
               f"  clock skew         {polls['clock_skew']}",
               f"  age when received  {figures['age_when_received']}",
-              "                     (how old a NEW provider observation was "
-              "when it reached us)",
+              "                     (how old a NEW provider observation "
+              "already was when it reached us:",
+              "                      the provider's own delay plus up to one "
+              "poll of waiting for ours)",
               f"  provider refresh   {figures['provider_refresh']}",
-              "                     (time between successive observations of "
-              "one game; polling faster buys repeats)", "",
-              f"  moves detected     {figures['moves']}"]
+              "                     (time between successive provider "
+              "observations of one game)",
+              f"  sightings          {seen['new']} new, {seen['repeat']} "
+              f"repeated, {seen['older_copy']} older copies, "
+              f"{seen['first']} first, {seen['unanswered_polls']} "
+              f"unanswered poll(s)"]
+    lines += _refresh_verdict(seen, figures.get("cadence_seconds"))
+    lines += ["", f"  moves detected     {figures['moves']}"]
     for key, count in sorted(figures["decisions"].items()):
         lines.append(f"    {key:<34} {count}")
     lines.append(f"  shadow entries     {len(figures['entries'])}")
@@ -880,6 +1004,12 @@ def render_report(figures: dict) -> str:
     if lags:
         lines.append(f"    followed within    "
                      f"{', '.join(f'{a:.0f}-{b:.0f}s' for a, b in lags[:12])}")
+    lines.append("  quotes the detector did not count as a move, by reason:")
+    refused = figures["detector"]
+    for key, count in sorted(refused.items(), key=lambda kv: (-kv[1], kv[0])):
+        lines.append(f"    {key:<34} {count:,}")
+    if not refused:
+        lines.append("    none recorded")
     lines += ["", "  No orders were placed. Predicted figures read the book "
               "at the decision; realised figures need settlement, which a "
               "live session does not have."]

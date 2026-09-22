@@ -106,6 +106,10 @@ class Response:
         return False
 
 
+def _inside(window, at) -> bool:
+    return window is not None and window[0] <= at < window[1]
+
+
 class LiveNetwork:
     """Answers the monitor's endpoints as they would stand at `clock.now()`.
 
@@ -120,9 +124,17 @@ class LiveNetwork:
       listing_status   the open-market listing fails with this status
       listing_fail_after  the listing answers this many times, then fails
       extra_in_play    add a game already under way, re-priced every poll
+      extra_pre_match  add a second, later game, re-priced every poll, with
+                       no Kalshi market to join
       follow_on_execution  Kalshi re-prices the instant the move is served:
                        the decision read sees the old book, the execution
                        read the new one
+      odds_fail_at     odds polls in this window fail (503)
+      undated_at       odds polls in this window carry no observation stamp
+      older_copy_at    odds polls in this window are answered from a copy
+                       made before the move: the old price, an older stamp
+      refresh_every    the provider re-observes on this grid rather than on
+                       every request, so polls in between repeat it
     """
 
     def __init__(self, clock: FakeClock, **knobs):
@@ -140,8 +152,13 @@ class LiveNetwork:
         self.fail_books_during = knobs.get("fail_books_during")
         self.interrupt_on_poll = knobs.get("interrupt_on_poll")
         self.follow_on_execution = knobs.get("follow_on_execution", False)
+        self.odds_fail_at = knobs.get("odds_fail_at")
+        self.undated_at = knobs.get("undated_at")
+        self.older_copy_at = knobs.get("older_copy_at")
+        self.refresh_every = knobs.get("refresh_every")
         self.listings_served = 0
         self.extra_in_play = knobs.get("extra_in_play", False)
+        self.extra_pre_match = knobs.get("extra_pre_match", False)
         self.odds_calls: list[datetime] = []
         self.book_calls: list[tuple[str, datetime]] = []
         self.urls: list[str] = []
@@ -179,26 +196,44 @@ class LiveNetwork:
         if self.odds_status:
             raise urllib.error.HTTPError(url, self.odds_status, "Unauthorized",
                                          {}, None)
-        moved = at >= MOVE_AT
+        if _inside(self.odds_fail_at, at):
+            raise urllib.error.HTTPError(url, 503, "Unavailable", {}, None)
         observed = at - PROVIDER_LAG
+        if self.refresh_every:
+            observed = T0 + self.refresh_every * (
+                (observed - T0) // self.refresh_every)
+        # The provider shows the move once it has OBSERVED the book after it.
+        moved = observed + PROVIDER_LAG >= MOVE_AT
+        if _inside(self.older_copy_at, at):
+            observed = MOVE_AT - PROVIDER_LAG - timedelta(minutes=1)
+            moved = False
         events = []
-        if not (self.absent_at and self.absent_at[0] <= at < self.absent_at[1]):
+        if not _inside(self.absent_at, at):
             events = odds_payload(at, 260 if moved else 120,
                                   -320 if moved else -140, observed,
                                   event_id=EVENT)["data"]
+            if _inside(self.undated_at, at):
+                book = events[0]["bookmakers"][0]
+                del book["last_update"]
+                del book["markets"][0]["last_update"]
             self.moved_served = self.moved_served or moved
+        extras = []
         if self.extra_in_play:
-            live = odds_payload(at, 150 + (at.minute % 7) * 40,
-                                -170 - (at.minute % 5) * 60, observed,
-                                event_id="evt-in-play")["data"][0]
-            live["commence_time"] = "2026-09-13T17:00:00Z"
-            live["home_team"], live["away_team"] = (
+            extras.append(("evt-in-play", "2026-09-13T17:00:00Z"))
+        if self.extra_pre_match:
+            extras.append(("evt-later", "2026-09-14T17:00:00Z"))
+        for event_id, commence in extras:
+            other = odds_payload(at, 150 + (at.minute % 7) * 40,
+                                 -170 - (at.minute % 5) * 60, observed,
+                                 event_id=event_id)["data"][0]
+            other["commence_time"] = commence
+            other["home_team"], other["away_team"] = (
                 "Kansas City Chiefs", "Denver Broncos")
-            for outcome in live["bookmakers"][0]["markets"][0]["outcomes"]:
+            for outcome in other["bookmakers"][0]["markets"][0]["outcomes"]:
                 outcome["name"] = ("Kansas City Chiefs"
                                    if outcome["name"] == "New York Giants"
                                    else "Denver Broncos")
-            events.append(live)
+            events.append(other)
         headers = {"Date": email.utils.format_datetime(
                        (at + self.skew).replace(microsecond=0), usegmt=True),
                    "x-requests-used": str(len(self.odds_calls)),
@@ -458,6 +493,29 @@ class StopTest(MonitorHarness):
     def test_a_nearly_empty_account_stops(self):
         self.assertStopped("quota_floor", polls=1, remaining=10)
 
+    def test_an_undated_feed_stops_on_its_first_answer(self):
+        """The provider's observation stamp is transcribed too. The detector
+        refuses an undated price, so a feed that sends none would be
+        watched, and paid for, with nothing able to trigger."""
+        _, rows, _ = self.assertStopped(
+            "undated_quotes", polls=1,
+            undated_at=(T0, T0 + timedelta(days=1)))
+        self.assertIn("observation time", self.end(rows)["detail"])
+
+    def test_only_a_pre_match_quote_can_vouch_for_the_stamps(self):
+        """A dated quote for a game already under way proves nothing: the
+        monitor never shows one to the detector."""
+        self.assertStopped("undated_quotes", polls=1, extra_in_play=True,
+                           undated_at=(T0, T0 + timedelta(days=1)))
+
+    def test_one_dated_pre_match_quote_is_enough(self):
+        """Only a feed with NO observation time stops. One dated game shows
+        the stamp exists; the undated one is the detector's to refuse."""
+        code, text, _ = self.paid(extra_pre_match=True,
+                                  undated_at=(T0, T0 + timedelta(days=1)))
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.end(self.records())["reason"], "end_of_session")
+
     def test_a_book_shape_nobody_knows_stops_before_any_purchase(self):
         text, rows, _ = self.assertStopped("book_unreadable", polls=0,
                                            book_shape_ok=False)
@@ -536,6 +594,36 @@ class HonestyTest(MonitorHarness):
             shadow_monitor.report(self.records()))
         self.assertIn("would have paid 0.7", rendered)
 
+    def test_an_older_copy_re_served_is_not_a_second_move(self):
+        """The two polls after the move are answered from a copy made
+        before it, then the newer copy returns. One book move, one trigger:
+        read as content, the older copy is a move back and the newer one's
+        return, three minutes after the first trigger, a second move."""
+        window = (MOVE_AT + timedelta(seconds=60),
+                  MOVE_AT + timedelta(seconds=180))
+        code, text, _ = self.paid(older_copy_at=window)
+        self.assertEqual(code, 0, text)
+        rows = self.records()
+        self.assertEqual(len(self.kinds(rows, "trigger")), 1)
+        figures = shadow_monitor.report(rows)
+        self.assertEqual(figures["detector"]["regressed_content"], 2)
+        self.assertEqual(figures["sightings"]["older_copy"], 2)
+
+    def test_a_stamp_lost_mid_session_is_counted_not_a_stop(self):
+        """The stamp check is on the first answer. After it, a quote with
+        no stamp is one the detector refuses, and the report counts it --
+        once: the next two undated polls carry the same content, which the
+        detector deduplicates like any re-served record."""
+        code, text, _ = self.paid(
+            undated_at=(MOVE_AT, MOVE_AT + timedelta(minutes=3)))
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.end(self.records())["reason"], "end_of_session")
+        figures = shadow_monitor.report(self.records())
+        self.assertEqual(figures["detector"]["unknown_content_age"], 1)
+        # and the undated stretch is a hole in the provider's timing too
+        self.assertIn("max 60.0s", figures["provider_refresh"])
+        self.assertEqual(figures["sightings"]["first"], 2)
+
     def test_a_game_absent_from_a_poll_is_a_hole_not_a_move(self):
         """The game vanishes on the 20:05 poll and returns moved on 20:06:
         nobody saw it move, so nothing may be measured across the hole."""
@@ -570,14 +658,22 @@ class HonestyTest(MonitorHarness):
 class LongSessionTest(MonitorHarness):
     """What a session left running for days must not do."""
 
-    def test_rejections_are_counted_into_the_records_and_dropped(self):
+    def test_each_poll_records_its_own_refusals(self):
+        """Counted once the poll's quotes have been through the detector,
+        so the first poll carries the baseline IT set. Counted before, every
+        record described the poll ahead of it and the last one's were lost."""
         code, text, _ = self.paid()
         self.assertEqual(code, 0, text)
-        polls = self.kinds(self.records(), "odds")
-        counted = [p["detector"] for p in polls if p.get("detector")]
-        self.assertTrue(counted, "no rejection counts recorded")
-        self.assertTrue(any("below_threshold" in c or "unchanged_content" in c
-                            for c in counted), counted[:3])
+        rows = self.records()
+        polls = self.kinds(rows, "odds")
+        counted = self.kinds(rows, "detector")
+        self.assertEqual(len(counted), len(polls))
+        for poll, refusals in zip(polls, counted):
+            self.assertEqual(refusals["received_at"], poll["received_at"])
+        self.assertEqual(counted[0]["rejections"], {"first_observation": 1})
+        self.assertTrue(any("below_threshold" in c["rejections"]
+                            for c in counted[1:]), counted[:3])
+        self.assertIn("detector", self.end(rows))
 
     def test_the_detector_holds_one_polls_worth_of_rejections(self):
         net = LiveNetwork(self.clock)
@@ -591,7 +687,8 @@ class LongSessionTest(MonitorHarness):
                 mock.patch("time.sleep"):
             monitor.run()
         recorder.close()
-        self.assertLessEqual(len(monitor.detector.result.rejections), 5)
+        # Each poll's are counted and dropped; the session_end takes the rest.
+        self.assertEqual(monitor.detector.result.rejections, [])
 
     def test_a_stalled_book_read_abandons_the_tick_not_the_poll(self):
         """Book reads fail across the 20:05 tick's decision reads. The rest
@@ -638,6 +735,72 @@ class ReportTest(MonitorHarness):
         self.assertEqual(code, 0)
         self.assertIn("1 unreadable line(s) skipped", out.getvalue())
         self.assertIn("moves detected     1", out.getvalue())
+
+    def test_a_provider_that_refreshes_every_poll_gives_a_ceiling(self):
+        """The story's provider re-observes on every request, so every poll
+        finds something new, and the 60s the report times is this session's
+        spacing, not the provider's. It says so."""
+        self.paid()
+        figures = shadow_monitor.report(self.records())
+        self.assertEqual(figures["sightings"]["repeat"], 0)
+        self.assertGreater(figures["sightings"]["new"], 20)
+        rendered = shadow_monitor.render_report(figures)
+        self.assertIn("60s poll spacing", rendered)
+        self.assertIn("a ceiling on the provider's interval", rendered)
+
+    def test_a_provider_slower_than_the_polls_is_measured(self):
+        code, text, _ = self.paid(refresh_every=timedelta(seconds=150))
+        self.assertEqual(code, 0, text)
+        figures = shadow_monitor.report(self.records())
+        self.assertIn("median 150.0s", figures["provider_refresh"])
+        self.assertIn("max 150.0s", figures["provider_refresh"])
+        self.assertGreater(figures["sightings"]["repeat"], 0)
+        rendered = shadow_monitor.render_report(figures)
+        self.assertNotIn("ceiling", rendered)
+        self.assertIn("buys more of those", rendered)
+
+    def test_a_game_missing_from_a_poll_is_not_timed_across(self):
+        """Three polls without the game: observations may have come and
+        gone inside the hole, so none is timed across it."""
+        self.paid(absent_at=(T0 + timedelta(minutes=2),
+                             T0 + timedelta(minutes=5)))
+        figures = shadow_monitor.report(self.records())
+        self.assertIn("max 60.0s", figures["provider_refresh"])
+        self.assertEqual(figures["sightings"]["first"], 2)
+
+    def test_an_unanswered_poll_is_not_timed_across(self):
+        code, text, _ = self.paid(odds_fail_at=(T0 + timedelta(minutes=2),
+                                                T0 + timedelta(minutes=4)))
+        self.assertEqual(code, 0, text)
+        figures = shadow_monitor.report(self.records())
+        self.assertIn("max 60.0s", figures["provider_refresh"])
+        self.assertEqual(figures["sightings"]["unanswered_polls"], 2)
+        self.assertEqual(figures["sightings"]["first"], 2)
+
+    def test_only_an_observation_first_seen_new_is_aged(self):
+        """A first sighting may predate our watching; its age is not a
+        delivery delay."""
+        self.paid()
+        figures = shadow_monitor.report(self.records())
+        self.assertTrue(figures["age_when_received"].startswith(
+            f"n={figures['sightings']['new']} "), figures)
+
+    def test_refusals_are_summed_from_every_poll_and_the_remainder(self):
+        rows = [{"kind": "session_start", "at": "2026-09-13T20:00:00+00:00",
+                 "cadence_seconds": 60},
+                {"kind": "detector", "rejections": {"below_threshold": 2}},
+                {"kind": "detector", "rejections": {"below_threshold": 1,
+                                                    "declared_gap": 1}},
+                {"kind": "session_end", "at": "2026-09-13T20:30:00+00:00",
+                 "reason": "interrupted",
+                 "detector": {"unknown_content_age": 4}}]
+        figures = shadow_monitor.report(rows)
+        self.assertEqual(figures["detector"], {"below_threshold": 3,
+                                               "declared_gap": 1,
+                                               "unknown_content_age": 4})
+        rendered = shadow_monitor.render_report(figures)
+        self.assertLess(rendered.index("unknown_content_age"),
+                        rendered.index("below_threshold"))
 
     def test_a_follow_past_the_window_is_censored_not_counted(self):
         code, _, _ = self.paid()

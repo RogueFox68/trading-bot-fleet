@@ -313,8 +313,10 @@ def _sharp_h2h_outcomes(
     entire thesis being tested.
 
     `last_update` is taken from the MARKET when the provider supplies one and
-    falls back to the bookmaker envelope, because the market-level stamp is the
-    one that says when this particular price moved.
+    falls back to the bookmaker envelope (deprecated upstream), because the
+    market's stamp is specific to this price and the bookmaker's covers all of
+    its markets. Either one is when the PROVIDER last saw the odds, not when
+    the book changed them -- see `SharpQuote`.
     """
     home_name, away_name = event.get("home_team"), event.get("away_team")
     for bookmaker in event.get("bookmakers", []) or []:

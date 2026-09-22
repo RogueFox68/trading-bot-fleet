@@ -752,6 +752,8 @@ class PilotProposalTest(unittest.TestCase):
         self.assertClaim(f"72 hours at one poll a minute is "
                          f"{session_price(72, _td(seconds=60)):,} credits")
         self.assertClaim(f"--spend {session_price(72, _td(seconds=60))}")
+        self.assertClaim(f"an hour at 15 seconds "
+                         f"({session_price(1, _td(seconds=15)):,} credits)")
 
     def test_the_documented_replay_commands_parse(self):
         """Exactly as spelled: argparse would otherwise accept a stale flag

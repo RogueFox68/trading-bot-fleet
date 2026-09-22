@@ -852,13 +852,14 @@ is an upper bound.
 
 ### Continuity and comparability are different facts
 
-A stream carries four pieces of state, not one:
+A stream carries five pieces of state, not one:
 
 ```
-_baseline     the last quote a move may be measured FROM
-_baseline_ok  False once an unusable interval intervened
-_last_seen_at the last VALID observation, changed or not
-_last_content the last record of any kind  (deduplication)
+_baseline         the last quote a move may be measured FROM
+_baseline_ok      False once an unusable interval intervened
+_last_seen_at     the last VALID observation, changed or not
+_last_content     the last record of any kind  (deduplication)
+_newest_observed  the latest PROVIDER stamp seen  (regression)
 ```
 
 Merged, it was wrong in both directions. An unchanged price polled every five
@@ -868,15 +869,25 @@ so a move was attributed across an interval the detector had just refused to
 read. `note_gap` is the collector's hook for an absence `observe()` cannot
 see — a market omitted from a provider response produces no envelope at all.
 
+**An older copy is not news.** A response served from a lagging copy carries
+what the provider saw *before* an observation already in hand. It is new
+content, so deduplication lets it through, and compared against the baseline
+it is a move back; the newer price arriving again a poll later is then a
+second move. The provider's own stamp orders them: a record stamped before
+the newest one seen is `regressed_content`, which advances continuity and
+leaves the baseline with the newest observation. It is judged after the
+freshness checks, so a record that is also stale still says `stale_at_decision`.
+
 **Stream identity is provider + book + event + market + orientation.** Keyed
 on event and market alone, two bookmakers shared one piece of state and the
 second book's price read as the first one moving.
 
 Every non-trigger is named and counted: `first_observation`,
-`unchanged_content`, `missing_side`, `undeviggable`, `unknown_content_age`,
-`gap_in_input`, `declared_gap`, `out_of_order`, `below_threshold`,
-`vig_only_change`, `no_availability_time`, `clock_order_invalid`,
-`stale_at_decision`, `wrong_book`, `baseline_invalidated`.
+`unchanged_content`, `regressed_content`, `missing_side`, `undeviggable`,
+`unknown_content_age`, `gap_in_input`, `declared_gap`, `out_of_order`,
+`below_threshold`, `vig_only_change`, `no_availability_time`,
+`clock_order_invalid`, `stale_at_decision`, `wrong_book`,
+`baseline_invalidated`.
 
 De-vigging happens **within one contemporaneous quote**, through
 `core.devig` — one implementation, Shin, named in the policy and recorded on
@@ -1059,10 +1070,10 @@ The no-order version of the bot the owner described: poll the sharp book,
 notice when it moves, look at Kalshi at once, and write down what a bot
 would have done — then keep watching Kalshi to learn whether, and how fast,
 it followed. It is the prospective recorder every replay figure has been
-waiting on, and it measures what no archive can: how old a sharp price is
-when it reaches us, how often the provider actually refreshes, how fast
-Kalshi follows at the spacing of its own reads, and what the book held at
-the moment of a move, with depth.
+waiting on, and it measures what no archive can: how old the provider's
+observation of a price is when it reaches us, how often the provider
+actually re-observes a game, how fast Kalshi follows at the spacing of its
+own reads, and what the book held at the moment of a move, with depth.
 
 ```
 python3 shadow_monitor.py --hours 72                   # the price, free
@@ -1096,10 +1107,24 @@ python3 shadow_monitor.py --report study_output/shadow/<session>.jsonl
   provider's, a nearly empty account, or a request outside the allow-list.
   Kalshi's book shape is transcribed rather than observed, so one real book
   is read — free — before the first paid poll, and a shape the parser
-  refuses stops the session with nothing bought.
+  refuses stops the session with nothing bought. The provider's observation
+  stamp is transcribed too, and the detector refuses a price without one, so
+  a first answer in which no pre-match quote carries a stamp stops the
+  session after one credit instead of paying for one that could never
+  trigger.
+- **The report says what it could not measure.** The provider's refresh is
+  only measurable by polling faster than it: if no poll ever finds a game
+  unchanged, the provider re-observed between every pair of polls, and the
+  report calls the figure what it is — a ceiling set by the poll spacing.
+  A hole — a failed poll, a game missing from an answer, an undated quote —
+  restarts the timing instead of being timed across, and an observation's
+  age is taken only when it was first seen new. "0 moves" is printed beside
+  the detector's refusals by reason, so a detector that could not see cannot
+  pass for a quiet market.
 - **Records, not state.** One append-only JSONL file per session: every raw
-  response with the clocks around it, every move, decision, gap and stop.
-  `--report` reads it offline; the key is in no record.
+  response with the clocks around it, every move, decision, gap and stop,
+  and each poll's detector refusals. `--report` reads it offline; the key is
+  in no record.
 - **Not yet:** scoring shadow entries against settlement. A live session
   ends before its games do, so its figures are *predicted*; realised
   results need the settled markets joined back in, which is not built.
