@@ -737,7 +737,7 @@ in the return figure; include them separately before calling anything viable.
   after the fact (`historical_schedule_as_of = unverified`), so no NFL result
   may be quoted as a point-in-time backtest, however green its coverage is.
 
-## The reaction-lag study (`run_reaction.py`) — separate, in progress
+## The reaction-lag study (`run_reaction.py`) — separate entry point
 
 A second, **separate** study asking a different question from the checkpoint
 one above:
@@ -749,90 +749,210 @@ one above:
 It has its own entry point and output schema **so the checkpoint result stays
 reproducible**. Nothing here edits `run_study.py`.
 
+```
+python3 run_reaction.py --capability          # the source timing audit
+python3 run_reaction.py --capability-verify   # free commands to re-check it
+python3 run_reaction.py --policy              # the DECLARED thresholds
+python3 run_reaction.py --replay bundle.json  # the whole chain, offline
+```
+
+All four are free: no network, no credential, no credits.
+
+### `last_update` is the PROVIDER's clock, not the book's
+
+This is the correction that reorganised the whole layer, and the first version
+of it asserted the opposite.
+
+`last_update` on an odds-archive row is **the last time the provider's system
+saw odds for that market from the bookmaker**. It is *not* when the bookmaker
+changed its price — and bookmaker-level `last_update` is deprecated upstream.
+The wrong reading came from `SharpQuote`'s own docstring, propagated into the
+clock module verbatim, and produced a confident `book_moved_at` point estimate
+the source cannot support.
+
+So there are **four clocks**, kept apart:
+
+```
+provider_observed_at    the provider last saw odds for this market
+provider_snapshot_time  the provider captured/closed this row
+local_receipt_time      WE received it  (live capture only; None in replay)
+scheduled_start         kickoff
+```
+
+and the book's own change instant is reported as a **bracket** between two
+consecutive provider observations. There is no point estimate, and
+`MoveTrigger` has no `book_moved_at` field — a test asserts its absence.
+
 ### The capability audit comes first, and it is a control
 
-`python3 run_reaction.py --capability` — free, no network, no credential. It
-grades each of the study's questions against the sources actually available,
-because two of them turn out to be unanswerable at **any** sample size, and
-building the measurement before discovering that would have produced numbers
-nobody should read.
+`reaction/capability.py` grades each of the study's questions against the
+sources actually available, because several turn out to be unanswerable at
+**any** sample size.
 
 | question | verdict |
 |---|---|
 | did the book's fair probability move, and by how much | **answerable** |
-| when did the BOOK move | **answerable** (`last_update`, seconds) |
+| when did the PROVIDER last observe this price | **answerable** |
+| when did the BOOK actually change its price | **NO** — bracketed only |
 | when could OUR SYSTEM have known | ±300s — the archive is a 5-minute grid |
 | when did the Kalshi quote change | ±60s — candles are 1-minute aggregates |
 | did the book move *before* Kalshi | ±300s — closer orderings are unidentifiable |
-| how long a discrepancy persisted | ±60s, both ends censored |
+| how long a discrepancy persisted | ±300s, both ends censored |
 | was the quote **fillable in size** | **NO** — no depth on either path |
 | suspended, or merely absent | **NO** — neither source distinguishes them |
 | the provider's delivery lag | **NO** — historical replay has no receipt time |
+| what the LIVE feed could do | **NO** — replay assumes zero delivery delay |
 
-**Reaction resolution floor: 300s.** Every lag, ordering and persistence figure
-inherits it. A five-minute sample is not second-resolution evidence.
+**Reaction resolution floor: 300s.** Every lag, ordering and persistence
+figure inherits it. A five-minute sample is not second-resolution evidence.
 
-The unanswerable rows are **not pending work** — and the audit exits **0**
+The unanswerable rows are **not pending work**, and the audit exits **0**
 anyway. They are permanent properties of these two sources that the design
-accounts for, so putting them in the exit code would burn it on a red line that
-never clears (rule 27, the stooq lesson). Non-zero is reserved for the
-transcribed cadence disagreeing with measured data, which is a real defect
-someone can fix.
+accounts for, so putting them in the exit code would burn it on a red line
+that never clears (rule 27, the stooq lesson).
 
-### The executable clock, which is the whole correctness story
+### The executable clock, and the bound that belongs on it
+
+`reaction/clocks.py` keeps them apart; `reaction/detector.py` decides a move.
 
 ```
-last_update  -> when the BOOK moved            (we could not have known it then)
-snapshot     -> when WE could first have known (the clock a decision runs on)
+provider_observed_at    -> when the PROVIDER saw it (we could not act then)
+available_at            -> when WE could first have acted
 ```
 
-A book move stamped 11:20 that first appears in the 11:25 snapshot is detected
-at **11:25**. Measuring from `last_update` is enormously tempting — it is
-stamped to the second and it *is* when the book moved — and it would credit the
-strategy with information it did not have. That is lookahead wearing a
-timestamp, and this study has already shipped lookahead twice (a snapshot
-captured after the decision; an execution quote written into the decision
-book), both caught in review rather than by the code. So it is an **exception**
-now: `assert_no_future_data` raises, and it checks the executable clock, not the
-source's own stamp.
+A move first appearing in the 11:25 snapshot is detected at **11:25**.
+Measuring from `provider_observed_at` is tempting — it is stamped to the
+second — and it would credit the strategy with information it did not have.
+`assert_no_future_data` **raises**, and it checks the executable clock.
 
-`local_receipt_time` is `None` for every historical record and may not be
-invented. Only a prospective recorder can supply one.
+The freshness bound sits on `age_at_decision_seconds`, not on capture age. In
+replay the two are the same number, which is why no historical fixture
+distinguishes them — but a LIVE record captured at 12:05 and received at 12:25
+is 1200s old when actionable, and a capture-age bound calls it fresh at 30s.
+That defect only exists on the live path, which is the path a pilot runs on.
 
-### The detector triggers on content, never on arrival
+An **impossible clock ordering is refused before any bound**: a stamp after
+its own capture yields a negative age, and every freshness test ever written
+is an upper bound.
 
-The archive re-serves an unchanged price every five minutes and a live feed
-re-sends on reconnect; both arrive looking fresh. Detection keys on the
-**content** (market + source update stamp + payload hash), so *a provider
-reconnect cannot masquerade as a move* — and a fresh envelope carrying a
-three-hour-old book price is `stale_content`, not a signal.
+### Continuity and comparability are different facts
 
-Every non-trigger is named and counted, so a run reports why it saw fewer moves
-than updates instead of a bare total: `first_observation` (a baseline has
-nothing to have moved from), `unchanged_content`, `missing_side`,
-`undeviggable`, `stale_content`, `unknown_content_age`, `gap_in_input`
-(a hole is not continuity — the baseline resets rather than calling the
-difference across it one move), `out_of_order`, `below_threshold`,
-`vig_only_change` (the margin moved while the fair view held — a real
-observation, not noise), `no_availability_time`.
+A stream carries four pieces of state, not one:
 
-De-vigging happens **within one contemporaneous quote**. Mixing an away price
-from one update with a home price from another manufactures a move out of two
-honest quotes.
+```
+_baseline     the last quote a move may be measured FROM
+_baseline_ok  False once an unusable interval intervened
+_last_seen_at the last VALID observation, changed or not
+_last_content the last record of any kind  (deduplication)
+```
 
-`MovePolicy` is declared, recorded on every trigger, and marked
-`tuned_on_outcomes: false`. **The 16 NFL games are development data**; fitting
-the threshold on them would make every downstream figure a selection artifact.
+Merged, it was wrong in both directions. An unchanged price polled every five
+minutes advanced neither, so a feed that never stopped read as `gap_in_input`;
+and an unusable observation between two good ones left the baseline standing,
+so a move was attributed across an interval the detector had just refused to
+read. `note_gap` is the collector's hook for an absence `observe()` cannot
+see — a market omitted from a provider response produces no envelope at all.
+
+**Stream identity is provider + book + event + market + orientation.** Keyed
+on event and market alone, two bookmakers shared one piece of state and the
+second book's price read as the first one moving.
+
+Every non-trigger is named and counted: `first_observation`,
+`unchanged_content`, `missing_side`, `undeviggable`, `unknown_content_age`,
+`gap_in_input`, `declared_gap`, `out_of_order`, `below_threshold`,
+`vig_only_change`, `no_availability_time`, `clock_order_invalid`,
+`stale_at_decision`, `wrong_book`, `baseline_invalidated`.
+
+De-vigging happens **within one contemporaneous quote**, through
+`core.devig` — one implementation, Shin, named in the policy and recorded on
+every trigger. A private multiplicative de-vig here disagreed with the
+study's baseline by up to 0.0052 against a 0.01 threshold.
+
+### A lag is an interval; the exchange leading is its own outcome
+
+`reaction/measure.py` answers two questions separately, because collapsing
+them is the temptation and "the book led by 90 seconds" is neither:
+
+- **ordering** — from bracket OVERLAP, using the detector's own bracket.
+  Two intervals that overlap do not order, at any sample size.
+- **tradeable lag** — `lag_earliest_seconds` / `lag_latest_seconds`. There is
+  no `lag_seconds`; a point estimate would be quoted and averaged, and half
+  its precision would be an artifact of the grid.
+
+`ALREADY_PRICED` is its own outcome, found by a **lookback**. A forward-only
+search sees the exchange already adjusted and reports `NO_RESPONSE` — filing
+the thesis being falsified under the same name as the thesis holding.
+
+A **missing candle is not a flat price**. Whether a quiet minute gets a candle
+is the audit's suspension-versus-absence question one layer down, so the
+conservative reading ships (`BLIND_INTERVAL` — we could not see, not nothing
+happened) and `--capability-verify` carries a free command that would settle
+it.
+
+`discrepancy_survives(delay)` has **three** answers: True, False, and None
+when the delay falls inside the lag interval. A boolean there is a coin flip
+formatted as a measurement.
+
+### The screen is the checkpoint study's own
+
+`reaction/screen.py` is an **adapter**, not a second screen. This layer's
+contribution is *which instants get screened*; `analysis.scoring` still
+decides what tradeable means, with the round-2 lesson intact (a midpoint
+screen passed bid .40 / ask .60 against a .53 fair — a predicted **-0.09 per
+contract**). A test parses this module's source and fails if it declares its
+own EV threshold, price band or spread bound.
+
+Settlement is **withheld, not defaulted**: predicted EV never reads the
+outcome, so a bundle without settlement still produces a complete run, and the
+serialised row is identical for both placeholder values.
+
+### Episode accounting: every count in its own unit
+
+One book move on a two-contract game is **1 trigger, 2 screened rows, 1
+entry** — three correct numbers, none interchangeable. Reporting one under
+another's name is how a run once printed `50.0% of 4 eligible contracts lost`.
+`reaction/episodes.py`'s `StageCount` cannot be built without a `Unit`, and a breakdown that does not
+sum to its total is called out loudly.
+
+**September 1–16 2026 is development data.** `HoldoutViolation` raises on a run
+over that window declared a holdout, and `holdout_available` is False because
+none has been collected.
+
+### Offline replay, and a capture contract with no transport
+
+`reaction/replay.py` reads a bundle of **raw provider payloads** and runs them
+through the
+live collector's own parsers, so a parser fix reaches the replay and
+a replay can never disagree with a live run about what a byte sequence means. The
+reader refuses rather than degrades — unknown schema, naive timestamp, a
+kickoff with no declared source, an unoriented contract — because a silently
+skipped game reports thinner coverage, and thinner coverage reads as a market
+with less activity.
+
+`reaction/capture.py` declares the bounded read-only interface a collection
+machine must satisfy, and deliberately contains **no HTTP client**: a module
+that could fetch would eventually fetch. The budget RAISES at its bound,
+`assert_read_only` parses the package for order-placing paths and trading
+credentials, and `CapturePlan.budget()` derives the enforced bound from the
+approved plan so it cannot be run wider than approved.
+
+`REACTION_PILOT.md` proposes a **feasibility probe, not an edge study**: if
+the exchange typically reacts inside five minutes, these sources cannot see
+the effect at all, and that is answerable far more cheaply than an edge
+estimate. Its cost figures are pinned to `estimate_credits` by tests, so the
+document cannot drift from the code.
 
 ### Status
 
-Built and tested: the capability audit, the clock/provenance contracts, and the
-causal move detector. **Not built and not faked:** reaction measurement, the
-executable-opportunity screen, the episode ledger and the paper replay. The
-owner's named test cases that need those layers (book-leads/Kalshi-follows with
-a surviving gap, indeterminate ordering, Kalshi-first, no response, a gap the
-delay misses) are deliberately absent rather than stubbed — a test that
-pretended to cover them would be worse than their absence.
+Built and tested: the capability audit, the clock/provenance contracts, the
+causal move detector, the reaction measurement, the opportunity screen, the
+episode ledger and the offline replay. Every named test case is present —
+book-leads-with-a-surviving-discrepancy, indeterminate ordering, Kalshi-first,
+no response, the delay that misses the gap, a quote beyond the allowed wait,
+and a move-plus-full-reaction between two coarse checkpoints.
+
+**Not built:** live capture. `capture.py` is its contract and its guards, with
+no transport.
 
 No orders. No live capture. No paid requests. None is authorised and none is
 implemented.

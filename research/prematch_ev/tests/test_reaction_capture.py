@@ -414,5 +414,126 @@ class PilotProposalTest(unittest.TestCase):
             self.assertIsNotNone(parsed)
 
 
+class ReadmeCurrencyTest(unittest.TestCase):
+    """The README's reaction section is checked against the code.
+
+    It had gone stale in the worst way: the capability table still graded
+    "when did the BOOK move" as ANSWERABLE on the strength of `last_update`
+    -- the exact defect review finding 1 was about -- it listed a
+    `stale_content` rejection that no longer exists, and its status section
+    said four built layers were "not built and not faked".
+
+    A README claiming a capability the sources do not have is the same class
+    of error as a dashboard reading a number beside a flag that contradicts
+    it: whoever reads it reads the claim. So the claims are pinned.
+    """
+
+    README = (Path(__file__).resolve().parent.parent / "README.md")
+
+    def setUp(self):
+        self.raw = self.README.read_text()
+        self.section = self.raw[self.raw.index("## The reaction-lag study"):]
+        self.text = self.section.lower()
+
+    def assertClaim(self, needle: str, where: str | None = None):
+        """assertIn without dumping the whole section on failure."""
+        haystack = self.text if where is None else where.lower()
+        if needle.lower() not in haystack:
+            self.fail(f"the README does not claim {needle!r}")
+
+    def _listed_rejections(self) -> set[str]:
+        """Parse the one paragraph that enumerates them, not the whole text.
+
+        Scanning the whole section for backticked tokens picked up field
+        names and module paths, and required an underscore to filter them --
+        which silently excluded `undeviggable`, the one rejection with no
+        underscore in it. A parser whose filter can drop a real entry cannot
+        report a missing one.
+        """
+        import re
+        marker = "Every non-trigger is named and counted:"
+        start = self.section.index(marker) + len(marker)
+        paragraph = self.section[start:self.section.index("\n\n", start)]
+        return set(re.findall(r"`([a-z_]+)`", paragraph))
+
+    def test_every_rejection_reason_is_listed_and_none_is_invented(self):
+        """The check that would have caught `stale_content` surviving."""
+        from reaction.detector import Rejection
+        listed = self._listed_rejections()
+        declared = {r.value for r in Rejection}
+        self.assertFalse(declared - listed,
+                         f"the README does not list these rejections: "
+                         f"{sorted(declared - listed)}")
+        self.assertFalse(listed - declared,
+                         f"the README lists rejections the code does not "
+                         f"emit: {sorted(listed - declared)}")
+
+    def test_the_capability_table_matches_the_audits_own_verdicts(self):
+        """Including the one that was wrong: the BOOK's change instant."""
+        from reaction import capability as cap
+        for needle, expected in (
+            ("BOOK actually change", cap.Answerability.UNANSWERABLE),
+            ("PROVIDER last observe", cap.Answerability.ANSWERABLE),
+            ("OUR SYSTEM", cap.Answerability.INTERVAL_CENSORED),
+            ("LIVE feed", cap.Answerability.UNANSWERABLE),
+        ):
+            with self.subTest(question=needle):
+                self.assertIs(cap.verdict_for(needle).answerability, expected)
+        self.assertClaim("when did the BOOK actually change its price")
+        self.assertClaim("bracketed only")
+        self.assertNotIn("**answerable** (`last_update`", self.section,
+                         "the corrected verdict has regressed")
+
+    def test_the_resolution_floor_in_the_readme_is_the_audits_own(self):
+        from reaction.capability import reaction_resolution_floor_seconds
+        floor = reaction_resolution_floor_seconds()
+        self.assertEqual(floor, 300.0)
+        self.assertClaim(f"Reaction resolution floor: {floor:.0f}s")
+
+    def test_the_status_section_does_not_call_a_built_layer_unbuilt(self):
+        """A line claiming less exists than does is read too."""
+        status = self.section[self.section.index("### Status"):]
+        built = status[:status.index("**Not built:**")]
+        for layer in ("reaction measurement", "opportunity screen",
+                      "episode ledger", "offline replay"):
+            self.assertIn(layer, built, f"{layer} is not listed as built")
+        unbuilt = status[status.index("**Not built:**"):]
+        self.assertIn("live capture", unbuilt)
+        for layer in ("reaction measurement", "episode ledger"):
+            self.assertNotIn(layer, unbuilt)
+
+    def test_every_module_the_readme_names_actually_imports(self):
+        import importlib
+        for module in ("reaction.capability", "reaction.clocks",
+                       "reaction.detector", "reaction.measure",
+                       "reaction.screen", "reaction.episodes",
+                       "reaction.replay", "reaction.capture"):
+            with self.subTest(module=module):
+                self.assertClaim(module.split(".")[-1] + ".py")
+                importlib.import_module(module)
+
+    def test_the_named_test_cases_are_claimed_and_present(self):
+        """The README says every named case exists. It has to be true."""
+        import tests.test_reaction_measure as measure_tests
+        import tests.test_reaction_clocks as clock_tests
+        self.assertClaim("Every named test case is present")
+        for case, holder in (
+            ("BookLeadsTest", measure_tests),
+            ("OrderingTest", measure_tests),
+            ("CensoringTest", measure_tests),
+            ("DelayTest", measure_tests),
+            ("CheckpointCounterexampleTest", measure_tests),
+            ("DelayedEntryTest", clock_tests),
+        ):
+            with self.subTest(case=case):
+                self.assertTrue(hasattr(holder, case),
+                                f"{holder.__name__}.{case} is claimed by the "
+                                f"README and does not exist")
+
+    def test_the_no_orders_commitment_is_still_there(self):
+        self.assertClaim("No orders. No live capture. No paid requests.")
+        self.assertClaim("none is authorised")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
