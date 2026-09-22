@@ -139,9 +139,25 @@ class SharpQuote:
     """One two-way moneyline from the sharp book, at one snapshot time.
 
     Carries THREE times, not one, because they answer different questions:
-    `snapshot` is when the archive was captured, `last_update` is when the book
-    actually moved this price, and `commence_time` is scheduled start. A
-    comparison against an exchange quote is only honest against the second.
+
+      snapshot        when the PROVIDER captured the archive row
+      last_update     the last time the PROVIDER'S SYSTEM saw odds for this
+                      market from the bookmaker
+      commence_time   scheduled start
+
+    `last_update` IS NOT WHEN THE BOOKMAKER CHANGED ITS PRICE. This docstring
+    said it was, and that error propagated: `reaction/clocks.py` inherited the
+    wording verbatim, `reaction/capability.py` graded "when did the BOOK move"
+    as ANSWERABLE on the strength of it, and the reaction detector reported a
+    `book_moved_at` point estimate the source cannot support. Bookmaker-level
+    `last_update` is deprecated upstream; what this field reports is the
+    provider's own observation, so the book's change instant can only be
+    BRACKETED between two consecutive observations.
+
+    Do not measure a lag FROM this field. `reaction/clocks.py` keeps the
+    clocks apart (`provider_observed_at`, `provider_snapshot_time`,
+    `local_receipt_time`) and `reaction/capability.py` grades what each one
+    can and cannot answer.
     """
 
     snapshot: datetime
@@ -158,10 +174,15 @@ class SharpQuote:
         return (self.commence_time - self.snapshot).total_seconds() / 60.0
 
     def age_seconds(self) -> float | None:
-        """How stale this price was when the snapshot was taken.
+        """How long before the capture the PROVIDER last observed this price.
 
-        None when the book published no update time -- unknown, which is not
-        the same as fresh and must not be treated as it.
+        Not "how long since the book moved" -- see the class docstring. The
+        arithmetic is the same either way; what it licenses is not. This is a
+        usable staleness bound on the provider's observation, and it is NOT a
+        measurement of the bookmaker's behaviour.
+
+        None when no update time was published -- unknown, which is not the
+        same as fresh and must not be treated as it.
         """
         if self.last_update is None:
             return None
