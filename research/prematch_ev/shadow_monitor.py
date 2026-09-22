@@ -1,0 +1,1016 @@
+"""Shadow monitor: watch the sharp book live, decide as a bot would, place nothing.
+
+    python3 shadow_monitor.py --hours 72                       # plan and price, free
+    python3 shadow_monitor.py --hours 72 --spend 4321          # run
+    python3 shadow_monitor.py --report study_output/shadow/<session>.jsonl
+
+WHAT IT IS
+----------
+The no-order version of the bot the owner described -- poll the sharp book,
+notice when it moves, look at Kalshi at once -- and the forward half of the
+reaction study. It records what a bot WOULD have done the instant a move was
+seen, then keeps watching Kalshi to learn whether, and how fast, it followed.
+Nothing is sent to Kalshi except reads of its public book.
+
+It measures what no archive can:
+
+  * how old a sharp price is by the time it reaches us -- the delivery delay
+    every replay has to assume is zero;
+  * how often the provider actually refreshes, so a poll cadence can be set
+    from evidence instead of bought on a guess;
+  * how fast Kalshi follows, at the resolution of this machine's polls
+    rather than the exchange's one-minute candles;
+  * and what the executable book was at the moment of a move, with depth.
+
+EACH TICK, IN THIS ORDER
+------------------------
+1. Kalshi's book for every watched contract (free). These are the DECISION
+   books: fetched BEFORE the odds poll, they are what a bot held when the
+   move arrived.
+2. The sharp book (paid, one attempt). Every quote goes through the study's
+   own detector, on the clock the decision runs on: when WE received it.
+3. For each move on a watched game, that game's books again (free). These are
+   the EXECUTION books, and how long they took is the entry delay, measured.
+   Then the study's own screen -- the checkpoint study's eligibility and fee
+   model, unchanged -- and the decision is written down before anything that
+   follows is known.
+4. A moved game is then followed every few seconds, free, for the declared
+   response window.
+
+WHAT IT CANNOT DO
+-----------------
+Trade. It holds no Kalshi credential, `reaction.capture.assert_read_only`
+scans every module it can reach before the first paid request, and every
+request in the process has to match `ALLOWED_ENDPOINTS` or the run stops.
+
+SPENDING
+--------
+Plan first, like the collector: without `--spend` it prices the session and
+stops, having made only free requests. The price per call is transcribed
+(1 credit: one market from one book), so the provider's own
+`x-requests-last` is checked against it on the first answer and a
+disagreement stops the run -- a cap priced at the wrong unit cost is not a
+cap. The cap enforced is the quoted price.
+
+STOPS, AND WHY EACH IS ONE
+--------------------------
+  credit cap             the session spent what it was allowed
+  3 failed polls         an outage or a refused key; the rest would buy the
+                         same answer
+  cost mismatch          see SPENDING
+  clock skew             this machine and the provider disagree about the
+                         time by more than MAX_CLOCK_SKEW, and every lag this
+                         records would inherit the disagreement. Run it on a
+                         machine whose clock is synchronised (NTP).
+  quota floor            the account is nearly out, whatever this session
+                         was allowed
+  unreadable book        Kalshi's book shape is transcribed, not observed, so
+                         one real book is read -- free -- before the first
+                         paid poll; a shape the parser refuses stops the run
+                         before anything is bought
+  undeclared request     a request outside ALLOWED_ENDPOINTS, refused before
+                         it was sent
+
+RECORDS
+-------
+One append-only JSONL file per session under `study_output/shadow/`: every
+raw response with the clocks around it, every move, every decision, every gap
+and the reason the session ended. `--report` reads it. The API key is in no
+record: a recorded URL is its path, never its query.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import signal
+import statistics
+import sys
+import time
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable, Iterable, Sequence
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+from analysis.scoring import Eligibility                          # noqa: E402
+from collect import Ledger, join_markets, yes_side                 # noqa: E402
+from collect_reaction import (                                     # noqa: E402
+    OUTPUT_DIR, Slate, assert_nothing_here_can_trade,
+    only_declared_endpoints, resolve_days,
+)
+from data import espn_schedule, kalshi_history                     # noqa: E402
+from data.cache import CreditCapReached, redact                    # noqa: E402
+from data.kalshi_history import BookQuote, Coverage, parse_orderbook  # noqa: E402
+from data.odds_history import (                                    # noqa: E402
+    SHARP_BOOK, CreditLedger, parse_snapshot,
+)
+from data.odds_live import (                                       # noqa: E402
+    CREDITS_PER_LIVE_CALL, LiveOdds, fetch_live_odds, live_odds_url,
+    recorded_url,
+)
+from reaction.capture import CaptureRefused                        # noqa: E402
+from reaction.clocks import envelope_for_live_sharp_quote          # noqa: E402
+from reaction.detector import MoveDetector, MovePolicy, MoveTrigger  # noqa: E402
+from reaction.measure import ReactionPolicy                        # noqa: E402
+from reaction.screen import screen_live                            # noqa: E402
+
+# --- declared operating values --------------------------------------------
+#
+# Operating values, not thresholds: none of them decides whether a move is a
+# move or a trade is a trade. Those are the detector's and the screen's
+# declared policies, used unchanged.
+
+DEFAULT_CADENCE = timedelta(seconds=60)
+#: Below this a poll is not monitoring, it is load; and it is faster than any
+#: refresh the provider documents, so it would buy the same answer again.
+MIN_CADENCE = timedelta(seconds=10)
+#: How often a moved game's books are re-read while it is being followed.
+FOLLOW_EVERY = timedelta(seconds=10)
+#: How long a moved game is followed: the study's declared response window.
+FOLLOW_FOR = ReactionPolicy().max_wait
+#: Decision books are read only for games this close to kickoff: beyond the
+#: screen's own ceiling no entry can be admitted, so a book there could only
+#: ever produce a refusal.
+BOOK_HORIZON = timedelta(minutes=Eligibility().max_minutes_to_start)
+#: The game days the slate covers, from today.
+SLATE_DAYS = 7
+#: How often the slate and the join are rebuilt (free requests): new listings
+#: appear during the week, and a flexed kickoff moves.
+REJOIN_EVERY = timedelta(hours=1)
+STOP_AFTER_FAILED_POLLS = 3
+MAX_CLOCK_SKEW = timedelta(seconds=5)
+QUOTA_FLOOR = 50
+#: How far back polled books are kept in memory for decisions. The records
+#: keep everything; this only bounds what a long session holds.
+BOOK_MEMORY = timedelta(hours=2)
+
+EXIT_OK, EXIT_STOPPED, EXIT_USAGE = 0, 1, 2
+
+SHADOW_DIR = OUTPUT_DIR / "shadow"
+
+
+def _iso(moment: datetime | None) -> str | None:
+    return (moment.astimezone(timezone.utc).isoformat()
+            if moment is not None else None)
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return _iso(value)
+    if isinstance(value, timedelta):
+        return value.total_seconds()
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, set):
+        return sorted(value)
+    raise TypeError(f"not serialisable: {type(value).__name__}")
+
+
+class SystemClock:
+    """The real clock. Tests pass one that only advances when told to."""
+
+    def now(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    def sleep(self, seconds: float) -> None:
+        if seconds > 0:
+            time.sleep(seconds)
+
+
+class Recorder:
+    """Append-only JSONL: each fact written, and flushed, when it is known.
+
+    A session killed at any point leaves every line it wrote readable, so a
+    report of a crashed session is a report of what happened up to the
+    crash, not an empty file.
+    """
+
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self._handle = path.open("a", encoding="utf-8")
+
+    def write(self, kind: str, **fields: Any) -> None:
+        row = {"kind": kind, **fields}
+        self._handle.write(json.dumps(row, default=_jsonable,
+                                      separators=(",", ":")) + "\n")
+        self._handle.flush()
+
+    def close(self) -> None:
+        self._handle.close()
+
+
+@dataclass(frozen=True)
+class Watched:
+    """One open contract joined to one sharp event."""
+
+    ticker: str
+    event_ticker: str
+    provider_event_id: str
+    yes_is_home: bool
+    start: datetime
+
+
+@dataclass
+class Follow:
+    until: datetime
+    next_at: datetime
+
+
+@dataclass(frozen=True)
+class Stop:
+    reason: str
+    detail: str = ""
+    ok: bool = False
+
+
+def live_slate(today: date, *, league: str, series: str,
+               enumerate_markets: Callable = kalshi_history
+               .enumerate_open_markets,
+               fetch_schedule: Callable = espn_schedule.fetch_schedule
+               ) -> Slate:
+    """This week's OPEN contracts and their kickoffs. Free.
+
+    The collector's own slate resolution over a range of game days, with
+    open markets instead of settled ones and no schedule cache: a cached
+    future kickoff is exactly the value a flex would have moved.
+    """
+    days = [today + timedelta(days=offset) for offset in range(-1, SLATE_DAYS + 1)]
+    return resolve_days(days, league=league, series=series,
+                        schedule_cache=None,
+                        enumerate_markets=enumerate_markets,
+                        fetch_schedule=fetch_schedule)
+
+
+def join_live(slate: Slate, quotes_by_event: dict[str, list], league: str
+              ) -> tuple[dict[str, list[Watched]], Ledger]:
+    """Open contracts to sharp events, through the study's own join.
+
+    `require_settlement=False` is the only difference from every other join
+    in the study: an open market has no result yet. Orientation is
+    `collect.yes_side`, and an unorientable contract is left out, never
+    defaulted -- an inverted signal is not a smaller one.
+    """
+    ledger = Ledger()
+    joined = join_markets(slate.markets, quotes_by_event, league, ledger,
+                          slate.resolver, require_settlement=False)
+    watched: dict[str, list[Watched]] = {}
+    for contract in joined:
+        reference = quotes_by_event[contract.provider_event_id][0]
+        side = yes_side(reference, contract.yes_participant, league)
+        if side is None:
+            ledger.reject("orientation_unresolved", contract.market_ticker,
+                          stage="contracts")
+            continue
+        watched.setdefault(contract.provider_event_id, []).append(Watched(
+            ticker=contract.market_ticker, event_ticker=contract.event_ticker,
+            provider_event_id=contract.provider_event_id,
+            yes_is_home=side == "home", start=contract.start))
+    return watched, ledger
+
+
+def session_polls(hours: float, cadence: timedelta) -> int:
+    """How many polls a session makes: one at the start and one per cadence."""
+    return math.floor(hours * 3600 / cadence.total_seconds()) + 1
+
+
+def session_price(hours: float, cadence: timedelta) -> int:
+    return session_polls(hours, cadence) * CREDITS_PER_LIVE_CALL
+
+
+class ShadowMonitor:
+    """The loop. Everything it touches is injected, so a test can drive it."""
+
+    def __init__(self, *, sport: str, series: str, api_key: str,
+                 cadence: timedelta, hours: float, ledger: CreditLedger,
+                 recorder: Recorder, clock: Any = None,
+                 slate_source: Callable[[], Slate] | None = None,
+                 follow_every: timedelta = FOLLOW_EVERY,
+                 follow_for: timedelta = FOLLOW_FOR,
+                 book_horizon: timedelta = BOOK_HORIZON):
+        self.sport = sport.upper()
+        self.series = series
+        self.api_key = api_key
+        self.cadence = cadence
+        self.hours = hours
+        self.ledger = ledger
+        self.recorder = recorder
+        self.clock = clock or SystemClock()
+        self.slate_source = slate_source or (lambda: live_slate(
+            self.clock.now().date(), league=self.sport, series=self.series))
+        self.follow_every = follow_every
+        self.follow_for = follow_for
+        self.book_horizon = book_horizon
+        self.detector = MoveDetector(MovePolicy(book=SHARP_BOOK))
+        self.watched: dict[str, list[Watched]] = {}
+        self.books: dict[str, list[BookQuote]] = {}
+        self.follows: dict[str, Follow] = {}
+        self.entered: set[str] = set()
+        self.seen: set[str] = set()
+        self.started: set[str] = set()
+        self.failed_polls = 0
+        self.cost_verified = False
+        self.next_rejoin: datetime | None = None
+        self.counts = {"polls": 0, "polls_failed": 0, "triggers": 0,
+                       "decisions": 0, "entries": 0, "book_reads": 0,
+                       "book_failures": 0, "in_play_skipped": 0}
+
+    # --- the Kalshi side (free) -------------------------------------------
+
+    def read_book(self, watched: Watched, purpose: str,
+                  context: dict | None = None) -> BookQuote | None:
+        sent = self.clock.now()
+        payload, coverage = kalshi_history.fetch_orderbook_payload(
+            watched.ticker)
+        received = self.clock.now()
+        book = None
+        if payload is not None:
+            book, parsed = parse_orderbook(payload, ticker=watched.ticker,
+                                           received_at=received, sent_at=sent)
+            coverage.merge(parsed)
+        self.counts["book_reads"] += 1
+        if not coverage.complete:
+            self.counts["book_failures"] += 1
+        self.recorder.write(
+            "book", ticker=watched.ticker, purpose=purpose, sent_at=sent,
+            received_at=received, payload=payload,
+            coverage=coverage.reasons, **(context or {}))
+        if book is not None:
+            history = self.books.setdefault(watched.ticker, [])
+            history.append(book)
+            horizon = received - BOOK_MEMORY
+            self.books[watched.ticker] = [b for b in history if b.ts >= horizon]
+        return book
+
+    def contracts_in_horizon(self, now: datetime) -> list[Watched]:
+        return [w for contracts in self.watched.values() for w in contracts
+                if now < w.start <= now + self.book_horizon]
+
+    # --- the stops --------------------------------------------------------
+
+    def preflight(self) -> Stop | None:
+        """Free checks before the first paid request."""
+        slate = self.slate_source()
+        self.recorder.write("slate", markets=len(slate.markets),
+                            kickoffs=slate.kickoffs,
+                            unresolved=slate.unresolved,
+                            coverage=slate.coverage.reasons)
+        if not slate.coverage.complete:
+            return Stop("slate_incomplete",
+                        f"the slate did not fully answer: {slate.coverage}")
+        if not slate.markets:
+            return Stop("no_open_markets",
+                        f"no open {self.series} market in the next "
+                        f"{SLATE_DAYS} days; nothing to watch")
+        # THE BOOK SHAPE IS TRANSCRIBED, so read one real book before paying
+        # for anything. A shape the parser refuses stops the run here, free.
+        ticker = sorted(slate.markets)[0]
+        sent = self.clock.now()
+        payload, coverage = kalshi_history.fetch_orderbook_payload(ticker)
+        book = None
+        if payload is not None:
+            book, parsed = parse_orderbook(payload, ticker=ticker,
+                                           received_at=self.clock.now(),
+                                           sent_at=sent)
+            coverage.merge(parsed)
+        self.recorder.write("shape_check", ticker=ticker,
+                            payload=payload, coverage=coverage.reasons,
+                            levels=(None if book is None else
+                                    book.yes_levels + book.no_levels))
+        if book is None or not coverage.complete:
+            return Stop("book_unreadable",
+                        f"Kalshi's order book for {ticker} could not be read "
+                        f"({coverage}); the parser's shape is transcribed "
+                        f"from documentation, and nothing was bought")
+        return None
+
+    def check_answer(self, live: LiveOdds) -> Stop | None:
+        """The per-answer stops: cost, clock, quota."""
+        if not self.cost_verified:
+            if live.charged is None:
+                return Stop("cost_unverifiable",
+                            "the provider sent no x-requests-last, so the "
+                            "price per call cannot be checked and the cap "
+                            "cannot be trusted")
+            if live.charged != CREDITS_PER_LIVE_CALL:
+                return Stop("cost_mismatch",
+                            f"the provider charged {live.charged} per call; "
+                            f"this session was priced at "
+                            f"{CREDITS_PER_LIVE_CALL}")
+            self.cost_verified = True
+        if live.provider_date is not None and live.received_at is not None:
+            skew = live.received_at - live.provider_date
+            # The Date header is truncated to the second, so a synchronised
+            # clock reads up to ~1s AHEAD of it; the bound is on the size.
+            if abs(skew) > MAX_CLOCK_SKEW:
+                return Stop("clock_skew",
+                            f"this machine's clock is "
+                            f"{skew.total_seconds():+.1f}s from the "
+                            f"provider's; every lag recorded would carry "
+                            f"that error. Synchronise the clock (NTP)")
+        if live.remaining is not None and live.remaining <= QUOTA_FLOOR:
+            return Stop("quota_floor",
+                        f"the account reports {live.remaining} credits "
+                        f"left, at or below the floor of {QUOTA_FLOOR}")
+        return None
+
+    # --- one tick ----------------------------------------------------------
+
+    def tick(self) -> Stop | None:
+        now = self.clock.now()
+        for watched in self.contracts_in_horizon(now):
+            if self.read_book(watched, "decision") is None:
+                # ONE failed read abandons the rest of this tick's reads: a
+                # stalled exchange must not hold the paid poll behind two
+                # dozen timeouts. A move this tick then has no decision book
+                # and the screen says so.
+                self.recorder.write("decision_reads_abandoned",
+                                    at=self.clock.now(),
+                                    after=watched.ticker)
+                break
+
+        live = fetch_live_odds(self.sport, self.api_key, ledger=self.ledger,
+                               now=self.clock.now)
+        self.counts["polls"] += 1
+        self.recorder.write(
+            "odds", url=recorded_url(live_odds_url(self.sport, "")),
+            sent_at=live.sent_at, received_at=live.received_at,
+            provider_date=live.provider_date, status=live.status,
+            charged=live.charged, used=live.used, remaining=live.remaining,
+            payload=live.payload, coverage=live.coverage.reasons,
+            detector=self._drain_rejections())
+        parsed = parse_snapshot(live.snapshot_body()) if live.ok else None
+        if parsed is None or not parsed.coverage.complete:
+            self.counts["polls_failed"] += 1
+            self.failed_polls += 1
+            # THE INTERVAL WAS NOT OBSERVED. Every stream re-anchors on its
+            # next good quote rather than closing a move across the hole.
+            for stream in sorted(self.seen):
+                self.detector.note_gap(stream, live.received_at,
+                                       "the live poll did not answer")
+            if self.failed_polls >= STOP_AFTER_FAILED_POLLS:
+                reasons = live.coverage.reasons or (
+                    parsed.coverage.reasons if parsed else [])
+                return Stop("failed_polls",
+                            f"{self.failed_polls} polls in a row failed: "
+                            f"{'; '.join(reasons) or 'no response'}")
+            return None
+        self.failed_polls = 0
+        stop = self.check_answer(live)
+        if stop:
+            return stop
+
+        quotes_by_event: dict[str, list] = {}
+        for quote in parsed.quotes:
+            quotes_by_event.setdefault(quote.provider_event_id, []).append(quote)
+        if self.next_rejoin is None or now >= self.next_rejoin:
+            self.rejoin(quotes_by_event)
+            self.next_rejoin = now + REJOIN_EVERY
+
+        present: set[str] = set()
+        for quote in parsed.quotes:
+            envelope = envelope_for_live_sharp_quote(
+                quote, received_at=live.received_at, sent_at=live.sent_at,
+                request_url=recorded_url(live_odds_url(self.sport, "")),
+                resolution_seconds=self.cadence.total_seconds())
+            stream = envelope.provenance.market_id
+            # IN PLAY IS NOT PRE-MATCH. A game under way re-prices on every
+            # score, and the study is about moves before kickoff. Its stream
+            # is retired, not gapped: it will not come back.
+            if quote.commence_time <= live.received_at:
+                self.counts["in_play_skipped"] += 1
+                self.started.add(stream)
+                continue
+            present.add(stream)
+            trigger = self.detector.observe(envelope)
+            if trigger is not None:
+                self.on_trigger(trigger)
+        # A MARKET MISSING FROM A LIVE ANSWER IS A HOLE, as in the replay.
+        for stream in sorted(self.seen - present - self.started):
+            self.detector.note_gap(stream, live.received_at,
+                                   "absent from the live response")
+        self.seen = (self.seen | present) - self.started
+        return None
+
+    def _drain_rejections(self) -> dict[str, int]:
+        """Why nothing triggered since the last poll, counted -- then dropped.
+
+        The detector keeps every rejection it ever made, one per stream per
+        poll: a few hundred thousand objects over a multi-day session. The
+        counts go into the record the moment they are known, and the list is
+        cleared, so a long session holds only one poll's worth.
+        """
+        rejections = self.detector.result.rejections
+        counts = dict(Counter(r.reason.value for r in rejections))
+        rejections.clear()
+        return counts
+
+    def rejoin(self, quotes_by_event: dict[str, list]) -> None:
+        slate = self.slate_source()
+        if not slate.coverage.complete:
+            # A failed read is not an empty slate: keep watching what was
+            # joined last time, and say so.
+            self.recorder.write("rejoin_skipped", coverage=slate.coverage.reasons)
+            return
+        watched, ledger = join_live(slate, quotes_by_event, self.sport)
+        self.watched = watched
+        self.recorder.write(
+            "join", contracts={w.ticker: {"event": event,
+                                          "yes_is_home": w.yes_is_home,
+                                          "start": w.start}
+                               for event, ws in watched.items() for w in ws},
+            rejections=ledger.as_dict())
+
+    def on_trigger(self, trigger: MoveTrigger) -> None:
+        self.counts["triggers"] += 1
+        self.recorder.write("trigger", **trigger.as_dict())
+        contracts = self.watched.get(trigger.event_id, [])
+        if not contracts:
+            self.recorder.write("decision", event_id=trigger.event_id,
+                                stream_id=trigger.stream_id,
+                                refusal="not_joined_to_an_open_contract",
+                                admitted=False)
+            return
+
+        executions = {w.ticker: self.read_book(
+            w, "execution", {"stream_id": trigger.stream_id})
+            for w in contracts}
+        decisions = []
+        for watched in contracts:
+            book = executions.get(watched.ticker)
+            # A FAILED EXECUTION READ IS NOT A FILL AT THE DECISION PRICE. With
+            # no book the delay is "until now", which no read satisfies, so
+            # the screen drops the side exactly as the replay does -- rather
+            # than a zero delay, which would price it at the decision book.
+            delay = ((book.ts if book is not None else self.clock.now())
+                     - trigger.detected_at)
+            decision = screen_live(
+                trigger, self.books.get(watched.ticker, []),
+                market_ticker=watched.ticker,
+                yes_is_home=watched.yes_is_home, start=watched.start,
+                entry_delay=delay, entry_tolerance=timedelta(seconds=1),
+                series=self.series)
+            decisions.append((watched, book, decision))
+
+        # ONE ENTRY PER GAME, as in the checkpoint study: the two contracts of
+        # a game are one outcome seen from two sides. The admitted contract
+        # with the higher predicted EV is the entry; a game already entered
+        # takes no second one.
+        admitted = sorted(
+            (d for d in decisions if d[2].admitted and d[2].trade),
+            key=lambda d: (-d[2].trade.predicted_ev, d[0].ticker))
+        entry = (admitted[0][0].ticker
+                 if admitted and trigger.event_id not in self.entered else None)
+        if entry is not None:
+            self.entered.add(trigger.event_id)
+            self.counts["entries"] += 1
+        for watched, book, decision in decisions:
+            self.counts["decisions"] += 1
+            self.recorder.write(
+                "decision", stream_id=trigger.stream_id,
+                yes_is_home=watched.yes_is_home,
+                book_move_for_yes=trigger.delta_for(watched.yes_is_home),
+                entered=watched.ticker == entry,
+                execution_depth=(None if book is None else {
+                    "yes_bid_size": book.bid_size,
+                    "no_bid_size": book.ask_size}),
+                **decision.as_dict())
+
+        until = trigger.detected_at + self.follow_for
+        current = self.follows.get(trigger.event_id)
+        if current is None:
+            self.follows[trigger.event_id] = Follow(
+                until=until, next_at=self.clock.now() + self.follow_every)
+        else:
+            current.until = max(current.until, until)
+
+    def follow_due(self) -> None:
+        now = self.clock.now()
+        for event_id in list(self.follows):
+            follow = self.follows[event_id]
+            if now > follow.until:
+                del self.follows[event_id]
+                continue
+            if now < follow.next_at:
+                continue
+            for watched in self.watched.get(event_id, []):
+                self.read_book(watched, "follow")
+            while follow.next_at <= self.clock.now():
+                follow.next_at += self.follow_every
+
+    # --- the session ---------------------------------------------------------
+
+    def run(self) -> Stop:
+        started = self.clock.now()
+        end = started + timedelta(hours=self.hours)
+        self.recorder.write(
+            "session_start", at=started, ends=end, sport=self.sport,
+            series=self.series, cadence_seconds=self.cadence.total_seconds(),
+            follow_every_seconds=self.follow_every.total_seconds(),
+            follow_for_seconds=self.follow_for.total_seconds(),
+            book_horizon_seconds=self.book_horizon.total_seconds(),
+            credit_cap=self.ledger.cap,
+            credits_per_call=CREDITS_PER_LIVE_CALL,
+            move_policy=self.detector.policy.as_dict(),
+            reaction_policy=ReactionPolicy().as_dict(),
+            eligibility=vars(Eligibility()))
+        try:
+            with only_declared_endpoints():
+                stop = self.preflight()
+                if stop is None:
+                    stop = self._loop(end)
+        except CreditCapReached as exc:
+            stop = Stop("credit_cap", str(exc))
+        except CaptureRefused as exc:
+            # A request outside the allow-list was refused before it was
+            # sent. That is a code change nobody declared, not a transient
+            # failure, so the session ends -- and says why in its own record.
+            stop = Stop("undeclared_request", str(exc))
+        except KeyboardInterrupt:
+            stop = Stop("interrupted", "stopped by the operator")
+        self.recorder.write("session_end", at=self.clock.now(),
+                            reason=stop.reason, detail=stop.detail,
+                            ok=stop.ok, counts=self.counts,
+                            ledger=str(self.ledger),
+                            credits_reserved=self.ledger.spent_this_run,
+                            account_remaining=self.ledger.remaining)
+        return stop
+
+    def _loop(self, end: datetime) -> Stop:
+        next_tick = self.clock.now()
+        while True:
+            now = self.clock.now()
+            if now >= end:
+                return Stop("end_of_session", ok=True)
+            if now >= next_tick:
+                stop = self.tick()
+                if stop is not None:
+                    return stop
+                while next_tick <= self.clock.now():
+                    next_tick += self.cadence
+            self.follow_due()
+            wake = min([next_tick, end]
+                       + [f.next_at for f in self.follows.values()])
+            self.clock.sleep((wake - self.clock.now()).total_seconds())
+
+
+# --- the report ------------------------------------------------------------------
+
+def _quantiles(values: Sequence[float]) -> str:
+    if not values:
+        return "none"
+    ordered = sorted(values)
+    p90 = ordered[min(len(ordered) - 1, int(round(0.9 * (len(ordered) - 1))))]
+    return (f"n={len(ordered)}  median {statistics.median(ordered):,.1f}s  "
+            f"p90 {p90:,.1f}s  max {ordered[-1]:,.1f}s")
+
+
+def _time(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def read_records(path: Path) -> tuple[list[dict], int]:
+    """Every readable line, and how many were not. A torn last line is what
+    a killed session leaves, and it is counted, not fatal."""
+    rows, bad = [], 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            bad += 1
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+        else:
+            bad += 1
+    return rows, bad
+
+
+def report(rows: Sequence[dict], *, min_response: float | None = None,
+           window: timedelta | None = None) -> dict:
+    """What the session measured. Pure: records in, figures out.
+
+    Each figure is computed from the raw records the session wrote, through
+    the same parsers the monitor used, so a report can be re-run after a
+    parser fix without re-collecting anything.
+    """
+    min_response = (ReactionPolicy().min_response if min_response is None
+                    else min_response)
+    out: dict[str, Any] = {}
+    start = next((r for r in rows if r["kind"] == "session_start"), {})
+    if window is None:
+        # The window the SESSION followed for, not today's default: a report
+        # re-run after the default changes must still judge the session by
+        # the window it actually watched.
+        window = timedelta(seconds=start.get("follow_for_seconds")
+                           or FOLLOW_FOR.total_seconds())
+    end = next((r for r in reversed(rows) if r["kind"] == "session_end"), None)
+    out["session"] = {"started": start.get("at"),
+                      "ended": end.get("at") if end else None,
+                      "stop": end.get("reason") if end else "no session_end "
+                      "record: the process did not finish writing",
+                      "detail": end.get("detail") if end else None,
+                      "credits_reserved": end.get("credits_reserved")
+                      if end else None}
+
+    odds = [r for r in rows if r["kind"] == "odds"]
+    skews, ages, refresh = [], [], []
+    last_seen: dict[str, datetime] = {}
+    for row in odds:
+        received, provider = _time(row.get("received_at")), _time(
+            row.get("provider_date"))
+        if received and provider:
+            skews.append((received - provider).total_seconds())
+        if row.get("payload") is None or not received:
+            continue
+        stamp = provider or received
+        parsed = parse_snapshot({"timestamp": stamp.strftime(
+            "%Y-%m-%dT%H:%M:%SZ"), "data": row["payload"]})
+        for quote in parsed.quotes:
+            if quote.last_update is None or quote.commence_time <= received:
+                continue
+            previous = last_seen.get(quote.provider_event_id)
+            if previous is not None and quote.last_update == previous:
+                continue
+            # A NEW provider observation: how old it was when it reached us,
+            # and how long the provider took to produce it after the last.
+            ages.append((received - quote.last_update).total_seconds())
+            if previous is not None:
+                refresh.append((quote.last_update - previous).total_seconds())
+            last_seen[quote.provider_event_id] = quote.last_update
+    out["polls"] = {"total": len(odds),
+                    "answered": sum(1 for r in odds if r.get("payload")
+                                    is not None and not r.get("coverage")),
+                    "clock_skew": _quantiles(skews)}
+    out["age_when_received"] = _quantiles(ages)
+    out["provider_refresh"] = _quantiles(refresh)
+
+    triggers = [r for r in rows if r["kind"] == "trigger"]
+    decisions = [r for r in rows if r["kind"] == "decision"]
+    books = [r for r in rows if r["kind"] == "book"]
+    out["moves"] = len(triggers)
+    refusals: dict[str, int] = {}
+    for d in decisions:
+        key = ("admitted" if d.get("admitted") else
+               (d.get("refusal") or "not admitted by the screen"))
+        refusals[key] = refusals.get(key, 0) + 1
+    out["decisions"] = refusals
+    out["entries"] = [{"ticker": d.get("market_ticker"),
+                       "decision_at": d.get("decision_at"),
+                       "predicted": d.get("predicted"),
+                       "entry_delay_seconds": d.get("entry_delay_seconds")}
+                      for d in decisions if d.get("entered")]
+    out["responses"] = [_response(d, books, min_response, window)
+                        for d in decisions if d.get("market_ticker")
+                        and d.get("book_move_for_yes") is not None]
+    return out
+
+
+def _book_mid(row: dict) -> float | None:
+    received = _time(row.get("received_at"))
+    if received is None or row.get("payload") is None:
+        return None
+    book, coverage = parse_orderbook(row["payload"], ticker=row["ticker"],
+                                     received_at=received)
+    if book is None or not coverage.complete:
+        return None
+    return book.mid
+
+
+def _response(decision: dict, books: Sequence[dict], min_response: float,
+              window: timedelta) -> dict:
+    """When Kalshi followed ONE move on ONE contract, as polled.
+
+    The baseline is the decision book -- the newest read at or before the
+    move. The response is the first later read INSIDE THE FOLLOW WINDOW whose
+    mid has moved at least `min_response`, and it is reported as a BRACKET
+    between the read before it and itself: a poll locates a change no more
+    finely than its own spacing. Past the window the answer is censored, not
+    "never", and the number of reads inside it is reported beside it so a
+    blind window cannot pass for a quiet one.
+    """
+    ticker = decision["market_ticker"]
+    decided = _time(decision.get("decision_at"))
+    direction = decision["book_move_for_yes"]
+    row = {"ticker": ticker, "decision_at": decision.get("decision_at"),
+           "outcome": "no_baseline", "lag_seconds": None}
+    if decided is None or not direction:
+        return row
+    series = sorted(((t, m) for t, m in
+                     ((_time(b.get("received_at")), _book_mid(b))
+                      for b in books if b.get("ticker") == ticker)
+                     if t is not None and m is not None), key=lambda x: x[0])
+    before = [(t, m) for t, m in series if t <= decided]
+    if not before:
+        return row
+    base_at, base = before[-1]
+    previous = base_at
+    inside = [(at, mid) for at, mid in series
+              if decided < at <= decided + window]
+    row["reads_in_window"] = len(inside)
+    for at, mid in inside:
+        moved = (mid - base) * (1 if direction > 0 else -1)
+        if moved >= min_response:
+            row.update(outcome="followed", lag_seconds=[
+                max(0.0, (previous - decided).total_seconds()),
+                (at - decided).total_seconds()])
+            return row
+        if moved <= -min_response:
+            row.update(outcome="moved_against", lag_seconds=[
+                max(0.0, (previous - decided).total_seconds()),
+                (at - decided).total_seconds()])
+            return row
+        previous = at
+    row["outcome"] = "not_followed_within_window"
+    return row
+
+
+def render_report(figures: dict) -> str:
+    s = figures["session"]
+    lines = ["SHADOW SESSION", "",
+             f"  started            {s['started']}",
+             f"  ended              {s['ended']}   ({s['stop']})",
+             f"  credits reserved   {s['credits_reserved']}", ""]
+    polls = figures["polls"]
+    lines += [f"  polls              {polls['total']} "
+              f"({polls['answered']} answered)",
+              f"  clock skew         {polls['clock_skew']}",
+              f"  age when received  {figures['age_when_received']}",
+              "                     (how old a NEW provider observation was "
+              "when it reached us)",
+              f"  provider refresh   {figures['provider_refresh']}",
+              "                     (time between successive observations of "
+              "one game; polling faster buys repeats)", "",
+              f"  moves detected     {figures['moves']}"]
+    for key, count in sorted(figures["decisions"].items()):
+        lines.append(f"    {key:<34} {count}")
+    lines.append(f"  shadow entries     {len(figures['entries'])}")
+    for entry in figures["entries"]:
+        predicted = entry.get("predicted") or {}
+        paid = predicted.get("paid_at_execution")
+        lines.append(
+            f"    {entry['ticker']}  {predicted.get('side')}: decided at "
+            f"{predicted.get('entry_price')} (predicted EV "
+            f"{predicted.get('predicted_ev_per_contract'):+.4f}), would have "
+            f"paid {'n/a' if paid is None else f'{paid:.4f}'} after "
+            f"{entry['entry_delay_seconds']:.1f}s")
+    outcomes: dict[str, int] = {}
+    for response in figures["responses"]:
+        outcomes[response["outcome"]] = outcomes.get(response["outcome"], 0) + 1
+    lines.append("  Kalshi after each move, per contract:")
+    for key, count in sorted(outcomes.items()):
+        lines.append(f"    {key:<34} {count}")
+    lags = [r["lag_seconds"] for r in figures["responses"]
+            if r["outcome"] == "followed"]
+    if lags:
+        lines.append(f"    followed within    "
+                     f"{', '.join(f'{a:.0f}-{b:.0f}s' for a, b in lags[:12])}")
+    lines += ["", "  No orders were placed. Predicted figures read the book "
+              "at the decision; realised figures need settlement, which a "
+              "live session does not have."]
+    return "\n".join(lines)
+
+
+# --- the command ----------------------------------------------------------------
+
+def _interrupt(signum: int, frame: Any) -> None:
+    raise KeyboardInterrupt
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=__doc__, allow_abbrev=False,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--sport", default="NFL")
+    parser.add_argument("--series", default="KXNFLGAME")
+    parser.add_argument("--hours", type=float, default=None,
+                        help="session length. The session stops at the end "
+                             "of it, or earlier on a stop rule")
+    parser.add_argument("--cadence-seconds", type=float,
+                        default=DEFAULT_CADENCE.total_seconds(),
+                        help="seconds between sharp-book polls; each costs "
+                             f"{CREDITS_PER_LIVE_CALL} credit")
+    parser.add_argument("--spend", type=int, default=None, metavar="CREDITS",
+                        help="confirm the quoted price. Without it nothing "
+                             "is bought")
+    parser.add_argument("--api-key", default=None,
+                        help="Odds API key (or set ODDS_API_KEY)")
+    parser.add_argument("--out-dir", default=str(SHADOW_DIR))
+    parser.add_argument("--report", default=None, metavar="SESSION_JSONL",
+                        help="summarise a recorded session. Free, offline")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None, *, clock: Any = None,
+         slate_source: Callable[[], Slate] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.report:
+        path = Path(args.report)
+        if not path.is_file():
+            print(f"no such session file: {path}", file=sys.stderr)
+            return EXIT_USAGE
+        rows, bad = read_records(path)
+        print(render_report(report(rows)))
+        if bad:
+            print(f"\n  *** {bad} unreadable line(s) skipped (a session "
+                  f"killed mid-write leaves one)")
+        return EXIT_OK
+
+    if args.hours is None or not args.hours > 0:
+        print("--hours must be given and positive", file=sys.stderr)
+        return EXIT_USAGE
+    cadence = timedelta(seconds=args.cadence_seconds)
+    if not cadence >= MIN_CADENCE:
+        print(f"--cadence-seconds must be at least "
+              f"{MIN_CADENCE.total_seconds():.0f}", file=sys.stderr)
+        return EXIT_USAGE
+    clock = clock or SystemClock()
+    price = session_price(args.hours, cadence)
+
+    print(f"SHADOW MONITOR  {args.sport} {args.series}")
+    with only_declared_endpoints():
+        slate = (slate_source or (lambda: live_slate(
+            clock.now().date(), league=args.sport.upper(),
+            series=args.series)))()
+    now = clock.now()
+    upcoming = sorted(k for k in slate.kickoffs.values() if k > now)
+    print(f"  slate: {len(slate.markets)} open contract(s), "
+          f"{len(upcoming)} upcoming game(s) with a kickoff")
+    if upcoming:
+        print(f"  next kickoff {_iso(upcoming[0])}; "
+              f"{sum(1 for k in upcoming if k <= now + BOOK_HORIZON)} "
+              f"within the screen's {BOOK_HORIZON.total_seconds() / 3600:.0f}h "
+              f"ceiling")
+    if not slate.coverage.complete:
+        print(f"  *** slate retrieval incomplete: {slate.coverage}")
+    print(f"\n  session {args.hours:g}h at one poll every "
+          f"{cadence.total_seconds():g}s: {session_polls(args.hours, cadence):,}"
+          f" poll(s), {price:,} credit(s) at {CREDITS_PER_LIVE_CALL} per call")
+    print("  the same session at other cadences:")
+    for seconds in (15, 30, 60, 120, 300):
+        print(f"    every {seconds:>3}s  "
+              f"{session_price(args.hours, timedelta(seconds=seconds)):>7,} "
+              f"credits")
+    print("  Kalshi reads are free: one book per watched contract per poll, "
+          f"then every {FOLLOW_EVERY.total_seconds():g}s for "
+          f"{FOLLOW_FOR.total_seconds() / 60:g} minutes after a move.")
+
+    if not slate.coverage.complete:
+        print("\n  The slate did not fully answer; nothing was bought. Run "
+              "again.", file=sys.stderr)
+        return EXIT_STOPPED
+    if args.spend is None:
+        print(f"\n  Nothing was spent. To run, re-run with --spend {price}.")
+        return EXIT_OK
+    if args.spend < price:
+        print(f"\n  --spend {args.spend} is below the {price} this session "
+              f"may need; refusing rather than stopping partway.",
+              file=sys.stderr)
+        return EXIT_USAGE
+    api_key = args.api_key or os.environ.get("ODDS_API_KEY", "")
+    if not api_key:
+        print("  need --api-key or ODDS_API_KEY", file=sys.stderr)
+        return EXIT_USAGE
+
+    assert_nothing_here_can_trade()
+    # A stop from the service manager (SIGTERM) ends the session like Ctrl-C
+    # does -- with a session_end record -- rather than cutting it off
+    # mid-write with no word of why it ended.
+    signal.signal(signal.SIGTERM, _interrupt)
+    started = clock.now()
+    path = Path(args.out_dir) / f"shadow_{started:%Y%m%dT%H%M%SZ}.jsonl"
+    recorder = Recorder(path)
+    monitor = ShadowMonitor(
+        sport=args.sport, series=args.series, api_key=api_key,
+        cadence=cadence, hours=args.hours,
+        ledger=CreditLedger(cap=price), recorder=recorder, clock=clock,
+        slate_source=slate_source)
+    print(f"\n  recording to {path}")
+    try:
+        stop = monitor.run()
+    finally:
+        recorder.close()
+    print(f"\n  session ended: {stop.reason}"
+          f"{': ' + stop.detail if stop.detail else ''}")
+    print(f"  {monitor.ledger}")
+    print(f"  next: python3 shadow_monitor.py --report {path}")
+    return EXIT_OK if stop.ok else EXIT_STOPPED
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

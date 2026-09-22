@@ -79,7 +79,11 @@ FORBIDDEN_CAPABILITIES = (
 # not a side effect of whatever a URL builder happens to produce.
 ALLOWED_ENDPOINTS = (
     "api.the-odds-api.com/v4/historical/sports/{sport}/odds",
+    # The shadow monitor's live poll: the same book and market, current.
+    "api.the-odds-api.com/v4/sports/{sport}/odds",
     "api.elections.kalshi.com/trade-api/v2/markets",
+    # The shadow monitor's live book: public market data, bids only.
+    "api.elections.kalshi.com/trade-api/v2/markets/{ticker}/orderbook",
     "api.elections.kalshi.com/trade-api/v2/historical/markets",
     "api.elections.kalshi.com/trade-api/v2/historical/cutoff",
     "api.elections.kalshi.com/trade-api/v2/series/{series}/markets/"

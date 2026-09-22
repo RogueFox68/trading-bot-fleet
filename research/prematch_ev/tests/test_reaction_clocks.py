@@ -1270,25 +1270,29 @@ class ReactionCliTest(unittest.TestCase):
                 self.assertNotIn(prose.lower(), unbuilt.lower(),
                                  f"{layer} shipped but is listed as unbuilt")
 
-    def test_live_capture_is_still_declared_unbuilt(self):
+    def test_orders_are_still_declared_unbuilt(self):
         """The one thing that genuinely is not built, and must stay said.
 
-        It used to read "NOT BUILT: collection", and stayed true until the
-        backtest collector shipped. A footer still saying so afterwards is
-        the same stale claim this block exists to catch, pointed the other
-        way -- so the collector is asserted BUILT, from the module itself.
+        The footer read "NOT BUILT: collection" until the collector shipped,
+        then "NOT BUILT: live capture" until the shadow monitor did. Each was
+        true when written and false the day its module landed -- so both are
+        asserted BUILT here from the modules themselves, and what is still
+        unbuilt is asserted by what the code cannot do.
         """
         import collect_reaction
+        import shadow_monitor
         self.assertTrue(callable(collect_reaction.main))
+        self.assertTrue(callable(shadow_monitor.main))
         _, text = self._run(["--capability"])
         unbuilt = self._unbuilt_section(text).lower()
         built = text[:len(text) - len(unbuilt)].lower()
-        self.assertIn("live capture", unbuilt)
+        self.assertIn("orders", unbuilt)
         self.assertNotIn("collection", unbuilt)
-        self.assertIn("collect_reaction.py", built)
+        self.assertNotIn("live capture", unbuilt)
+        for entry_point in ("collect_reaction.py", "shadow_monitor.py"):
+            self.assertIn(entry_point, built)
         self.assertIn("--spend", built)
-        self.assertIn("no orders", unbuilt)
-        self.assertIn("no live capture", unbuilt)
+        self.assertIn("none can be placed", unbuilt)
         self.assertIn("makes no paid request", unbuilt)
 
     def test_the_cli_does_not_claim_the_books_move_instant_is_answerable(self):

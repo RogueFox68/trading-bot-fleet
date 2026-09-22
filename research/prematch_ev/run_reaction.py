@@ -56,10 +56,10 @@ OFFLINE REPLAY
 `--replay` reads a bundle of RAW provider payloads from disk and runs the
 whole chain -- detector, reaction measurement, opportunity screen, episode
 ledger -- with no network, no credential and no credits. Producing the bundle
-is `collect_reaction.py`'s job -- the study's one paid entry point, which
-plans for free and buys only behind an explicit `--spend`. It runs under
-`reaction/capture.py`'s guards: the read-only scan, the endpoint allow-list,
-and the manifest that sets its bound.
+is `collect_reaction.py`'s job, which plans for free and buys only behind an
+explicit `--spend`. It runs under `reaction/capture.py`'s guards: the
+read-only scan, the endpoint allow-list, and the manifest that sets its
+bound. The live counterpart is `shadow_monitor.py`, under the same guards.
 
 EXIT CODES SAY WHAT KIND OF THING WENT WRONG
 --------------------------------------------
@@ -79,10 +79,13 @@ EXIT CODES SAY WHAT KIND OF THING WENT WRONG
 
 NOT BUILT, AND NOT FAKED
 ------------------------
-Live capture, and orders. Neither is authorised and neither is implemented.
-Paid requests exist in exactly one place, `collect_reaction.py`, behind an
-explicit `--spend`; this command makes none. `capture.py` is the interface
-and its guards, with no transport that can reach a network.
+Orders. None is authorised and none can be placed: nothing in the study holds
+a Kalshi credential, and the read-only scan fails a run if anything could.
+Live capture IS built, read-only, as `shadow_monitor.py`. Paid requests
+exist in two places, `collect_reaction.py` (the archive) and
+`shadow_monitor.py` (live), each behind an explicit `--spend`; this command
+makes none. `capture.py` is the interface and its guards, with no transport
+that can reach a network.
 """
 
 from __future__ import annotations
@@ -300,15 +303,16 @@ def main(argv=None) -> int:
         print("  the reaction measurement, the executable-opportunity screen,")
         print("  the episode ledger and the offline replay -- run the whole")
         print("  chain with --replay, and --policy prints every threshold.")
-        print("  The backtest collector is collect_reaction.py, a separate")
-        print("  entry point: it plans for free and buys only behind --spend.")
-        print("  NOT BUILT AND NOT FAKED: live capture.")
-        print("  No orders and no live capture -- neither is authorised and")
-        print("  neither is implemented, and this command makes no paid "
-              "request.")
-        print("  reaction/capture.py holds the guards the collector runs")
+        print("  The backtest collector is collect_reaction.py and the live,")
+        print("  read-only shadow monitor is shadow_monitor.py: separate entry")
+        print("  points that plan for free and buy only behind --spend.")
+        print("  NOT BUILT AND NOT FAKED: orders.")
+        print("  None is authorised and none can be placed -- nothing here")
+        print("  holds an exchange credential -- and this command makes no "
+              "paid request.")
+        print("  reaction/capture.py holds the guards both paid commands run")
         print("  under -- the read-only scan, the endpoint allow-list, the")
-        print("  manifest that sets its bound -- and no transport that can")
+        print("  bound on what they may buy -- and no transport that can")
         print("  reach a network.")
         # EXIT ZERO even though several questions are unanswerable. Those are
         # PERMANENT properties of these two sources, and the design already

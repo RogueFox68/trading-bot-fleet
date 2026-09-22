@@ -106,21 +106,22 @@ class Candle:
         return self.ask_close - self.bid_close
 
 
-def _get(url: str) -> Any:
+def _get(url: str, retries: int = RETRIES,
+         timeout: float = REQUEST_TIMEOUT) -> Any:
     """One GET with retry/backoff. Raises rather than returning a short read."""
     last: Exception | None = None
-    for attempt in range(RETRIES):
+    for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers={"Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 if resp.status != 200:
                     raise KalshiFetchError(f"HTTP {resp.status} from {url}")
                 return json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
             last = exc
-            if attempt < RETRIES - 1:
+            if attempt < retries - 1:
                 time.sleep(BACKOFF_SECONDS[attempt])
-    raise KalshiFetchError(f"{url} failed after {RETRIES} attempts: {last}")
+    raise KalshiFetchError(f"{url} failed after {retries} attempts: {last}")
 
 
 # Kalshi serialises `*_dollars` as a fixed-point STRING ("0.5600"), not a JSON
@@ -153,10 +154,17 @@ def _dollars(node: Any, key: str) -> tuple[float | None, str]:
         return None, ABSENT
     if f"{key}_dollars" not in node:
         return None, ABSENT
-    raw = node[f"{key}_dollars"]
+    return _price_value(node[f"{key}_dollars"])
+
+
+def _price_value(raw: Any) -> tuple[float | None, str]:
+    """One fixed-point dollar price, with `_dollars`'s three-way status.
+
+    Shared by the candle parser and the live order-book parser, so the two
+    cannot disagree about what a readable price is (rule 19).
+    """
     if raw is None:
         return None, ABSENT
-
     if isinstance(raw, bool):            # bool is an int subclass; not a price
         return None, MALFORMED
     if isinstance(raw, (int, float)):
@@ -413,12 +421,13 @@ def fetch_historical_cutoff(base_url: str = BASE_URL) -> tuple[datetime | None, 
     )
 
 
-def _iter_market_pages(path: str, series_ticker: str, base_url: str, max_pages: int):
+def _iter_market_pages(path: str, series_ticker: str, base_url: str,
+                       max_pages: int, status: str = "settled"):
     cursor = ""
     for page_no in range(max_pages):
         query = urllib.parse.urlencode(
             {k: v for k, v in
-             {"series_ticker": series_ticker, "status": "settled",
+             {"series_ticker": series_ticker, "status": status,
               "limit": PAGE_LIMIT, "cursor": cursor}.items() if v}
         )
         try:
@@ -550,6 +559,206 @@ def market_open_time(market: dict) -> datetime | None:
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             return datetime.fromtimestamp(value, tz=timezone.utc)
     return None
+
+
+def enumerate_open_markets(
+    series_ticker: str,
+    base_url: str = BASE_URL,
+    max_pages: int = MAX_PAGES,
+) -> tuple[dict[str, dict], Coverage]:
+    """Every OPEN market for a series -- the live partition only.
+
+    For the shadow monitor. An open market has no settlement yet, so nothing
+    downstream of this may read one. Empty with complete coverage is an
+    answer (no market is listed); a failed page is not, and says so.
+    """
+    coverage = Coverage()
+    markets: dict[str, dict] = {}
+    for page, page_cov in _iter_market_pages("/markets", series_ticker,
+                                             base_url, max_pages,
+                                             status="open"):
+        coverage.merge(page_cov)
+        for market in page:
+            if not isinstance(market, dict):
+                continue
+            ticker = str(market.get("ticker", "")).strip()
+            if ticker and ticker not in markets:
+                market[PARTITION_FIELD] = PARTITION_LIVE
+                markets[ticker] = market
+    return markets, coverage
+
+
+# --- the live book ------------------------------------------------------------
+#
+# TRANSCRIBED, NOT OBSERVED. This session cannot reach Kalshi (the egress proxy
+# refuses api.elections.kalshi.com and docs.kalshi.com), so the shape below is
+# Kalshi's documentation as relayed, not a response anyone here has read:
+#
+#   {"orderbook_fp": {"yes_dollars": [["0.4500", "120.00"], ...],
+#                     "no_dollars":  [["0.5300", "80.00"], ...]}}
+#
+# BIDS ONLY, on both sides. A YES bid at x is a NO ask at 1 - x, so the YES ask
+# is 1 minus the best NO bid. The older integer-cent form
+# {"orderbook": {"yes": [[45, 120]], "no": [[53, 80]]}} is read too. Anything
+# else is REFUSED rather than guessed at -- and the shadow monitor reads one
+# real book before its first paid request, so a wrong transcription stops the
+# run for free instead of surfacing as a strategy that never finds a price.
+
+ORDERBOOK_PATH = "/markets/{ticker}/orderbook"
+
+
+def orderbook_url(ticker: str, base_url: str = BASE_URL) -> str:
+    return f"{base_url}{ORDERBOOK_PATH.format(ticker=ticker)}"
+
+
+@dataclass(frozen=True)
+class BookQuote:
+    """One contract's live book, as polled. Top of book plus its depth.
+
+    The price fields carry the CANDLE names (`bid_close`, `ask_close`, `ts`)
+    on purpose: `reaction.screen` reads an exchange quote through those names,
+    so a polled book goes through the study's one screen rather than a second
+    one written for it (rule 19). `ts` is when WE received it -- the only
+    clock a live poll has, and the one a decision runs on.
+    """
+
+    ticker: str
+    ts: datetime
+    bid_close: float | None          # best YES bid
+    ask_close: float | None          # YES ask = 1 - best NO bid
+    bid_size: float | None           # contracts at the best YES bid
+    ask_size: float | None           # contracts at the best NO bid
+    yes_levels: int = 0
+    no_levels: int = 0
+    has_malformed_price: bool = False
+    sent_at: datetime | None = None
+
+    @property
+    def mid(self) -> float | None:
+        if self.bid_close is None or self.ask_close is None:
+            return None
+        return (self.bid_close + self.ask_close) / 2.0
+
+    @property
+    def spread(self) -> float | None:
+        if self.bid_close is None or self.ask_close is None:
+            return None
+        return self.ask_close - self.bid_close
+
+
+def _book_levels(raw: Any, cents: bool) -> tuple[list[tuple[float, float]], int]:
+    """(price, count) pairs, and how many levels could not be read."""
+    if raw is None:
+        return [], 0
+    if not isinstance(raw, list):
+        return [], 1
+    levels: list[tuple[float, float]] = []
+    bad = 0
+    for level in raw:
+        if not isinstance(level, (list, tuple)) or len(level) < 2:
+            bad += 1
+            continue
+        price_raw, count_raw = level[0], level[1]
+        if cents:
+            if isinstance(price_raw, bool) or not isinstance(price_raw, int):
+                bad += 1
+                continue
+            price, status = _price_value(price_raw / 100.0)
+        else:
+            price, status = _price_value(price_raw)
+        count = _count_value(count_raw)
+        if status != OK or count is None:
+            bad += 1
+            continue
+        levels.append((price, count))
+    return levels, bad
+
+
+def _count_value(raw: Any) -> float | None:
+    """A resting quantity: a finite, non-negative number or numeric string."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+    elif isinstance(raw, str):
+        try:
+            value = float(raw.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    if value != value or value in (float("inf"), float("-inf")) or value < 0:
+        return None
+    return value
+
+
+def parse_orderbook(payload: Any, *, ticker: str, received_at: datetime,
+                    sent_at: datetime | None = None
+                    ) -> tuple[BookQuote | None, Coverage]:
+    """Parse one order-book response. Pure -- no network.
+
+    An EMPTY side is an answer (no resting bids) and leaves that side's price
+    None, exactly as a one-sided candle does; an UNREADABLE level is not, and
+    fails coverage. An unrecognised body is refused, never read as empty.
+    """
+    coverage = Coverage()
+    if not isinstance(payload, dict):
+        return None, coverage.fail(
+            f"{ticker}: order book was {type(payload).__name__}, expected object")
+    if isinstance(payload.get("orderbook_fp"), dict):
+        book, cents = payload["orderbook_fp"], False
+        yes_raw, no_raw = book.get("yes_dollars"), book.get("no_dollars")
+    elif isinstance(payload.get("orderbook"), dict):
+        book = payload["orderbook"]
+        if "yes_dollars" in book or "no_dollars" in book:
+            cents = False
+            yes_raw, no_raw = book.get("yes_dollars"), book.get("no_dollars")
+        else:
+            cents = True
+            yes_raw, no_raw = book.get("yes"), book.get("no")
+    else:
+        return None, coverage.fail(
+            f"{ticker}: unrecognised order-book shape (keys: "
+            f"{sorted(payload)}); refusing to guess a price from it")
+
+    yes, bad_yes = _book_levels(yes_raw, cents)
+    no, bad_no = _book_levels(no_raw, cents)
+    if bad_yes or bad_no:
+        coverage.fail(f"{ticker}: {bad_yes + bad_no} order-book level(s) "
+                      f"unreadable (wire format may have changed)")
+
+    def best(levels: list[tuple[float, float]]) -> tuple[float | None,
+                                                         float | None]:
+        if not levels:
+            return None, None
+        price = max(p for p, _ in levels)
+        return price, sum(c for p, c in levels if p == price)
+
+    yes_bid, yes_size = best(yes)
+    no_bid, no_size = best(no)
+    ask = None if no_bid is None else round(1.0 - no_bid, 6)
+    return BookQuote(
+        ticker=ticker, ts=received_at, bid_close=yes_bid, ask_close=ask,
+        bid_size=yes_size, ask_size=no_size, yes_levels=len(yes),
+        no_levels=len(no), has_malformed_price=bool(bad_yes or bad_no),
+        sent_at=sent_at), coverage
+
+
+#: A live book read gets ONE attempt and a short timeout. The archive readers
+#: retry, because a lost candle is gone; a lost book read is replaced by the
+#: next one seconds later, and three 30-second attempts on each of two dozen
+#: contracts would stall the paid poll behind them for minutes.
+LIVE_BOOK_TIMEOUT = 10
+
+
+def fetch_orderbook_payload(ticker: str, base_url: str = BASE_URL
+                            ) -> tuple[Any, Coverage]:
+    """The RAW order-book body for one market. Free; public market data."""
+    try:
+        return (_get(orderbook_url(ticker, base_url), retries=1,
+                     timeout=LIVE_BOOK_TIMEOUT), Coverage())
+    except KalshiFetchError as exc:
+        return None, Coverage().fail(str(exc))
 
 
 def uses_archive(market: dict, cutoff: datetime | None) -> bool | None:

@@ -764,11 +764,14 @@ python3 run_reaction.py --capability-verify   # free commands to re-check it
 python3 run_reaction.py --policy              # the DECLARED thresholds
 python3 run_reaction.py --replay bundle.json  # the whole chain, offline
 python3 collect_reaction.py --day 2026-09-20  # price a collection, free
+python3 shadow_monitor.py --hours 72          # price a live session, free
 ```
 
 The four `run_reaction.py` commands are free: no network, no credential, no
-credits. `collect_reaction.py` is the study's one paid entry point, and it is
-free too until `--spend` confirms a price — see *The backtest collector*.
+credits. The study buys data in two places — `collect_reaction.py` from the
+odds archive, `shadow_monitor.py` from the live feed — and both are free
+until `--spend` confirms a price. See *The backtest collector* and *The
+shadow monitor*.
 
 ### `last_update` is the PROVIDER's clock, not the book's
 
@@ -1000,7 +1003,7 @@ approved plan so it cannot be run wider than approved.
 
 ### The backtest collector (`collect_reaction.py`)
 
-The study's one paid entry point, and it **plans first**. Without `--spend`
+The archive purchase, and it **plans first**. Without `--spend`
 it makes only free requests — the ESPN schedule and Kalshi's public market
 listing — prints the manifest of UTC instants it would buy and what is
 already cached, and exits having spent nothing. `--spend N` confirms a price:
@@ -1049,6 +1052,57 @@ python3 run_reaction.py --replay bundle.json --max-wait 1800
   `assert_read_only` scans every module the collector can reach before the
   first paid request. Flags are matched exactly: a command that spends money
   is spelled out or refused, never completed from a prefix.
+
+### The shadow monitor (`shadow_monitor.py`)
+
+The no-order version of the bot the owner described: poll the sharp book,
+notice when it moves, look at Kalshi at once, and write down what a bot
+would have done — then keep watching Kalshi to learn whether, and how fast,
+it followed. It is the prospective recorder every replay figure has been
+waiting on, and it measures what no archive can: how old a sharp price is
+when it reaches us, how often the provider actually refreshes, how fast
+Kalshi follows at the spacing of its own reads, and what the book held at
+the moment of a move, with depth.
+
+```
+python3 shadow_monitor.py --hours 72                   # the price, free
+python3 shadow_monitor.py --hours 72 --spend 4321      # a live, read-only session
+python3 shadow_monitor.py --report study_output/shadow/<session>.jsonl
+```
+
+- **Each tick, in order:** Kalshi's book for every watched contract (free —
+  the *decision* books, what a bot held when a move arrived); one sharp-book
+  poll (paid); the study's own detector on every quote, clocked by our
+  receipt; for a move on a watched game, that game's books again (the
+  *execution* books — how long they took is the entry delay, measured
+  rather than assumed); the checkpoint study's own screen, reached through
+  `reaction.screen.screen_live`, the same observation path the replay uses;
+  then the game is followed every 10s, free, for the declared 30-minute
+  response window.
+- **Decided on what it knew; charged what it would have paid.** The screen
+  judges the decision book, as the replay does. The execution book sets
+  `paid`, and the difference is recorded per entry as the **latency cost** —
+  the number that says whether a live bot's own delay eats the edge.
+- **A failed execution read is not a fill.** Priced at the decision book
+  instead, it would record an entry that could not have happened; the
+  screen drops the side, as in the replay. One entry per game, as in the
+  checkpoint study.
+- **What a live feed can fake is refused.** A game missing from a poll is a
+  hole, not a move; a game already under way is never a move; the detector
+  runs on the clock the decision would have run on.
+- **It stops, and says why,** on the credit cap, three failed polls in a
+  row, a price per call other than quoted (checked against the provider's
+  own `x-requests-last` on the first answer), a clock more than 5s off the
+  provider's, a nearly empty account, or a request outside the allow-list.
+  Kalshi's book shape is transcribed rather than observed, so one real book
+  is read — free — before the first paid poll, and a shape the parser
+  refuses stops the session with nothing bought.
+- **Records, not state.** One append-only JSONL file per session: every raw
+  response with the clocks around it, every move, decision, gap and stop.
+  `--report` reads it offline; the key is in no record.
+- **Not yet:** scoring shadow entries against settlement. A live session
+  ends before its games do, so its figures are *predicted*; realised
+  results need the settled markets joined back in, which is not built.
 
 ### The pilot proposal (`REACTION_PILOT.md`)
 
@@ -1113,18 +1167,22 @@ are scheduled on five-minute marks.
 
 Built and tested: the capability audit, the clock/provenance contracts, the
 causal move detector, the reaction measurement, the opportunity screen, the
-episode ledger, the offline replay and the backtest collector
-(`collect_reaction.py`). Every named test case is present —
+episode ledger, the offline replay, the backtest collector
+(`collect_reaction.py`) and the shadow monitor (`shadow_monitor.py`). Every
+named test case is present —
 book-leads-with-a-surviving-discrepancy, indeterminate ordering, Kalshi-first,
 no response, the delay that misses the gap, a quote beyond the allowed wait,
 and a move-plus-full-reaction between two coarse checkpoints.
 
-**Not built:** live capture. `capture.py` is its contract and its guards, with
-no transport.
+**Not built:** anything that places an order, and scoring shadow entries
+against settlement. `capture.py` is the contract both paid commands run
+under, with no transport of its own.
 
-No orders and no live capture: neither is authorised and neither is
-implemented. Paid requests exist in exactly one place, `collect_reaction.py`,
-behind an explicit `--spend`; none is authorised by this repository.
+No orders: none is authorised and none can be placed — nothing in the study
+holds an exchange credential, and the read-only scan fails a run if anything
+could. Live capture is read-only. Paid requests exist in exactly two places,
+`collect_reaction.py` and `shadow_monitor.py`, each behind an explicit
+`--spend`; none is authorised by this repository.
 
 ## Relationship to the fleet
 
@@ -1135,7 +1193,7 @@ worth inheriting; it lifts out to its own repo if the thesis survives.
 
 ## If it survives
 
-Only then: a read-only **forward recorder** of signals, depth and latency —
-because paper fills establish no queue priority. Any execution service after
-that needs start-time order expiry, position and exposure reconciliation, and
-event-level risk accounting built for Kalshi.
+The read-only **forward recorder** of signals, depth and latency now exists
+as the shadow monitor, and paper fills still establish no queue priority.
+Any execution service after it needs start-time order expiry, position and
+exposure reconciliation, and event-level risk accounting built for Kalshi.

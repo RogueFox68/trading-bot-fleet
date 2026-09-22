@@ -2,8 +2,9 @@
 
 WHAT IS UNDER TEST
 ------------------
-Not a capture -- there isn't one, and live capture is not authorised. These
-check the CONTRACT and its guards:
+Not a capture -- the captures are `collect_reaction.py` and
+`shadow_monitor.py`, tested in their own suites, and nothing here authorises
+either. These check the CONTRACT and its guards:
 
 * `BudgetTest` -- the bound REFUSES rather than warns. A warning on the last
   request is indistinguishable from a warning on the first, and the thing
@@ -215,7 +216,8 @@ class EndpointTest(unittest.TestCase):
         reaches `urlopen` is what gets checked.
         """
         from unittest import mock
-        from data import espn_schedule, kalshi_history, odds_history
+        from data import espn_schedule, kalshi_history, odds_history, odds_live
+        from data.odds_history import CreditLedger
         seen: list[str] = []
 
         def record(request, *args, **kwargs):
@@ -234,6 +236,12 @@ class EndpointTest(unittest.TestCase):
                     at + _td(hours=1), use_archive=archive)
             espn_schedule.fetch_schedule("NFL", at.date(), at.date(),
                                          buffer_days=0)
+            # The shadow monitor's live fetchers.
+            odds_live.fetch_live_odds("NFL", "KEY", ledger=CreditLedger(),
+                                      now=lambda: at)
+            kalshi_history.enumerate_open_markets("KXNFLGAME", max_pages=1)
+            kalshi_history.fetch_orderbook_payload(
+                "KXNFLGAME-26SEP13DALNYG-NYG")
         return seen
 
     def test_every_url_a_fetcher_requests_is_declared(self):
@@ -719,6 +727,32 @@ class PilotProposalTest(unittest.TestCase):
                 with contextlib.redirect_stderr(io.StringIO()):
                     collect_reaction.parse_args(argv)
 
+    def test_the_documented_monitor_commands_parse(self):
+        import shadow_monitor
+        commands = self._commands("shadow_monitor.py")
+        self.assertGreaterEqual(len(commands), 3)
+        self.assertFalse(shadow_monitor.build_parser().allow_abbrev)
+        for argv in commands:
+            with self.subTest(argv=argv):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    shadow_monitor.build_parser().parse_args(argv)
+
+    def test_the_monitor_prices_are_the_monitors_own(self):
+        """Every figure in the table, and the one in the budget paragraph,
+        from `session_price` -- the function that sets the cap."""
+        from shadow_monitor import session_price
+        for hours in (24, 72):
+            row = [line for line in self.raw.splitlines()
+                   if line.startswith(f"| {hours}h |")]
+            self.assertEqual(len(row), 1, f"no {hours}h row")
+            for seconds in (60, 120, 300):
+                price = session_price(hours, _td(seconds=seconds))
+                with self.subTest(hours=hours, seconds=seconds):
+                    self.assertIn(f"| {price:,} |", row[0] + " |")
+        self.assertClaim(f"72 hours at one poll a minute is "
+                         f"{session_price(72, _td(seconds=60)):,} credits")
+        self.assertClaim(f"--spend {session_price(72, _td(seconds=60))}")
+
     def test_the_documented_replay_commands_parse(self):
         """Exactly as spelled: argparse would otherwise accept a stale flag
         that happens to be a prefix of the current one."""
@@ -850,12 +884,14 @@ class ReadmeCurrencyTest(unittest.TestCase):
         status = self.section[self.section.index("### Status"):]
         built = status[:status.index("**Not built:**")]
         for layer in ("reaction measurement", "opportunity screen",
-                      "episode ledger", "offline replay", "backtest collector"):
+                      "episode ledger", "offline replay", "backtest collector",
+                      "shadow monitor"):
             self.assertIn(layer, built, f"{layer} is not listed as built")
         unbuilt = status[status.index("**Not built:**"):]
-        self.assertIn("live capture", unbuilt)
-        for layer in ("reaction measurement", "episode ledger"):
-            self.assertNotIn(layer, unbuilt)
+        self.assertIn("places an order", unbuilt)
+        for layer in ("reaction measurement", "episode ledger",
+                      "live capture"):
+            self.assertNotIn(layer, unbuilt.split("No orders")[0])
 
     def test_every_module_the_readme_names_actually_imports(self):
         import importlib
@@ -863,7 +899,7 @@ class ReadmeCurrencyTest(unittest.TestCase):
                        "reaction.detector", "reaction.measure",
                        "reaction.screen", "reaction.episodes",
                        "reaction.replay", "reaction.capture",
-                       "collect_reaction"):
+                       "collect_reaction", "shadow_monitor"):
             with self.subTest(module=module):
                 self.assertClaim(module.split(".")[-1] + ".py")
                 importlib.import_module(module)
@@ -887,18 +923,19 @@ class ReadmeCurrencyTest(unittest.TestCase):
                                 f"README and does not exist")
 
     def test_the_no_orders_commitment_is_still_there(self):
-        """It used to say "No paid requests ... none is implemented", which
-        stopped being true when the collector shipped. What is still true is
-        pinned instead: no orders, no live capture, and paid requests in one
-        place, behind one flag."""
-        self.assertClaim("No orders and no live capture: neither is authorised "
-                         "and neither is implemented.")
-        self.assertClaim("Paid requests exist in exactly one place, "
-                         "`collect_reaction.py`")
+        """It used to say "No paid requests ... none is implemented", false
+        once the collector shipped, and then "no live capture", false once
+        the shadow monitor did. What is still true is pinned instead: no
+        orders, and paid requests in two places, each behind one flag."""
+        self.assertClaim("No orders: none is authorised and none can be "
+                         "placed")
+        self.assertClaim("Paid requests exist in exactly two places, "
+                         "`collect_reaction.py` and `shadow_monitor.py`")
         self.assertClaim("behind an explicit `--spend`")
         self.assertClaim("none is authorised")
-        self.assertNotIn("no paid requests. none is authorised",
-                         " ".join(self.text.split()))
+        flat = " ".join(self.text.split())
+        self.assertNotIn("no paid requests. none is authorised", flat)
+        self.assertNotIn("no live capture: neither", flat)
 
     def test_the_documented_commands_parse_exactly(self):
         """The commands in this section get pasted; each is parsed by the
@@ -906,8 +943,10 @@ class ReadmeCurrencyTest(unittest.TestCase):
         import shlex
         import collect_reaction
         import run_reaction
+        import shadow_monitor
         parsers = {"collect_reaction.py": collect_reaction.build_parser,
-                   "run_reaction.py": run_reaction.build_parser}
+                   "run_reaction.py": run_reaction.build_parser,
+                   "shadow_monitor.py": shadow_monitor.build_parser}
         seen = 0
         for line in self.section.splitlines():
             line = line.split("#", 1)[0].strip()

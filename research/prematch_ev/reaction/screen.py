@@ -273,6 +273,28 @@ def observation_for(reaction: Reaction, trigger: MoveTrigger, candles: Sequence,
         return None, ScreenRefusal.NOT_A_MOVE_WE_COULD_TRADE, (
             f"reaction outcome {reaction.outcome.value} carries no decision "
             f"instant to screen")
+    return observation_at(trigger, candles, market_ticker=market_ticker,
+                          yes_is_home=yes_is_home, start=start,
+                          settled_yes=settled_yes, entry_delay=entry_delay,
+                          entry_tolerance=entry_tolerance,
+                          checkpoint_label=checkpoint_label)
+
+
+def observation_at(trigger: MoveTrigger, candles: Sequence, *,
+                   market_ticker: str, yes_is_home: bool,
+                   start: datetime | None, settled_yes: int | None = None,
+                   entry_delay: timedelta = timedelta(0),
+                   entry_tolerance: timedelta = timedelta(minutes=5),
+                   checkpoint_label: float | None = None
+                   ) -> tuple[Observation | None, ScreenRefusal | None, str]:
+    """`observation_for` without the reaction gate.
+
+    A LIVE decision is made the moment a move is seen, before any reaction can
+    exist, so it cannot pass a measured reaction in. It enters here instead,
+    and from here on the path is the replay's own: the same decision book,
+    the same execution quote, the same Observation. `observation_for` is this
+    plus its gate, not a copy of it (rule 19).
+    """
     decided_at = trigger.detected_at
     if start is None:
         return None, ScreenRefusal.NO_START_TIME, (
@@ -368,14 +390,115 @@ def screen_reaction(reaction: Reaction, trigger: MoveTrigger,
                                 admitted=False, trade=None, detail=detail,
                                 **common)
 
-    kwargs = dict(venue=venue, role=role, series=series)
-    if route is not None:
-        kwargs["route"] = route
-    admitted = eligibility.admits(observation, **kwargs)
-    trade = as_trade(observation, eligibility=eligibility, **kwargs)
+    admitted, trade = _admit(observation, eligibility, venue=venue, role=role,
+                             series=series, route=route)
     return ScreenedReaction(refusal=None, observation=observation,
                             admitted=admitted, trade=trade,
                             detail=detail, **common)
+
+
+def _admit(observation: Observation, eligibility: Eligibility, *, venue: str,
+           role: str, series: str | None, route: str | None
+           ) -> tuple[bool, Trade | None]:
+    """The checkpoint study's own admission and pricing, called one way."""
+    kwargs = dict(venue=venue, role=role, series=series)
+    if route is not None:
+        kwargs["route"] = route
+    return (eligibility.admits(observation, **kwargs),
+            as_trade(observation, eligibility=eligibility, **kwargs))
+
+
+@dataclass
+class LiveDecision:
+    """What a bot would have done at the instant a live move was seen.
+
+    Made BEFORE anything that follows is known, and recorded then, so it
+    cannot be improved by hindsight. It is SCREENED at the decision book --
+    the last one read before the move -- exactly as the replay screens, so
+    `entry_price` and the predicted EV are what the bot knew. `paid` is what
+    the EXECUTION book, read after the move was seen, would have cost, and
+    `entry_delay_seconds` is how long that read took: a measured delay where
+    the replay can only assume one. The difference is `latency_cost`.
+    """
+
+    event_id: str
+    market_ticker: str
+    decision_at: datetime | None
+    refusal: ScreenRefusal | None
+    observation: Observation | None
+    admitted: bool
+    trade: Trade | None
+    entry_delay_seconds: float
+    detail: str = ""
+
+    def as_dict(self) -> dict:
+        row = {
+            "event_id": self.event_id,
+            "market_ticker": self.market_ticker,
+            "decision_at": (self.decision_at.isoformat()
+                            if self.decision_at else None),
+            "refusal": self.refusal.value if self.refusal else None,
+            "admitted": self.admitted,
+            "entry_delay_seconds": self.entry_delay_seconds,
+            "detail": self.detail,
+            "predicted": None,
+            "realized_withheld_because": (
+                "a live decision is recorded before settlement exists"),
+        }
+        if self.observation is not None:
+            o = self.observation
+            row["book"] = {"decision_bid": o.exchange_bid,
+                           "decision_ask": o.exchange_ask,
+                           "entry_bid": o.entry_bid, "entry_ask": o.entry_ask,
+                           "p_sharp": o.p_sharp,
+                           "minutes_to_start": o.minutes_to_start}
+        if self.trade is not None:
+            decided_cost = self.trade.entry_price + self.trade.fee
+            row["predicted"] = {
+                "side": self.trade.side,
+                "entry_price": self.trade.entry_price,
+                "fee": self.trade.fee,
+                "predicted_ev_per_contract": self.trade.predicted_ev,
+                "paid_at_execution": self.trade.paid,
+                # What the delay between seeing the move and reading the book
+                # cost per contract: the trade's own two prices, subtracted.
+                "latency_cost": (None if self.trade.paid is None
+                                 else self.trade.paid - decided_cost),
+            }
+        return row
+
+
+def screen_live(trigger: MoveTrigger, books: Sequence, *, market_ticker: str,
+                yes_is_home: bool, start: datetime | None,
+                entry_delay: timedelta,
+                entry_tolerance: timedelta = timedelta(minutes=5),
+                eligibility: Eligibility | None = None,
+                series: str | None = None, venue: str = "kalshi",
+                role: str = "taker", route: str | None = None
+                ) -> LiveDecision:
+    """Screen a live move through the checkpoint study's own policy.
+
+    `books` are polled books (`data.kalshi_history.BookQuote`), which carry
+    the candle field names so they pass through `observation_at` unchanged:
+    the newest at or before the move is the decision book, and the first at
+    or after `detected_at + entry_delay` is the execution book.
+    """
+    eligibility = eligibility or Eligibility()
+    observation, refusal, detail = observation_at(
+        trigger, books, market_ticker=market_ticker, yes_is_home=yes_is_home,
+        start=start, entry_delay=entry_delay,
+        entry_tolerance=entry_tolerance)
+    common = dict(event_id=trigger.event_id, market_ticker=market_ticker,
+                  decision_at=trigger.detected_at,
+                  entry_delay_seconds=entry_delay.total_seconds())
+    if observation is None:
+        return LiveDecision(refusal=refusal, observation=None, admitted=False,
+                            trade=None, detail=detail, **common)
+    admitted, trade = _admit(observation, eligibility, venue=venue, role=role,
+                             series=series, route=route)
+    return LiveDecision(refusal=None, observation=observation,
+                        admitted=admitted, trade=trade, detail=detail,
+                        **common)
 
 
 def screen_all(items: Iterable[tuple], **kwargs) -> ScreenResult:

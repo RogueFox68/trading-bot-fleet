@@ -7,11 +7,13 @@
         --spend 7320 --out bundle.json                                # collect
     python3 run_reaction.py --replay bundle.json --max-wait 1800      # analyse
 
-THE ONLY PART OF THE REACTION STUDY THAT SPENDS CREDITS
--------------------------------------------------------
-`reaction/` and `run_reaction.py` are offline. (The checkpoint study's
-`run_study.py` is the other paid entry point in this directory, under its own
-`--max-credits` cap.) This is the collection machine that
+THE REACTION STUDY'S ARCHIVE PURCHASE
+-------------------------------------
+`reaction/` and `run_reaction.py` are offline. The reaction study spends
+credits in two places: here, on the odds ARCHIVE, and in `shadow_monitor.py`,
+on the LIVE feed. (The checkpoint study's `run_study.py` is a third paid entry
+point in this directory, under its own `--max-credits` cap.) This is the
+collection machine that
 `reaction/capture.py` describes: it resolves one NFL date's slate, prices the
 exact UTC instants it would request, and -- only when told to -- buys them from
 the odds archive, adds the exchange's free 1-minute candles, and writes a
@@ -163,14 +165,36 @@ def resolve_slate(day: date, *, league: str = "NFL",
     is the local game day -- not the UTC day of kickoff, which for an evening
     game is the next one.
     """
-    slate = Slate(day=day, league=league.upper(), series=series)
+    return resolve_days([day], league=league, series=series,
+                        schedule_cache=schedule_cache,
+                        enumerate_markets=enumerate_markets,
+                        fetch_schedule=fetch_schedule)
+
+
+def resolve_days(days: Sequence[date], *, league: str = "NFL",
+                 series: str = "KXNFLGAME",
+                 schedule_cache: str | None = None,
+                 enumerate_markets: Callable = kalshi_history
+                 .enumerate_settled_markets,
+                 fetch_schedule: Callable = espn_schedule.fetch_schedule
+                 ) -> Slate:
+    """`resolve_slate` over several game days, for the shadow monitor.
+
+    One implementation of "which contracts, and when do they kick off" for
+    both the collector and the monitor; the monitor passes open markets and
+    a week of days, the collector settled markets and one.
+    """
+    wanted = set(days)
+    slate = Slate(day=min(wanted), league=league.upper(), series=series)
     every, coverage = enumerate_markets(series)
     slate.coverage.merge(coverage)
     slate.markets = {
         ticker: market for ticker, market in every.items()
-        if parse_event_body_date(kalshi_event_ticker(market) or ticker) == day}
+        if parse_event_body_date(kalshi_event_ticker(market) or ticker)
+        in wanted}
     try:
-        schedule = fetch_schedule(league, day, day, cache_dir=schedule_cache)
+        schedule = fetch_schedule(league, min(wanted), max(wanted),
+                                  cache_dir=schedule_cache)
     except Exception as exc:                     # transport-shaped, by contract
         slate.coverage.fail(redact(f"schedule retrieval failed: {exc}. An "
                                    f"unreachable schedule is not an empty "

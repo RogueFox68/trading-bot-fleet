@@ -498,6 +498,50 @@ def envelope_for_sharp_quote(quote: Any, *, request_url: str = "",
     docstring and it does not look wrong in a diff.
     """
     capability = capability_for("the_odds_api_historical")
+    return _sharp_envelope(
+        quote, source="the_odds_api_historical",
+        origin=Origin.HISTORICAL_REPLAY, request_url=request_url,
+        sequence=sequence,
+        resolution_seconds=(capability.resolution_seconds
+                            if capability else None))
+
+
+#: The live feed's source name. A different source from the archive on
+#: purpose: the stream id carries it, so a live quote can never be compared
+#: against an archived one as though the two were one feed.
+LIVE_SHARP_SOURCE = "the_odds_api_live"
+
+
+def envelope_for_live_sharp_quote(quote: Any, *, received_at: datetime,
+                                  sent_at: datetime | None = None,
+                                  request_url: str = "",
+                                  resolution_seconds: float | None = None,
+                                  sequence: int | None = None
+                                  ) -> SourceEnvelope:
+    """Wrap a quote from a LIVE poll. The executable clock is OUR RECEIPT.
+
+    `quote.snapshot` is the provider's own clock for the response (its HTTP
+    `Date`) when it sent one; `last_update` is still the provider's
+    observation, never the book's change. `received_at` is when we had it,
+    which is the first instant a live system could act -- the clock the
+    archive can only assume. `resolution_seconds` is the POLL cadence: the
+    archive's five-minute grid does not describe a live poll, and borrowing
+    it would understate what the live feed can resolve.
+    """
+    return _sharp_envelope(
+        quote, source=LIVE_SHARP_SOURCE, origin=Origin.LIVE_CAPTURE,
+        request_url=request_url, sequence=sequence,
+        resolution_seconds=resolution_seconds, received_at=received_at,
+        sent_at=sent_at)
+
+
+def _sharp_envelope(quote: Any, *, source: str, origin: Origin,
+                    request_url: str, sequence: int | None,
+                    resolution_seconds: float | None,
+                    received_at: datetime | None = None,
+                    sent_at: datetime | None = None) -> SourceEnvelope:
+    """The one body both sharp-quote envelopes are built from, so live and
+    archived quotes cannot differ in stream identity or payload hashing."""
     payload = {
         "away_name": getattr(quote, "away_name", None),
         "home_name": getattr(quote, "home_name", None),
@@ -508,14 +552,14 @@ def envelope_for_sharp_quote(quote: Any, *, request_url: str = "",
     }
     return SourceEnvelope(
         provenance=Provenance(
-            source="the_odds_api_historical",
+            source=source,
             event_id=str(getattr(quote, "provider_event_id", "")),
             # STREAM IDENTITY INCLUDES THE BOOK. Keyed on the event alone, two
             # bookmakers' quotes overwrite each other in the detector's state
             # and the second book's different price reads as the first book
             # moving. Provider + book + event + market is the stream.
             market_id=stream_id(
-                source="the_odds_api_historical",
+                source=source,
                 book=str(getattr(quote, "book", "") or "unknown"),
                 event_id=str(getattr(quote, "provider_event_id", "")),
                 market="h2h",
@@ -526,11 +570,14 @@ def envelope_for_sharp_quote(quote: Any, *, request_url: str = "",
             request_url=request_url,
             sequence=sequence,
         ),
-        origin=Origin.HISTORICAL_REPLAY,
+        origin=origin,
         provider_snapshot_time=getattr(quote, "snapshot"),
         provider_observed_at=getattr(quote, "last_update", None),
+        local_receipt_time=received_at,
+        request_sent_at=sent_at,
+        response_received_at=received_at,
         payload=quote,
-        resolution_seconds=(capability.resolution_seconds if capability else None),
+        resolution_seconds=resolution_seconds,
     )
 
 

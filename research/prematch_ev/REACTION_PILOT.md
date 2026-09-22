@@ -261,10 +261,10 @@ the actual day before anything is bought.
 
 **What the rest of the budget is for is a separate decision.** After the
 probe and option D, 9,470 credits remain of the 20,000. They could buy a
-second Sunday at the same floor as the §7 holdout (D48, 7,320), or fund a
-forward recorder (§8), which answers what no archive can: responses faster
-than five minutes, and the delivery delay every replay assumes is zero.
-Neither is proposed here.
+second Sunday at the same floor as the §7 holdout (D48, 7,320), or run the
+shadow monitor (§8) — 72 hours at one poll a minute is 4,321 credits — which
+answers what no archive can: responses faster than five minutes, and the
+delivery delay every replay assumes is zero. Neither is proposed here.
 
 **On a coarse grid, alignment is most of the bill.** Three clusters at 13:00,
 16:25 and 20:20 put their unaligned 30-minute grids minutes apart, so nothing
@@ -346,27 +346,41 @@ looked at cannot be un-looked-at.
 
 ## 8. What would have to be true before a live pilot
 
-1. **A prospective recorder.** Every availability figure in replay assumes
-   **zero delivery delay** — a historical snapshot has no receipt time. The
-   audit grades "what the LIVE feed could do" UNANSWERABLE. A live pilot's
-   first job is to *measure* that delay. It is also the only route to
-   responses faster than the archive's 300-second floor.
-2. **The decision-clock bound, on live records.** In replay it and the
-   capture-age bound are the same number, so no historical fixture
-   distinguishes them. That defect only exists on the live path.
+The first three are now the **shadow monitor's** job (`shadow_monitor.py`):
+the owner's forward plan with the order left out — poll the sharp book,
+notice a move, look at Kalshi at once, and record what a bot would have done.
 
-The recorder is also the owner's stated forward path: a monitor on NFL
-Sundays that polls the sharp book and acts on Kalshi when it moves. The odds
-provider publishes no push feed, so that monitor **polls**, and polling faster
-than the provider's own refresh buys the same snapshot twice. Its cadence
-should come from the refresh the recorder measures in successive
-`last_update` stamps, not be set in advance.
-3. **Depth, from a source that has it** — or an explicit decision that
-   one-contract size is the whole strategy.
+1. **A prospective recorder — built.** Every availability figure in replay
+   assumes **zero delivery delay**, because a historical snapshot has no
+   receipt time. The monitor measures it (how old each new provider
+   observation was when it reached us), measures the provider's actual
+   refresh, and times Kalshi's follow at the spacing of its own reads — 10
+   seconds after a move, finer than the archive's 300-second floor.
+2. **The decision-clock bound, on live records — exercised.** The detector
+   runs on the receipt clock, so a record captured at 12:05 and received at
+   12:25 is judged 20 minutes old when it could be acted on.
+3. **Depth — recorded, not decided.** The monitor reads Kalshi's public
+   order book, so every shadow decision carries the size resting at the
+   price it would have paid. Whether that is enough is a strategy question.
 4. **A fee schedule for `KXNFLGAME`.** The dated multiplier is known for
    `KXMLBGAME` (halved 2026-08-07); NFL's is assumed at the generic 0.07.
 5. **The account route.** `$0.0001` direct versus `$0.01` non-direct, where
    at one-contract size the rounding quantum is most of the fee.
+
+**Polling, not listening.** The odds provider publishes no push feed, so the
+monitor polls, at 1 credit a poll — transcribed, and checked against the
+provider's own `x-requests-last` on the first answer. Polling faster than
+the provider refreshes buys the same answer twice, which is why the report
+prints the refresh it measured: a first session is how the cadence gets set
+from evidence.
+
+| session | every 60s | every 120s | every 300s |
+|---|---|---|---|
+| 24h | 1,441 | 721 | 289 |
+| 72h | 4,321 | 2,161 | 865 |
+
+Its entries are **predicted**, not realised: a live session ends before its
+games do, and scoring shadow entries against settlement is not built yet.
 
 ---
 
@@ -391,6 +405,9 @@ python3 run_reaction.py --policy              # the declared thresholds
 python3 collect_reaction.py --day 2026-09-20 --lead-hours 72   # the price, free
 python3 collect_reaction.py --day 2026-09-20 --lead-hours 72 --spend 10490 --out bundle.json
 python3 run_reaction.py --replay bundle.json --max-wait 1800   # the whole chain, offline
+python3 shadow_monitor.py --hours 72                           # a live session's price, free
+python3 shadow_monitor.py --hours 72 --spend 4321              # live and read-only
+python3 shadow_monitor.py --report study_output/shadow/SESSION.jsonl
 ```
 
 Everything but a `--spend` run is free. The key comes from `--api-key` or

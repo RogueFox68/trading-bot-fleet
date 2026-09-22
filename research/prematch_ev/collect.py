@@ -1084,7 +1084,9 @@ class JoinedMarket:
     event_ticker: str
     yes_participant: str
     start: datetime
-    outcome: int
+    #: None ONLY for an open market joined by the shadow monitor
+    #: (`require_settlement=False`); every settled-market path receives an int.
+    outcome: int | None
     provider_event_id: str
     settled_at: datetime | None
     start_verified: bool = False
@@ -1155,8 +1157,15 @@ def join_markets(
     league: str,
     ledger: Ledger,
     resolver: "StartResolver | None" = None,
+    require_settlement: bool = True,
 ) -> list[JoinedMarket]:
     """Match settled contracts to sharp events on (matchup, DATE), then time.
+
+    `require_settlement=False` is for OPEN markets -- the shadow monitor
+    joins contracts that have not settled, and has to, since it decides
+    before the game. Such a contract joins with `outcome=None`; the default
+    still rejects an unreadable settlement, so no settled-market study can
+    receive a contract whose result it cannot score.
 
     Three defects this replaces, each seen in a live run:
 
@@ -1281,7 +1290,7 @@ def join_markets(
         for ticker in tickers:
             parsed = parse_kalshi_game_ticker(ticker)
             outcome = settlement_outcome(markets[ticker])
-            if outcome is None:
+            if outcome is None and require_settlement:
                 ledger.reject("no_readable_settlement", ticker, stage="contracts")
                 continue
             joined.append(JoinedMarket(
