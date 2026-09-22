@@ -46,8 +46,8 @@ from reaction.detector import (                                 # noqa: E402
 )
 from reaction.measure import (                                  # noqa: E402
     CANDLE_PERIOD, Bracket, Ordering, ReactionOutcome, ReactionPolicy,
-    candle_bracket, measure_all, measure_candle_cadence, measure_reaction,
-    measure_response, order_brackets,
+    candle_bracket, inside_window, measure_all, measure_candle_cadence,
+    measure_reaction, measure_response, order_brackets, request_span,
 )
 
 UTC = timezone.utc
@@ -711,11 +711,75 @@ class LiveReadingTest(unittest.TestCase):
         self.assertIs(reaction.outcome, ReactionOutcome.BLIND_INTERVAL)
         self.assertEqual(reaction.blind_to, self.at(120))
 
+    def test_a_read_in_flight_at_the_deadline_is_inside_the_window(self):
+        """Requested before the window ended, answered after it: the book it
+        shows may be from inside the window, so the read is -- by the rule
+        the monitor counts its coverage with -- and the lag bracket says how
+        far past the deadline the change could lie."""
+        readings = self.followed_every(10, until=110)
+        readings.append(read(self.at(120.1), 0.64))
+        reaction = self.measure(readings)
+        self.assertIs(reaction.outcome, ReactionOutcome.RESPONDED)
+        self.assertAlmostEqual(reaction.lag_earliest_seconds, 109.8, places=6)
+        self.assertAlmostEqual(reaction.lag_latest_seconds, 120.1, places=6)
+
     def test_a_demonstrated_reaction_survives_all_of_it(self):
         reaction = self.measure(self.followed_every(10, change_at=50))
         self.assertIs(reaction.outcome, ReactionOutcome.RESPONDED)
         self.assertAlmostEqual(reaction.lag_earliest_seconds, 39.8, places=6)
         self.assertAlmostEqual(reaction.lag_latest_seconds, 50.0, places=6)
+
+
+class RequestSpanTest(unittest.TestCase):
+    """The interval a read answered over -- for good reads and failed ones
+    alike, which is why it is a function of two times and not of a book."""
+
+    RECEIVED = START - timedelta(hours=3)
+
+    def test_a_read_spans_its_request_to_its_receipt(self):
+        sent = self.RECEIVED - timedelta(seconds=2)
+        self.assertEqual(request_span(sent, self.RECEIVED),
+                         (sent, self.RECEIVED))
+
+    def test_without_a_request_time_it_is_known_only_at_receipt(self):
+        self.assertEqual(request_span(None, self.RECEIVED),
+                         (self.RECEIVED, self.RECEIVED))
+
+    def test_a_request_after_its_receipt_is_not_believed(self):
+        """A wall clock stepped back mid-request. No read answers before it
+        was asked, so the span collapses to the receipt rather than turning
+        inside out."""
+        later = self.RECEIVED + timedelta(seconds=1)
+        self.assertEqual(request_span(later, self.RECEIVED),
+                         (self.RECEIVED, self.RECEIVED))
+
+
+class InsideWindowTest(unittest.TestCase):
+    """Which reads belong to a response window. One rule, used by the
+    measurement and by the monitor's coverage counts alike."""
+
+    DECIDED = START - timedelta(hours=3)
+    DEADLINE = DECIDED + timedelta(minutes=2)
+
+    def inside(self, sent, answered):
+        return inside_window((self.DECIDED + timedelta(seconds=sent),
+                              self.DECIDED + timedelta(seconds=answered)),
+                             self.DECIDED, self.DEADLINE)
+
+    def test_a_read_answered_at_the_decision_is_the_baseline_side(self):
+        self.assertFalse(self.inside(-0.2, 0))
+
+    def test_a_read_in_flight_at_the_decision_is_in(self):
+        self.assertTrue(self.inside(-0.2, 0.1))
+
+    def test_a_read_requested_at_the_deadline_is_in(self):
+        self.assertTrue(self.inside(120, 120.2))
+
+    def test_a_read_in_flight_at_the_deadline_is_in(self):
+        self.assertTrue(self.inside(119.9, 120.1))
+
+    def test_a_read_requested_after_the_deadline_is_out(self):
+        self.assertFalse(self.inside(120.1, 120.3))
 
 
 class BatchTest(unittest.TestCase):

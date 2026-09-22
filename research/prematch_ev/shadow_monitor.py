@@ -134,7 +134,8 @@ from reaction.capture import CaptureRefused                        # noqa: E402
 from reaction.clocks import envelope_for_live_sharp_quote          # noqa: E402
 from reaction.detector import MoveDetector, MovePolicy, MoveTrigger  # noqa: E402
 from reaction.measure import (                                     # noqa: E402
-    Bracket, ReactionOutcome, ReactionPolicy, measure_response,
+    Bracket, ReactionOutcome, ReactionPolicy, inside_window, measure_response,
+    request_span,
 )
 from reaction.screen import screen_live                            # noqa: E402
 
@@ -968,36 +969,44 @@ def _session_policy(start: dict, *, min_response: float | None,
                             MAX_UNOBSERVED))
 
 
+Span = tuple[datetime, datetime]
+
+
 def _book_reads(books: Sequence[dict]
-                ) -> dict[str, list[tuple[datetime, BookQuote | None]]]:
-    """Every read of every contract, in answer order: (when it answered, the
-    book -- or None when the read gave nothing a price can be read from).
+                ) -> dict[str, list[tuple[Span, BookQuote | None]]]:
+    """Every read of every contract, in answer order: (the span it answered
+    over -- request to receipt -- and the book, or None when the read gave
+    nothing a price can be read from).
 
     Failed reads are KEPT, as None: they are not observations, but a window
     is only as watched as its reads were, and the count of the ones that
-    failed is reported beside every outcome.
+    failed is reported beside every outcome. The span comes from
+    `request_span`, the function `reading_span` gives a successful read's,
+    so both kinds are placed in a window by one rule.
     """
-    out: dict[str, list[tuple[datetime, BookQuote | None]]] = {}
+    out: dict[str, list[tuple[Span, BookQuote | None]]] = {}
     for row in books:
         ticker, received = row.get("ticker"), _time(row.get("received_at"))
         if not ticker or received is None:
             continue
+        sent = _time(row.get("sent_at"))
+        span = request_span(sent, received)
         book = None
         if row.get("payload") is not None and not row.get("coverage"):
             parsed, coverage = parse_orderbook(
                 row["payload"], ticker=ticker, received_at=received,
-                sent_at=_time(row.get("sent_at")))
+                sent_at=sent)
             if (parsed is not None and coverage.complete
                     and parsed.mid is not None):
                 book = parsed
-        out.setdefault(ticker, []).append((received, book))
+        out.setdefault(ticker, []).append((span, book))
     for series in out.values():
-        series.sort(key=lambda item: item[0])
+        series.sort(key=lambda item: (item[0][1], item[0][0]))
     return out
 
 
 def _response(decision: dict, trigger: dict | None,
-              reads: Sequence[tuple[datetime, BookQuote | None]],
+              reads: Sequence[tuple[Span, BookQuote | None]],
               policy: ReactionPolicy, ended: datetime | None) -> dict:
     """What Kalshi did after ONE move, on ONE contract -- measured by the
     replay's own `measure_response`, over this session's reads.
@@ -1010,7 +1019,8 @@ def _response(decision: dict, trigger: dict | None,
     to its end -- reads that failed, stopped, or never came -- is
     `blind_interval`, never a quiet market. Coverage rides along: the reads
     inside the window, the ones that failed, and whether the session itself
-    ended before the window did.
+    ended before the window did -- "inside" by the measurement's own
+    `inside_window`, so the counts are of the reads the outcome used.
     """
     ticker = decision["market_ticker"]
     decided = _time(decision.get("decision_at"))
@@ -1037,7 +1047,8 @@ def _response(decision: dict, trigger: dict | None,
            "detail": reaction.detail}
     if decided is not None:
         deadline = decided + policy.max_wait
-        inside = [book for at, book in reads if decided < at <= deadline]
+        inside = [book for span, book in reads
+                  if inside_window(span, decided, deadline)]
         row.update(
             window_ends=_iso(deadline),
             reads_in_window=sum(1 for book in inside if book is not None),

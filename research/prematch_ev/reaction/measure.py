@@ -500,17 +500,41 @@ def usable_candle(candle) -> bool:
             and not getattr(candle, "has_malformed_price", False))
 
 
+def request_span(sent: datetime | None, received: datetime
+                 ) -> tuple[datetime, datetime]:
+    """The interval a read answered over: from its request leaving to its
+    answer arriving. With no request time -- or one after the receipt, which
+    no read can have -- it is known only at its receipt. PUBLIC: the shadow
+    monitor places its FAILED reads with it, which have no book to carry a
+    span, so they are placed exactly as `reading_span` places good ones."""
+    earliest = sent if sent is not None and sent <= received else received
+    return earliest, received
+
+
 def reading_span(reading) -> tuple[datetime, datetime]:
     """The interval a reading can describe the book in: `(earliest, latest)`.
 
     A candle's close is an exact instant (`ts`). A live order-book read is
     known only to describe the book somewhere between our request leaving
-    (`sent_at`) and its answer arriving (`ts`, the receipt). PUBLIC, because
-    the shadow monitor's report reads its books through it.
+    (`sent_at`) and its answer arriving (`ts`, the receipt). The shadow
+    monitor's reads are measured through it.
     """
-    latest = reading.ts
-    sent = getattr(reading, "sent_at", None)
-    return (sent if sent is not None and sent <= latest else latest), latest
+    return request_span(getattr(reading, "sent_at", None), reading.ts)
+
+
+def inside_window(span: tuple[datetime, datetime], decided_at: datetime,
+                  deadline: datetime) -> bool:
+    """Whether a reading over `span` belongs to the response window: answered
+    after the decision, and requested no later than the deadline -- a read in
+    flight at the deadline may describe the book inside it.
+
+    PUBLIC, and the one statement of it: the shadow monitor counts the reads
+    covering each window -- the failed ones too, which never reach the
+    measurement -- by this same rule, so the coverage printed beside an
+    outcome is the coverage that outcome was measured on (rule 19).
+    """
+    earliest, latest = span
+    return latest > decided_at and earliest <= deadline
 
 
 def _change_bracket(before, after) -> Bracket:
@@ -655,7 +679,7 @@ def measure_response(*, event_id: str, stream_id: str, market_ticker: str,
     # THE SEARCH. First reading inside the window whose mid has moved far
     # enough. Direction is checked against the book's oriented delta.
     window = [r for r in usable
-              if r.ts > decided_at and reading_span(r)[0] <= deadline]
+              if inside_window(reading_span(r), decided_at, deadline)]
     previous = baseline
     for index, reading in enumerate(window):
         delta = reading.mid - baseline.mid

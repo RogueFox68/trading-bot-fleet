@@ -126,6 +126,8 @@ class LiveNetwork:
       remaining        what the account reports left
       book_shape_ok    False answers the order book in a shape nobody knows
       fail_books       the next N order-book requests fail (500)
+      fail_books_during  order-book requests in this window -- or in any of
+                       a list of windows -- fail (500)
       absent_at        odds polls in this window omit the game entirely
       listing_status   the open-market listing fails with this status
       listing_fail_after  the listing answers this many times, then fails
@@ -160,7 +162,10 @@ class LiveNetwork:
         self.absent_at = knobs.get("absent_at")
         self.listing_status = knobs.get("listing_status")
         self.listing_fail_after = knobs.get("listing_fail_after")
-        self.fail_books_during = knobs.get("fail_books_during")
+        during = knobs.get("fail_books_during")
+        self.fail_books_during = ([] if during is None else
+                                  [during] if isinstance(during[0], datetime)
+                                  else list(during))
         self.interrupt_on_poll = knobs.get("interrupt_on_poll")
         self.follow_on_execution = knobs.get("follow_on_execution", False)
         self.odds_fail_at = knobs.get("odds_fail_at")
@@ -265,8 +270,7 @@ class LiveNetwork:
 
     def _book(self, url, ticker, at):
         self.book_calls.append((ticker, at))
-        if self.fail_books_during and (
-                self.fail_books_during[0] <= at < self.fail_books_during[1]):
+        if any(_inside(window, at) for window in self.fail_books_during):
             raise urllib.error.HTTPError(url, 500, "Error", {}, None)
         if self.fail_books > 0:
             self.fail_books -= 1
@@ -1017,6 +1021,55 @@ class ResponseCoverageTest(MonitorHarness):
         self.assertGreater(by[NYG]["unreadable_in_window"], 0)
         self.assertIn("gave no usable book",
                       shadow_monitor.render_report(figures))
+
+    def test_the_coverage_counts_are_of_the_reads_the_outcome_used(self):
+        """Beside every outcome the report prints how many reads covered its
+        window and how many of those failed. They are counted by the
+        measurement's own rule -- answered after the decision, requested no
+        later than the window's end -- so a read in flight at the deadline
+        is in, and reads before the decision or after the window, failed
+        ones included, are not."""
+        before = (T0 + timedelta(minutes=1), T0 + timedelta(minutes=3))
+        # From the first follow read after the fifth minute of the window:
+        # that read is in flight when the window below ends, and it fails.
+        after = (T0 + timedelta(minutes=10, seconds=6),
+                 T0 + timedelta(minutes=12))
+        code, text, _ = self.paid(follow_at=None,
+                                  fail_books_during=[before, after])
+        self.assertEqual(code, 0, text)
+        rows = self.records()
+        decided = datetime.fromisoformat(next(
+            d for d in self.kinds(rows, "decision")
+            if d.get("market_ticker") == NYG)["decision_at"])
+        reads = [b for b in self.kinds(rows, "book") if b["ticker"] == NYG]
+
+        def sent(b):
+            return datetime.fromisoformat(b["sent_at"])
+
+        def got(b):
+            return datetime.fromisoformat(b["received_at"])
+
+        straddling = next(b for b in reads if sent(b) >= after[0])
+        self.assertIsNone(straddling["payload"])
+        deadline = sent(straddling) + (got(straddling) - sent(straddling)) / 2
+        by, _ = self.responses(rows, window=deadline - decided)
+
+        inside = [b for b in reads
+                  if got(b) > decided and sent(b) <= deadline]
+        outside = [b for b in reads if b not in inside]
+        # Something to exclude on every side, failed and successful alike.
+        for side in (lambda b: got(b) <= decided,
+                     lambda b: sent(b) > deadline):
+            self.assertTrue(any(side(b) and b["payload"] is None
+                                for b in outside))
+            self.assertTrue(any(side(b) and b["payload"] is not None
+                                for b in outside))
+        self.assertIn(straddling, inside)
+        self.assertEqual(by[NYG]["window_ends"], deadline.isoformat())
+        self.assertEqual(by[NYG]["reads_in_window"],
+                         sum(1 for b in inside if b["payload"] is not None))
+        self.assertEqual(by[NYG]["unreadable_in_window"], 1)
+        self.assertEqual(by[NYG]["outcome"], "no_response_in_window")
 
     def test_a_slow_read_widens_the_response_to_its_request(self):
         """Each book takes three seconds to answer. The change is bracketed

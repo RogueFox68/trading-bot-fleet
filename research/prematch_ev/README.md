@@ -1161,7 +1161,10 @@ python3 shadow_monitor.py --report study_output/shadow/<session>.jsonl
   ended inside it, no reads at all — is `blind_interval`, never a quiet
   market; the limit is three follow intervals, one lost read, recorded on
   every session. Beside each outcome: the reads inside the window, the ones
-  that failed, and whether the session outlived it.
+  that failed, and whether the session outlived it — "inside" by the
+  measurement's own `inside_window` (answered after the decision, requested
+  by the deadline), so the counts are of the reads the outcome was measured
+  on, and a failed read is placed in a window exactly as a good one is.
 - **It stops, and says why,** on the credit cap, three failed polls in a
   row, a price per call other than quoted (checked against the provider's
   own `x-requests-last` on the first answer), a clock more than 5s off the
