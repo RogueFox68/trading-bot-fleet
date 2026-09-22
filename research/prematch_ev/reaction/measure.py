@@ -423,12 +423,19 @@ def measure_candle_cadence(timestamps: Sequence[datetime],
 
 # --- the measurement --------------------------------------------------------
 
-def _usable(candle) -> bool:
-    """A candle we may read a price from.
+def usable_candle(candle) -> bool:
+    """A candle we may read a price from. PUBLIC, and shared on purpose.
 
     `mid` is None for a one-sided book -- which is the audit's
     suspension-versus-absence question again, so it is excluded rather than
-    filled in from the last trade.
+    filled in from the last trade. `has_malformed_price` means the parser may
+    be behind the wire format, which is a reason to distrust the value rather
+    than to use it.
+
+    `reaction.screen` reads the same filter, so the candle this module calls
+    the pre-move baseline and the candle that module screens as the decision
+    book are the SAME candle by construction. Two matching filters would be
+    two filters, and one of them would eventually be changed (rule 19).
     """
     return (getattr(candle, "mid", None) is not None
             and not getattr(candle, "has_malformed_price", False))
@@ -479,7 +486,7 @@ def measure_reaction(trigger: MoveTrigger, candles: Iterable,
                         **base)
 
     book_delta = trigger.delta_for(participant_is_home=yes_is_home)
-    usable = sorted((c for c in candles if _usable(c)),
+    usable = sorted((c for c in candles if usable_candle(c)),
                     key=lambda c: c.ts)
 
     # THE BASELINE. The exchange price we could have seen at the instant the
