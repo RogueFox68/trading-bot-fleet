@@ -29,6 +29,7 @@ coverage ledger exists to prevent. So every structural defect raises
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 import tempfile
@@ -39,6 +40,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from reaction.episodes import DataRole, HoldoutViolation            # noqa: E402
+from reaction.measure import usable_candle                          # noqa: E402
 from reaction.replay import (                                       # noqa: E402
     BUNDLE_SCHEMA, BundleError, load_bundle, render_report, replay,
     replay_file,
@@ -725,7 +727,7 @@ class EmptyTargetCollectionTest(unittest.TestCase):
              "settled_yes": 1, "candlesticks": []},
         ])
         self.assertFalse(report.complete)
-        self.assertIn(f"{TICKER}-NYG", report.contracts_without_candles)
+        self.assertIn(f"{TICKER}-NYG", report.contracts_without_usable_candles)
 
     def test_a_healthy_bundle_reports_complete(self):
         """The control: none of the above may fire on a good bundle."""
@@ -764,7 +766,8 @@ class EmptyTargetCollectionCliTest(_CliDriver, unittest.TestCase):
             {"market_ticker": f"{TICKER}-NYG", "yes_is_home": True,
              "settled_yes": 1, "candlesticks": []}])))])
         self.assertEqual(code, 1)
-        self.assertIn("NO usable candle", self._failure_block(text))
+        self.assertIn("NO usable exchange quote",
+                      self._failure_block(text))
 
     def test_a_genuine_zero_trigger_run_still_exits_zero(self):
         """rule 27. A run with real observations and no qualifying move is a
@@ -785,3 +788,182 @@ class EmptyTargetCollectionCliTest(_CliDriver, unittest.TestCase):
             odds_payload(at(190), 160, -190, at(191)),
         ])))])
         self.assertEqual(code, 0)
+
+
+def responding_bundle(response_minutes: float, *, move_at: int = 195,
+                      first: int = 210, last: int = 100) -> dict:
+    """A bundle whose exchange responds `response_minutes` after the move.
+
+    One contract, continuous 1-minute candles, a single detected book move.
+    The exchange holds 0.56/0.58 and then steps to 0.70/0.72.
+    """
+    responds_at = move_at - response_minutes
+    rows = []
+    for minute in range(first, last - 1, -1):
+        moved = minute <= responds_at
+        bid, ask = (0.70, 0.72) if moved else (0.56, 0.58)
+        rows.append((at(minute), bid, ask))
+    return bundle(
+        odds_snapshots=[odds_payload(at(200), 120, -140, at(201)),
+                        odds_payload(at(move_at), 260, -320, at(move_at + 1))],
+        contracts=[{"market_ticker": f"{TICKER}-NYG", "yes_is_home": True,
+                    "settled_yes": 1,
+                    "candlesticks": [candle_payload(rows)]}])
+
+
+class UnusableCandleCoverageTest(unittest.TestCase):
+    """A PARSED candle is not a USABLE exchange quote.
+
+    The coverage check counted rows. A payload can carry well-formed
+    candles -- timestamps, volume, trade prices -- with no bid or ask at
+    all, and `usable_candle` (the measurement's own predicate, which needs a
+    two-sided quote to form a mid) rejects every one. 102 candles parsed,
+    zero usable, `complete=True`, and every reaction came back
+    `no_exchange_baseline`, which reads as an exchange that did not move.
+    """
+
+    @staticmethod
+    def _quoteless() -> dict:
+        payload = copy.deepcopy(bundle())
+        for contract in payload["games"][0]["contracts"]:
+            for body in contract["candlesticks"]:
+                for row in body["candlesticks"]:
+                    row.pop("yes_bid", None)
+                    row.pop("yes_ask", None)
+        return payload
+
+    def test_candles_that_parse_but_carry_no_quote_fail_coverage(self):
+        _, report = load_bundle(write(self._quoteless()))
+        self.assertGreater(report.candles, 0, "the fixture parsed nothing")
+        self.assertEqual(report.usable_candles, 0)
+        self.assertFalse(report.complete)
+        self.assertTrue(any("NO usable exchange quote" in reason
+                            for reason in report.coverage_failures()))
+
+    def test_the_usability_verdict_is_the_measurements_own(self):
+        """rule 26: take the predicate the measurement uses, never a second
+        reading of what a good candle looks like."""
+        games, report = load_bundle(write(bundle()))
+        counted = sum(1 for contract in games[0].contracts
+                      for candle in contract.candles
+                      if usable_candle(candle))
+        self.assertEqual(report.usable_candles, counted)
+        self.assertTrue(report.complete)
+
+    def test_the_cli_exits_nonzero_and_names_it(self):
+        from unittest import mock
+        import run_reaction
+        chunks: list[str] = []
+        with mock.patch("builtins.print", side_effect=lambda *a, **k:
+                        chunks.append(" ".join(str(x) for x in a))):
+            code = run_reaction.main(
+                ["--replay", str(write(self._quoteless()))])
+        text = "\n".join(chunks)
+        self.assertEqual(code, 1)
+        _, _, tail = text.partition("coverage is incomplete")
+        self.assertIn("NO usable exchange quote", tail)
+
+
+class FeasibilityReachableEndToEndTest(unittest.TestCase):
+    """The declared rule must be satisfiable by an actual replay.
+
+    The rule it replaces required a lag interval starting beyond 1,800s,
+    while the policy's ceiling is `max_wait - candle_period` = 1,740s. These
+    drive whole bundles so the claim is about the chain, not the arithmetic.
+    """
+
+    def _verdict(self, ledger):
+        return ledger.feasibility
+
+    def test_a_response_inside_the_window_orders_book_first(self):
+        """The positive case: a real book-led reaction, end to end."""
+        games, report = load_bundle(write(responding_bundle(5)))
+        ledger = replay(games)
+        self.assertTrue(report.complete)
+        stages = {s.stage: s for s in ledger.stages}
+        self.assertEqual(stages["reactions measured"].breakdown,
+                         {"responded": 1})
+        verdict = self._verdict(ledger)
+        self.assertEqual(verdict.book_led, 1)
+        self.assertEqual(verdict.determinate, 1)
+
+    def test_the_ceiling_is_what_the_policy_says_it_is(self):
+        """A response AT the deadline reports `max_wait - candle_period`,
+        which is the number the old rule sat 60s above."""
+        from reaction.clocks import envelope_for_sharp_quote
+        from reaction.detector import MoveDetector
+        from reaction.measure import ReactionPolicy, measure_reaction
+        policy = ReactionPolicy()
+        games, _ = load_bundle(write(responding_bundle(30)))
+        game = games[0]
+        # The same two steps replay takes, so the number under test is the
+        # one a run would report rather than a re-derivation of it.
+        detector = MoveDetector()
+        triggers = [t for t in
+                    (detector.observe(envelope_for_sharp_quote(q))
+                     for q in game.quotes) if t is not None]
+        self.assertEqual(len(triggers), 1)
+        reaction = measure_reaction(
+            triggers[0], game.contracts[0].candles,
+            market_ticker=game.contracts[0].market_ticker,
+            yes_is_home=game.contracts[0].yes_is_home, policy=policy)
+        self.assertEqual(reaction.outcome.value, "responded")
+        self.assertEqual(reaction.lag_earliest_seconds,
+                         policy.max_reportable_lag_seconds)
+        self.assertLess(reaction.lag_earliest_seconds, 1800.0)
+
+    def test_a_response_past_the_window_is_censored_not_absent(self):
+        """The negative case, and it is NOT `no reaction happened`."""
+        games, _ = load_bundle(write(responding_bundle(45)))
+        ledger = replay(games)
+        stages = {s.stage: s for s in ledger.stages}
+        self.assertEqual(stages["reactions measured"].breakdown,
+                         {"no_response_in_window": 1})
+        verdict = self._verdict(ledger)
+        self.assertEqual(verdict.determinate, 0)
+        self.assertEqual(verdict.outcomes["no_response_in_window"], 1)
+        self.assertEqual(verdict.verdict.value,
+                         "insufficient_observable_events")
+
+    def test_widening_max_wait_recovers_the_censored_response(self):
+        """Censoring is a property of the declared window, not the market --
+        so the CLI has to expose it, and it does."""
+        from reaction.measure import ReactionPolicy
+        games, _ = load_bundle(write(responding_bundle(45)))
+        wide = replay(games, reaction_policy=ReactionPolicy(
+            max_wait=timedelta(hours=1)))
+        stages = {s.stage: s for s in wide.stages}
+        self.assertEqual(stages["reactions measured"].breakdown,
+                         {"responded": 1})
+        self.assertEqual(wide.feasibility.book_led, 1)
+
+    def test_the_unreachable_rule_is_refused_rather_than_returning_zero(self):
+        """The exact rule that shipped, through the whole chain."""
+        from reaction.episodes import FeasibilityRule
+        games, _ = load_bundle(write(responding_bundle(5)))
+        ledger = replay(games,
+                        feasibility_rule=FeasibilityRule(
+                            min_lag_seconds=1800.0))
+        self.assertEqual(ledger.feasibility.verdict.value,
+                         "rule_unreachable_against_policy")
+        self.assertIn("1,740s", ledger.feasibility.detail)
+
+
+class MaxWaitCliTest(_CliDriver, unittest.TestCase):
+    """`--max-wait` exists because a declared horizon must be reachable."""
+
+    def test_the_flag_changes_the_censoring_horizon(self):
+        path = str(write(responding_bundle(45)))
+        censored, text = self._run(["--replay", path])
+        self.assertEqual(censored, 0)
+        self.assertIn("no_response_in_window", text)
+        code, widened = self._run(["--replay", path, "--max-wait", "3600"])
+        self.assertEqual(code, 0)
+        self.assertIn("responded", widened)
+
+    def test_the_verdict_is_printed_with_what_it_excluded(self):
+        _, text = self._run(["--replay", str(write(responding_bundle(45)))])
+        self.assertIn("FEASIBILITY RULE", text)
+        self.assertIn("declared before any data", text)
+        self.assertIn("never folded in", text)
+        self.assertIn("insufficient_observable_events", text)

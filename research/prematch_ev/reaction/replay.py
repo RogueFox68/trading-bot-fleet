@@ -60,8 +60,12 @@ from data.kalshi_history import parse_candles                    # noqa: E402
 from data.odds_history import parse_snapshot                     # noqa: E402
 from .clocks import envelope_for_sharp_quote                     # noqa: E402
 from .detector import MoveDetector, MovePolicy                   # noqa: E402
-from .episodes import DataRole, EpisodeLedger, build_ledger      # noqa: E402
-from .measure import ReactionPolicy, measure_reaction            # noqa: E402
+from .episodes import (                                          # noqa: E402
+    DataRole, EpisodeLedger, FeasibilityRule, build_ledger,
+)
+from .measure import (                                           # noqa: E402
+    ReactionPolicy, measure_reaction, usable_candle,
+)
 from .screen import ScreenResult, screen_reaction                # noqa: E402
 
 BUNDLE_SCHEMA = "reaction_replay_bundle/1"
@@ -91,10 +95,11 @@ class BundleReport:
     candles: int = 0
     snapshots_with_target: int = 0
     snapshots_without_target: list[str] = field(default_factory=list)
+    usable_candles: int = 0
     incomplete_snapshots: list[str] = field(default_factory=list)
     incomplete_candles: list[str] = field(default_factory=list)
     games_without_target_quotes: list[str] = field(default_factory=list)
-    contracts_without_candles: list[str] = field(default_factory=list)
+    contracts_without_usable_candles: list[str] = field(default_factory=list)
     games_without_settlement: list[str] = field(default_factory=list)
     start_sources: dict[str, int] = field(default_factory=dict)
     point_in_time_unverified: list[str] = field(default_factory=list)
@@ -118,7 +123,7 @@ class BundleReport:
         """
         return not (self.incomplete_snapshots or self.incomplete_candles
                     or self.games_without_target_quotes
-                    or self.contracts_without_candles)
+                    or self.contracts_without_usable_candles)
 
     def coverage_failures(self) -> list[str]:
         """The named reasons `complete` is False, for a CLI to print."""
@@ -133,10 +138,10 @@ class BundleReport:
             out.append(f"{len(self.games_without_target_quotes)} game(s) "
                        f"carry NO usable sharp quote for the target event: "
                        f"{', '.join(self.games_without_target_quotes[:5])}")
-        if self.contracts_without_candles:
-            out.append(f"{len(self.contracts_without_candles)} contract(s) "
-                       f"carry NO usable candle: "
-                       f"{', '.join(self.contracts_without_candles[:5])}")
+        if self.contracts_without_usable_candles:
+            out.append(f"{len(self.contracts_without_usable_candles)} "
+                       f"contract(s) carry NO usable exchange quote: "
+                       f"{', '.join(self.contracts_without_usable_candles[:5])}")
         return out
 
     def as_dict(self) -> dict:
@@ -155,7 +160,9 @@ class BundleReport:
             "incomplete_snapshots": self.incomplete_snapshots,
             "incomplete_candles": self.incomplete_candles,
             "games_without_target_quotes": self.games_without_target_quotes,
-            "contracts_without_candles": self.contracts_without_candles,
+            "contracts_without_usable_candles":
+                self.contracts_without_usable_candles,
+            "candles_usable": self.usable_candles,
             "games_without_settlement": self.games_without_settlement,
             "start_sources": dict(sorted(self.start_sources.items())),
             "point_in_time_unverified": self.point_in_time_unverified,
@@ -348,13 +355,20 @@ def load_bundle(path: str | Path) -> tuple[list[ReplayGame], BundleReport]:
                 candles.extend(parsed)
             candles.sort(key=lambda c: c.ts)
             report.candles += len(candles)
+            # A PARSED candle is not a USABLE quote. `usable_candle` is the
+            # measurement's own definition -- it needs a two-sided quote to
+            # form a mid -- and a payload can carry well-formed rows with
+            # timestamps and trade prices and no bid/ask at all. Counting
+            # rows rather than asking the shared predicate meant a contract
+            # with 102 candles and ZERO usable quotes passed coverage while
+            # every reaction on it came back `no_exchange_baseline`, which
+            # reads as an exchange that did not move (rule 26: take the
+            # measurement's verdict, do not invent a second one).
+            fit = sum(1 for candle in candles if usable_candle(candle))
+            report.usable_candles += fit
             report.contracts += 1
-            if not candles:
-                # Every reaction on this contract would measure
-                # BLIND_INTERVAL, which reads as "the exchange did not
-                # respond". It is the same false quiet as an empty odds
-                # collection, one source over.
-                report.contracts_without_candles.append(market_ticker)
+            if not fit:
+                report.contracts_without_usable_candles.append(market_ticker)
             contracts.append(ReplayContract(market_ticker, yes_is_home,
                                             tuple(candles), settled))
 
@@ -433,6 +447,7 @@ def replay(games: Sequence[ReplayGame], *,
            entry_policy: EntryPolicy | None = None,
            entry_delay: timedelta = timedelta(0),
            declared_role: DataRole = DataRole.UNDECLARED,
+           feasibility_rule: FeasibilityRule | None = None,
            series: str | None = None) -> EpisodeLedger:
     """Detect, measure, screen and account for every game in the bundle.
 
@@ -498,7 +513,8 @@ def replay(games: Sequence[ReplayGame], *,
         screen_result=screen_result, observation_count=observation_count,
         declared_role=declared_role, eligibility=eligibility,
         entry_policy=entry_policy, move_policy=move_policy,
-        reaction_policy=reaction_policy, series=series)
+        reaction_policy=reaction_policy, feasibility_rule=feasibility_rule,
+        series=series)
 
 
 def replay_file(path: str | Path, **kwargs
@@ -519,7 +535,8 @@ def render_report(report: BundleReport,
                  f"{report.snapshots_with_target:>7,}"
                  f" / {report.snapshots_parsed:,}")
     lines.append(f"    sharp quotes                {report.quotes:>7,}")
-    lines.append(f"    candles                     {report.candles:>7,}")
+    lines.append(f"    candles (usable / parsed)   "
+                 f"{report.usable_candles:>7,} / {report.candles:,}")
     lines.append("")
     if report.snapshots_without_target:
         lines.append(f"    {len(report.snapshots_without_target)} parsed "

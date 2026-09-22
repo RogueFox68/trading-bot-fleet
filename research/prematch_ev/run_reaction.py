@@ -110,7 +110,7 @@ MODES = ("--capability", "--capability-verify", "--policy", "--replay")
 #: sets partition every option the parser accepts -- a new option must be
 #: classified as one or the other, and the test fails if it is neither.
 MODIFIERS = ("--entry-delay", "--declare-role", "--series", "--json",
-             "--help")
+             "--max-wait", "--help")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -141,6 +141,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help="what this window is. Declaring a run over the "
                              "2026-09-01..16 development window a holdout is "
                              "REFUSED, not warned about")
+    parser.add_argument("--max-wait", type=float, default=None,
+                        metavar="SECONDS",
+                        help="how long after a detected move to keep looking "
+                             "for the exchange's response. THIS IS THE "
+                             "CENSORING HORIZON: past it a reaction is "
+                             "right-censored, not absent, and the largest "
+                             "lag the run can report is this minus one "
+                             "candle period. Defaults to the declared "
+                             "policy; --policy prints both numbers")
     parser.add_argument("--series", default=None,
                         help="exchange series, for the DATED fee schedule. "
                              "Omitting it prices at the generic coefficients, "
@@ -174,10 +183,14 @@ def main(argv=None) -> int:
 
     if args.replay:
         try:
+            reaction_policy = (
+                ReactionPolicy(max_wait=timedelta(seconds=args.max_wait))
+                if args.max_wait is not None else None)
             ledger, report = replay_file(
                 args.replay,
                 entry_delay=timedelta(seconds=args.entry_delay),
                 declared_role=DataRole(args.declare_role),
+                reaction_policy=reaction_policy,
                 series=args.series)
         except BundleError as exc:
             print(f"unusable bundle: {exc}", file=sys.stderr)

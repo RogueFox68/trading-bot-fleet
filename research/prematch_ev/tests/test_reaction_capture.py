@@ -36,6 +36,34 @@ from reaction.capture import (                                    # noqa: E402
 
 UTC = timezone.utc
 
+# --- the timestamp manifest -------------------------------------------------
+#
+# The cost model used to be `days x snapshots_per_day`, which answered a
+# different question and was wrong twice over for a 72-hour window: `days`
+# counts INCLUSIVE CALENDAR DATES (Thursday to Sunday is 72 elapsed hours but
+# four dates), and the formula cannot express two kickoff clusters sharing
+# most of their windows. It quoted 192 requests for a window holding 145.
+
+from datetime import timedelta as _td                              # noqa: E402
+
+from reaction.capture import (                                     # noqa: E402
+    ARCHIVE_GRID, WINDOW_IS_CLOSED_AT_BOTH_ENDS, CaptureWindow,
+    build_manifest,
+)
+
+#: One NFL Sunday (2026-09-27), the three kickoff clusters in UTC.
+CLUSTERS = (datetime(2026, 9, 27, 17, 0, tzinfo=UTC),
+            datetime(2026, 9, 27, 20, 25, tzinfo=UTC),
+            datetime(2026, 9, 28, 0, 20, tzinfo=UTC))
+LEAD = _td(hours=72)
+
+
+def windows(cadence_minutes: int, kickoffs=CLUSTERS):
+    cadence = _td(minutes=cadence_minutes)
+    return [CaptureWindow(k, LEAD, cadence) for k in kickoffs]
+
+
+
 
 def plan(**overrides) -> CapturePlan:
     base = dict(
@@ -310,51 +338,79 @@ class AuthorisationTest(unittest.TestCase):
 
 
 class PilotProposalTest(unittest.TestCase):
-    """The proposal's numbers are checked against the cost model.
+    """The proposal's numbers are recomputed from the manifest that prices it.
 
     A document nothing verifies drifts, and a credit figure in a proposal is
-    read as a fact. These parse `REACTION_PILOT.md` and recompute every
-    option in its cost table, so a change to `estimate_credits` -- or a typo
-    in the table -- fails the build instead of quietly mispricing a decision
-    someone is about to make.
+    read as a fact. Every cost row here is rebuilt with `build_manifest` --
+    so a change to the cost model, the window convention or the retry
+    reserve fails the build instead of quietly mispricing a decision someone
+    is about to make.
 
-    They also pin the HORIZON. An earlier version recommended three-hour
-    pre-kickoff windows while the thesis is about moves days out; that is a
-    different study with a different answer, and substituting it is the kind
-    of change a cost table alone would not catch.
+    Three earlier revisions each shipped a defect this class now pins: a
+    near-kickoff window substituted for the multi-day one, a decision rule
+    that no run could satisfy, and a cost table computed from calendar dates
+    rather than instants.
     """
 
     PROPOSAL = (Path(__file__).resolve().parent.parent / "REACTION_PILOT.md")
 
-    # (label, days, snapshots_per_day) as the table's rows describe them.
+    #: label -> (cadence minutes, kickoff clusters, retry fraction)
     OPTIONS = {
-        "0": (1, 3), "A": (3, 48), "B": (3, 24),
-        "C": (3, 96), "D": (3, 288), "E": (6, 48),
+        "0": (1440, CLUSTERS[:1], 0.0),
+        "A": (30, CLUSTERS, 0.10),
+        "B": (60, CLUSTERS, 0.10),
+        "C": (15, CLUSTERS, 0.10),
+        "D": (5, CLUSTERS, 0.10),
     }
     RECOMMENDED = "A"
     TRAP = "B"
-    #: the measurement cadences. "0" is the coverage probe and deliberately
-    #: has no cadence or bracket -- it answers whether the book is quoted at
-    #: all, which is not a timing measurement.
-    CADENCES = ("A", "B", "C", "D", "E")
+    PROBE = "0"
 
     def setUp(self):
         self.raw = self.PROPOSAL.read_text()
-        # Assert the CLAIM, not the typography. Prose carries en-dashes,
-        # markdown emphasis, sentence capitals AND LINE WRAPPING, and a test
+        # Assert the CLAIM, not the typography: prose carries en-dashes,
+        # markdown emphasis, sentence capitals and LINE WRAPPING, and a test
         # that breaks on any of those gets "fixed" by loosening it until it
-        # checks nothing. Whitespace is collapsed for the same reason a dash
-        # is normalised: a reflowed paragraph is not a changed claim.
+        # checks nothing.
         text = (self.raw.lower()
                 .replace("\u2013", "-").replace("\u2014", "-")
+                .replace("\u2192", "->")
                 .replace("*", "").replace("`", ""))
         self.text = " ".join(text.split())
 
     def assertClaim(self, needle: str, where: str | None = None):
-        """assertIn without dumping the whole document on failure."""
         haystack = self.text if where is None else where
         if " ".join(needle.lower().split()) not in haystack:
             self.fail(f"the proposal does not claim {needle!r}")
+
+    #: Phrases that mark a nearby quotation as a RETRACTION rather than an
+    #: assertion. A document that records why it changed is more useful than
+    #: one that silently drops the old wording, so a retracted claim may
+    #: appear -- but only where it is marked as retracted.
+    RETRACTION_MARKERS = (
+        "was simply wrong", "is removed", "are removed", "it does not",
+        "a previous revision", "an earlier claim", "an earlier revision",
+        "substituted", "that was a different thesis",
+    )
+
+    def refuteClaim(self, needle: str, window: int = 400):
+        """The proposal must not ASSERT this, though it may retract it.
+
+        A plain absence check failed here for the right reason: §1 and §3
+        quote each removed claim in order to correct it. Deleting the
+        quotation to satisfy a test would lose the record of why the
+        document changed -- so every occurrence must instead sit within
+        `window` characters of a retraction marker.
+        """
+        target = " ".join(needle.lower().split())
+        position = self.text.find(target)
+        while position != -1:
+            near = self.text[max(0, position - window):
+                             position + len(target) + window]
+            if not any(marker in near for marker in self.RETRACTION_MARKERS):
+                self.fail(f"the proposal asserts {needle!r} with no "
+                          f"retraction anywhere near it")
+            position = self.text.find(target, position + 1)
 
     def _row(self, label: str) -> str:
         rows = [line for line in self.raw.splitlines()
@@ -364,54 +420,140 @@ class PilotProposalTest(unittest.TestCase):
                          f"option {label} is not a single table row")
         return rows[0]
 
-    def test_every_cost_table_row_matches_the_shared_cost_model(self):
-        from data.odds_history import estimate_credits
-        for label, (days, snaps) in self.OPTIONS.items():
-            with self.subTest(option=label):
-                row = self._row(label)
-                self.assertIn(f"| {days * snaps:,} |", row,
-                              f"option {label}: request count")
-                self.assertIn(f"**{estimate_credits(days, snaps, 1, 1):,}**",
-                              row, f"option {label}: credit figure")
+    def _manifest(self, label: str):
+        cadence, kickoffs, retry = self.OPTIONS[label]
+        align = None if label == self.PROBE else _td(minutes=cadence)
+        return build_manifest(windows(cadence, kickoffs), align_to=align,
+                              retry_fraction=retry)
 
-    def test_each_brackets_column_is_its_own_cadence(self):
-        """The bracket IS the interval between paid snapshots, and the whole
-        argument for a coarse grid turns on that identity. A bracket column
-        that disagreed with its cadence would make the case for the
-        recommendation out of arithmetic that is not true."""
-        self.assertEqual(set(self.CADENCES) | {"0"}, set(self.OPTIONS),
-                         "an option is neither a cadence nor the probe")
-        for label in self.CADENCES:
-            _, snaps = self.OPTIONS[label]
+    def test_every_cost_row_is_recomputed_from_the_manifest(self):
+        for label in self.OPTIONS:
             with self.subTest(option=label):
-                self.assertIn(f"| {86400 // snaps:,}s |", self._row(label))
+                manifest, row = self._manifest(label), self._row(label)
+                self.assertIn(f"| {manifest.requests:,} |", row,
+                              f"option {label}: distinct instants")
+                self.assertIn(f"| {manifest.requests_with_retries:,} |", row,
+                              f"option {label}: requests with retries")
+                self.assertIn(f"**{manifest.credits:,}**", row,
+                              f"option {label}: credit figure")
+
+    def test_each_bracket_column_is_its_own_cadence(self):
+        """The whole cost/resolution argument rests on that identity."""
+        for label, (cadence, _, _) in self.OPTIONS.items():
+            if label == self.PROBE:
+                continue
+            with self.subTest(option=label):
+                self.assertIn(f"| {cadence * 60:,}s |", self._row(label))
 
     def test_the_recommended_option_is_the_one_the_text_argues_for(self):
-        """And its figure is the derived one, not a restated one."""
-        from data.odds_history import estimate_credits
-        days, snaps = self.OPTIONS[self.RECOMMENDED]
-        credits = estimate_credits(days, snaps, 1, 1)
+        credits = self._manifest(self.RECOMMENDED).credits
         self.assertClaim(f"recommendation: option "
                          f"{self.RECOMMENDED.lower()}, {credits:,} credits")
         self.assertClaim(f"option {self.RECOMMENDED.lower()} = "
                          f"{credits:,} credits")
 
-    def test_the_recommendation_covers_the_whole_multi_day_horizon(self):
-        """The finding that produced this rewrite: a three-hour pre-kickoff
-        window measures a different thing from a 72-hour one, and is not a
-        cheaper version of it."""
+    def test_the_probe_gates_the_measurement_spend(self):
+        credits = self._manifest(self.PROBE).credits
+        self.assertClaim(f"{credits:,}-credit coverage probe")
+        self.assertClaim("unverified for nfl")
+        self.assertClaim("nothing below should be approved before it answers")
+
+    def test_the_recommendation_covers_the_multi_day_horizon(self):
         row = self._row(self.RECOMMENDED).lower()
-        self.assertIn("72h", row)
-        self.assertIn("kickoff", row)
-        self.assertClaim("t-72h through kickoff")
-        self.assertNotIn("three-hour pre-kickoff windows.", self.text,
-                         "the near-kickoff design is being recommended again")
+        self.assertIn("30-min", row)
+        self.assertClaim("t-72h -> kickoff")
+        self.refuteClaim("3h before each of 3 kickoff clusters")
 
     def test_the_cheap_option_is_marked_as_unable_to_answer(self):
-        """A table whose cheapest row is not flagged invites the wrong pick."""
-        _, snaps = self.OPTIONS[self.TRAP]
+        cadence, _, _ = self.OPTIONS[self.TRAP]
         self.assertClaim(f"option {self.TRAP.lower()} is a trap")
-        self.assertClaim(f"{86400 // snaps:,}s")
+        self.assertClaim(f"{cadence * 60:,}s")
+
+    def test_the_alignment_saving_is_the_real_one(self):
+        """Unaligned clusters nearly triple the bill, which is not obvious
+        and is the single biggest lever in the table."""
+        cadence, kickoffs, retry = self.OPTIONS[self.RECOMMENDED]
+        unaligned = build_manifest(windows(cadence, kickoffs),
+                                   retry_fraction=retry)
+        aligned = self._manifest(self.RECOMMENDED)
+        self.assertClaim(f"{unaligned.requests:,} instants instead of "
+                         f"{aligned.requests:,}")
+        self.assertClaim(f"{unaligned.credits:,} credits instead of "
+                         f"{aligned.credits:,}")
+
+    def test_the_calendar_estimate_disagreement_is_stated(self):
+        manifest = build_manifest(windows(30, CLUSTERS[:1]))
+        self.assertClaim("inclusive calendar dates")
+        self.assertClaim("192")
+        self.assertClaim(f"{manifest.requests}")
+
+    # --- the rule ---------------------------------------------------------
+
+    def test_the_unsatisfiable_rule_is_named_and_its_ceiling_is_the_code(self):
+        """The defect: a rule needing >1,800s from a policy that tops out at
+        1,740s. Both numbers are taken from the code, not the prose."""
+        from reaction.measure import ReactionPolicy
+        policy = ReactionPolicy()
+        self.assertEqual(policy.max_reportable_lag_seconds, 1740.0)
+        self.assertClaim(f"beyond {policy.max_wait.total_seconds():,.0f}s")
+        self.assertClaim(f"{policy.max_reportable_lag_seconds:,.0f}s")
+        self.assertClaim("no measured reaction could ever have satisfied it")
+
+    def test_the_declared_rule_is_reachable_against_the_declared_policy(self):
+        """The whole point. A rule nothing can satisfy is not a rule."""
+        from reaction.episodes import FeasibilityRule
+        from reaction.measure import ReactionPolicy
+        rule = FeasibilityRule()
+        self.assertIsNone(rule.unreachable_against(ReactionPolicy()))
+        self.assertIsNone(rule.min_lag_seconds)
+        self.assertClaim(f"at least {rule.min_determinate}")
+        self.assertClaim(f"{rule.min_book_led_fraction:.0%}")
+
+    def test_all_three_verdicts_are_documented(self):
+        from reaction.episodes import Feasibility
+        for verdict in Feasibility:
+            if verdict is Feasibility.UNREACHABLE:
+                continue                      # named in its own section
+            with self.subTest(verdict=verdict.value):
+                self.assertClaim(verdict.value)
+
+    # --- the framing the reviewer corrected -------------------------------
+
+    def test_horizon_and_response_lag_are_kept_independent(self):
+        """The objective is a move DAYS out that Kalshi may follow in
+        SECONDS. A revision that treated long lags as the thesis had
+        substituted a slower-response study for the stated one."""
+        self.assertClaim("two separate dimensions")
+        self.assertClaim("may do in seconds")
+        self.refuteClaim("long lags are precisely the regime this thesis is "
+                         "about")
+
+    def test_the_cadence_is_named_as_the_pollers_own_latency(self):
+        """The honest reason cadence matters, and it does not make fast
+        responses uninteresting -- only invisible to this pilot."""
+        self.assertClaim("simulated poller's own latency")
+        self.assertClaim("cannot rule out faster ones")
+
+    def test_the_catches_every_move_overclaim_is_gone(self):
+        self.refuteClaim("catches every move")
+        self.assertClaim("reverses inside one interval")
+        self.assertClaim("only the net change between consecutive samples")
+
+    def test_a_null_result_carries_no_claim_about_short_lags(self):
+        self.refuteClaim("means the lag is under 30 minutes")
+        self.assertClaim("does not establish that the lag is shorter than 30 "
+                         "minutes")
+        self.assertClaim("sparse moves")
+
+    def test_insufficient_events_is_a_declared_possible_outcome(self):
+        self.assertClaim("may well return insufficient")
+        self.assertClaim("it is not a negative result")
+
+    def test_it_does_not_claim_to_be_the_capture_study(self):
+        self.assertClaim("constrained long-lived-discrepancy probe")
+        self.assertClaim("does not stand in for it")
+
+    # --- unchanged guarantees ---------------------------------------------
 
     def test_the_proposal_states_it_is_not_authorised(self):
         status = self.text.split("---", 1)[0]
@@ -428,41 +570,13 @@ class PilotProposalTest(unittest.TestCase):
         self.assertEqual(ODDS_SNAPSHOT_GRID_SECONDS, 300.0)
         self.assertEqual(KALSHI_CANDLE_FLOOR_SECONDS, 60.0)
         self.assertClaim("300-second archive floor")
-        self.assertClaim("1-minute")
+        self.assertClaim("60s")
 
-    def test_the_proposal_declares_its_decision_rule_before_any_data(self):
-        """Otherwise it is a rationalisation written after the fact."""
-        _, snaps = self.OPTIONS[self.RECOMMENDED]
-        self.assertClaim("declared now")
-        self.assertClaim("one third")
-        self.assertClaim("before any data")
-        # The rule's threshold must be the recommended option's OWN bracket.
-        # A rule quoting some other number would be unmeasurable by the run
-        # it governs.
-        self.assertClaim(f"beyond {86400 // snaps:,}s")
-
-    def test_the_null_result_is_scoped_rather_than_read_as_no_edge(self):
-        """rule 24 in prose: an unresolvable lag is not a measured absence."""
-        self.assertClaim("does not mean there is no edge")
-        self.assertClaim("shorter than 30 minutes")
-
-    def test_a_cheap_coverage_probe_gates_the_measurement_spend(self):
-        """72h sharp availability is UNVERIFIED for NFL and MLB failed at
-        48h. Buying a 72-hour horizon before checking the book is quoted
-        there is buying a window that may not exist."""
-        from data.odds_history import estimate_credits
-        days, snaps = self.OPTIONS["0"]
-        self.assertClaim(f"{estimate_credits(days, snaps, 1, 1):,} credits")
-        self.assertClaim("unverified for nfl")
-        self.assertClaim("mlb was measured and failed at 48h")
-
-    def test_the_operational_bounds_the_review_asked_for_are_stated(self):
-        """Cache reuse, baseline snapshots and a retry allowance each change
-        what the quoted price actually buys."""
+    def test_the_operational_bounds_are_stated(self):
         for claim in ("one snapshot is the whole sport's slate",
                       "duplicate at full price",
-                      "is a baseline, not a measurement",
-                      "allow 10% for retries"):
+                      "earliest instant is a pure baseline",
+                      "10% reserve is inside the enforced bound"):
             with self.subTest(claim=claim):
                 self.assertClaim(claim)
 
@@ -596,3 +710,107 @@ class ReadmeCurrencyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class ManifestTest(unittest.TestCase):
+    """The instants, enumerated -- because the estimate was wrong."""
+
+    def test_a_single_72h_window_holds_145_instants_not_192(self):
+        """The reviewer's arithmetic, reproduced as a regression.
+
+        72 elapsed hours at 30 minutes, closed at both ends, is 145 samples.
+        The same window touches FOUR calendar dates, and 4 x 48 is 192.
+        """
+        manifest = build_manifest(windows(30, CLUSTERS[:1]))
+        self.assertEqual(manifest.requests, 145)
+        self.assertEqual(manifest.calendar_dates, 4)
+        self.assertEqual(manifest.span, LEAD)
+        disagreement = manifest.disagreement_with_calendar_estimate()
+        self.assertIsNotNone(disagreement)
+        self.assertIn("192", disagreement)
+        self.assertIn("145", disagreement)
+
+    def test_the_window_is_closed_at_both_ends_and_says_so(self):
+        """A half-open reading is equally defensible and differs by one
+        request per window, so the choice is declared, not implied."""
+        self.assertTrue(WINDOW_IS_CLOSED_AT_BOTH_ENDS)
+        manifest = build_manifest(windows(30, CLUSTERS[:1]))
+        self.assertEqual(manifest.timestamps[0], CLUSTERS[0] - LEAD)
+        self.assertEqual(manifest.timestamps[-1], CLUSTERS[0])
+        self.assertTrue(manifest.as_dict()["window_closed_at_both_ends"])
+
+    def test_clusters_deduplicate_only_when_aligned(self):
+        """Alignment is most of the bill, and it is not obvious.
+
+        Three kickoffs minutes apart put their 30-minute grids out of phase,
+        so the union of three 145-point windows is 435 points -- no sharing
+        at all. Snapped to a common boundary it is 161.
+        """
+        unaligned = build_manifest(windows(30))
+        aligned = build_manifest(windows(30), align_to=_td(minutes=30))
+        self.assertEqual(unaligned.requests, 435)
+        self.assertEqual(unaligned.cache_hits, 0)
+        self.assertEqual(aligned.requests, 161)
+        self.assertEqual(aligned.cache_hits, 276)
+        self.assertLess(aligned.credits, unaligned.credits)
+
+    def test_only_the_earliest_instant_is_a_pure_baseline(self):
+        """A snapshot is SPORT-WIDE, so a later cluster's games are already
+        in the first one. Counting one baseline per window (a first version
+        did) understates the measurable samples by one per extra cluster."""
+        manifest = build_manifest(windows(30), align_to=_td(minutes=30))
+        self.assertEqual(manifest.measurement_requests, manifest.requests - 1)
+        self.assertEqual(manifest.as_dict()["baseline_samples"], 1)
+        # the per-window opens are still reported, as guaranteed coverage
+        self.assertEqual(len(manifest.baselines), 3)
+
+    def test_the_retry_reserve_is_inside_the_enforced_bound(self):
+        """It was promised in prose while `budget()` derived a bound without
+        it, so the first retried request past the base count would have
+        raised mid-window -- a hole in the series the study measures."""
+        manifest = build_manifest(windows(30), align_to=_td(minutes=30),
+                                  retry_fraction=0.10)
+        self.assertEqual(manifest.retry_reserve, 17)
+        self.assertEqual(manifest.requests_with_retries, 178)
+        budget = manifest.budget()
+        self.assertEqual(budget.max_requests, 178)
+        self.assertEqual(budget.max_credits, manifest.credits)
+        # and the bound still refuses past it
+        for _ in range(178):
+            budget.spend(0)
+        with self.assertRaises(CaptureRefused):
+            budget.spend(0)
+
+    def test_credits_come_from_the_shared_cost_model(self):
+        from data.odds_history import estimate_credits
+        manifest = build_manifest(windows(30), align_to=_td(minutes=30))
+        self.assertEqual(manifest.credits,
+                         estimate_credits(1, manifest.requests_with_retries))
+
+    def test_a_cadence_finer_than_the_archive_grid_is_refused(self):
+        """Those requests return DUPLICATE snapshots at full price."""
+        self.assertEqual(ARCHIVE_GRID, _td(seconds=300))
+        with self.assertRaises(ValueError) as caught:
+            CaptureWindow(CLUSTERS[0], LEAD, _td(minutes=1))
+        self.assertIn("DUPLICATE", str(caught.exception))
+
+    def test_a_naive_kickoff_is_refused(self):
+        """The offset decides which calendar date the estimate counts."""
+        with self.assertRaises(ValueError):
+            CaptureWindow(datetime(2026, 9, 27, 17, 0), LEAD, _td(minutes=30))
+
+    def test_an_empty_manifest_is_refused_rather_than_priced_at_zero(self):
+        with self.assertRaises(ValueError):
+            build_manifest([])
+
+    def test_a_plan_carrying_a_manifest_prices_from_it(self):
+        """And the calendar arithmetic becomes a cross-check, not the model."""
+        manifest = build_manifest(windows(30), align_to=_td(minutes=30))
+        plain = plan(snapshots_per_day=48)
+        with_manifest = plan(snapshots_per_day=48, manifest=manifest)
+        self.assertEqual(plain.cost_model(), "days_x_per_day")
+        self.assertEqual(with_manifest.cost_model(), "timestamp_manifest")
+        self.assertEqual(with_manifest.odds_credits, manifest.credits)
+        self.assertEqual(with_manifest.odds_requests,
+                         manifest.requests_with_retries)
+        self.assertNotEqual(plain.odds_credits, with_manifest.odds_credits)

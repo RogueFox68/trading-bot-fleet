@@ -34,11 +34,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from analysis.scoring import Eligibility, EntryPolicy               # noqa: E402
 from reaction.detector import MovePolicy, detect_moves              # noqa: E402
+from reaction.detector import DetectorResult                        # noqa: E402
 from reaction.episodes import (                                     # noqa: E402
-    DEVELOPMENT_WINDOW, DataRole, EpisodeLedger, HoldoutViolation,
-    StageCount, Unit, build_ledger, classify_window,
+    DEVELOPMENT_WINDOW, DataRole, EpisodeLedger, Feasibility,
+    FeasibilityRule, HoldoutViolation, StageCount, Unit, build_ledger,
+    classify_window, judge_feasibility,
 )
-from reaction.measure import ReactionPolicy, measure_reaction        # noqa: E402
+from reaction.measure import (                                      # noqa: E402
+    Ordering, ReactionPolicy, measure_reaction,
+)
 from reaction.screen import ScreenResult, screen_reaction            # noqa: E402
 from tests.test_reaction_measure import (                            # noqa: E402
     AFTER_PRICES, BEFORE_PRICES, EVENT, START, at, env, make_trigger,
@@ -372,3 +376,126 @@ class LedgerShapeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def _make_reaction(ordering, outcome=None):
+    """A Reaction carrying only what the feasibility rule reads.
+
+    Built through the real constructor, so a field the rule depends on
+    cannot be renamed out from under these without the suite noticing.
+    """
+    from reaction.measure import Bracket, Reaction, ReactionOutcome
+    moment = START - timedelta(minutes=30)
+    return Reaction(
+        outcome=outcome or ReactionOutcome.RESPONDED,
+        ordering=ordering,
+        event_id=EVENT, stream_id="stream-1", market_ticker="KXT-Y",
+        policy=ReactionPolicy(), detected_at=moment,
+        book_change=Bracket(moment - timedelta(minutes=5), moment),
+        exchange_change=Bracket(moment, moment + timedelta(minutes=1)))
+
+
+class FeasibilityRuleTest(unittest.TestCase):
+    """The stop rule must be satisfiable, evaluated, and honest when thin.
+
+    The rule this replaces required a lag interval starting beyond 1,800s
+    from a policy whose ceiling is 1,740s -- `max_wait` minus one candle
+    period. No measured reaction could satisfy it, and nothing said so,
+    because the ceiling was never computed: `--policy` printed
+    `max_wait_seconds: 1800` and the proposal quoted 1,800s, and by eye the
+    two numbers agreed.
+    """
+
+    def test_the_policy_publishes_the_ceiling_it_can_report(self):
+        from reaction.measure import ReactionPolicy
+        policy = ReactionPolicy()
+        self.assertEqual(policy.max_reportable_lag_seconds, 1740.0)
+        self.assertEqual(
+            policy.max_reportable_lag_seconds,
+            (policy.max_wait - policy.candle_period).total_seconds())
+        self.assertIn("max_reportable_lag_seconds", policy.as_dict())
+
+    def test_the_rule_that_shipped_is_refused_as_unreachable(self):
+        """The exact defect, as a regression."""
+        from reaction.measure import ReactionPolicy
+        rule = FeasibilityRule(min_lag_seconds=1800.0)
+        why = rule.unreachable_against(ReactionPolicy())
+        self.assertIsNotNone(why)
+        self.assertIn("1,800s", why)
+        self.assertIn("1,740s", why)
+        verdict = judge_feasibility([_make_reaction(Ordering.BOOK_LED)] * 50,
+                                    rule)
+        self.assertIs(verdict.verdict, Feasibility.UNREACHABLE)
+
+    def test_a_lag_threshold_inside_the_ceiling_is_allowed(self):
+        """The guard must not refuse every threshold, only impossible ones."""
+        from reaction.measure import ReactionPolicy
+        rule = FeasibilityRule(min_lag_seconds=600.0)
+        self.assertIsNone(rule.unreachable_against(ReactionPolicy()))
+
+    def test_a_wider_wait_makes_the_old_threshold_reachable_again(self):
+        """The ceiling is a property of the POLICY, not a constant."""
+        from reaction.measure import ReactionPolicy
+        wide = ReactionPolicy(max_wait=timedelta(hours=2))
+        self.assertIsNone(
+            FeasibilityRule(min_lag_seconds=1800.0).unreachable_against(wide))
+
+    def test_the_declared_pilot_rule_is_reachable(self):
+        from reaction.measure import ReactionPolicy
+        self.assertIsNone(
+            FeasibilityRule().unreachable_against(ReactionPolicy()))
+
+    def test_too_few_ordered_reactions_is_insufficient_not_stop(self):
+        """Sparse events are not evidence about the exchange, and a rule
+        with no floor turns any of them into a confident negative."""
+        verdict = judge_feasibility([_make_reaction(Ordering.BOOK_LED)] * 3)
+        self.assertIs(verdict.verdict, Feasibility.INSUFFICIENT)
+        self.assertIn("NOT a negative result", verdict.detail)
+
+    def test_a_clear_majority_of_book_led_continues(self):
+        reactions = ([_make_reaction(Ordering.BOOK_LED)] * 15
+                     + [_make_reaction(Ordering.KALSHI_LED)] * 10)
+        verdict = judge_feasibility(reactions)
+        self.assertIs(verdict.verdict, Feasibility.CONTINUE)
+        self.assertAlmostEqual(verdict.book_led_fraction, 0.6)
+
+    def test_a_clear_minority_of_book_led_stops(self):
+        reactions = ([_make_reaction(Ordering.BOOK_LED)] * 5
+                     + [_make_reaction(Ordering.KALSHI_LED)] * 20)
+        verdict = judge_feasibility(reactions)
+        self.assertIs(verdict.verdict, Feasibility.STOP)
+        self.assertIn("NOT that the lag is short", verdict.detail)
+
+    def test_censored_and_indeterminate_never_enter_the_denominator(self):
+        """They are different facts and folding them in would let missing
+        data vote."""
+        from reaction.measure import ReactionOutcome
+        reactions = (
+            [_make_reaction(Ordering.BOOK_LED)] * 10
+            + [_make_reaction(Ordering.KALSHI_LED)] * 10
+            + [_make_reaction(Ordering.INDETERMINATE)] * 40
+            + [_make_reaction(Ordering.UNKNOWN,
+                              ReactionOutcome.NO_RESPONSE)] * 40)
+        verdict = judge_feasibility(reactions)
+        self.assertEqual(verdict.determinate, 20)
+        self.assertAlmostEqual(verdict.book_led_fraction, 0.5)
+        self.assertEqual(verdict.indeterminate, 40)
+        self.assertEqual(verdict.unknown_ordering, 40)
+        self.assertEqual(verdict.outcomes["no_response_in_window"], 40)
+
+    def test_an_empty_denominator_reports_no_fraction_rather_than_zero(self):
+        """0.0 would read as a measured absence (rule 24)."""
+        verdict = judge_feasibility([])
+        self.assertIsNone(verdict.book_led_fraction)
+        self.assertIsNone(verdict.as_dict()["book_led_fraction"])
+
+    def test_the_verdict_rides_on_the_ledger_and_renders(self):
+        from reaction.measure import ReactionPolicy
+        ledger = build_ledger(
+            detector_result=DetectorResult(), reactions=[],
+            screen_result=ScreenResult(), observation_count=0,
+            reaction_policy=ReactionPolicy())
+        self.assertIsNotNone(ledger.feasibility)
+        self.assertIn("FEASIBILITY RULE", ledger.render())
+        self.assertIn("declared before any data", ledger.render())
+        self.assertIsNotNone(ledger.as_dict()["feasibility"])

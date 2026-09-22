@@ -158,11 +158,31 @@ class ReactionPolicy:
                 raise ValueError(f"{name} must be a positive timedelta, "
                                  f"got {value!r}")
 
+    @property
+    def max_reportable_lag_seconds(self) -> float:
+        """The largest `lag_earliest_seconds` this policy can EVER report.
+
+        The response search ends at `decided_at + max_wait`, and a candle's
+        bracket opens one period before its close, so the latest possible
+        earliest-bound is `max_wait - candle_period`. With the defaults that
+        is 1,740s, not 1,800s.
+
+        This exists because a pilot decision rule was declared at "beyond
+        1,800s" against exactly this policy, and no measured reaction could
+        ever satisfy it. The rule was unfalsifiable in the direction that
+        mattered and nothing said so: `--policy` printed 1,800s as the wait
+        and the document quoted 1,800s as the threshold, and the two numbers
+        looked like agreement. A ceiling nothing computes is a ceiling
+        nothing can be checked against (rule 21).
+        """
+        return (self.max_wait - self.candle_period).total_seconds()
+
     def as_dict(self) -> dict:
         return {
             "label": self.label,
             "min_response": self.min_response,
             "max_wait_seconds": self.max_wait.total_seconds(),
+            "max_reportable_lag_seconds": self.max_reportable_lag_seconds,
             "lookback_seconds": self.lookback.total_seconds(),
             "candle_period_seconds": self.candle_period.total_seconds(),
             "require_direction": self.require_direction,

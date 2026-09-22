@@ -64,7 +64,9 @@ from analysis.scoring import (                                   # noqa: E402
     SelectionDiagnostics, select_entries,
 )
 from .detector import DetectorResult, MovePolicy, MoveTrigger     # noqa: E402
-from .measure import Reaction, ReactionPolicy                    # noqa: E402
+from .measure import (                                           # noqa: E402
+    Ordering, Reaction, ReactionOutcome, ReactionPolicy,
+)
 from .screen import ScreenedReaction, ScreenResult               # noqa: E402
 
 # DEVELOPMENT DATA. Declared here, as a constant, because it is a fact about
@@ -105,6 +107,214 @@ class HoldoutViolation(RuntimeError):
     it corrupts how every figure in the run is read, and it does so silently
     and permanently once the number is quoted.
     """
+
+
+class Feasibility(str, Enum):
+    """The pilot's verdict. Four values, and three of them are not "no"."""
+
+    CONTINUE = "continue"
+    STOP = "stop"
+    INSUFFICIENT = "insufficient_observable_events"
+    UNREACHABLE = "rule_unreachable_against_policy"
+
+
+@dataclass(frozen=True)
+class FeasibilityRule:
+    """The pilot stop rule, DECLARED BEFORE ANY DATA AND CHECKED.
+
+    WHAT IT ASKS, AND WHAT IT DELIBERATELY DOES NOT
+    ------------------------------------------------
+    It asks whether these two sources can ESTABLISH AN ORDERING often enough
+    to be worth funding: of the reactions whose brackets actually order, how
+    many put the book first.
+
+    It does NOT ask whether lags are long. An earlier version did, and that
+    was a different thesis substituted for the one being tested: the study is
+    about catching a sharp move days before kickoff, and the exchange may
+    follow in seconds. Horizon and response speed are independent, and a rule
+    that rewards slow exchanges answers neither.
+
+    WHY A REACHABILITY CHECK EXISTS
+    -------------------------------
+    The rule it replaces required a lag interval starting beyond 1,800s from
+    a policy whose ceiling is 1,740s. Nothing could satisfy it, and nothing
+    said so -- `--policy` printed `max_wait_seconds: 1800` and the proposal
+    quoted 1,800s, and the two numbers read as agreement. So any lag
+    threshold is now checked against `max_reportable_lag_seconds` and an
+    impossible rule is a REFUSAL, not a quiet zero.
+
+    WHY AN INSUFFICIENCY FLOOR EXISTS
+    ---------------------------------
+    A fraction over three reactions is not evidence. Sparse events, censored
+    responses and blind intervals all shrink the denominator, and a rule with
+    no floor turns any of them into a confident "stop".
+    """
+
+    min_determinate: int = 20
+    min_book_led_fraction: float = 1.0 / 3.0
+    #: Optional. None is the declared pilot value: ordering is the question,
+    #: not duration. Present so that a lag threshold, if one is ever wanted,
+    #: cannot be declared beyond what the policy can report.
+    min_lag_seconds: float | None = None
+    label: str = "reaction-feasibility-v1"
+
+    def unreachable_against(self, policy: ReactionPolicy) -> str | None:
+        """Why no run under `policy` could satisfy this rule, or None."""
+        if self.min_lag_seconds is None:
+            return None
+        ceiling = policy.max_reportable_lag_seconds
+        if self.min_lag_seconds >= ceiling:
+            return (f"the rule needs a lag interval starting beyond "
+                    f"{self.min_lag_seconds:,.0f}s, but this policy can "
+                    f"never report more than {ceiling:,.0f}s "
+                    f"(max_wait {policy.max_wait.total_seconds():,.0f}s "
+                    f"minus one {policy.candle_period.total_seconds():,.0f}s "
+                    f"candle period). No measured reaction could satisfy it")
+        return None
+
+    def as_dict(self) -> dict:
+        return {
+            "label": self.label,
+            "min_determinate_reactions": self.min_determinate,
+            "min_book_led_fraction": self.min_book_led_fraction,
+            "min_lag_seconds": self.min_lag_seconds,
+            "tuned_on_outcomes": False,
+            "note": ("ordering, not duration: the exchange may follow in "
+                     "seconds and that is still a book-led reaction"),
+        }
+
+
+@dataclass(frozen=True)
+class FeasibilityVerdict:
+    """The rule's answer, with every count that did NOT enter it."""
+
+    verdict: Feasibility
+    rule: FeasibilityRule
+    determinate: int = 0
+    book_led: int = 0
+    kalshi_led: int = 0
+    indeterminate: int = 0
+    unknown_ordering: int = 0
+    outcomes: dict[str, int] = field(default_factory=dict)
+    detail: str = ""
+
+    @property
+    def book_led_fraction(self) -> float | None:
+        """None, not zero, when nothing ordered. An empty denominator has no
+        fraction, and reporting 0.0 would read as a measured absence."""
+        if not self.determinate:
+            return None
+        return self.book_led / self.determinate
+
+    def as_dict(self) -> dict:
+        return {
+            "verdict": self.verdict.value,
+            "rule": self.rule.as_dict(),
+            "determinate_reactions": self.determinate,
+            "book_led": self.book_led,
+            "kalshi_led": self.kalshi_led,
+            "book_led_fraction": self.book_led_fraction,
+            "excluded_from_the_fraction": {
+                "indeterminate_ordering": self.indeterminate,
+                "unknown_ordering": self.unknown_ordering,
+                "by_outcome": dict(sorted(self.outcomes.items())),
+            },
+            "detail": self.detail,
+            "note": ("censored, blind and indeterminate reactions are "
+                     "reported beside the fraction and never inside it"),
+        }
+
+    def render(self) -> str:
+        lines = ["FEASIBILITY RULE (declared before any data)", ""]
+        lines.append(f"    verdict                     {self.verdict.value}")
+        fraction = self.book_led_fraction
+        shown = "n/a" if fraction is None else f"{fraction:.0%}"
+        lines.append(f"    book-led share              {shown}"
+                     f"   ({self.book_led:,} of {self.determinate:,} that "
+                     f"ordered)")
+        lines.append(f"    needs                       "
+                     f"{self.rule.min_book_led_fraction:.0%} of at least "
+                     f"{self.rule.min_determinate:,}")
+        lines.append("")
+        lines.append("    NOT in that denominator (reported, never folded in):")
+        lines.append(f"        indeterminate ordering  "
+                     f"{self.indeterminate:>7,}")
+        lines.append(f"        unknown ordering        "
+                     f"{self.unknown_ordering:>7,}")
+        for name, count in sorted(self.outcomes.items()):
+            lines.append(f"        {name:<23} {count:>7,}")
+        if self.detail:
+            lines.append("")
+            for chunk in _wrap_detail(self.detail):
+                lines.append(f"    {chunk}")
+        return "\n".join(lines)
+
+
+def _wrap_detail(text: str, width: int = 66) -> list[str]:
+    words, out, line = text.split(), [], ""
+    for word in words:
+        if len(line) + len(word) + 1 > width and line:
+            out.append(line)
+            line = word
+        else:
+            line = f"{line} {word}".strip()
+    if line:
+        out.append(line)
+    return out
+
+
+def judge_feasibility(reactions: Sequence[Reaction],
+                      rule: FeasibilityRule | None = None,
+                      policy: ReactionPolicy | None = None
+                      ) -> FeasibilityVerdict:
+    """Evaluate the declared stop rule. Refuses an unreachable one."""
+    rule = rule or FeasibilityRule()
+    policy = policy or ReactionPolicy()
+    outcomes: dict[str, int] = {}
+    for reaction in reactions:
+        name = reaction.outcome.value
+        outcomes[name] = outcomes.get(name, 0) + 1
+
+    why = rule.unreachable_against(policy)
+    if why is not None:
+        return FeasibilityVerdict(Feasibility.UNREACHABLE, rule,
+                                  outcomes=outcomes, detail=why)
+
+    book_led = sum(1 for r in reactions if r.ordering is Ordering.BOOK_LED)
+    kalshi_led = sum(1 for r in reactions if r.ordering is Ordering.KALSHI_LED)
+    indeterminate = sum(1 for r in reactions
+                        if r.ordering is Ordering.INDETERMINATE)
+    unknown = sum(1 for r in reactions if r.ordering is Ordering.UNKNOWN)
+    determinate = book_led + kalshi_led
+    common = dict(determinate=determinate, book_led=book_led,
+                  kalshi_led=kalshi_led, indeterminate=indeterminate,
+                  unknown_ordering=unknown, outcomes=outcomes)
+
+    if determinate < rule.min_determinate:
+        return FeasibilityVerdict(
+            Feasibility.INSUFFICIENT, rule, **common,
+            detail=(f"only {determinate:,} reaction(s) ordered, against a "
+                    f"floor of {rule.min_determinate:,}. This is NOT a "
+                    f"negative result: sparse moves, right-censored "
+                    f"responses and blind intervals all shrink this "
+                    f"denominator, and none of them is evidence about the "
+                    f"exchange"))
+
+    fraction = book_led / determinate
+    if fraction < rule.min_book_led_fraction:
+        return FeasibilityVerdict(
+            Feasibility.STOP, rule, **common,
+            detail=(f"{fraction:.0%} of ordered reactions are book-led, "
+                    f"under the declared {rule.min_book_led_fraction:.0%}. "
+                    f"That says these sources rarely establish the book "
+                    f"leading -- NOT that the lag is short, and NOT that "
+                    f"there is no edge"))
+    return FeasibilityVerdict(
+        Feasibility.CONTINUE, rule, **common,
+        detail=(f"{fraction:.0%} of ordered reactions are book-led, over the "
+                f"declared {rule.min_book_led_fraction:.0%}. Ordering is "
+                f"resolvable from these sources often enough to design a "
+                f"larger study"))
 
 
 @dataclass(frozen=True)
@@ -275,6 +485,7 @@ class EpisodeLedger:
     reaction_policy: ReactionPolicy | None = None
     entry_policy: EntryPolicy | None = None
     eligibility: Eligibility | None = None
+    feasibility: FeasibilityVerdict | None = None
 
     @property
     def entries(self) -> list[SelectedEntry]:
@@ -294,6 +505,8 @@ class EpisodeLedger:
         return {
             "schema": "reaction_episode_ledger/1",
             "window": self.window.as_dict(),
+            "feasibility": (self.feasibility.as_dict()
+                            if self.feasibility else None),
             "declared_policies": {
                 "move_detection": (self.move_policy.as_dict()
                                    if self.move_policy else None),
@@ -349,6 +562,9 @@ class EpisodeLedger:
         if self.selection is not None:
             lines.append(self.selection.render())
             lines.append("    (looks = screened contract rows, not games)")
+        if self.feasibility is not None:
+            lines.append("")
+            lines.append(self.feasibility.render())
         if not self.reconciles:
             lines.append("")
             lines.append("  *** A STAGE'S BREAKDOWN DOES NOT SUM TO ITS TOTAL.")
@@ -366,6 +582,7 @@ def build_ledger(*, detector_result: DetectorResult,
                  entry_policy: EntryPolicy | None = None,
                  move_policy: MovePolicy | None = None,
                  reaction_policy: ReactionPolicy | None = None,
+                 feasibility_rule: FeasibilityRule | None = None,
                  venue: str = "kalshi", role: str = "taker",
                  series: str | None = None) -> EpisodeLedger:
     """Assemble the ledger, and run the entry policy over the screened rows.
@@ -461,7 +678,9 @@ def build_ledger(*, detector_result: DetectorResult,
     return EpisodeLedger(window=window, episodes=episodes, stages=stages,
                          selection=selection, move_policy=move_policy,
                          reaction_policy=reaction_policy,
-                         entry_policy=entry_policy, eligibility=eligibility)
+                         entry_policy=entry_policy, eligibility=eligibility,
+                         feasibility=judge_feasibility(
+                             reactions, feasibility_rule, reaction_policy))
 
 
 def _reaction_counts(reactions: Sequence[Reaction]) -> dict[str, int]:

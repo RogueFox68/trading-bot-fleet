@@ -948,9 +948,17 @@ the bug it was fixing.
 the one a result depends on.** A bundle whose snapshots are all well-formed
 and none of which carries the target parses cleanly and replays to zero
 moves, which is byte-for-byte what a quiet slate looks like. So a game with
-no usable sharp quote, and a contract with no usable candle, are named
-coverage failures with a non-zero exit — while a run with real observations
-and no qualifying move still exits 0, because zero entries is a result.
+no usable sharp quote, and a contract with no usable exchange quote, are
+named coverage failures with a non-zero exit — while a run with real
+observations and no qualifying move still exits 0, because zero entries is a
+result.
+
+**A parsed candle is not a usable quote**, and the check asks the
+measurement's own predicate rather than counting rows. A payload can carry
+well-formed candles — timestamps, volume, trade prices — with no bid or ask
+at all, and `usable_candle` rejects every one because there is no mid. 102
+candles parsed, zero usable, coverage clean, and every reaction returning
+`no_exchange_baseline`, which reads as an exchange that did not move.
 
 `reaction/capture.py` declares the bounded read-only interface a collection
 machine must satisfy, and deliberately contains **no HTTP client**: a module
@@ -960,23 +968,40 @@ credentials, and `CapturePlan.budget()` derives the enforced bound from the
 approved plan so it cannot be run wider than approved.
 
 `REACTION_PILOT.md` proposes a **feasibility probe, not an edge study**,
-over the horizon the thesis is actually about: **T-72h through kickoff**,
-not a few hours before the whistle. Whether these sources can resolve the
-lag at all is answerable far more cheaply than an edge estimate, and it
-decides whether the expensive question can be answered.
+over the horizon the thesis is actually about: **T-72h through kickoff**.
 
-The cadence is the measurement, not a cost knob: the interval between paid
-snapshots **is** the book bracket, so it sets the shortest lag that can be
-resolved. That cuts a useful way at this horizon — the exchange side is free
-and 1-minute, only the book side is paid and coarse, so a coarse grid loses
-only reactions faster than its own spacing and still measures a long one.
-Uniform cadence beats fine bursts for the same money, because bursts resolve
-only the moves that happen to land inside them and moves days out are sparse.
-The proposal recommends a **30-minute uniform grid**, gated behind a
-**30-credit** probe of whether the sharp book is quoted at T-72h at all —
-unverified for NFL, and MLB failed at 48h. Its cost figures, its bracket
-arithmetic and its decision rule are pinned to `estimate_credits` and the
-audit's own constants by tests, so the document cannot drift from the code.
+**The pregame horizon and the response lag are independent dimensions.** The
+objective is a sharp move days out that Kalshi may follow *in seconds*; an
+earlier revision of the proposal collapsed the two and argued that long lags
+were the thesis, which substituted a slower-response study for the stated
+one. What the cadence actually decides is narrower: it is simultaneously the
+measurement's resolution **and the simulated poller's own latency**. A
+30-minute grid can only demonstrate opportunities a 30-minute poller could
+have taken — it cannot rule out faster ones, it cannot see them. So the
+proposal is explicitly a **constrained long-lived-discrepancy probe**, not
+the capture study, and it says what it cannot answer: a move that reverses
+inside one interval is invisible, the true lag has no upper bound tighter
+than one cadence, and a null result carries no claim about short lags.
+
+**The stop rule is checked for reachability, because the last one was
+unsatisfiable.** It required a lag interval starting beyond 1,800s from a
+policy whose ceiling is `max_wait − candle_period` = **1,740s**; nothing
+could satisfy it and nothing said so, because the ceiling was never
+computed. `ReactionPolicy.max_reportable_lag_seconds` computes it now,
+`FeasibilityRule.unreachable_against` refuses a rule that exceeds it, and
+`judge_feasibility` evaluates the declared rule on every replay — reporting
+`continue`, `stop` or `insufficient_observable_events`, with censored, blind
+and indeterminate reactions counted beside the fraction and never inside it.
+
+**Cost comes from a timestamp manifest, not `days × snapshots_per_day`.**
+That arithmetic counts inclusive calendar *dates*, so a 72-hour window
+opening Thursday and closing Sunday quoted 192 requests for one holding 145,
+and it could not express two kickoff clusters sharing most of their windows.
+`build_manifest` enumerates the actual UTC instants, deduplicates them,
+marks the single true baseline, and derives the enforced bound **including
+the retry reserve** the prose used to promise and `budget()` did not carry.
+It also exposes the largest lever in the table: three unaligned NFL kickoff
+clusters share nothing, 435 instants against 161 aligned.
 
 ### Status
 
