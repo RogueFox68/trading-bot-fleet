@@ -23,6 +23,7 @@ request before you spend the rest.
 
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import urllib.error
@@ -428,7 +429,11 @@ def fetch_snapshot(
                         and result.coverage.complete):
                     cache.put(key_for(sport, at, bookmakers or "", "h2h"), payload)
                 return result
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        # A body cut off partway is http.client's IncompleteRead -- an
+        # HTTPException, not an OSError. It is a failed attempt like any other:
+        # charged, perhaps, so the next one reserves again above.
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError,
+                OSError, http.client.HTTPException) as exc:
             last = exc
             if attempt < RETRIES - 1:
                 time.sleep(BACKOFF_SECONDS[attempt])

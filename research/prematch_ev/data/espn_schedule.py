@@ -99,6 +99,7 @@ feature or a checkpoint through this path even by accident.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -711,8 +712,10 @@ def _default_transport(url: str) -> Any:
                 if response.status != 200:
                     raise ScheduleFetchError(f"HTTP {response.status} from {url}")
                 return json.loads(response.read().decode("utf-8"))
+        # IncompleteRead (a body cut off partway) is an HTTPException, not
+        # an OSError, and a lost read like any other.
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError,
-                OSError, ScheduleFetchError) as exc:
+                OSError, http.client.HTTPException, ScheduleFetchError) as exc:
             last = exc
             if attempt < RETRIES - 1:
                 import time

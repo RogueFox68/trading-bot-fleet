@@ -744,6 +744,58 @@ class CacheKeyTimezoneTest(unittest.TestCase):
         self.assertEqual(result.raw, body)
 
 
+class TransportFailureTest(unittest.TestCase):
+    """A historical request whose body is cut off is a failed attempt --
+    reserved, retried and reported like any other -- not a traceback.
+    http.client raises `IncompleteRead`, which is not an `OSError`."""
+
+    AT = datetime(2026, 9, 27, 17, 0, tzinfo=UTC)
+
+    def test_a_body_cut_off_is_retried_and_reported_not_raised(self):
+        from data import odds_history
+        from tests import chunked, http_response
+        body = json.dumps({"timestamp": "2026-09-27T17:00:00Z",
+                           "data": []}).encode("utf-8")
+        calls = []
+
+        def cut(*args, **kwargs):
+            calls.append(1)
+            return http_response(
+                200, {"Transfer-Encoding": "chunked",
+                      "x-requests-used": "10", "x-requests-remaining": "90"},
+                chunked(body, 2, cut_short=True))
+
+        each = odds_history.CREDITS_PER_HISTORICAL_CALL
+        ledger = CreditLedger(cap=each * odds_history.RETRIES)
+        with mock.patch("urllib.request.urlopen", side_effect=cut), \
+                mock.patch("time.sleep"):
+            result = run_study.fetch_snapshot("NFL", self.AT, "K",
+                                              ledger=ledger)
+        self.assertFalse(result.coverage.complete)
+        self.assertIn("IncompleteRead", " ".join(result.coverage.reasons))
+        self.assertEqual(len(calls), odds_history.RETRIES)
+        self.assertEqual(ledger.spent_this_run, each * odds_history.RETRIES)
+
+    def test_the_cap_still_stops_the_retries(self):
+        """Room for one attempt: the cut body is not retried past the cap."""
+        from data import odds_history
+        from data.cache import CreditCapReached
+        from tests import chunked, http_response
+        calls = []
+
+        def cut(*args, **kwargs):
+            calls.append(1)
+            return http_response(200, {"Transfer-Encoding": "chunked"},
+                                 chunked(b'{"data": []}', 2, cut_short=True))
+
+        ledger = CreditLedger(cap=odds_history.CREDITS_PER_HISTORICAL_CALL)
+        with mock.patch("urllib.request.urlopen", side_effect=cut), \
+                mock.patch("time.sleep"):
+            with self.assertRaises(CreditCapReached):
+                run_study.fetch_snapshot("NFL", self.AT, "K", ledger=ledger)
+        self.assertEqual(len(calls), 1)
+
+
 class AnswerProblemTest(unittest.TestCase):
     """Does a snapshot body answer a request? The archive's rule, not equality.
 

@@ -25,6 +25,7 @@ happily conclude there was no edge on a window it failed to read.
 
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import urllib.error
@@ -117,7 +118,10 @@ def _get(url: str, retries: int = RETRIES,
                 if resp.status != 200:
                     raise KalshiFetchError(f"HTTP {resp.status} from {url}")
                 return json.loads(resp.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        # A body cut off partway is http.client's IncompleteRead -- an
+        # HTTPException, not an OSError -- and a lost read like any other.
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError,
+                OSError, http.client.HTTPException) as exc:
             last = exc
             if attempt < retries - 1:
                 time.sleep(BACKOFF_SECONDS[attempt])

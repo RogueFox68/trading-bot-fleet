@@ -542,6 +542,26 @@ class TransportTest(unittest.TestCase):
         resolution = snap.resolve(frozenset({"DEN", "KC"}), date(2026, 9, 14))
         self.assertFalse(resolution.resolved)
 
+    def test_a_body_cut_off_is_a_failed_fetch_not_a_crash(self):
+        """http.client's `IncompleteRead` is not an `OSError`; the default
+        transport retries it and names it, like any other lost read."""
+        from tests import chunked, http_response
+        calls = []
+
+        def cut(*args, **kwargs):
+            calls.append(1)
+            return http_response(
+                200, {"Transfer-Encoding": "chunked"},
+                chunked(json.dumps(board()).encode("utf-8"), 2,
+                        cut_short=True))
+
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=cut), \
+                unittest.mock.patch("time.sleep"):
+            with self.assertRaises(es.ScheduleFetchError) as caught:
+                es._default_transport("https://site.api.espn.com/x")
+        self.assertIn("IncompleteRead", str(caught.exception))
+        self.assertEqual(len(calls), es.RETRIES)
+
     def test_raw_payloads_are_cached_and_replayed_without_the_network(self):
         with tempfile.TemporaryDirectory() as tmp:
             calls = {"n": 0}

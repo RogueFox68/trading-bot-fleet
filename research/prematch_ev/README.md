@@ -1148,6 +1148,15 @@ python3 shadow_monitor.py --report study_output/shadow/<session>.jsonl
   reading it is recorded as `processing`, a delay every move carries,
   never time to trade. Clock skew is judged against the headers, which is
   what the provider's `Date` marks, so a slow body is not a skewed clock.
+  A chunked body is in hand when its last chunk is: `http.client` decodes
+  the chunks inside the one timed read, and the tests drive a real
+  `HTTPResponse` through it. A body cut off partway — chunked or sized — is
+  `IncompleteRead`, an `HTTPException` and not an `OSError`, which every
+  fetcher's handler used to let through: one dropped connection would have
+  ended a session with a traceback and no `session_end`. On all four
+  fetchers (live odds, Kalshi books, historical odds, ESPN) it is now a
+  failed read like any other — retried where that path retries, and on the
+  paid historical path reserved again before each retry, under the same cap.
 - **Kalshi's response is measured by the replay's own rule.** The report
   hands its reads to `reaction.measure.measure_response`, the function the
   replay's candles go through, so the two cannot disagree about what a

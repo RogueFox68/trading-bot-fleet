@@ -51,6 +51,7 @@ import collect_reaction                                             # noqa: E402
 import shadow_monitor                                               # noqa: E402
 from data.odds_history import CreditLedger                         # noqa: E402
 from reaction.capture import endpoint_allowed                      # noqa: E402
+from tests import chunked, http_response                           # noqa: E402
 from tests.test_reaction_replay import EVENT, START, odds_payload  # noqa: E402
 from tests.test_schedule import OBSERVED_DAL_NYG, board, nfl_market  # noqa: E402
 
@@ -148,6 +149,12 @@ class LiveNetwork:
       odds_body_delay  each odds body takes this long to arrive after its
                        headers; `odds_bodies_done` records when each did
       book_body_delay  the same for every order-book body
+      odds_chunks      (count, gap): every odds body is a REAL chunked
+                       transfer, decoded by http.client, its chunks arriving
+                       `gap` apart; `odds_pieces` records when each did
+      odds_cut_at      odds polls in this window are chunked transfers the
+                       connection drops halfway through the last chunk
+      books_cut_during the same for order-book reads in this window
     """
 
     def __init__(self, clock: FakeClock, **knobs):
@@ -175,6 +182,10 @@ class LiveNetwork:
         self.follow_at = knobs.get("follow_at", FOLLOW_AT)
         self.odds_body_delay = knobs.get("odds_body_delay")
         self.book_body_delay = knobs.get("book_body_delay")
+        self.odds_chunks = knobs.get("odds_chunks")
+        self.odds_cut_at = knobs.get("odds_cut_at")
+        self.books_cut_during = knobs.get("books_cut_during")
+        self.odds_pieces: list[list[datetime]] = []
         self.odds_bodies_done: list[datetime] = []
         self.book_bodies_done: list[tuple[str, datetime]] = []
         self.listings_served = 0
@@ -261,6 +272,22 @@ class LiveNetwork:
                    "x-requests-remaining": str(self.remaining)}
         if self.charged is not None:
             headers["x-requests-last"] = str(self.charged)
+        cut = _inside(self.odds_cut_at, at)
+        if self.odds_chunks or cut:
+            count, gap = self.odds_chunks or (3, timedelta(seconds=1))
+            arrived: list[datetime] = []
+            self.odds_pieces.append(arrived)
+
+            def piece():
+                self.clock.t += gap
+                arrived.append(self.clock.t)
+
+            return http_response(
+                200, {**headers, "Content-Type": "application/json",
+                      "Transfer-Encoding": "chunked"},
+                chunked(json.dumps(events).encode("utf-8"), count,
+                        cut_short=cut),
+                advance=piece)
         return Response(events, headers, on_read=self._odds_body)
 
     def _odds_body(self):
@@ -286,11 +313,16 @@ class LiveNetwork:
         if ticker == DAL:
             yes_bid, no_bid = no_bid, yes_bid
         # TRANSCRIBED from Kalshi's documentation, not observed.
-        return Response({"orderbook_fp": {
+        body = {"orderbook_fp": {
             "yes_dollars": [[f"{yes_bid - 0.02:.4f}", "40.00"],
                             [f"{yes_bid:.4f}", "100.00"]],
-            "no_dollars": [[f"{no_bid:.4f}", "150.00"]]}},
-            on_read=lambda: self._book_body(ticker))
+            "no_dollars": [[f"{no_bid:.4f}", "150.00"]]}}
+        if _inside(self.books_cut_during, at):
+            return http_response(
+                200, {"Content-Type": "application/json",
+                      "Transfer-Encoding": "chunked"},
+                chunked(json.dumps(body).encode("utf-8"), 2, cut_short=True))
+        return Response(body, on_read=lambda: self._book_body(ticker))
 
     def _book_body(self, ticker):
         if self.book_body_delay:
@@ -717,6 +749,47 @@ class HonestyTest(MonitorHarness):
         self.assertGreater(self.end(rows)["counts"]["in_play_skipped"], 0)
 
 
+class TruncatedBodyTest(MonitorHarness):
+    """A connection that drops partway through a body is a failed read,
+    never a crash.
+
+    http.client reports a body cut short -- chunked or sized -- as
+    `IncompleteRead`: an `HTTPException`, NOT an `OSError`. Every fetcher's
+    transport handler caught `OSError` and not it, so one dropped connection
+    ended the session with a traceback and no `session_end` saying why.
+    """
+
+    def test_an_odds_body_cut_off_is_a_failed_poll(self):
+        window = (T0 + timedelta(minutes=2), T0 + timedelta(minutes=3))
+        code, text, net = self.paid(odds_cut_at=window)
+        self.assertEqual(code, 0, text)
+        rows = self.records()
+        self.assertEqual(self.end(rows)["reason"], "end_of_session")
+        cut = [r for r in self.kinds(rows, "odds")
+               if _inside(window, datetime.fromisoformat(r["sent_at"]))]
+        self.assertEqual(len(cut), 1)
+        self.assertIsNone(cut[0]["payload"])
+        self.assertIn("IncompleteRead", " ".join(cut[0]["coverage"]))
+        # Dated when the connection dropped, after what did arrive.
+        self.assertEqual(datetime.fromisoformat(cut[0]["received_at"]),
+                         net.odds_pieces[0][-1])
+        self.assertTrue(self.kinds(rows, "trigger"))
+
+    def test_a_book_body_cut_off_is_a_failed_read(self):
+        window = (MOVE_AT + timedelta(seconds=60),
+                  MOVE_AT + timedelta(seconds=70))
+        code, text, _ = self.paid(books_cut_during=window)
+        self.assertEqual(code, 0, text)
+        rows = self.records()
+        self.assertEqual(self.end(rows)["reason"], "end_of_session")
+        cut = [b for b in self.kinds(rows, "book")
+               if _inside(window, datetime.fromisoformat(b["sent_at"]))]
+        self.assertTrue(cut)
+        for book in cut:
+            self.assertIsNone(book["payload"])
+            self.assertIn("IncompleteRead", " ".join(book["coverage"]))
+
+
 class ReceiptClockTest(MonitorHarness):
     """A move is dated by when its answer was usable, never before.
 
@@ -790,6 +863,28 @@ class ReceiptClockTest(MonitorHarness):
                          detected)
         figures = shadow_monitor.report(rows)
         self.assertIn("median 2.0s", figures["polls"]["processing"])
+
+    def test_a_chunked_body_is_dated_by_its_last_chunk(self):
+        """A REAL chunked transfer, decoded by http.client: four chunks and
+        the end marker, two seconds apart. The headers are in hand at once;
+        the answer is not, until the marker has arrived."""
+        code, text, net = self.paid(odds_chunks=(4, timedelta(seconds=2)))
+        self.assertEqual(code, 0, text)
+        rows = self.records()
+        index = next(i for i, at in enumerate(net.odds_calls) if at >= MOVE_AT)
+        arrived = net.odds_pieces[index]
+        self.assertEqual(len(arrived), 5)
+        poll = next(r for r in self.kinds(rows, "odds")
+                    if datetime.fromisoformat(r["sent_at"])
+                    == net.odds_calls[index])
+        headers = datetime.fromisoformat(poll["headers_at"])
+        received = datetime.fromisoformat(poll["received_at"])
+        self.assertEqual(headers, net.odds_calls[index] + LATENCY)
+        self.assertEqual(received, arrived[-1])
+        self.assertEqual(received - headers, timedelta(seconds=10))
+        trigger = self.kinds(rows, "trigger")[0]
+        self.assertGreaterEqual(datetime.fromisoformat(trigger["detected_at"]),
+                                arrived[-1])
 
     def test_a_slow_book_read_is_dated_by_its_completion(self):
         """The execution book is the book when its answer was complete; the
@@ -1176,6 +1271,75 @@ class LiveFetchClockTest(unittest.TestCase):
         self.assertLessEqual(live.sent_at, live.headers_at)
         self.assertEqual(live.received_at - live.headers_at,
                          timedelta(seconds=8))
+
+    HEADERS = {"Date": email.utils.format_datetime(T0, usegmt=True),
+               "x-requests-last": "1", "Content-Type": "application/json"}
+    BODY = json.dumps([{"id": f"evt-{n}"} for n in range(8)]).encode("utf-8")
+
+    def fetch(self, response, clock):
+        from data import odds_live
+        with mock.patch("urllib.request.urlopen", return_value=response):
+            return odds_live.fetch_live_odds(
+                "NFL", KEY, ledger=CreditLedger(cap=1), now=clock.now)
+
+    def test_a_chunked_body_is_received_at_its_last_chunk(self):
+        """Three chunks and the end marker, two seconds apart, through
+        http.client's own decoder."""
+        clock = FakeClock()
+
+        def piece():
+            clock.t += timedelta(seconds=2)
+
+        live = self.fetch(http_response(
+            200, {**self.HEADERS, "Transfer-Encoding": "chunked"},
+            chunked(self.BODY, 3), advance=piece), clock)
+        self.assertTrue(live.ok, live.coverage.reasons)
+        self.assertEqual(live.payload, json.loads(self.BODY))
+        self.assertEqual(live.received_at - live.headers_at,
+                         timedelta(seconds=8))
+
+    def test_a_body_cut_off_is_a_failed_poll_dated_when_it_dropped(self):
+        for shape, headers, pieces in (
+                ("chunked", {"Transfer-Encoding": "chunked"},
+                 chunked(self.BODY, 3, cut_short=True)),
+                ("sized", {"Content-Length": str(len(self.BODY))},
+                 [self.BODY[:40], self.BODY[40:80]])):
+            with self.subTest(shape):
+                clock = FakeClock()
+
+                def piece():
+                    clock.t += timedelta(seconds=2)
+
+                live = self.fetch(http_response(
+                    200, {**self.HEADERS, **headers}, pieces,
+                    advance=piece), clock)
+                self.assertFalse(live.ok)
+                self.assertIsNone(live.payload)
+                self.assertIn("IncompleteRead",
+                              " ".join(live.coverage.reasons))
+                self.assertEqual(live.received_at, clock.t)
+                self.assertGreater(live.received_at, live.headers_at)
+
+    def test_a_book_cut_off_is_a_failed_read_and_retried_where_retries_are(
+            self):
+        from data import kalshi_history
+        calls = []
+
+        def cut(*args, **kwargs):
+            calls.append(1)
+            return http_response(
+                200, {"Transfer-Encoding": "chunked"},
+                chunked(b'{"orderbook_fp": {}}', 2, cut_short=True))
+
+        with mock.patch("urllib.request.urlopen", side_effect=cut), \
+                mock.patch("time.sleep"):
+            payload, coverage = kalshi_history.fetch_orderbook_payload(NYG)
+            self.assertIsNone(payload)
+            self.assertIn("IncompleteRead", " ".join(coverage.reasons))
+            self.assertEqual(len(calls), 1)
+            with self.assertRaises(kalshi_history.KalshiFetchError):
+                kalshi_history._get("https://api.elections.kalshi.com/x")
+        self.assertEqual(len(calls), 1 + kalshi_history.RETRIES)
 
 
 class OrderBookParserTest(unittest.TestCase):

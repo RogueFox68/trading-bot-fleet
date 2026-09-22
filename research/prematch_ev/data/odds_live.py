@@ -48,6 +48,7 @@ message (`redact`), not a log.
 from __future__ import annotations
 
 import email.utils
+import http.client
 import json
 import urllib.error
 import urllib.parse
@@ -180,8 +181,10 @@ def fetch_live_odds(sport: str, api_key: str, *, ledger: CreditLedger,
             # Not before: a response is not in hand until all of it is.
             result.received_at = now()
         payload = json.loads(body.decode("utf-8"))
+    # A body cut off partway is http.client's IncompleteRead -- an
+    # HTTPException, not an OSError -- and a failed poll like any other.
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError,
-            OSError, ValueError) as exc:
+            OSError, ValueError, http.client.HTTPException) as exc:
         result.received_at = result.received_at or now()
         result.coverage.fail(redact(f"live odds poll failed: {exc}"))
         return result
