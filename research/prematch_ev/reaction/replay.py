@@ -69,6 +69,20 @@ from .measure import (                                           # noqa: E402
 from .screen import ScreenResult, screen_reaction                # noqa: E402
 
 BUNDLE_SCHEMA = "reaction_replay_bundle/1"
+
+#: Why a parsed snapshot yielded nothing for the target. ONE label covering
+#: three causes, deliberately: the event absent, the sharp book absent from
+#: it, or the h2h market absent from that book. An earlier label said "the
+#: target event is absent" for all three, which was false whenever the event
+#: was present and the BOOK was not -- the very case the reviewer asked to be
+#: treated as a hole. Telling them apart would mean reading the payload a
+#: second time, outside the shared parser, and a second reading of the same
+#: bytes is how two components come to disagree about them (rule 19). The
+#: behaviour is identical for all three -- the stream re-baselines -- so the
+#: label says what is known rather than guessing which.
+NO_TARGET_QUOTE = ("no usable sharp quote for the target in this snapshot "
+                   "(the event, its sharp book, or that book's h2h market "
+                   "is absent)")
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
@@ -318,8 +332,7 @@ def load_bundle(path: str | Path) -> tuple[list[ReplayGame], BundleReport]:
                        if result.snapshot else " (no usable timestamp)"))
             observations.append(SnapshotObservation(
                 snap_index, result.snapshot, mine,
-                "" if mine else ("the target event is absent from this "
-                                 "provider snapshot")))
+                "" if mine else NO_TARGET_QUOTE))
             quotes.extend(mine)
         observations = _in_availability_order(observations)
 

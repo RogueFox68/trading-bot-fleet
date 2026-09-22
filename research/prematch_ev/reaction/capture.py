@@ -434,6 +434,11 @@ class TimestampManifest:
                       if self.timestamps else None),
             "last": (self.timestamps[-1].isoformat()
                      if self.timestamps else None),
+            # The instants THEMSELVES. A manifest that reported only a count
+            # and two endpoints was an estimate with better arithmetic; what
+            # someone approves before a spend is the list of requests.
+            "instants": [t.astimezone(timezone.utc).isoformat()
+                         for t in self.timestamps],
             "calendar_estimate_disagreement":
                 self.disagreement_with_calendar_estimate(),
         }

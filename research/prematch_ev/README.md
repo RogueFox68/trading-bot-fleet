@@ -992,6 +992,13 @@ computed. `ReactionPolicy.max_reportable_lag_seconds` computes it now,
 `judge_feasibility` evaluates the declared rule on every replay — reporting
 `continue`, `stop` or `insufficient_observable_events`, with censored, blind
 and indeterminate reactions counted beside the fraction and never inside it.
+**It counts book moves, not contract rows**: a reaction is one (move,
+contract) pair and every NFL game has two mirror-image contracts, so a
+first version counted each move twice and met its floor of 20 with ten. A
+Kalshi step claimed by two overlapping response windows likewise counts
+once, for the earlier move. `--policy` prints the rule with the thresholds
+it judges, so it can be committed before collection like every other
+declared number.
 
 **Cost comes from a timestamp manifest, not `days × snapshots_per_day`.**
 That arithmetic counts inclusive calendar *dates*, so a 72-hour window

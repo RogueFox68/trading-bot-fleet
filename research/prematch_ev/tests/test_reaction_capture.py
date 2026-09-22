@@ -20,6 +20,7 @@ check the CONTRACT and its guards:
 
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 import unittest
@@ -383,34 +384,41 @@ class PilotProposalTest(unittest.TestCase):
         if " ".join(needle.lower().split()) not in haystack:
             self.fail(f"the proposal does not claim {needle!r}")
 
-    #: Phrases that mark a nearby quotation as a RETRACTION rather than an
-    #: assertion. A document that records why it changed is more useful than
-    #: one that silently drops the old wording, so a retracted claim may
-    #: appear -- but only where it is marked as retracted.
+    #: Phrases that mark a quotation as a RETRACTION rather than an
+    #: assertion. SPECIFIC ones only: an earlier list included "it does
+    #: not", which appears in ordinary prose and excused whatever sat near
+    #: it -- including a re-asserted claim placed next to the correction.
     RETRACTION_MARKERS = (
-        "was simply wrong", "is removed", "are removed", "it does not",
+        "was simply wrong", "is removed", "are removed",
         "a previous revision", "an earlier claim", "an earlier revision",
         "substituted", "that was a different thesis",
     )
 
-    def refuteClaim(self, needle: str, window: int = 400):
+    def refuteClaim(self, needle: str):
         """The proposal must not ASSERT this, though it may retract it.
 
-        A plain absence check failed here for the right reason: §1 and §3
-        quote each removed claim in order to correct it. Deleting the
-        quotation to satisfy a test would lose the record of why the
-        document changed -- so every occurrence must instead sit within
-        `window` characters of a retraction marker.
+        A plain absence check fails for the right reason here: the document
+        quotes each removed claim in order to correct it, and deleting the
+        quotation to satisfy a test would lose the record of why it changed.
+
+        So each occurrence must carry a retraction marker IN ITS OWN SENTENCE
+        OR AN ADJACENT ONE. A first version accepted any marker within 400
+        characters, and it had no teeth exactly where a regression is most
+        likely: a sentence reverted to the old claim right beside the
+        correction was excused by the correction's own markers.
         """
         target = " ".join(needle.lower().split())
-        position = self.text.find(target)
-        while position != -1:
-            near = self.text[max(0, position - window):
-                             position + len(target) + window]
-            if not any(marker in near for marker in self.RETRACTION_MARKERS):
+        sentences = [part for part in
+                     re.split(r"(?<=[.!?])\s+", self.text) if part]
+        for index, sentence in enumerate(sentences):
+            if target not in sentence:
+                continue
+            scope = " ".join(sentences[max(0, index - 1): index + 2])
+            if not any(marker in scope
+                       for marker in self.RETRACTION_MARKERS):
                 self.fail(f"the proposal asserts {needle!r} with no "
-                          f"retraction anywhere near it")
-            position = self.text.find(target, position + 1)
+                          f"retraction in or beside that sentence: "
+                          f"{sentence[:120]!r}")
 
     def _row(self, label: str) -> str:
         rows = [line for line in self.raw.splitlines()
@@ -548,6 +556,37 @@ class PilotProposalTest(unittest.TestCase):
     def test_insufficient_events_is_a_declared_possible_outcome(self):
         self.assertClaim("may well return insufficient")
         self.assertClaim("it is not a negative result")
+
+    def test_the_refutation_check_has_teeth_beside_a_correction(self):
+        """A check nothing has seen fail is a decoration.
+
+        The first `refuteClaim` accepted any marker within 400 characters,
+        so a sentence reverted to the old claim RIGHT BESIDE the correction
+        passed -- excused by the correction's own words. This reverts §3
+        exactly that way and requires the check to catch it.
+        """
+        reverted = self.raw.replace(
+            "If option A returns `stop`, that means: **on a 30-minute grid, "
+            "over this\nsample, these sources rarely established the book "
+            "leading.**",
+            "If option A returns `stop`, it means the lag is under 30 "
+            "minutes.")
+        self.assertNotEqual(reverted, self.raw, "the anchor text moved")
+        text = (reverted.lower()
+                .replace("\u2013", "-").replace("\u2014", "-")
+                .replace("\u2192", "->").replace("*", "").replace("`", ""))
+        original, self.text = self.text, " ".join(text.split())
+        try:
+            with self.assertRaises(AssertionError):
+                self.refuteClaim("means the lag is under 30 minutes")
+        finally:
+            self.text = original
+
+    def test_the_rule_is_counted_in_book_moves(self):
+        self.assertClaim("of the book moves whose brackets actually order")
+        self.assertClaim("each exchange response counts once")
+        self.assertClaim("shared_response")
+        self.refuteClaim("derived from the cadence rather than chosen freely")
 
     def test_it_does_not_claim_to_be_the_capture_study(self):
         self.assertClaim("constrained long-lived-discrepancy probe")
@@ -798,6 +837,17 @@ class ManifestTest(unittest.TestCase):
         """The offset decides which calendar date the estimate counts."""
         with self.assertRaises(ValueError):
             CaptureWindow(datetime(2026, 9, 27, 17, 0), LEAD, _td(minutes=30))
+
+    def test_the_manifest_enumerates_every_instant_it_prices(self):
+        """What someone approves before a spend is the list of requests. A
+        manifest reporting only a count and two endpoints was an estimate
+        with better arithmetic."""
+        manifest = build_manifest(windows(30), align_to=_td(minutes=30))
+        instants = manifest.as_dict()["instants"]
+        self.assertEqual(len(instants), manifest.requests)
+        self.assertEqual(instants, sorted(instants))
+        self.assertEqual(len(set(instants)), len(instants))
+        self.assertTrue(all(i.endswith("+00:00") for i in instants))
 
     def test_an_empty_manifest_is_refused_rather_than_priced_at_zero(self):
         with self.assertRaises(ValueError):

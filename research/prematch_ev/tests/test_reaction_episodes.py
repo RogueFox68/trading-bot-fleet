@@ -378,21 +378,35 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 
 
-def _make_reaction(ordering, outcome=None):
-    """A Reaction carrying only what the feasibility rule reads.
+def _make_reaction(ordering, outcome=None, *, move=0, contract="KXT-Y",
+                   event=EVENT, response=None):
+    """One reaction: book move number `move`, measured on `contract`.
 
     Built through the real constructor, so a field the rule depends on
     cannot be renamed out from under these without the suite noticing.
+
+    `move` sets the trigger identity (stream + detection time) and, unless
+    `response` is given, a distinct exchange bracket. An earlier helper had
+    no such parameter, so "25 reactions" in these tests were 25 copies of
+    ONE move -- the suite itself encoded the unit error the rule had.
     """
     from reaction.measure import Bracket, Reaction, ReactionOutcome
-    moment = START - timedelta(minutes=30)
+    detected = START - timedelta(hours=10) + timedelta(minutes=30 * move)
+    exchange = response or Bracket(detected + timedelta(minutes=4),
+                                   detected + timedelta(minutes=5))
     return Reaction(
         outcome=outcome or ReactionOutcome.RESPONDED,
         ordering=ordering,
-        event_id=EVENT, stream_id="stream-1", market_ticker="KXT-Y",
-        policy=ReactionPolicy(), detected_at=moment,
-        book_change=Bracket(moment - timedelta(minutes=5), moment),
-        exchange_change=Bracket(moment, moment + timedelta(minutes=1)))
+        event_id=event, stream_id=f"stream-{event}", market_ticker=contract,
+        policy=ReactionPolicy(), detected_at=detected,
+        book_change=Bracket(detected - timedelta(minutes=30), detected),
+        exchange_change=exchange)
+
+
+def _moves(ordering, count, *, first=0, outcome=None, contracts=("KXT-Y",)):
+    """`count` DISTINCT book moves, each measured on every contract given."""
+    return [_make_reaction(ordering, outcome, move=first + i, contract=c)
+            for i in range(count) for c in contracts]
 
 
 class FeasibilityRuleTest(unittest.TestCase):
@@ -448,20 +462,20 @@ class FeasibilityRuleTest(unittest.TestCase):
     def test_too_few_ordered_reactions_is_insufficient_not_stop(self):
         """Sparse events are not evidence about the exchange, and a rule
         with no floor turns any of them into a confident negative."""
-        verdict = judge_feasibility([_make_reaction(Ordering.BOOK_LED)] * 3)
+        verdict = judge_feasibility(_moves(Ordering.BOOK_LED, 3))
         self.assertIs(verdict.verdict, Feasibility.INSUFFICIENT)
         self.assertIn("NOT a negative result", verdict.detail)
 
     def test_a_clear_majority_of_book_led_continues(self):
-        reactions = ([_make_reaction(Ordering.BOOK_LED)] * 15
-                     + [_make_reaction(Ordering.KALSHI_LED)] * 10)
+        reactions = (_moves(Ordering.BOOK_LED, 15)
+                     + _moves(Ordering.KALSHI_LED, 10, first=15))
         verdict = judge_feasibility(reactions)
         self.assertIs(verdict.verdict, Feasibility.CONTINUE)
         self.assertAlmostEqual(verdict.book_led_fraction, 0.6)
 
     def test_a_clear_minority_of_book_led_stops(self):
-        reactions = ([_make_reaction(Ordering.BOOK_LED)] * 5
-                     + [_make_reaction(Ordering.KALSHI_LED)] * 20)
+        reactions = (_moves(Ordering.BOOK_LED, 5)
+                     + _moves(Ordering.KALSHI_LED, 20, first=5))
         verdict = judge_feasibility(reactions)
         self.assertIs(verdict.verdict, Feasibility.STOP)
         self.assertIn("NOT that the lag is short", verdict.detail)
@@ -471,17 +485,103 @@ class FeasibilityRuleTest(unittest.TestCase):
         data vote."""
         from reaction.measure import ReactionOutcome
         reactions = (
-            [_make_reaction(Ordering.BOOK_LED)] * 10
-            + [_make_reaction(Ordering.KALSHI_LED)] * 10
-            + [_make_reaction(Ordering.INDETERMINATE)] * 40
-            + [_make_reaction(Ordering.UNKNOWN,
-                              ReactionOutcome.NO_RESPONSE)] * 40)
+            _moves(Ordering.BOOK_LED, 10)
+            + _moves(Ordering.KALSHI_LED, 10, first=10)
+            + _moves(Ordering.INDETERMINATE, 40, first=20)
+            + _moves(Ordering.UNKNOWN, 40, first=60,
+                     outcome=ReactionOutcome.NO_RESPONSE))
         verdict = judge_feasibility(reactions)
         self.assertEqual(verdict.determinate, 20)
         self.assertAlmostEqual(verdict.book_led_fraction, 0.5)
         self.assertEqual(verdict.indeterminate, 40)
         self.assertEqual(verdict.unknown_ordering, 40)
-        self.assertEqual(verdict.outcomes["no_response_in_window"], 40)
+        self.assertEqual(verdict.book_moves, 100)
+        self.assertEqual(
+            verdict.contract_rows_by_outcome["no_response_in_window"], 40)
+
+    # --- the unit: one book move, however many contracts measured it ---
+
+    def test_one_move_on_two_contracts_counts_once(self):
+        """The defect this section exists for. A reaction is one (move,
+        contract) pair; every NFL game has two mirror-image contracts; the
+        first version counted each move twice."""
+        verdict = judge_feasibility(
+            _moves(Ordering.BOOK_LED, 1, contracts=("KX-NYG", "KX-DAL")))
+        self.assertEqual(verdict.book_moves, 1)
+        self.assertEqual(verdict.determinate, 1)
+        self.assertEqual(verdict.book_led, 1)
+        self.assertEqual(sum(verdict.contract_rows_by_outcome.values()), 2,
+                         "the ROWS are still two -- in their own unit")
+
+    def test_the_floor_is_met_by_moves_not_by_contract_rows(self):
+        """Ten moves on two contracts are twenty rows and still ten moves.
+        Under the old unit this crossed the floor of 20."""
+        verdict = judge_feasibility(
+            _moves(Ordering.BOOK_LED, 10, contracts=("KX-NYG", "KX-DAL")))
+        self.assertEqual(verdict.determinate, 10)
+        self.assertIs(verdict.verdict, Feasibility.INSUFFICIENT)
+
+    def test_contracts_that_disagree_about_one_move_do_not_vote(self):
+        """Contradictory evidence about ONE move may not count either way."""
+        reactions = [_make_reaction(Ordering.BOOK_LED, contract="KX-NYG"),
+                     _make_reaction(Ordering.KALSHI_LED, contract="KX-DAL")]
+        verdict = judge_feasibility(reactions)
+        self.assertEqual(verdict.conflicting, 1)
+        self.assertEqual(verdict.determinate, 0)
+
+    def test_one_contract_ordering_and_its_mirror_not_is_still_ordered(self):
+        """A mirror that could not resolve does not contradict one that did."""
+        reactions = [_make_reaction(Ordering.BOOK_LED, contract="KX-NYG"),
+                     _make_reaction(Ordering.INDETERMINATE, contract="KX-DAL")]
+        verdict = judge_feasibility(reactions)
+        self.assertEqual(verdict.book_led, 1)
+        self.assertEqual(verdict.conflicting, 0)
+
+    # --- each exchange response counts once ---
+
+    def test_one_exchange_response_claimed_by_two_moves_counts_once(self):
+        """Overlapping windows let one Kalshi step answer two book moves.
+        The earlier move keeps it; the later adds no exchange evidence."""
+        from reaction.measure import Bracket
+        shared = Bracket(START - timedelta(hours=8),
+                         START - timedelta(hours=8) + timedelta(minutes=1))
+        reactions = [_make_reaction(Ordering.BOOK_LED, move=0, response=shared),
+                     _make_reaction(Ordering.BOOK_LED, move=1, response=shared)]
+        verdict = judge_feasibility(reactions)
+        self.assertEqual(verdict.book_moves, 2)
+        self.assertEqual(verdict.book_led, 1)
+        self.assertEqual(verdict.shared_response, 1)
+        self.assertEqual(verdict.determinate, 1)
+
+    def test_the_earlier_move_keeps_it_whatever_order_rows_arrive_in(self):
+        from reaction.measure import Bracket
+        shared = Bracket(START - timedelta(hours=8),
+                         START - timedelta(hours=8) + timedelta(minutes=1))
+        early = _make_reaction(Ordering.BOOK_LED, move=0, response=shared)
+        late = _make_reaction(Ordering.KALSHI_LED, move=1, response=shared)
+        for rows in ([early, late], [late, early]):
+            with self.subTest(order=[r.detected_at for r in rows]):
+                verdict = judge_feasibility(rows)
+                self.assertEqual(verdict.book_led, 1)
+                self.assertEqual(verdict.kalshi_led, 0)
+                self.assertEqual(verdict.shared_response, 1)
+
+    def test_distinct_responses_on_the_same_contract_both_count(self):
+        """The dedup must key on the RESPONSE, not merely the contract."""
+        verdict = judge_feasibility(_moves(Ordering.BOOK_LED, 2))
+        self.assertEqual(verdict.book_led, 2)
+        self.assertEqual(verdict.shared_response, 0)
+
+    def test_games_behind_the_fraction_are_reported(self):
+        """Moves within one game are not independent; a share driven by one
+        volatile game has to be visible as one game."""
+        one_game = judge_feasibility(_moves(Ordering.BOOK_LED, 5))
+        self.assertEqual(one_game.games, 1)
+        spread = judge_feasibility(
+            [_make_reaction(Ordering.BOOK_LED, move=i, event=f"evt-{i}")
+             for i in range(5)])
+        self.assertEqual(spread.games, 5)
+        self.assertIn("across 5 game(s)", spread.render())
 
     def test_an_empty_denominator_reports_no_fraction_rather_than_zero(self):
         """0.0 would read as a measured absence (rule 24)."""

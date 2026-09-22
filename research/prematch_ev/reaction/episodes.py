@@ -51,6 +51,7 @@ actually collected -- which, as of this commit, none is.
 from __future__ import annotations
 
 import sys
+import textwrap
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from enum import Enum
@@ -186,16 +187,38 @@ class FeasibilityRule:
 
 @dataclass(frozen=True)
 class FeasibilityVerdict:
-    """The rule's answer, with every count that did NOT enter it."""
+    """The rule's answer, COUNTED IN BOOK MOVES, with every exclusion named.
+
+    THE UNIT IS THE BOOK MOVE, NOT THE CONTRACT ROW. A first version counted
+    reactions, and a reaction is one (book move, contract) pair -- so one
+    move on a two-contract game, which every NFL game is, counted as TWO
+    ordered observations of what is one book move and its mirror image on
+    the other contract. The floor of 20 was met by 10 moves and the fraction
+    was computed over correlated duplicates. That is the exact unit error
+    this module's stage ledger exists to prevent ("one move, two contract
+    rows, one bet"), reintroduced by the rule added one round later.
+
+    AND EACH EXCHANGE RESPONSE COUNTS ONCE. When `max_wait` exceeds the gap
+    between two book moves on a stream, their response windows overlap, and
+    a single Kalshi step lands in both -- claimed as a book-led reaction by
+    each. The EARLIER move keeps it; the later one is `shared_response` and
+    leaves the denominator, because it adds no exchange evidence the first
+    did not. With `max_wait` at one cadence interval the windows tile, so on
+    the recommended run this never fires -- but it is counted, not assumed.
+    """
 
     verdict: Feasibility
     rule: FeasibilityRule
     determinate: int = 0
     book_led: int = 0
     kalshi_led: int = 0
+    conflicting: int = 0
+    shared_response: int = 0
     indeterminate: int = 0
     unknown_ordering: int = 0
-    outcomes: dict[str, int] = field(default_factory=dict)
+    book_moves: int = 0
+    games: int = 0
+    contract_rows_by_outcome: dict[str, int] = field(default_factory=dict)
     detail: str = ""
 
     @property
@@ -210,18 +233,26 @@ class FeasibilityVerdict:
         return {
             "verdict": self.verdict.value,
             "rule": self.rule.as_dict(),
-            "determinate_reactions": self.determinate,
+            "unit": "book moves (one per trigger, however many contracts)",
+            "book_moves": self.book_moves,
+            "determinate_book_moves": self.determinate,
             "book_led": self.book_led,
             "kalshi_led": self.kalshi_led,
             "book_led_fraction": self.book_led_fraction,
+            "games_among_determinate": self.games,
             "excluded_from_the_fraction": {
+                "conflicting_contracts": self.conflicting,
+                "shared_exchange_response": self.shared_response,
                 "indeterminate_ordering": self.indeterminate,
                 "unknown_ordering": self.unknown_ordering,
-                "by_outcome": dict(sorted(self.outcomes.items())),
             },
+            "contract_rows_by_outcome": dict(
+                sorted(self.contract_rows_by_outcome.items())),
             "detail": self.detail,
-            "note": ("censored, blind and indeterminate reactions are "
-                     "reported beside the fraction and never inside it"),
+            "note": ("censored, blind, indeterminate, conflicting and shared "
+                     "responses are reported beside the fraction and never "
+                     "inside it; the outcome breakdown is in CONTRACT ROWS, "
+                     "a different unit from everything above it"),
         }
 
     def render(self) -> str:
@@ -230,89 +261,130 @@ class FeasibilityVerdict:
         fraction = self.book_led_fraction
         shown = "n/a" if fraction is None else f"{fraction:.0%}"
         lines.append(f"    book-led share              {shown}"
-                     f"   ({self.book_led:,} of {self.determinate:,} that "
-                     f"ordered)")
+                     f"   ({self.book_led:,} of {self.determinate:,} book "
+                     f"moves that ordered, across {self.games:,} game(s))")
         lines.append(f"    needs                       "
                      f"{self.rule.min_book_led_fraction:.0%} of at least "
-                     f"{self.rule.min_determinate:,}")
+                     f"{self.rule.min_determinate:,} book moves")
         lines.append("")
-        lines.append("    NOT in that denominator (reported, never folded in):")
-        lines.append(f"        indeterminate ordering  "
-                     f"{self.indeterminate:>7,}")
-        lines.append(f"        unknown ordering        "
-                     f"{self.unknown_ordering:>7,}")
-        for name, count in sorted(self.outcomes.items()):
-            lines.append(f"        {name:<23} {count:>7,}")
+        lines.append(f"    NOT in that denominator ({self.book_moves:,} book "
+                     f"moves in all; reported, never folded in):")
+        for label, count in (
+                ("contracts disagree", self.conflicting),
+                ("response already claimed", self.shared_response),
+                ("indeterminate ordering", self.indeterminate),
+                ("unknown ordering", self.unknown_ordering)):
+            lines.append(f"        {label:<27} {count:>7,}")
+        if self.contract_rows_by_outcome:
+            lines.append("    contract rows by outcome (a different unit):")
+            for name, count in sorted(self.contract_rows_by_outcome.items()):
+                lines.append(f"        {name:<27} {count:>7,}")
         if self.detail:
             lines.append("")
-            for chunk in _wrap_detail(self.detail):
+            for chunk in textwrap.wrap(self.detail, 66):
                 lines.append(f"    {chunk}")
         return "\n".join(lines)
 
 
-def _wrap_detail(text: str, width: int = 66) -> list[str]:
-    words, out, line = text.split(), [], ""
-    for word in words:
-        if len(line) + len(word) + 1 > width and line:
-            out.append(line)
-            line = word
-        else:
-            line = f"{line} {word}".strip()
-    if line:
-        out.append(line)
-    return out
+_DETERMINATE = (Ordering.BOOK_LED, Ordering.KALSHI_LED)
+
+
+def _response_key(reaction: Reaction) -> tuple:
+    """One exchange response on one contract: the thing counted once."""
+    bracket = reaction.exchange_change
+    return (reaction.market_ticker, bracket.earliest, bracket.latest)
+
+
+def _move_order(key: tuple) -> tuple:
+    """Detection order. An undated move sorts last, never first: it must not
+    be the one that gets to claim a shared response."""
+    stream, detected_at = key
+    return (detected_at is None,
+            detected_at.timestamp() if detected_at else 0.0, stream)
 
 
 def judge_feasibility(reactions: Sequence[Reaction],
                       rule: FeasibilityRule | None = None,
                       policy: ReactionPolicy | None = None
                       ) -> FeasibilityVerdict:
-    """Evaluate the declared stop rule. Refuses an unreachable one."""
+    """Evaluate the declared stop rule, one BOOK MOVE at a time.
+
+    Reactions are grouped by the trigger that produced them, processed in
+    detection order, and each exchange response is credited to the first
+    book move that claimed it. Refuses an unreachable rule outright.
+    """
     rule = rule or FeasibilityRule()
     policy = policy or ReactionPolicy()
-    outcomes: dict[str, int] = {}
+    rows: dict[str, int] = {}
     for reaction in reactions:
-        name = reaction.outcome.value
-        outcomes[name] = outcomes.get(name, 0) + 1
+        rows[reaction.outcome.value] = rows.get(reaction.outcome.value, 0) + 1
 
     why = rule.unreachable_against(policy)
     if why is not None:
         return FeasibilityVerdict(Feasibility.UNREACHABLE, rule,
-                                  outcomes=outcomes, detail=why)
+                                  contract_rows_by_outcome=rows, detail=why)
 
-    book_led = sum(1 for r in reactions if r.ordering is Ordering.BOOK_LED)
-    kalshi_led = sum(1 for r in reactions if r.ordering is Ordering.KALSHI_LED)
-    indeterminate = sum(1 for r in reactions
-                        if r.ordering is Ordering.INDETERMINATE)
-    unknown = sum(1 for r in reactions if r.ordering is Ordering.UNKNOWN)
-    determinate = book_led + kalshi_led
-    common = dict(determinate=determinate, book_led=book_led,
-                  kalshi_led=kalshi_led, indeterminate=indeterminate,
-                  unknown_ordering=unknown, outcomes=outcomes)
+    by_move: dict[tuple, list[Reaction]] = {}
+    for reaction in reactions:
+        by_move.setdefault((reaction.stream_id, reaction.detected_at),
+                           []).append(reaction)
+
+    tally = dict(book_led=0, kalshi_led=0, conflicting=0, shared_response=0,
+                 indeterminate=0, unknown_ordering=0)
+    games: set[str] = set()
+    claimed: set[tuple] = set()
+    for key in sorted(by_move, key=_move_order):
+        move = by_move[key]
+        ordered = [r for r in move if r.ordering in _DETERMINATE]
+        fresh = [r for r in ordered if _response_key(r) not in claimed]
+        claimed.update(_response_key(r) for r in ordered)
+        if ordered and not fresh:
+            tally["shared_response"] += 1
+            continue
+        kinds = {r.ordering for r in fresh}
+        if len(kinds) > 1:
+            # One contract says the book led and its mirror says the exchange
+            # did. That is contradictory evidence about ONE move, and it is
+            # not allowed to vote either way.
+            tally["conflicting"] += 1
+        elif kinds == {Ordering.BOOK_LED}:
+            tally["book_led"] += 1
+            games.add(fresh[0].event_id)
+        elif kinds == {Ordering.KALSHI_LED}:
+            tally["kalshi_led"] += 1
+            games.add(fresh[0].event_id)
+        elif any(r.ordering is Ordering.INDETERMINATE for r in move):
+            tally["indeterminate"] += 1
+        else:
+            tally["unknown_ordering"] += 1
+
+    determinate = tally["book_led"] + tally["kalshi_led"]
+    common = dict(determinate=determinate, book_moves=len(by_move),
+                  games=len(games), contract_rows_by_outcome=rows, **tally)
 
     if determinate < rule.min_determinate:
         return FeasibilityVerdict(
             Feasibility.INSUFFICIENT, rule, **common,
-            detail=(f"only {determinate:,} reaction(s) ordered, against a "
+            detail=(f"only {determinate:,} book move(s) ordered, against a "
                     f"floor of {rule.min_determinate:,}. This is NOT a "
                     f"negative result: sparse moves, right-censored "
                     f"responses and blind intervals all shrink this "
                     f"denominator, and none of them is evidence about the "
                     f"exchange"))
 
-    fraction = book_led / determinate
+    fraction = tally["book_led"] / determinate
     if fraction < rule.min_book_led_fraction:
         return FeasibilityVerdict(
             Feasibility.STOP, rule, **common,
-            detail=(f"{fraction:.0%} of ordered reactions are book-led, "
+            detail=(f"{fraction:.0%} of ordered book moves are book-led, "
                     f"under the declared {rule.min_book_led_fraction:.0%}. "
                     f"That says these sources rarely establish the book "
                     f"leading -- NOT that the lag is short, and NOT that "
                     f"there is no edge"))
     return FeasibilityVerdict(
         Feasibility.CONTINUE, rule, **common,
-        detail=(f"{fraction:.0%} of ordered reactions are book-led, over the "
-                f"declared {rule.min_book_led_fraction:.0%}. Ordering is "
+        detail=(f"{fraction:.0%} of ordered book moves are book-led, over "
+                f"the declared {rule.min_book_led_fraction:.0%}. Ordering is "
                 f"resolvable from these sources often enough to design a "
                 f"larger study"))
 

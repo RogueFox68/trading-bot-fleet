@@ -921,7 +921,8 @@ class FeasibilityReachableEndToEndTest(unittest.TestCase):
                          {"no_response_in_window": 1})
         verdict = self._verdict(ledger)
         self.assertEqual(verdict.determinate, 0)
-        self.assertEqual(verdict.outcomes["no_response_in_window"], 1)
+        self.assertEqual(
+            verdict.contract_rows_by_outcome["no_response_in_window"], 1)
         self.assertEqual(verdict.verdict.value,
                          "insufficient_observable_events")
 
@@ -966,4 +967,128 @@ class MaxWaitCliTest(_CliDriver, unittest.TestCase):
         self.assertIn("FEASIBILITY RULE", text)
         self.assertIn("declared before any data", text)
         self.assertIn("never folded in", text)
+        self.assertIn("insufficient_observable_events", text)
+
+
+def mirrored_bundle(response_minutes: float = 5, move_at: int = 195) -> dict:
+    """One book move, BOTH contracts, each showing the mirrored response."""
+    responds_at = move_at - response_minutes
+    home, away = [], []
+    for minute in range(210, 99, -1):
+        moved = minute <= responds_at
+        home.append((at(minute), 0.70, 0.72) if moved
+                    else (at(minute), 0.56, 0.58))
+        away.append((at(minute), 0.28, 0.30) if moved
+                    else (at(minute), 0.42, 0.44))
+    return bundle(
+        odds_snapshots=[odds_payload(at(200), 120, -140, at(201)),
+                        odds_payload(at(move_at), 260, -320,
+                                     at(move_at + 1))],
+        contracts=[{"market_ticker": f"{TICKER}-NYG", "yes_is_home": True,
+                    "settled_yes": 1, "candlesticks": [candle_payload(home)]},
+                   {"market_ticker": f"{TICKER}-DAL", "yes_is_home": False,
+                    "settled_yes": 0,
+                    "candlesticks": [candle_payload(away)]}])
+
+
+class FeasibilityUnitEndToEndTest(unittest.TestCase):
+    """The verdict's unit, through a whole replay rather than a hand-built
+    list -- because the unit error lived in how replay's rows were counted."""
+
+    def test_one_move_measured_on_both_contracts_orders_once(self):
+        games, _ = load_bundle(write(mirrored_bundle()))
+        ledger = replay(games)
+        stages = {s.stage: s for s in ledger.stages}
+        self.assertEqual(stages["moves detected"].total, 1)
+        self.assertEqual(stages["reactions measured"].total, 2)
+        self.assertEqual(ledger.feasibility.book_moves, 1)
+        self.assertEqual(ledger.feasibility.determinate, 1)
+
+    def test_one_kalshi_step_after_two_book_moves_counts_once(self):
+        """Default max_wait (30 min) over moves 5 min apart: the windows
+        overlap and both moves claim the same exchange step."""
+        rows = [(at(m), 0.70, 0.72) if m <= 180 else (at(m), 0.56, 0.58)
+                for m in range(210, 99, -1)]
+        games, _ = load_bundle(write(bundle(
+            odds_snapshots=[odds_payload(at(200), 120, -140, at(201)),
+                            odds_payload(at(195), 160, -190, at(196)),
+                            odds_payload(at(190), 260, -320, at(191))],
+            contracts=[{"market_ticker": f"{TICKER}-NYG",
+                        "yes_is_home": True, "settled_yes": 1,
+                        "candlesticks": [candle_payload(rows)]}])))
+        ledger = replay(games)
+        stages = {s.stage: s for s in ledger.stages}
+        self.assertEqual(stages["moves detected"].total, 2)
+        self.assertEqual(stages["reactions measured"].breakdown,
+                         {"responded": 2})
+        self.assertEqual(ledger.feasibility.book_led, 1)
+        self.assertEqual(ledger.feasibility.shared_response, 1)
+
+
+class AbsenceLabelTest(unittest.TestCase):
+    """A reason is a claim, and it must not name a cause it cannot see."""
+
+    def test_a_missing_book_is_not_reported_as_a_missing_event(self):
+        snap = odds_payload(at(195), 160, -190, at(196))
+        snap["data"][0]["bookmakers"][0]["key"] = "draftkings"
+        games, _ = load_bundle(write(bundle(odds_snapshots=[
+            odds_payload(at(200), 120, -140, at(201)), snap])))
+        absences = [o.absence for o in games[0].snapshots if o.absence]
+        self.assertEqual(len(absences), 1)
+        self.assertNotIn("target event is absent", absences[0])
+        self.assertIn("sharp book", absences[0])
+
+    def test_it_is_still_a_hole(self):
+        """The label changed; the behaviour must not have."""
+        snap = odds_payload(at(195), 160, -190, at(196))
+        snap["data"][0]["bookmakers"][0]["key"] = "draftkings"
+        games, _ = load_bundle(write(bundle(odds_snapshots=[
+            odds_payload(at(200), 120, -140, at(201)), snap,
+            odds_payload(at(190), 260, -320, at(191))])))
+        stages = {s.stage: s for s in replay(games).stages}
+        self.assertEqual(stages["moves detected"].total, 0)
+        self.assertEqual(
+            stages["detector outcomes"].breakdown.get("declared_gap"), 1)
+
+
+class FeasibilityCliTest(_CliDriver, unittest.TestCase):
+    """What the exit code says about a verdict, and about a bad flag."""
+
+    def _exit(self, argv):
+        """argparse reports usage errors by raising SystemExit."""
+        from unittest import mock
+        import run_reaction
+        with mock.patch("sys.stderr"):
+            try:
+                return run_reaction.main(argv)
+            except SystemExit as stop:
+                return stop.code
+
+    def test_a_bad_max_wait_is_a_usage_error_not_a_data_defect(self):
+        """Exit 1 means a defect in the DATA. A typo is not one, and a
+        traceback reporting it as one sends someone hunting a bad bundle."""
+        path = str(write(bundle()))
+        for bad in ("-5", "0", "nan", "inf", "soon"):
+            with self.subTest(value=bad):
+                self.assertEqual(
+                    self._exit(["--replay", path, "--max-wait", bad]), 2)
+
+    def test_an_unreachable_rule_exits_one(self):
+        """`stop` and `insufficient` are results (exit 0); a rule nothing
+        could satisfy is a defect -- the decision was never being made."""
+        from unittest import mock
+        import reaction.episodes as episodes
+        real = episodes.judge_feasibility
+        with mock.patch.object(
+                episodes, "judge_feasibility",
+                side_effect=lambda rows, rule, policy: real(
+                    rows, episodes.FeasibilityRule(min_lag_seconds=1800.0),
+                    policy)):
+            code, text = self._run(["--replay", str(write(bundle()))])
+        self.assertEqual(code, 1)
+        self.assertIn("cannot be satisfied", text)
+
+    def test_an_insufficient_verdict_still_exits_zero(self):
+        code, text = self._run(["--replay", str(write(bundle()))])
+        self.assertEqual(code, 0)
         self.assertIn("insufficient_observable_events", text)

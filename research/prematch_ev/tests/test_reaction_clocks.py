@@ -1358,7 +1358,27 @@ class ReactionCliTest(unittest.TestCase):
         self.assertIn("never serve as a holdout", text)
         self.assertNotIn("apiKey=", text)
 
-    def test_policy_json_carries_both_policies_and_the_not_tuned_flag(self):
+    def test_policy_publishes_the_decision_rule_it_judges_by(self):
+        """`--policy` exists so a declared number can be committed before any
+        data. The stop rule was declared only in prose, the one place
+        nothing checks, while `--policy` printed every threshold but it."""
+        import json as _json
+        from unittest import mock
+        import run_reaction
+        from reaction.episodes import FeasibilityRule
+        chunks: list[str] = []
+        with mock.patch("builtins.print", side_effect=lambda *a, **k:
+                        chunks.append(" ".join(str(x) for x in a))):
+            code = run_reaction.main(["--policy", "--json"])
+        self.assertEqual(code, 0)
+        rule = _json.loads("\n".join(chunks))["feasibility_rule"]
+        self.assertEqual(rule, FeasibilityRule().as_dict())
+        self.assertFalse(rule["tuned_on_outcomes"])
+        _, text = self._run(["--policy"])
+        self.assertIn("feasibility_rule", text)
+        self.assertIn("min_determinate_reactions", text)
+
+    def test_policy_json_carries_every_declaration_and_the_not_tuned_flag(self):
         import json as _json
         from unittest import mock
         import run_reaction
@@ -1369,7 +1389,8 @@ class ReactionCliTest(unittest.TestCase):
         self.assertEqual(code, 0)
         payload = _json.loads("\n".join(chunks))
         self.assertEqual(set(payload),
-                         {"move_detection", "reaction_measurement"})
+                         {"move_detection", "reaction_measurement",
+                          "feasibility_rule"})
         for section in payload.values():
             self.assertFalse(section["tuned_on_outcomes"])
         self.assertEqual(payload["move_detection"]["devig_method"], "shin")

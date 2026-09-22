@@ -65,7 +65,8 @@ EXIT CODES SAY WHAT KIND OF THING WENT WRONG
      and an exit code that called that broken would burn the signal a real
      defect needs (rule 27).
   1  a defect someone can fix: an unreadable bundle, a mislabelled holdout,
-     a ledger whose stage breakdowns do not sum to their totals, or
+     a ledger whose stage breakdowns do not sum to their totals, a decision
+     rule the declared policy can never satisfy, or
      INCOMPLETE COVERAGE -- a payload that would not parse, a game with no
      usable sharp quote, a contract with no usable candle. The last three
      are the dangerous ones: they parse cleanly and produce zero moves,
@@ -92,7 +93,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from reaction import capability                                  # noqa: E402
 from reaction.detector import MovePolicy                        # noqa: E402
-from reaction.episodes import DataRole, HoldoutViolation        # noqa: E402
+from reaction.episodes import (                                 # noqa: E402
+    DataRole, Feasibility, FeasibilityRule, HoldoutViolation,
+)
 from reaction.measure import ReactionPolicy                     # noqa: E402
 from reaction.replay import (                                   # noqa: E402
     BundleError, render_report, replay_file,
@@ -141,7 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="what this window is. Declaring a run over the "
                              "2026-09-01..16 development window a holdout is "
                              "REFUSED, not warned about")
-    parser.add_argument("--max-wait", type=float, default=None,
+    parser.add_argument("--max-wait", type=_positive_seconds, default=None,
                         metavar="SECONDS",
                         help="how long after a detected move to keep looking "
                              "for the exchange's response. THIS IS THE "
@@ -157,6 +160,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true",
                         help="machine-readable output")
     return parser
+
+
+def _positive_seconds(text: str) -> float:
+    """A censoring horizon: positive and finite, or a USAGE error.
+
+    Left to `ReactionPolicy`, a bad value surfaced as a traceback and exit 1
+    -- the code this CLI reserves for a defect in the DATA. A typo on the
+    command line is not that, and reporting it as one would send someone to
+    look for a bad bundle that does not exist.
+    """
+    import math
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number")
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} must be a positive, finite number of seconds")
+    return value
 
 
 def parse_args(argv=None):
@@ -214,6 +236,14 @@ def main(argv=None) -> int:
             print("a stage breakdown does not sum to its total",
                   file=sys.stderr)
             return 1
+        # A rule no run could satisfy is a DEFECT someone can fix. `stop` and
+        # `insufficient` are results and exit 0 (rule 27); this is neither --
+        # it means the decision was never being made at all.
+        if (ledger.feasibility is not None and ledger.feasibility.verdict
+                is Feasibility.UNREACHABLE):
+            print(f"the declared decision rule cannot be satisfied by this "
+                  f"policy: {ledger.feasibility.detail}", file=sys.stderr)
+            return 1
         # INCOMPLETE COVERAGE is a loss, and a loss is a defect someone can
         # fix. Two different things land here and the message has to say
         # which: a payload the parser could not read, and a payload that
@@ -229,8 +259,13 @@ def main(argv=None) -> int:
         return 0
 
     if args.policy:
+        # The decision rule is printed with the thresholds it judges.
+        # `--policy` exists so "declared, not fitted" can be committed before
+        # any data is collected; a stop rule it did not print was declared
+        # only in prose, which is the one place nothing checks.
         declared = {"move_detection": MovePolicy().as_dict(),
-                    "reaction_measurement": ReactionPolicy().as_dict()}
+                    "reaction_measurement": ReactionPolicy().as_dict(),
+                    "feasibility_rule": FeasibilityRule().as_dict()}
         if args.json:
             print(json.dumps(declared, indent=2))
             return 0

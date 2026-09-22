@@ -75,13 +75,25 @@ has no finer grid to buy.
 
 ## 2. The decision rule, declared now — and checked for reachability
 
-**The rule:** of the reactions whose brackets actually **order**, at least
-**one third (33%)** must be `book_led`, over a floor of at least **20**
-ordered reactions.
+**The rule:** of the **book moves** whose brackets actually **order**, at
+least **one third (33%)** must be `book_led`, over a floor of at least **20**
+ordered book moves.
 
 It asks about **ordering, not duration**. `reaction/episodes.py` evaluates it
-(`FeasibilityRule`, `judge_feasibility`) and the replay prints the verdict, so
-it is applied rather than asserted.
+(`FeasibilityRule`, `judge_feasibility`), the replay prints the verdict, and
+`--policy` prints the rule beside the thresholds it judges — so it can be
+committed before any data exists, like every other declared number.
+
+**The unit is the book move, and each exchange response counts once.** A
+reaction is one (book move, contract) pair, and every NFL game has two
+mirror-image contracts. The first version of this rule counted reactions, so
+one move counted twice and the floor of 20 was met by ten. It now groups by
+the move: contracts that disagree about one move are `conflicting` and do not
+vote, and a Kalshi step already claimed by an earlier move is
+`shared_response` rather than a second observation. The games the ordered
+moves come from are reported beside the fraction, because moves within one
+game are not independent and a share driven by one volatile game should be
+visible as one.
 
 **Three outcomes, and two of them are not "no":**
 
@@ -89,10 +101,11 @@ it is applied rather than asserted.
 |---|---|
 | `continue` | ordering is resolvable often enough to design a larger study |
 | `stop` | these sources rarely establish the book leading |
-| `insufficient_observable_events` | fewer than 20 reactions ordered at all |
+| `insufficient_observable_events` | fewer than 20 book moves ordered at all |
 
-Censored responses, blind intervals and indeterminate orderings are counted
-**beside** the fraction and never inside it. One Sunday may well return
+Censored responses, blind intervals, indeterminate orderings, conflicting
+contracts and shared responses are counted **beside** the fraction and never
+inside it. One Sunday may well return
 `insufficient` — that is a real possible outcome of this spend and it is not
 a negative result.
 
@@ -113,11 +126,20 @@ and an impossible rule is **refused** with `rule_unreachable_against_policy`
 rather than quietly returning zero. The pilot's own rule carries
 `min_lag_seconds = None`, because duration is not what it asks.
 
-**Why `max_wait` stays at one cadence interval.** Past one book sampling
-interval another book move may have occurred, so an exchange response can no
-longer be attributed to a particular trigger. The censoring horizon is
-therefore *derived* from the cadence rather than chosen freely, and
-`--max-wait` exposes it so a declared value is reachable and checkable.
+**Why `max_wait` should be one cadence interval.** With `max_wait` equal to
+the book sampling interval, consecutive moves' response windows tile end to
+end, so no Kalshi step can fall in two of them. Set it wider and they
+overlap. The code does **not** derive `max_wait` from the cadence — a replay
+does not know what cadence the bundle was collected at — so the run must pass
+it (`--max-wait 1800` for option A), and the verdict enforces the consequence
+instead: a response claimed by two moves counts once, for the earlier, and
+the later is reported as `shared_response`.
+
+Overlap would also blur the **lag**, which is why the setting still matters
+even though the ordering count is protected: when a second book move follows
+inside the window, a Kalshi step after both is book-led either way, but the
+lag measured from the first move overstates the lag if the exchange was
+answering the second.
 
 ---
 
