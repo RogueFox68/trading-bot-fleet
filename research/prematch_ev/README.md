@@ -737,6 +737,106 @@ in the return figure; include them separately before calling anything viable.
   after the fact (`historical_schedule_as_of = unverified`), so no NFL result
   may be quoted as a point-in-time backtest, however green its coverage is.
 
+## The reaction-lag study (`run_reaction.py`) — separate, in progress
+
+A second, **separate** study asking a different question from the checkpoint
+one above:
+
+> Detect a meaningful change in a sharp book's de-vigged probability, and test
+> whether an executable Kalshi price stays behind long enough to act after
+> realistic detection and order delays.
+
+It has its own entry point and output schema **so the checkpoint result stays
+reproducible**. Nothing here edits `run_study.py`.
+
+### The capability audit comes first, and it is a control
+
+`python3 run_reaction.py --capability` — free, no network, no credential. It
+grades each of the study's questions against the sources actually available,
+because two of them turn out to be unanswerable at **any** sample size, and
+building the measurement before discovering that would have produced numbers
+nobody should read.
+
+| question | verdict |
+|---|---|
+| did the book's fair probability move, and by how much | **answerable** |
+| when did the BOOK move | **answerable** (`last_update`, seconds) |
+| when could OUR SYSTEM have known | ±300s — the archive is a 5-minute grid |
+| when did the Kalshi quote change | ±60s — candles are 1-minute aggregates |
+| did the book move *before* Kalshi | ±300s — closer orderings are unidentifiable |
+| how long a discrepancy persisted | ±60s, both ends censored |
+| was the quote **fillable in size** | **NO** — no depth on either path |
+| suspended, or merely absent | **NO** — neither source distinguishes them |
+| the provider's delivery lag | **NO** — historical replay has no receipt time |
+
+**Reaction resolution floor: 300s.** Every lag, ordering and persistence figure
+inherits it. A five-minute sample is not second-resolution evidence.
+
+The unanswerable rows are **not pending work** — and the audit exits **0**
+anyway. They are permanent properties of these two sources that the design
+accounts for, so putting them in the exit code would burn it on a red line that
+never clears (rule 27, the stooq lesson). Non-zero is reserved for the
+transcribed cadence disagreeing with measured data, which is a real defect
+someone can fix.
+
+### The executable clock, which is the whole correctness story
+
+```
+last_update  -> when the BOOK moved            (we could not have known it then)
+snapshot     -> when WE could first have known (the clock a decision runs on)
+```
+
+A book move stamped 11:20 that first appears in the 11:25 snapshot is detected
+at **11:25**. Measuring from `last_update` is enormously tempting — it is
+stamped to the second and it *is* when the book moved — and it would credit the
+strategy with information it did not have. That is lookahead wearing a
+timestamp, and this study has already shipped lookahead twice (a snapshot
+captured after the decision; an execution quote written into the decision
+book), both caught in review rather than by the code. So it is an **exception**
+now: `assert_no_future_data` raises, and it checks the executable clock, not the
+source's own stamp.
+
+`local_receipt_time` is `None` for every historical record and may not be
+invented. Only a prospective recorder can supply one.
+
+### The detector triggers on content, never on arrival
+
+The archive re-serves an unchanged price every five minutes and a live feed
+re-sends on reconnect; both arrive looking fresh. Detection keys on the
+**content** (market + source update stamp + payload hash), so *a provider
+reconnect cannot masquerade as a move* — and a fresh envelope carrying a
+three-hour-old book price is `stale_content`, not a signal.
+
+Every non-trigger is named and counted, so a run reports why it saw fewer moves
+than updates instead of a bare total: `first_observation` (a baseline has
+nothing to have moved from), `unchanged_content`, `missing_side`,
+`undeviggable`, `stale_content`, `unknown_content_age`, `gap_in_input`
+(a hole is not continuity — the baseline resets rather than calling the
+difference across it one move), `out_of_order`, `below_threshold`,
+`vig_only_change` (the margin moved while the fair view held — a real
+observation, not noise), `no_availability_time`.
+
+De-vigging happens **within one contemporaneous quote**. Mixing an away price
+from one update with a home price from another manufactures a move out of two
+honest quotes.
+
+`MovePolicy` is declared, recorded on every trigger, and marked
+`tuned_on_outcomes: false`. **The 16 NFL games are development data**; fitting
+the threshold on them would make every downstream figure a selection artifact.
+
+### Status
+
+Built and tested: the capability audit, the clock/provenance contracts, and the
+causal move detector. **Not built and not faked:** reaction measurement, the
+executable-opportunity screen, the episode ledger and the paper replay. The
+owner's named test cases that need those layers (book-leads/Kalshi-follows with
+a surviving gap, indeterminate ordering, Kalshi-first, no response, a gap the
+delay misses) are deliberately absent rather than stubbed — a test that
+pretended to cover them would be worse than their absence.
+
+No orders. No live capture. No paid requests. None is authorised and none is
+implemented.
+
 ## Relationship to the fleet
 
 None, deliberately. No `fleet_registry` entry, no PM2 app, separate
