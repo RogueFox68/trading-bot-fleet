@@ -160,6 +160,15 @@ book, market), and `redact()` scrubs anything destined for a message. Only
 successful, parseable responses are stored — caching a failure would make a
 transient outage permanent on replay.
 
+**A cache key names one instant.** Its stamp is UTC, explicitly. It used to
+be the machine's local time with a literal `Z`, so on a machine observing DST
+the two instants of the autumn fall-back hour shared a key, and the second
+request silently returned the first one's snapshot (06:30Z and 07:30Z on
+2026-11-01, under US Central). An NFL Sunday straddles that change. Keys
+written before the fix are still read, except inside a fold, where they are
+ambiguous by construction; `resolve_key` is the one function both the fetch
+and `--preflight` use, so the two cannot disagree about what is cached.
+
 **Cutoffs are not clipped to the study window.** A 00:30 UTC game at a
 60-minute lead needs the previous day's 23:30 snapshot. Widening `--from`
 would change the study universe, which is a different thing from fetching the
@@ -754,9 +763,12 @@ python3 run_reaction.py --capability          # the source timing audit
 python3 run_reaction.py --capability-verify   # free commands to re-check it
 python3 run_reaction.py --policy              # the DECLARED thresholds
 python3 run_reaction.py --replay bundle.json  # the whole chain, offline
+python3 collect_reaction.py --day 2026-09-20  # price a collection, free
 ```
 
-All four are free: no network, no credential, no credits.
+The four `run_reaction.py` commands are free: no network, no credential, no
+credits. `collect_reaction.py` is the study's one paid entry point, and it is
+free too until `--spend` confirms a price — see *The backtest collector*.
 
 ### `last_update` is the PROVIDER's clock, not the book's
 
@@ -918,7 +930,7 @@ sum to its total is called out loudly.
 over that window declared a holdout, and `holdout_available` is False because
 none has been collected.
 
-### Offline replay, and a capture contract with no transport
+### Offline replay, and the capture contract
 
 `reaction/replay.py` reads a bundle of **raw provider payloads** and runs them
 through the
@@ -960,12 +972,85 @@ at all, and `usable_candle` rejects every one because there is no mid. 102
 candles parsed, zero usable, coverage clean, and every reaction returning
 `no_exchange_baseline`, which reads as an exchange that did not move.
 
+**A snapshot after kickoff is in-play, and it is excluded, not observed.**
+The parser keeps every event in a response, including games already under
+way, and nothing downstream asked whether a quote was pregame — so a
+score-driven swing after kickoff was detected as a book move, measured
+against the exchange's own in-play repricing, and entered the feasibility
+verdict with coverage reported clean. One snapshot carries every game on the
+slate, so every snapshot after the early kickoff has those games in play: it
+would have been most of the data, not an edge case. The kickoff instant
+itself is kept — it is the closing pregame sample, matching the manifest's
+window closed at both ends — and exclusions are counted
+(`in_play_pairs_excluded`).
+
+**Bundle schema 2 stores each snapshot once.** A per-game copy repeats every
+payload for every game on the slate. `reaction_replay_bundle/2` keeps one
+root `odds_snapshots` pool, and each game declares `observe_from`, where its
+window opened, and reads the pool from there to kickoff. The reader refuses a
+schema-2 game carrying its own snapshots, a missing pool, and an
+`observe_from` after the kickoff. Schema-1 bundles still load.
+
 `reaction/capture.py` declares the bounded read-only interface a collection
 machine must satisfy, and deliberately contains **no HTTP client**: a module
 that could fetch would eventually fetch. The budget RAISES at its bound,
 `assert_read_only` parses the package for order-placing paths and trading
 credentials, and `CapturePlan.budget()` derives the enforced bound from the
 approved plan so it cannot be run wider than approved.
+
+### The backtest collector (`collect_reaction.py`)
+
+The study's one paid entry point, and it **plans first**. Without `--spend`
+it makes only free requests — the ESPN schedule and Kalshi's public market
+listing — prints the manifest of UTC instants it would buy and what is
+already cached, and exits having spent nothing. `--spend N` confirms a price:
+below what the run needs it is refused before any purchase, and the cap
+enforced is the need, never more. A window reaching past now is refused too
+— the archive holds no snapshot that has not happened — and so is a slate
+whose listing or schedule did not fully answer, because the manifest priced
+from it may be missing games.
+
+```
+python3 collect_reaction.py --day 2026-09-20 --probe --spend 40   # coverage probe
+python3 collect_reaction.py --day 2026-09-20 --lead-hours 72 --spend 10490 --out bundle.json
+python3 run_reaction.py --replay bundle.json --max-wait 1800
+```
+
+- **Nothing is re-derived.** Contracts join to sharp events through
+  `collect.join_markets`, sides come from `collect.yes_side` and kickoffs from
+  the same `StartResolver` — the checkpoint study's own code — so a bundle
+  cannot disagree with the rest of the study about which contract is which.
+- **Every request in the process must be declared.** The fetchers live in
+  three modules and each calls `urlopen` itself, so the collector gates
+  `urlopen` process-wide against `ALLOWED_ENDPOINTS` rather than trusting a
+  convention in each. That list is tested against the URLs the real fetchers
+  build, both ways: an entry nothing requests and a request nothing declares
+  each fail the suite.
+- **A lost instant is a counted hole; a run of them stops the purchase.** An
+  instant that fails after its retries keeps a placeholder in the pool, which
+  the replay reads as a hole — left out, it would make its neighbours look
+  adjacent. Three in a row stop the run: that is an outage or a refused key,
+  and the rest of the reserve would buy the same answer. The stop names its
+  reasons; a refused key used to surface only as "budget reached", which
+  reads as money spent. No bundle is written from a run that stopped.
+- **Everything bought is cached**, under `study_output/cache` in the study
+  directory whatever the shell's working directory, so a re-run — or the full
+  run after the probe — pays only for what it has not got. It is where the
+  checkpoint study caches when run from this directory, under the same key,
+  so either reuses what the other bought.
+- **Candles are not trusted to arrive whole.** Kalshi documents a candle cap
+  for its batch endpoint and none this study could find for the single-market
+  one, so a response that stops before its span ends is followed by a request
+  for the rest, and one answered with candles outside the requested span is
+  reported rather than read as quiet. Undetected, a truncation would reach the
+  measurement as blind intervals — an exchange nobody could see — rather than
+  as a truncation.
+- **The key reaches no file and no output, and nothing here can trade.**
+  `assert_read_only` scans every module the collector can reach before the
+  first paid request. Flags are matched exactly: a command that spends money
+  is spelled out or refused, never completed from a prefix.
+
+### The pilot proposal (`REACTION_PILOT.md`)
 
 `REACTION_PILOT.md` proposes a **feasibility probe, not an edge study**,
 over the horizon the thesis is actually about: **T-72h through kickoff**.
@@ -977,11 +1062,23 @@ were the thesis, which substituted a slower-response study for the stated
 one. What the cadence actually decides is narrower: it is simultaneously the
 measurement's resolution **and the simulated poller's own latency**. A
 30-minute grid can only demonstrate opportunities a 30-minute poller could
-have taken — it cannot rule out faster ones, it cannot see them. So the
-proposal is explicitly a **constrained long-lived-discrepancy probe**, not
-the capture study, and it says what it cannot answer: a move that reverses
-inside one interval is invisible, the true lag has no upper bound tighter
-than one cadence, and a null result carries no claim about short lags.
+have taken — it cannot rule out faster ones, it cannot see them. A coarse
+grid is therefore only a **constrained long-lived-discrepancy probe**, and
+the proposal now recommends the archive's own **5-minute floor** over the
+full horizon: the owner's call, finer data over more of it, within a
+20,000-credit budget. It still says what any grid cannot answer: a move that
+reverses inside one interval is invisible, the true lag has no upper bound
+tighter than one cadence, and a null result carries no claim about short
+lags.
+
+**The replay horizon is not one cadence interval.** An earlier revision tied
+`max_wait` to the cadence so that response windows would tile. On a 5-minute
+grid that right-censors every exchange response slower than about four
+minutes — the followers a 5-minute poller could trade against — and tiling
+was never available anyway, because the 30-minute lookback overlaps earlier
+moves at any finer grid. The verdict's per-response dedupe is what protects
+the count, so the horizon is the declared 30 minutes or one cadence,
+whichever is longer, and the collector prints it with the replay command.
 
 **The stop rule is checked for reachability, because the last one was
 unsatisfiable.** It required a lag interval starting beyond 1,800s from a
@@ -1007,14 +1104,17 @@ and it could not express two kickoff clusters sharing most of their windows.
 `build_manifest` enumerates the actual UTC instants, deduplicates them,
 marks the single true baseline, and derives the enforced bound **including
 the retry reserve** the prose used to promise and `budget()` did not carry.
-It also exposes the largest lever in the table: three unaligned NFL kickoff
-clusters share nothing, 435 instants against 161 aligned.
+It also exposes the largest lever on a coarse grid: three unaligned NFL
+kickoff clusters share nothing on a 30-minute grid, 435 instants against 161
+aligned. At the 5-minute floor alignment saves nothing, because NFL kickoffs
+are scheduled on five-minute marks.
 
 ### Status
 
 Built and tested: the capability audit, the clock/provenance contracts, the
 causal move detector, the reaction measurement, the opportunity screen, the
-episode ledger and the offline replay. Every named test case is present —
+episode ledger, the offline replay and the backtest collector
+(`collect_reaction.py`). Every named test case is present —
 book-leads-with-a-surviving-discrepancy, indeterminate ordering, Kalshi-first,
 no response, the delay that misses the gap, a quote beyond the allowed wait,
 and a move-plus-full-reaction between two coarse checkpoints.
@@ -1022,8 +1122,9 @@ and a move-plus-full-reaction between two coarse checkpoints.
 **Not built:** live capture. `capture.py` is its contract and its guards, with
 no transport.
 
-No orders. No live capture. No paid requests. None is authorised and none is
-implemented.
+No orders and no live capture: neither is authorised and neither is
+implemented. Paid requests exist in exactly one place, `collect_reaction.py`,
+behind an explicit `--spend`; none is authorised by this repository.
 
 ## Relationship to the fleet
 

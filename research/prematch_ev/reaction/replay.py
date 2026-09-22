@@ -70,6 +70,14 @@ from .screen import ScreenResult, screen_reaction                # noqa: E402
 
 BUNDLE_SCHEMA = "reaction_replay_bundle/1"
 
+#: v2 keeps ONE shared pool of odds snapshots at the bundle root. A snapshot
+#: is sport-wide -- one response carries the whole slate at that instant -- so
+#: v1's per-game lists stored the same payload once per game: a 5-minute NFL
+#: Sunday would copy ~950 snapshots into each of 13 games, roughly 90 MB of
+#: duplicated JSON. Each game still sees only the snapshots in its own window.
+BUNDLE_SCHEMA_POOLED = "reaction_replay_bundle/2"
+SUPPORTED_SCHEMAS = (BUNDLE_SCHEMA, BUNDLE_SCHEMA_POOLED)
+
 #: Why a parsed snapshot yielded nothing for the target. ONE label covering
 #: three causes, deliberately: the event absent, the sharp book absent from
 #: it, or the h2h market absent from that book. An earlier label said "the
@@ -107,8 +115,11 @@ class BundleReport:
     candle_payloads: int = 0
     quotes: int = 0
     candles: int = 0
+    game_snapshot_pairs: int = 0
     snapshots_with_target: int = 0
     snapshots_without_target: list[str] = field(default_factory=list)
+    in_play_excluded: int = 0
+    before_window_excluded: int = 0
     usable_candles: int = 0
     incomplete_snapshots: list[str] = field(default_factory=list)
     incomplete_candles: list[str] = field(default_factory=list)
@@ -169,8 +180,11 @@ class BundleReport:
             "candles_parsed": self.candles,
             "coverage_complete": self.complete,
             "coverage_failures": self.coverage_failures(),
+            "game_snapshot_pairs_in_window": self.game_snapshot_pairs,
             "snapshots_with_target": self.snapshots_with_target,
             "snapshots_without_target": self.snapshots_without_target,
+            "in_play_pairs_excluded": self.in_play_excluded,
+            "pre_window_pairs_excluded": self.before_window_excluded,
             "incomplete_snapshots": self.incomplete_snapshots,
             "incomplete_candles": self.incomplete_candles,
             "games_without_target_quotes": self.games_without_target_quotes,
@@ -263,6 +277,89 @@ def _time(value: Any, what: str) -> datetime:
     return parsed
 
 
+def _parse_pool(bodies: Sequence[Any], report: BundleReport, label: str
+                ) -> list[tuple[int, Any, str]]:
+    """Parse each snapshot payload ONCE: (index, result, unreadable-reason).
+
+    Payload-level facts -- how many arrived, how many parsed, which could not
+    be read -- are counted here and only here, so a pooled payload that eight
+    games share is one payload in the report, not eight.
+    """
+    out: list[tuple[int, Any, str]] = []
+    for index, body in enumerate(bodies):
+        report.snapshot_payloads += 1
+        result = parse_snapshot(body)
+        if result.coverage.complete:
+            report.snapshots_parsed += 1
+            out.append((index, result, ""))
+            continue
+        detail = "; ".join(result.coverage.reasons) or "incomplete"
+        report.incomplete_snapshots.append(f"{label} snapshot[{index}]: "
+                                           f"{detail}")
+        out.append((index, result, f"the parser could not read this "
+                                   f"snapshot payload: {detail}"))
+    return out
+
+
+def _game_observations(pool: Sequence[tuple[int, Any, str]], *,
+                       event_id: str, start: datetime,
+                       observe_from: datetime | None, report: BundleReport
+                       ) -> tuple[list[SnapshotObservation], list]:
+    """What ONE game saw: its own pregame window of the pool, and no more.
+
+    A SNAPSHOT AFTER KICKOFF IS IN-PLAY, and it is excluded, not observed.
+    The parser keeps every event in a response, including games already under
+    way, and nothing downstream asked whether a quote was pregame -- so a
+    score-driven swing after kickoff was detected as a book move, measured
+    against the exchange's own in-play repricing, and entered the feasibility
+    verdict with coverage reported clean. With one pool shared by three
+    kickoff clusters, every snapshot after 13:00 carries the early games in
+    play, so it would not have been an edge case: it would have been most of
+    the data. `start` itself is kept -- the kickoff instant is the closing
+    pregame sample, matching the manifest's window closed at both ends.
+
+    An undateable snapshot is windowed by the last time known before it, the
+    same carry-forward `_in_availability_order` uses, so the two cannot
+    disagree about where it sits.
+    """
+    observations: list[SnapshotObservation] = []
+    quotes: list = []
+    carried: datetime | None = None
+    for index, result, unreadable in pool:
+        if result.snapshot is not None:
+            carried = result.snapshot
+        moment = carried
+        if moment is not None and moment > start:
+            report.in_play_excluded += 1
+            continue
+        if (moment is not None and observe_from is not None
+                and moment < observe_from):
+            report.before_window_excluded += 1
+            continue
+        report.game_snapshot_pairs += 1
+        if unreadable:
+            # BOTH a parse loss (counted once, in `_parse_pool`) and a hole
+            # in this game's continuity. Recording only the first left the
+            # second invisible, and the second is what lets a move be
+            # attributed across the interval.
+            observations.append(SnapshotObservation(
+                index, result.snapshot, (), unreadable))
+            continue
+        mine = tuple(q for q in result.quotes
+                     if q.provider_event_id == event_id)
+        if mine:
+            report.snapshots_with_target += 1
+        else:
+            report.snapshots_without_target.append(
+                f"{event_id} snapshot[{index}]"
+                + (f" @ {result.snapshot.isoformat()}"
+                   if result.snapshot else " (no usable timestamp)"))
+        observations.append(SnapshotObservation(
+            index, result.snapshot, mine, "" if mine else NO_TARGET_QUOTE))
+        quotes.extend(mine)
+    return _in_availability_order(observations), quotes
+
+
 def load_bundle(path: str | Path) -> tuple[list[ReplayGame], BundleReport]:
     """Read and VALIDATE a replay bundle. Raises rather than guessing."""
     payload = json.loads(Path(path).read_text())
@@ -270,16 +367,25 @@ def load_bundle(path: str | Path) -> tuple[list[ReplayGame], BundleReport]:
         raise BundleError(f"bundle root is {type(payload).__name__}, "
                           f"expected an object")
     schema = payload.get("schema")
-    if schema != BUNDLE_SCHEMA:
-        raise BundleError(f"bundle schema is {schema!r}, expected "
-                          f"{BUNDLE_SCHEMA!r} -- refusing to guess at the "
-                          f"shape of an unknown version")
+    if schema not in SUPPORTED_SCHEMAS:
+        raise BundleError(f"bundle schema is {schema!r}, expected one of "
+                          f"{list(SUPPORTED_SCHEMAS)} -- refusing to guess at "
+                          f"the shape of an unknown version")
     raw_games = payload.get("games")
     if not isinstance(raw_games, list) or not raw_games:
         raise BundleError("bundle has no 'games' list; an empty bundle is a "
                           "collection failure, not a quiet market")
 
     report = BundleReport()
+    pooled = schema == BUNDLE_SCHEMA_POOLED
+    shared_pool: list = []
+    if pooled:
+        bodies = payload.get("odds_snapshots")
+        if not isinstance(bodies, list):
+            raise BundleError("a pooled bundle needs a root 'odds_snapshots' "
+                              "list; an absent pool is a collection failure")
+        shared_pool = _parse_pool(bodies, report, "pool")
+
     games: list[ReplayGame] = []
     for index, raw in enumerate(raw_games):
         where = f"games[{index}]"
@@ -301,40 +407,25 @@ def load_bundle(path: str | Path) -> tuple[list[ReplayGame], BundleReport]:
                 f"the two sources carry different warranties")
         start = _time(raw.get("start"), f"{where}.start")
         as_of = raw.get("historical_schedule_as_of", "unverified")
+        observe_from = (_time(raw["observe_from"], f"{where}.observe_from")
+                        if raw.get("observe_from") is not None else None)
+        if observe_from is not None and observe_from > start:
+            raise BundleError(f"{where}: observe_from is after the kickoff, "
+                              f"so the game has no pregame window at all")
 
-        quotes: list = []
-        observations: list[SnapshotObservation] = []
-        for snap_index, body in enumerate(raw.get("odds_snapshots") or []):
-            report.snapshot_payloads += 1
-            result = parse_snapshot(body)
-            if not result.coverage.complete:
-                detail = ('; '.join(result.coverage.reasons) or 'incomplete')
-                report.incomplete_snapshots.append(
-                    f"{event_id} snapshot[{snap_index}]: {detail}")
-                # An unreadable payload is BOTH a parse loss and a hole in
-                # this game's continuity. Recording only the first left the
-                # second invisible, and the second is what lets a move be
-                # attributed across the interval.
-                observations.append(SnapshotObservation(
-                    snap_index, result.snapshot, (),
-                    f"the parser could not read this snapshot payload: "
-                    f"{detail}"))
-                continue
-            report.snapshots_parsed += 1
-            mine = tuple(q for q in result.quotes
-                         if q.provider_event_id == event_id)
-            if mine:
-                report.snapshots_with_target += 1
-            else:
-                report.snapshots_without_target.append(
-                    f"{event_id} snapshot[{snap_index}]"
-                    + (f" @ {result.snapshot.isoformat()}"
-                       if result.snapshot else " (no usable timestamp)"))
-            observations.append(SnapshotObservation(
-                snap_index, result.snapshot, mine,
-                "" if mine else NO_TARGET_QUOTE))
-            quotes.extend(mine)
-        observations = _in_availability_order(observations)
+        if pooled:
+            if "odds_snapshots" in raw:
+                # Two sources of odds for one game would need a rule for
+                # which wins, and any such rule is a guess.
+                raise BundleError(f"{where}: a pooled bundle's games may not "
+                                  f"carry their own odds_snapshots")
+            pool = shared_pool
+        else:
+            pool = _parse_pool(raw.get("odds_snapshots") or [], report,
+                               event_id)
+        observations, quotes = _game_observations(
+            pool, event_id=event_id, start=start, observe_from=observe_from,
+            report=report)
 
         contracts: list[ReplayContract] = []
         for contract_index, raw_contract in enumerate(
@@ -544,9 +635,12 @@ def render_report(report: BundleReport,
     lines.append(f"    contracts                   {report.contracts:>7,}")
     lines.append(f"    odds snapshots parsed       {report.snapshots_parsed:>7,}"
                  f" / {report.snapshot_payloads:,}")
-    lines.append(f"    snapshots carrying target   "
-                 f"{report.snapshots_with_target:>7,}"
-                 f" / {report.snapshots_parsed:,}")
+    lines.append(f"    game-snapshot pairs w/ target "
+                 f"{report.snapshots_with_target:>5,}"
+                 f" / {report.game_snapshot_pairs:,} in window")
+    if report.in_play_excluded:
+        lines.append(f"    in-play pairs excluded      "
+                     f"{report.in_play_excluded:>7,}  (after kickoff)")
     lines.append(f"    sharp quotes                {report.quotes:>7,}")
     lines.append(f"    candles (usable / parsed)   "
                  f"{report.usable_candles:>7,} / {report.candles:,}")

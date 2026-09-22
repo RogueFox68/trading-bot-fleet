@@ -374,10 +374,6 @@ class LedgerShapeTest(unittest.TestCase):
             ledger.stage("detector outcomes").breakdown["first_observation"], 1)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 def _make_reaction(ordering, outcome=None, *, move=0, contract="KXT-Y",
                    event=EVENT, response=None):
     """One reaction: book move number `move`, measured on `contract`.
@@ -599,3 +595,7 @@ class FeasibilityRuleTest(unittest.TestCase):
         self.assertIn("FEASIBILITY RULE", ledger.render())
         self.assertIn("declared before any data", ledger.render())
         self.assertIsNotNone(ledger.as_dict()["feasibility"])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

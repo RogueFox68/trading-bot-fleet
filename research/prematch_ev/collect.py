@@ -1090,6 +1090,30 @@ class JoinedMarket:
     start_verified: bool = False
 
 
+def yes_side(quote: SharpQuote, yes_participant: str,
+             league: str) -> str | None:
+    """"home" or "away": which of the sharp event's teams this contract pays on.
+
+    THE orientation decision, in one place. `orient_probability` reads it to
+    pick a de-vigged probability and the reaction collector reads it to
+    write `yes_is_home` into a replay bundle; two derivations of the same
+    fact would eventually disagree, and a contract oriented the wrong way is
+    a silently INVERTED signal (rule 19).
+
+    None when the YES code matches neither team, never a guess.
+    """
+    home = resolve_team(quote.home_name, league)
+    away = resolve_team(quote.away_name, league)
+    # The YES side is an EXCHANGE code; compare it canonically or every
+    # Arizona contract silently fails orientation as well as matching.
+    target = normalise_exchange_code(yes_participant, league)
+    if home.resolved and home.abbreviation == target:
+        return "home"
+    if away.resolved and away.abbreviation == target:
+        return "away"
+    return None
+
+
 def orient_probability(
     quote: SharpQuote, yes_participant: str, league: str, method: str = "shin"
 ) -> float | None:
@@ -1104,15 +1128,10 @@ def orient_probability(
     except DevigError:
         return None
     fair = result.shin if method == "shin" else result.multiplicative
-
-    home = resolve_team(quote.home_name, league)
-    away = resolve_team(quote.away_name, league)
-    # The YES side is an EXCHANGE code; compare it canonically or every
-    # Arizona contract silently fails orientation as well as matching.
-    target = normalise_exchange_code(yes_participant, league)
-    if home.resolved and home.abbreviation == target:
+    side = yes_side(quote, yes_participant, league)
+    if side == "home":
         return fair[0]
-    if away.resolved and away.abbreviation == target:
+    if side == "away":
         return fair[1]
     return None
 

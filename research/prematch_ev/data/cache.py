@@ -22,9 +22,11 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+STAMP = "%Y-%m-%dT%H:%M:%SZ"
 
 _SECRET = re.compile(r"(apiKey|api_key|token|secret)=([^&\s\"']+)", re.I)
 
@@ -34,20 +36,68 @@ def redact(text: str) -> str:
     return _SECRET.sub(lambda m: f"{m.group(1)}=REDACTED", str(text))
 
 
+def _digest(sport: str, stamp: str, bookmakers: str, markets: str) -> str:
+    canonical = "|".join([sport.upper(), stamp, (bookmakers or "").lower(),
+                          (markets or "").lower()])
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
 def key_for(sport: str, at: datetime, bookmakers: str, markets: str) -> str:
-    """A stable key for one request's MEANING.
+    """A stable key for one request's MEANING, stamped in UTC.
 
     Deliberately takes the fields, not a URL: a URL carries the credential and
     a hash of it would silently bind the cache to one key while also embedding
     the secret in a filename.
+
+    THE STAMP IS UTC, EXPLICITLY. It used to be `at.astimezone()` -- the
+    MACHINE'S local time -- formatted with a literal "Z". On a machine that
+    observes DST the two instants of the autumn fall-back hour render as the
+    same wall clock, so they shared a key and the second request silently
+    returned the FIRST one's snapshot: on US Central time, 06:30Z and 07:30Z on
+    2026-11-01 hashed identically. An NFL Sunday straddles that change, and a
+    5-minute collector puts twelve requests inside the hour. A cache key that
+    can name two instants is a cache that can serve the wrong one.
     """
-    canonical = "|".join([
-        sport.upper(),
-        at.astimezone().strftime("%Y-%m-%dT%H:%M:%SZ"),
-        (bookmakers or "").lower(),
-        (markets or "").lower(),
-    ])
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+    return _digest(sport, at.astimezone(timezone.utc).strftime(STAMP),
+                   bookmakers, markets)
+
+
+def legacy_key_for(sport: str, at: datetime, bookmakers: str,
+                   markets: str) -> str | None:
+    """The key a pre-UTC cache stored this instant under, IF that is safe.
+
+    Existing caches were written with local-time stamps, and every entry in
+    them was paid for. Orphaning them would re-spend credits on a machine
+    that is not on UTC. So an instant may still be READ from its legacy key --
+    but never when that key is ambiguous: inside a fall-back fold the legacy
+    stamp names two instants and the entry may belong to the other one. There
+    the answer is None, the read misses, and the request is made again. A
+    wasted credit is recoverable; a silently substituted snapshot is not.
+    """
+    local = at.astimezone()
+    wall = local.replace(tzinfo=None)
+    if (wall.replace(fold=0).astimezone(timezone.utc)
+            != wall.replace(fold=1).astimezone(timezone.utc)):
+        return None                        # a fold: the stamp names two instants
+    legacy = _digest(sport, local.strftime(STAMP), bookmakers, markets)
+    return None if legacy == key_for(sport, at, bookmakers, markets) else legacy
+
+
+def resolve_key(cache: "ResponseCache", sport: str, at: datetime,
+                bookmakers: str, markets: str) -> str:
+    """THE key to read this instant from: current if present, else legacy.
+
+    The fetch and the preflight both go through here, so the run and the
+    estimate of what it will cost cannot disagree about what is cached
+    (rule 19). Uses `has()`, which moves no statistics.
+    """
+    key = key_for(sport, at, bookmakers, markets)
+    if cache.has(key):
+        return key
+    legacy = legacy_key_for(sport, at, bookmakers, markets)
+    if legacy is not None and cache.has(legacy):
+        return legacy
+    return key
 
 
 @dataclass

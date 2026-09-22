@@ -5,14 +5,20 @@ run.** No paid collection, no live capture, no orders. The earlier
 1,500-credit approval does not carry over, and every credit figure below is a
 **price quoted from a transcribed cost model**, not a permission.
 
-Everything described is reachable today from
-`python3 run_reaction.py --policy` and `--replay`, over a bundle someone else
-produces. This document is about whether producing that bundle is worth
-paying for, and what the answer would and would not mean.
+The owner has set the direction (2026-09-22): **finer data over more of it**,
+within a **20,000-credit** account budget. That decides which option §5
+recommends; it does not spend anything. The collector that would spend it,
+`collect_reaction.py`, is built and **plans by default**: it buys only when
+`--spend` confirms a price at least as large as the one it has just printed,
+on the owner's machine.
+
+Everything downstream is reachable today from `python3 run_reaction.py
+--policy` and `--replay`. This document is about whether producing the bundle
+is worth paying for, and what the answer would and would not mean.
 
 ---
 
-## 1. Two independent dimensions, and this pilot only probes one
+## 1. Two independent dimensions, and the grid decides what is visible
 
 The objective is to catch a **sharp-book move days before kickoff** and reach
 Kalshi before the exchange follows — which it may do **in seconds**. Those
@@ -39,11 +45,15 @@ care about it:
 > demonstrate opportunities that a 30-minute poller could have taken. It
 > cannot rule out faster ones. It cannot see them at all.
 
-So option A below is a **constrained long-lived-discrepancy probe**. It is
+So a coarse grid is a **constrained long-lived-discrepancy probe**. It is
 not the sharp-move capture study and does not stand in for it. Its positive
-result would be real and its negative result would be narrow.
+result would be real and its negative result would be narrow. That is why the
+recommendation is now the archive's own **300-second** floor (option D, §5):
+the finest grid the archive sells is the closest a backtest can come to the
+poller the strategy would actually run. Below five minutes only a live
+recorder sees anything (§8).
 
-### What a 30-minute grid can and cannot answer
+### What a sampled grid can and cannot answer
 
 **Can:**
 
@@ -51,8 +61,8 @@ result would be real and its negative result would be narrow.
   our samples: `BOOK_LED` needs only that Kalshi's candle bracket opens after
   our snapshot, which is reachable throughout the measurement window.
 - Give a **lower** bound on the true lag.
-- Show whether a discrepancy that a 30-minute poller could have seen was
-  still open when it looked again.
+- Show whether a discrepancy that a poller at that cadence could have seen
+  was still open when it looked again.
 
 **Cannot:**
 
@@ -63,13 +73,17 @@ result would be real and its negative result would be narrow.
 - **Bound the true lag from above.** The book changed somewhere inside the
   preceding interval, so the true lag is somewhere in
   `[measured, measured + cadence]`.
-- **Say anything about responses faster than the cadence.** Not "they are
-  rare" — unobserved.
+- **See an opportunity shorter than the cadence.** An exchange that follows
+  faster than the grid has already moved by the time the poller looks; the
+  replay files that as `exchange_moved_before_trigger`, an opportunity this
+  poller could not have taken — not evidence that none existed. Not "they are
+  rare" — unobserved. At 30 minutes that is most of the range that matters;
+  at 5 minutes it is the sub-five-minute followers.
 - **Support a claim about short lags from a null result.** See §3.
 
-Closing that gap means the archive's own 300-second floor (option D), and
-below five minutes it means a live prospective recorder, because the archive
-has no finer grid to buy.
+Closing that gap as far as history allows means the archive's floor, which
+is what §5 recommends; below five minutes it means a live prospective
+recorder, because the archive has no finer grid to buy.
 
 ---
 
@@ -126,36 +140,52 @@ and an impossible rule is **refused** with `rule_unreachable_against_policy`
 rather than quietly returning zero. The pilot's own rule carries
 `min_lag_seconds = None`, because duration is not what it asks.
 
-**Why `max_wait` should be one cadence interval.** With `max_wait` equal to
-the book sampling interval, consecutive moves' response windows tile end to
-end, so no Kalshi step can fall in two of them. Set it wider and they
-overlap. The code does **not** derive `max_wait` from the cadence — a replay
-does not know what cadence the bundle was collected at — so the run must pass
-it (`--max-wait 1800` for option A), and the verdict enforces the consequence
-instead: a response claimed by two moves counts once, for the earlier, and
-the later is reported as `shared_response`.
+### Why the horizon is not one cadence interval
 
-Overlap would also blur the **lag**, which is why the setting still matters
-even though the ordering count is protected: when a second book move follows
-inside the window, a Kalshi step after both is book-led either way, but the
-lag measured from the first move overstates the lag if the exchange was
-answering the second.
+An earlier revision said `max_wait` should be one cadence interval, so that
+consecutive moves' response windows would tile end to end. On the 30-minute
+grid it priced, that was the declared horizon anyway and nothing turned on
+it. On a 5-minute grid it would **right-censor every exchange response slower
+than about four minutes** — the slow followers a 5-minute poller could trade
+against, which is the thesis — and a censored response leaves the fraction
+entirely.
+
+Tiling was not available at a finer grid in any case: the 30-minute
+**lookback** overlaps earlier moves' windows at any grid finer than 30
+minutes, whatever the horizon. What protects the count is the verdict: a
+response claimed by two moves counts once, for the earlier, and the later is
+reported as `shared_response`.
+
+So the horizon is the declared 30 minutes or one cadence interval, whichever
+is longer. A replay does not derive it — it does not know the grid a bundle
+was collected at — so the collector prints it with the replay command:
+`--max-wait 1800` at 5 minutes, and at 30.
+
+Two limits remain, and neither is the horizon's to fix. The dedupe matches
+**identical** exchange brackets, so an exchange drifting in sub-threshold
+steps can still register at different candles for two moves. And overlap
+blurs the **lag**: when a second book move follows inside the window, a
+Kalshi step after both is book-led either way, but the lag measured from the
+first move overstates the lag if the exchange was answering the second.
 
 ---
 
 ## 3. What a null result would and would not establish
 
-If option A returns `stop`, that means: **on a 30-minute grid, over this
-sample, these sources rarely established the book leading.**
+If the recommended run returns `stop`, that means: **on a 5-minute grid,
+over this sample, these sources rarely established the book leading.**
 
-It does **not** establish that the lag is shorter than 30 minutes. The same
-output is produced by sparse moves, right-censored responses, blind
-candle intervals, or a genuinely smaller share of long-lived discrepancies.
-Those are different causes with different implications and the run reports
-their counts separately for exactly that reason.
+It does **not** establish that the lag is shorter than 5 minutes. A null
+result — `stop` or `insufficient_observable_events` — is produced by sparse
+moves, right-censored responses (a follower slower than the horizon leaves
+the fraction, which can push it toward `stop`), blind candle intervals, or a
+genuinely smaller share of book-led moves. Those are different causes with
+different implications and the run reports their counts separately for
+exactly that reason.
 
-A previous revision said a failure "means the lag is under 30 minutes". It
-does not, and that sentence is removed.
+A previous revision said a failure of its 30-minute option "means the lag is
+under 30 minutes". It does not, and that sentence is removed; the same
+reasoning holds at 5 minutes.
 
 ---
 
@@ -169,8 +199,20 @@ this horizon cannot be bought at any price and the window truncates to
 wherever coverage starts.
 
 Four archive snapshots on a **past** NFL date — T-72h, T-48h, T-24h and
-kickoff — settle it for **40 credits**. Its only output is "from when is the
-sharp book present". Nothing below should be approved before it answers.
+kickoff, against that date's earliest kickoff — settle it for **40
+credits**:
+
+```
+python3 collect_reaction.py --day 2026-09-20 --probe             # the price, free
+python3 collect_reaction.py --day 2026-09-20 --probe --spend 40  # the probe
+```
+
+It prints, per instant, how many of the slate's games the sharp book quotes.
+Its only output is "from when is the sharp book present", and that answer
+picks the row in §5: the full 72h (option D) if the slate is quoted at T-72h,
+48h (D48) if it first appears at T-48h. Nothing below should be approved
+before it answers. Its snapshots sit on the 5-minute grid, so the full run
+reuses them for free.
 
 It also checks the assumption under §5's measurement count: that the earliest
 snapshot carries the *later* clusters' games too.
@@ -193,31 +235,48 @@ The cost is **the instants themselves**, enumerated, deduplicated and priced
 **including the retry reserve** — which the prose previously promised and
 `CapturePlan.budget()` did not enforce.
 
-All rows: one NFL Sunday, three kickoff clusters, **T-72h → kickoff closed at
-both ends**, grid-aligned, 10% retry reserve.
+Every row: three kickoff clusters, closed at both ends, grid-aligned, 10%
+retry reserve; one NFL Sunday, **T-72h → kickoff**, except D48 (T-48h) and E
+(two Sundays).
 
 | option | cadence | book bracket | instants | + retries | **credits** |
 |---|---|---|---|---|---|
 | **0** | coverage probe, one window, no reserve | — | 4 | 4 | **40** |
-| **A** | 30-min | 1,800s | 161 | 178 | **1,780** |
+| A | 30-min | 1,800s | 161 | 178 | **1,780** |
 | B | hourly | 3,600s | 82 | 91 | **910** |
 | C | 15-min | 900s | 320 | 352 | **3,520** |
-| D | 5-min (archive floor) | 300s | 953 | 1,049 | **10,490** |
+| **D** | 5-min (archive floor) | 300s | 953 | 1,049 | **10,490** |
+| D48 | 5-min (archive floor), T-48h | 300s | 665 | 732 | **7,320** |
 | E | two Sundays at A's cadence | 1,800s | 322 | 355 | **3,550** |
 
-**Alignment is most of the bill.** Three clusters at 13:00, 16:25 and 20:20
-put their unaligned 30-minute grids minutes apart, so nothing deduplicates:
-**435** instants instead of 161, and **4,790** credits instead of 1,780.
-Snapping every window to a common 30-minute boundary costs only that each
-opens up to one cadence early. The manifest reports both.
+**Recommendation: option D, 10,490 credits**, after option 0 answers — or
+D48 at 7,320 if the sharp book first appears at T-48h. This is the owner's
+decision made concrete: **finer data over more of it**. One Sunday at the
+archive's floor asks a question a coarse grid cannot ask at all (§1), while
+more Sundays of a coarse grid (option E) only enlarge the sample of the one
+narrow question it can. The price is for this table's three clusters; a slate
+with an early international kickoff opens its window earlier (a 13:30Z London
+game adds 42 instants and 460 credits), and the collector's plan mode prices
+the actual day before anything is bought.
+
+**What the rest of the budget is for is a separate decision.** After the
+probe and option D, 9,470 credits remain of the 20,000. They could buy a
+second Sunday at the same floor as the §7 holdout (D48, 7,320), or fund a
+forward recorder (§8), which answers what no archive can: responses faster
+than five minutes, and the delivery delay every replay assumes is zero.
+Neither is proposed here.
+
+**On a coarse grid, alignment is most of the bill.** Three clusters at 13:00,
+16:25 and 20:20 put their unaligned 30-minute grids minutes apart, so nothing
+deduplicates: **435** instants instead of 161, and **4,790** credits instead
+of 1,780. Snapping every window to a common 30-minute boundary costs only that
+each opens up to one cadence early. The manifest reports both. **At the
+5-minute floor alignment saves nothing:** NFL kickoffs are scheduled on
+five-minute marks, so the clusters already share instants.
 
 **Option B is a trap.** Cheapest real row, and its *negative* case teaches
 nothing: a 3,600s bracket cannot distinguish "the exchange follows in four
 minutes" from "in fifty", and those point opposite ways.
-
-**Recommendation: option A, 1,780 credits**, after option 0 answers. Read as
-a long-lived-discrepancy probe with the limits in §1, not as the capture
-study.
 
 ### Cache reuse, baselines and retries
 
@@ -231,6 +290,17 @@ study.
 - **A dropped request costs the move that spans it**, since a gap
   re-baselines the stream. Retries are part of the measurement, not just the
   budget, and the 10% reserve is inside the enforced bound.
+- **The collector buys exactly this manifest.** Plan mode prints it and its
+  price; `--spend` must cover the price and the cap enforced is the price,
+  never more. An instant that still fails after its retries is kept as a
+  counted hole; three in a row stop the purchase, because that is an outage
+  or a refused key rather than a gap, and no bundle is written from a run
+  that stopped — a re-run pays only for what is not cached.
+- **Candles are free and are not trusted to arrive whole.** Kalshi documents
+  a candle cap for its batch endpoint and none this study could find for the
+  single-market one, so every candle response that stops before its span
+  ends is followed by a request for the rest. A truncated series would
+  otherwise read as blind intervals rather than as a truncation.
 
 ---
 
@@ -284,6 +354,13 @@ looked at cannot be un-looked-at.
 2. **The decision-clock bound, on live records.** In replay it and the
    capture-age bound are the same number, so no historical fixture
    distinguishes them. That defect only exists on the live path.
+
+The recorder is also the owner's stated forward path: a monitor on NFL
+Sundays that polls the sharp book and acts on Kalshi when it moves. The odds
+provider publishes no push feed, so that monitor **polls**, and polling faster
+than the provider's own refresh buys the same snapshot twice. Its cadence
+should come from the refresh the recorder measures in successive
+`last_update` stamps, not be set in advance.
 3. **Depth, from a source that has it** — or an explicit decision that
    one-contract size is the whole strategy.
 4. **A fee schedule for `KXNFLGAME`.** The dated multiplier is known for
@@ -296,7 +373,8 @@ looked at cannot be un-looked-at.
 ## 9. Still open, from the owner
 
 - Authorisation for the **40-credit** coverage probe (option 0), and
-  separately for **any** measurement collection (option A = 1,780 credits).
+  separately for the measurement collection (option D = 10,490 credits, or
+  D48 = 7,320 if the probe says T-48h).
 - 72h/48h sharp-quote availability for NFL. Option 0 exists to answer this.
 - The dated `KXNFLGAME` fee schedule.
 - The seven-item NCAA gap list.
@@ -304,16 +382,25 @@ looked at cannot be un-looked-at.
 
 ---
 
-## 10. What is already built and free
+## 10. What is already built
 
 ```
 python3 run_reaction.py --capability          # the source timing audit
 python3 run_reaction.py --capability-verify   # free commands to re-check it
 python3 run_reaction.py --policy              # the declared thresholds
-python3 run_reaction.py --replay bundle.json  # the whole chain, offline
+python3 collect_reaction.py --day 2026-09-20 --lead-hours 72   # the price, free
+python3 collect_reaction.py --day 2026-09-20 --lead-hours 72 --spend 10490 --out bundle.json
+python3 run_reaction.py --replay bundle.json --max-wait 1800   # the whole chain, offline
 ```
 
-Exit codes: `0` when the replay ran — **zero entries is a result** — `1` for
-a defect someone can fix (unreadable bundle, mislabelled holdout,
+Everything but a `--spend` run is free. The key comes from `--api-key` or
+`ODDS_API_KEY` and reaches no cache key, path, bundle or output.
+
+Replay exit codes: `0` when the replay ran — **zero entries is a result** —
+`1` for a defect someone can fix (unreadable bundle, mislabelled holdout,
 non-reconciling ledger, incomplete parse, or no usable target coverage),
-`2` for usage.
+`2` for usage. Collector exit codes: `0` for a complete bundle or probe, `1`
+for an incomplete one (holes, candle warnings, nothing joinable) or a stopped
+purchase — including a slate that did not fully answer, which buys nothing —
+and `2` for a refusal made before anything was bought (a `--spend` below the
+price, a window reaching past now, no key).

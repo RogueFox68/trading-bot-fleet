@@ -6,20 +6,27 @@ missing import in an entry point -- only calling the entry point can.
 """
 
 import json
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-import run_study
-from analysis.scoring import (
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import run_study                                                   # noqa: E402
+from analysis.scoring import (                                     # noqa: E402
     Eligibility, Observation, screen_diagnostics,
 )
-from collect import CheckpointMatrix, Ledger, StartResolver, default_lead_grid
-from data.cache import CreditCapReached, ResponseCache, key_for, redact
-from data.kalshi_history import Coverage
-from data.odds_history import CreditLedger
+from collect import (                                              # noqa: E402
+    CheckpointMatrix, Ledger, StartResolver, default_lead_grid,
+)
+from data.cache import (                                           # noqa: E402
+    CreditCapReached, ResponseCache, key_for, redact,
+)
+from data.kalshi_history import Coverage                           # noqa: E402
+from data.odds_history import CreditLedger                         # noqa: E402
 
 UTC = timezone.utc
 
@@ -539,6 +546,125 @@ class BoundaryLookbackTest(unittest.TestCase):
         self.assertEqual(len(cutoffs), 1)
         self.assertLess(cutoffs[0], datetime(2026, 9, 14, tzinfo=UTC),
                         "the needed snapshot precedes --from")
+
+
+class CacheKeyTimezoneTest(unittest.TestCase):
+    """A cache key must name ONE instant, whatever timezone the machine is in.
+
+    `key_for` used to stamp `at.astimezone()` -- LOCAL time -- with a literal
+    "Z". On a machine observing DST the two instants of the autumn fall-back
+    hour then rendered as the same wall clock and shared a key, so the second
+    request silently returned the first one's snapshot. These run under
+    America/Chicago because that is the only place the bug exists: on a UTC
+    machine every assertion here would pass against the broken code too.
+    """
+
+    FIRST = datetime(2026, 11, 1, 6, 30, tzinfo=UTC)     # 01:30 CDT
+    SECOND = datetime(2026, 11, 1, 7, 30, tzinfo=UTC)    # 01:30 CST
+    PLAIN = datetime(2026, 9, 27, 17, 0, tzinfo=UTC)     # no fold anywhere near
+
+    def setUp(self):
+        import os
+        import time
+        self._saved = os.environ.get("TZ")
+        os.environ["TZ"] = "America/Chicago"
+        time.tzset()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        import os
+        import time
+        if self._saved is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = self._saved
+        time.tzset()
+
+    def _old_key(self, at):
+        """Exactly how the pre-UTC cache built its keys."""
+        from data.cache import STAMP, _digest
+        return _digest("NFL", at.astimezone().strftime(STAMP), "pinnacle",
+                       "h2h")
+
+    def test_the_fall_back_hour_no_longer_collides(self):
+        self.assertEqual(self._old_key(self.FIRST), self._old_key(self.SECOND),
+                         "the premise: the old key really did collide here")
+        self.assertNotEqual(key_for("NFL", self.FIRST, "pinnacle", "h2h"),
+                            key_for("NFL", self.SECOND, "pinnacle", "h2h"))
+
+    def test_the_key_does_not_depend_on_the_machines_timezone(self):
+        import os
+        import time
+        here = key_for("NFL", self.PLAIN, "pinnacle", "h2h")
+        os.environ["TZ"] = "UTC"
+        time.tzset()
+        self.assertEqual(key_for("NFL", self.PLAIN, "pinnacle", "h2h"), here)
+
+    def test_an_entry_paid_for_under_the_old_key_is_still_served_free(self):
+        """Orphaning existing caches would re-spend credits already spent."""
+        from data.cache import resolve_key
+        with tempfile.TemporaryDirectory() as d:
+            cache = ResponseCache(Path(d))
+            cache.put(self._old_key(self.PLAIN),
+                      {"timestamp": "2026-09-27T17:00:00Z", "data": []})
+            self.assertEqual(
+                resolve_key(cache, "NFL", self.PLAIN, "pinnacle", "h2h"),
+                self._old_key(self.PLAIN))
+            led = CreditLedger(cap=0)
+            result = run_study.fetch_snapshot("NFL", self.PLAIN, "K",
+                                              ledger=led, cache=cache)
+        self.assertEqual(led.spent_this_run, 0)
+        self.assertTrue(result.coverage.complete)
+        self.assertEqual(result.raw["timestamp"], "2026-09-27T17:00:00Z")
+
+    def test_inside_the_fold_an_old_entry_is_never_trusted(self):
+        """The old key there names two instants and may hold the other one.
+        A miss costs a credit; serving the wrong snapshot costs the study."""
+        from data.cache import legacy_key_for, resolve_key
+        self.assertIsNone(legacy_key_for("NFL", self.FIRST, "pinnacle", "h2h"))
+        self.assertIsNone(legacy_key_for("NFL", self.SECOND, "pinnacle", "h2h"))
+        with tempfile.TemporaryDirectory() as d:
+            cache = ResponseCache(Path(d))
+            cache.put(self._old_key(self.FIRST),
+                      {"timestamp": "2026-11-01T06:30:00Z", "data": []})
+            self.assertEqual(
+                resolve_key(cache, "NFL", self.SECOND, "pinnacle", "h2h"),
+                key_for("NFL", self.SECOND, "pinnacle", "h2h"))
+            self.assertFalse(cache.has(
+                resolve_key(cache, "NFL", self.SECOND, "pinnacle", "h2h")))
+
+    def test_resolving_a_key_moves_no_statistics(self):
+        """The preflight asks this to cost a run; it must not look like one."""
+        from data.cache import resolve_key
+        with tempfile.TemporaryDirectory() as d:
+            cache = ResponseCache(Path(d))
+            resolve_key(cache, "NFL", self.PLAIN, "pinnacle", "h2h")
+            self.assertEqual((cache.hits, cache.misses), (0, 0))
+
+    def test_the_network_path_carries_the_raw_body_too(self):
+        """A bundle must keep an UNREADABLE body to count it as a loss, and
+        the cache only ever stores readable ones."""
+        from unittest import mock
+        body = {"timestamp": "2026-09-27T17:00:00Z", "data": "not a list"}
+
+        class Response:
+            status = 200
+            headers = {"x-requests-used": "10", "x-requests-remaining": "90"}
+
+            def read(self):
+                return json.dumps(body).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with mock.patch("urllib.request.urlopen", return_value=Response()):
+            result = run_study.fetch_snapshot("NFL", self.PLAIN, "K",
+                                              ledger=CreditLedger(cap=10))
+        self.assertFalse(result.coverage.complete)
+        self.assertEqual(result.raw, body)
 
 
 if __name__ == "__main__":

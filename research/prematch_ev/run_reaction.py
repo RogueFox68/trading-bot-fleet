@@ -19,8 +19,9 @@ WHAT THIS ANSWERS TODAY
 -----------------------
 The capability audit, the declared thresholds, and a full OFFLINE REPLAY of a
 bundle of raw provider payloads -- detector, reaction measurement, opportunity
-screen and episode ledger, end to end. What is NOT here is collection: no
-network, no credential, no credits, in any path.
+screen and episode ledger, end to end. What is NOT here is collection: this
+command makes no network request, holds no credential and spends no credits,
+in any path. Collection is `collect_reaction.py`.
 
 The audit still comes first, because it decides which of the study's
 questions these sources can support AT ALL, and several turn out to be
@@ -55,8 +56,10 @@ OFFLINE REPLAY
 `--replay` reads a bundle of RAW provider payloads from disk and runs the
 whole chain -- detector, reaction measurement, opportunity screen, episode
 ledger -- with no network, no credential and no credits. Producing the bundle
-is a collection machine's job; `reaction/capture.py` declares the bounded
-read-only interface that job has to satisfy.
+is `collect_reaction.py`'s job -- the study's one paid entry point, which
+plans for free and buys only behind an explicit `--spend`. It runs under
+`reaction/capture.py`'s guards: the read-only scan, the endpoint allow-list,
+and the manifest that sets its bound.
 
 EXIT CODES SAY WHAT KIND OF THING WENT WRONG
 --------------------------------------------
@@ -76,9 +79,10 @@ EXIT CODES SAY WHAT KIND OF THING WENT WRONG
 
 NOT BUILT, AND NOT FAKED
 ------------------------
-Live capture. No orders, no live capture, no paid requests -- none of those
-is authorised and none is implemented. `capture.py` is the interface and its
-guards, with no transport that can reach a network.
+Live capture, and orders. Neither is authorised and neither is implemented.
+Paid requests exist in exactly one place, `collect_reaction.py`, behind an
+explicit `--spend`; this command makes none. `capture.py` is the interface
+and its guards, with no transport that can reach a network.
 """
 
 from __future__ import annotations
@@ -228,7 +232,8 @@ def main(argv=None) -> int:
             print()
             print(ledger.render())
             print()
-            print("  No orders. No live capture. No paid requests.")
+            print("  No orders. No live capture. This replay made no paid "
+                  "request.")
         # A ledger whose breakdowns do not sum is a DEFECT: the totals may be
         # right while the reasons are not, which is the failure mode that
         # produced a credible percentage over the wrong denominator twice.
@@ -295,14 +300,16 @@ def main(argv=None) -> int:
         print("  the reaction measurement, the executable-opportunity screen,")
         print("  the episode ledger and the offline replay -- run the whole")
         print("  chain with --replay, and --policy prints every threshold.")
-        print("  NOT BUILT AND NOT FAKED: collection.")
-        print("  No orders, no live capture, no paid requests -- none of "
-              "those is")
-        print("  authorised and none is implemented. reaction/capture.py is "
-              "the")
-        print("  bounded read-only interface a collector would have to "
-              "satisfy, and")
-        print("  it holds no transport that can reach a network.")
+        print("  The backtest collector is collect_reaction.py, a separate")
+        print("  entry point: it plans for free and buys only behind --spend.")
+        print("  NOT BUILT AND NOT FAKED: live capture.")
+        print("  No orders and no live capture -- neither is authorised and")
+        print("  neither is implemented, and this command makes no paid "
+              "request.")
+        print("  reaction/capture.py holds the guards the collector runs")
+        print("  under -- the read-only scan, the endpoint allow-list, the")
+        print("  manifest that sets its bound -- and no transport that can")
+        print("  reach a network.")
         # EXIT ZERO even though several questions are unanswerable. Those are
         # PERMANENT properties of these two sources, and the design already
         # accounts for them -- so reporting them through the exit code would

@@ -20,6 +20,8 @@ check the CONTRACT and its guards:
 
 from __future__ import annotations
 
+import contextlib
+import io
 import re
 import sys
 import tempfile
@@ -62,8 +64,6 @@ LEAD = _td(hours=72)
 def windows(cadence_minutes: int, kickoffs=CLUSTERS):
     cadence = _td(minutes=cadence_minutes)
     return [CaptureWindow(k, LEAD, cadence) for k in kickoffs]
-
-
 
 
 def plan(**overrides) -> CapturePlan:
@@ -192,24 +192,68 @@ class ReadOnlyTest(unittest.TestCase):
                         assert_read_only(path)
 
 
+def _matches(template: str, url: str) -> bool:
+    """Does `url` fall under this ONE allow-list entry?"""
+    bare = url.split("?", 1)[0]
+    pattern = "^https?://" + re.escape(template).replace(
+        r"\{", "{").replace(r"\}", "}")
+    pattern = re.sub(r"\{[a-z_]+\}", "[^/]+", pattern) + "$"
+    return re.match(pattern, bare) is not None
+
+
 class EndpointTest(unittest.TestCase):
     """The allowed set is a decision, not whatever a URL builder produces."""
 
-    def test_the_declared_read_only_endpoints_are_allowed(self):
-        for url in (
-            "https://api.the-odds-api.com/v4/historical/sports/"
-            "americanfootball_nfl/odds?apiKey=x&date=2026-09-25T00:00:00Z",
-            "https://api.elections.kalshi.com/trade-api/v2/series/"
-            "KXNFLGAME/markets",
-            "https://api.elections.kalshi.com/trade-api/v2/series/KXNFLGAME"
-            "/markets/KXNFLGAME-26SEP14DENKC-KC/candlesticks"
-            "?period_interval=1",
-            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/"
-            "scoreboard?dates=20260925",
-        ):
-            with self.subTest(url=url[:60]):
+    @staticmethod
+    def _requested_urls() -> list[str]:
+        """Every URL the real fetchers build, captured at the socket boundary.
+
+        The allow-list was first written from a reading of the providers'
+        APIs rather than from `data/`, and it was wrong in BOTH directions: it
+        named an endpoint no fetcher calls and omitted four that they do. So
+        these URLs are not typed here -- each fetcher is driven, and whatever
+        reaches `urlopen` is what gets checked.
+        """
+        from unittest import mock
+        from data import espn_schedule, kalshi_history, odds_history
+        seen: list[str] = []
+
+        def record(request, *args, **kwargs):
+            seen.append(getattr(request, "full_url", request))
+            raise OSError("recorded, not sent")
+
+        at = datetime(2026, 9, 13, 17, tzinfo=UTC)
+        with mock.patch("urllib.request.urlopen", side_effect=record), \
+                mock.patch("time.sleep"):
+            odds_history.fetch_snapshot("NFL", at, "KEY")
+            kalshi_history.fetch_historical_cutoff()
+            kalshi_history.enumerate_settled_markets("KXNFLGAME", max_pages=1)
+            for archive in (False, True):
+                kalshi_history.fetch_candlestick_payload(
+                    "KXNFLGAME-26SEP13DALNYG-NYG", "KXNFLGAME", at,
+                    at + _td(hours=1), use_archive=archive)
+            espn_schedule.fetch_schedule("NFL", at.date(), at.date(),
+                                         buffer_days=0)
+        return seen
+
+    def test_every_url_a_fetcher_requests_is_declared(self):
+        urls = self._requested_urls()
+        self.assertTrue(urls, "no fetcher reached the socket boundary")
+        for url in urls:
+            with self.subTest(url=url.split("?", 1)[0]):
                 self.assertTrue(endpoint_allowed(url))
-                require_allowed_endpoint(url)
+
+    def test_every_declared_endpoint_is_one_a_fetcher_requests(self):
+        """A phantom entry is a permission nothing needs -- and the first
+        version's phantom was on the exchange host."""
+        urls = self._requested_urls()
+        for template in ALLOWED_ENDPOINTS:
+            with self.subTest(endpoint=template):
+                probe = [u for u in urls
+                         if endpoint_allowed(u)
+                         and _matches(template, u)]
+                self.assertTrue(probe, f"{template} is declared but no "
+                                       f"fetcher requests it")
 
     def test_an_order_placing_path_is_refused(self):
         """Same host, different path. The host is not the permission."""
@@ -355,17 +399,22 @@ class PilotProposalTest(unittest.TestCase):
 
     PROPOSAL = (Path(__file__).resolve().parent.parent / "REACTION_PILOT.md")
 
-    #: label -> (cadence minutes, kickoff clusters, retry fraction)
+    #: label -> (cadence minutes, kickoff clusters, retry fraction, lead h)
     OPTIONS = {
-        "0": (1440, CLUSTERS[:1], 0.0),
-        "A": (30, CLUSTERS, 0.10),
-        "B": (60, CLUSTERS, 0.10),
-        "C": (15, CLUSTERS, 0.10),
-        "D": (5, CLUSTERS, 0.10),
+        "0": (1440, CLUSTERS[:1], 0.0, 72),
+        "A": (30, CLUSTERS, 0.10, 72),
+        "B": (60, CLUSTERS, 0.10, 72),
+        "C": (15, CLUSTERS, 0.10, 72),
+        "D": (5, CLUSTERS, 0.10, 72),
+        "D48": (5, CLUSTERS, 0.10, 48),
     }
-    RECOMMENDED = "A"
+    #: The owner's call (2026-09-22): finer data over more of it.
+    RECOMMENDED = "D"
+    FALLBACK = "D48"
+    COARSE = "A"
     TRAP = "B"
     PROBE = "0"
+    BUDGET = 20_000
 
     def setUp(self):
         self.raw = self.PROPOSAL.read_text()
@@ -428,11 +477,13 @@ class PilotProposalTest(unittest.TestCase):
                          f"option {label} is not a single table row")
         return rows[0]
 
-    def _manifest(self, label: str):
-        cadence, kickoffs, retry = self.OPTIONS[label]
-        align = None if label == self.PROBE else _td(minutes=cadence)
-        return build_manifest(windows(cadence, kickoffs), align_to=align,
-                              retry_fraction=retry)
+    def _manifest(self, label: str, *, aligned: bool = True):
+        cadence, kickoffs, retry, lead = self.OPTIONS[label]
+        align = (None if label == self.PROBE or not aligned
+                 else _td(minutes=cadence))
+        spans = [CaptureWindow(k, _td(hours=lead), _td(minutes=cadence))
+                 for k in kickoffs]
+        return build_manifest(spans, align_to=align, retry_fraction=retry)
 
     def test_every_cost_row_is_recomputed_from_the_manifest(self):
         for label in self.OPTIONS:
@@ -447,7 +498,7 @@ class PilotProposalTest(unittest.TestCase):
 
     def test_each_bracket_column_is_its_own_cadence(self):
         """The whole cost/resolution argument rests on that identity."""
-        for label, (cadence, _, _) in self.OPTIONS.items():
+        for label, (cadence, _, _, _) in self.OPTIONS.items():
             if label == self.PROBE:
                 continue
             with self.subTest(option=label):
@@ -459,6 +510,36 @@ class PilotProposalTest(unittest.TestCase):
                          f"{self.RECOMMENDED.lower()}, {credits:,} credits")
         self.assertClaim(f"option {self.RECOMMENDED.lower()} = "
                          f"{credits:,} credits")
+        fallback = self._manifest(self.FALLBACK).credits
+        self.assertClaim(f"or {self.FALLBACK.lower()} at {fallback:,} if the "
+                         f"sharp book first appears at t-48h")
+
+    def test_the_recommendation_is_the_finest_grid_the_archive_sells(self):
+        """Finer over more: the recommended cadence IS the archive floor."""
+        cadence = self.OPTIONS[self.RECOMMENDED][0]
+        self.assertEqual(_td(minutes=cadence), ARCHIVE_GRID)
+        self.assertClaim("finer data over more of it")
+
+    def test_the_budget_arithmetic_is_the_manifests(self):
+        """The recommendation fits the stated budget, and the remainder the
+        text quotes is what is actually left after it."""
+        probe = self._manifest(self.PROBE).credits
+        run = self._manifest(self.RECOMMENDED).credits
+        left = self.BUDGET - probe - run
+        self.assertGreaterEqual(left, 0)
+        self.assertClaim(f"{self.BUDGET:,}-credit account budget")
+        self.assertClaim(f"{left:,} credits remain of the {self.BUDGET:,}")
+
+    def test_the_international_kickoff_increment_is_the_manifests(self):
+        london = datetime(2026, 9, 27, 13, 30, tzinfo=UTC)
+        cadence, kickoffs, retry, lead = self.OPTIONS[self.RECOMMENDED]
+        spans = [CaptureWindow(k, _td(hours=lead), _td(minutes=cadence))
+                 for k in (london, *kickoffs)]
+        wider = build_manifest(spans, align_to=_td(minutes=cadence),
+                               retry_fraction=retry)
+        base = self._manifest(self.RECOMMENDED)
+        self.assertClaim(f"adds {wider.requests - base.requests} instants and "
+                         f"{wider.credits - base.credits:,} credits")
 
     def test_the_probe_gates_the_measurement_spend(self):
         credits = self._manifest(self.PROBE).credits
@@ -468,26 +549,33 @@ class PilotProposalTest(unittest.TestCase):
 
     def test_the_recommendation_covers_the_multi_day_horizon(self):
         row = self._row(self.RECOMMENDED).lower()
-        self.assertIn("30-min", row)
+        self.assertIn(f"{self.OPTIONS[self.RECOMMENDED][0]}-min", row)
+        self.assertEqual(self.OPTIONS[self.RECOMMENDED][3], 72)
         self.assertClaim("t-72h -> kickoff")
         self.refuteClaim("3h before each of 3 kickoff clusters")
 
     def test_the_cheap_option_is_marked_as_unable_to_answer(self):
-        cadence, _, _ = self.OPTIONS[self.TRAP]
+        cadence, _, _, _ = self.OPTIONS[self.TRAP]
         self.assertClaim(f"option {self.TRAP.lower()} is a trap")
         self.assertClaim(f"{cadence * 60:,}s")
 
     def test_the_alignment_saving_is_the_real_one(self):
-        """Unaligned clusters nearly triple the bill, which is not obvious
-        and is the single biggest lever in the table."""
-        cadence, kickoffs, retry = self.OPTIONS[self.RECOMMENDED]
-        unaligned = build_manifest(windows(cadence, kickoffs),
-                                   retry_fraction=retry)
-        aligned = self._manifest(self.RECOMMENDED)
+        """On a coarse grid, unaligned clusters nearly triple the bill, which
+        is not obvious and is the single biggest lever in the table."""
+        unaligned = self._manifest(self.COARSE, aligned=False)
+        aligned = self._manifest(self.COARSE)
         self.assertClaim(f"{unaligned.requests:,} instants instead of "
                          f"{aligned.requests:,}")
         self.assertClaim(f"{unaligned.credits:,} credits instead of "
                          f"{aligned.credits:,}")
+
+    def test_alignment_saves_nothing_at_the_floor(self):
+        """NFL kickoffs sit on five-minute marks, so the recommended grid
+        shares instants unaided -- the claim, and the manifest behind it."""
+        self.assertEqual(
+            self._manifest(self.RECOMMENDED, aligned=False).requests,
+            self._manifest(self.RECOMMENDED).requests)
+        self.assertClaim("at the 5-minute floor alignment saves nothing")
 
     def test_the_calendar_estimate_disagreement_is_stated(self):
         manifest = build_manifest(windows(30, CLUSTERS[:1]))
@@ -548,9 +636,11 @@ class PilotProposalTest(unittest.TestCase):
         self.assertClaim("only the net change between consecutive samples")
 
     def test_a_null_result_carries_no_claim_about_short_lags(self):
+        cadence = self.OPTIONS[self.RECOMMENDED][0]
         self.refuteClaim("means the lag is under 30 minutes")
-        self.assertClaim("does not establish that the lag is shorter than 30 "
-                         "minutes")
+        self.assertClaim(f"does not establish that the lag is shorter than "
+                         f"{cadence} minutes")
+        self.assertClaim(f"on a {cadence}-minute grid, over this sample")
         self.assertClaim("sparse moves")
 
     def test_insufficient_events_is_a_declared_possible_outcome(self):
@@ -566,11 +656,11 @@ class PilotProposalTest(unittest.TestCase):
         exactly that way and requires the check to catch it.
         """
         reverted = self.raw.replace(
-            "If option A returns `stop`, that means: **on a 30-minute grid, "
-            "over this\nsample, these sources rarely established the book "
-            "leading.**",
-            "If option A returns `stop`, it means the lag is under 30 "
-            "minutes.")
+            "If the recommended run returns `stop`, that means: **on a "
+            "5-minute grid,\nover this sample, these sources rarely "
+            "established the book leading.**",
+            "If the recommended run returns `stop`, it means the lag is under "
+            "30 minutes.")
         self.assertNotEqual(reverted, self.raw, "the anchor text moved")
         text = (reverted.lower()
                 .replace("\u2013", "-").replace("\u2014", "-")
@@ -591,6 +681,56 @@ class PilotProposalTest(unittest.TestCase):
     def test_it_does_not_claim_to_be_the_capture_study(self):
         self.assertClaim("constrained long-lived-discrepancy probe")
         self.assertClaim("does not stand in for it")
+
+    # --- the horizon, and the commands that carry it -------------------------
+
+    def test_the_horizon_is_not_one_cadence_interval(self):
+        """At 5 minutes, one interval would right-censor every follower
+        slower than about four minutes -- the ones the thesis is about."""
+        import collect_reaction
+        cadence = _td(minutes=self.OPTIONS[self.RECOMMENDED][0])
+        horizon = collect_reaction.replay_max_wait_seconds(cadence)
+        self.assertEqual(horizon, 1800)
+        self.assertClaim(f"--max-wait {horizon} at "
+                         f"{self.OPTIONS[self.RECOMMENDED][0]} minutes")
+        self.assertClaim("whichever is longer")
+        self.refuteClaim("max_wait should be one cadence interval")
+
+    def _commands(self, script: str) -> list[list[str]]:
+        """Every documented invocation of `script`, as argv."""
+        import shlex
+        found = []
+        for line in self.raw.splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line.startswith(f"python3 {script} "):
+                found.append(shlex.split(line)[2:])
+        return found
+
+    def test_the_documented_collector_commands_parse(self):
+        """A command in a proposal gets pasted. Each one is parsed by the
+        collector's own parser, so a renamed flag fails the build here
+        rather than on the owner's machine."""
+        import collect_reaction
+        commands = self._commands("collect_reaction.py")
+        self.assertGreaterEqual(len(commands), 4)
+        self.assertFalse(collect_reaction.build_parser().allow_abbrev)
+        for argv in commands:
+            with self.subTest(argv=argv):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    collect_reaction.parse_args(argv)
+
+    def test_the_documented_replay_commands_parse(self):
+        """Exactly as spelled: argparse would otherwise accept a stale flag
+        that happens to be a prefix of the current one."""
+        import run_reaction
+        commands = self._commands("run_reaction.py")
+        self.assertTrue(any("--max-wait" in argv for argv in commands))
+        for argv in commands:
+            with self.subTest(argv=argv):
+                parser = run_reaction.build_parser()
+                parser.allow_abbrev = False
+                with contextlib.redirect_stderr(io.StringIO()):
+                    parser.parse_args(argv)
 
     # --- unchanged guarantees ---------------------------------------------
 
@@ -648,9 +788,12 @@ class ReadmeCurrencyTest(unittest.TestCase):
         self.text = self.section.lower()
 
     def assertClaim(self, needle: str, where: str | None = None):
-        """assertIn without dumping the whole section on failure."""
-        haystack = self.text if where is None else where.lower()
-        if needle.lower() not in haystack:
+        """assertIn without dumping the whole section on failure. Whitespace
+        is normalised on both sides: a claim is not refuted by the line it
+        happens to wrap on."""
+        haystack = " ".join(
+            (self.text if where is None else where.lower()).split())
+        if " ".join(needle.lower().split()) not in haystack:
             self.fail(f"the README does not claim {needle!r}")
 
     def _listed_rejections(self) -> set[str]:
@@ -707,7 +850,7 @@ class ReadmeCurrencyTest(unittest.TestCase):
         status = self.section[self.section.index("### Status"):]
         built = status[:status.index("**Not built:**")]
         for layer in ("reaction measurement", "opportunity screen",
-                      "episode ledger", "offline replay"):
+                      "episode ledger", "offline replay", "backtest collector"):
             self.assertIn(layer, built, f"{layer} is not listed as built")
         unbuilt = status[status.index("**Not built:**"):]
         self.assertIn("live capture", unbuilt)
@@ -719,7 +862,8 @@ class ReadmeCurrencyTest(unittest.TestCase):
         for module in ("reaction.capability", "reaction.clocks",
                        "reaction.detector", "reaction.measure",
                        "reaction.screen", "reaction.episodes",
-                       "reaction.replay", "reaction.capture"):
+                       "reaction.replay", "reaction.capture",
+                       "collect_reaction"):
             with self.subTest(module=module):
                 self.assertClaim(module.split(".")[-1] + ".py")
                 importlib.import_module(module)
@@ -743,12 +887,40 @@ class ReadmeCurrencyTest(unittest.TestCase):
                                 f"README and does not exist")
 
     def test_the_no_orders_commitment_is_still_there(self):
-        self.assertClaim("No orders. No live capture. No paid requests.")
+        """It used to say "No paid requests ... none is implemented", which
+        stopped being true when the collector shipped. What is still true is
+        pinned instead: no orders, no live capture, and paid requests in one
+        place, behind one flag."""
+        self.assertClaim("No orders and no live capture: neither is authorised "
+                         "and neither is implemented.")
+        self.assertClaim("Paid requests exist in exactly one place, "
+                         "`collect_reaction.py`")
+        self.assertClaim("behind an explicit `--spend`")
         self.assertClaim("none is authorised")
+        self.assertNotIn("no paid requests. none is authorised",
+                         " ".join(self.text.split()))
 
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    def test_the_documented_commands_parse_exactly(self):
+        """The commands in this section get pasted; each is parsed by the
+        real CLI with abbreviations off, so a stale flag fails here."""
+        import shlex
+        import collect_reaction
+        import run_reaction
+        parsers = {"collect_reaction.py": collect_reaction.build_parser,
+                   "run_reaction.py": run_reaction.build_parser}
+        seen = 0
+        for line in self.section.splitlines():
+            line = line.split("#", 1)[0].strip()
+            for script, build in parsers.items():
+                if not line.startswith(f"python3 {script} "):
+                    continue
+                seen += 1
+                parser = build()
+                parser.allow_abbrev = False
+                with self.subTest(line=line):
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        parser.parse_args(shlex.split(line)[2:])
+        self.assertGreaterEqual(seen, 8)
 
 
 class ManifestTest(unittest.TestCase):
@@ -864,3 +1036,7 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(with_manifest.odds_requests,
                          manifest.requests_with_retries)
         self.assertNotEqual(plain.odds_credits, with_manifest.odds_credits)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

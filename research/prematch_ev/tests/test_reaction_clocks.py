@@ -1270,14 +1270,26 @@ class ReactionCliTest(unittest.TestCase):
                 self.assertNotIn(prose.lower(), unbuilt.lower(),
                                  f"{layer} shipped but is listed as unbuilt")
 
-    def test_collection_is_still_declared_unbuilt(self):
-        """The one thing that genuinely is not built, and must stay said."""
+    def test_live_capture_is_still_declared_unbuilt(self):
+        """The one thing that genuinely is not built, and must stay said.
+
+        It used to read "NOT BUILT: collection", and stayed true until the
+        backtest collector shipped. A footer still saying so afterwards is
+        the same stale claim this block exists to catch, pointed the other
+        way -- so the collector is asserted BUILT, from the module itself.
+        """
+        import collect_reaction
+        self.assertTrue(callable(collect_reaction.main))
         _, text = self._run(["--capability"])
         unbuilt = self._unbuilt_section(text).lower()
-        self.assertIn("collection", unbuilt)
-        self.assertIn("no orders", text.lower())
-        self.assertIn("no live capture", text.lower())
-        self.assertIn("no paid requests", text.lower())
+        built = text[:len(text) - len(unbuilt)].lower()
+        self.assertIn("live capture", unbuilt)
+        self.assertNotIn("collection", unbuilt)
+        self.assertIn("collect_reaction.py", built)
+        self.assertIn("--spend", built)
+        self.assertIn("no orders", unbuilt)
+        self.assertIn("no live capture", unbuilt)
+        self.assertIn("makes no paid request", unbuilt)
 
     def test_the_cli_does_not_claim_the_books_move_instant_is_answerable(self):
         """`last_update` is the PROVIDER's observation, not the book's change.

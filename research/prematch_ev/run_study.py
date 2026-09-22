@@ -48,7 +48,7 @@ from data.kalshi_history import (                                  # noqa: E402
     fetch_historical_cutoff, uses_archive,
 )
 from data.cache import (                                           # noqa: E402
-    CreditCapReached, ResponseCache, key_for,
+    CreditCapReached, ResponseCache, resolve_key,
 )
 from data.odds_history import (                                    # noqa: E402
     CreditLedger, DEFAULT_BOOKMAKERS, MAX_QUOTE_AGE_SECONDS, RETRIES, SPORT_KEYS,
@@ -655,7 +655,8 @@ def preflight(args) -> int:
     # would quote a price nobody is going to be charged.
     cache = ResponseCache(Path(args.cache_dir) if args.cache_dir else None)
     missing = [at for at in cutoffs
-               if not cache.has(key_for(args.sport, at, DEFAULT_BOOKMAKERS, "h2h"))]
+               if not cache.has(resolve_key(cache, args.sport, at,
+                                            DEFAULT_BOOKMAKERS, "h2h"))]
     cached = len(cutoffs) - len(missing)
 
     print()

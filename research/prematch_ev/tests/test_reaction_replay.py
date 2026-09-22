@@ -42,8 +42,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from reaction.episodes import DataRole, HoldoutViolation            # noqa: E402
 from reaction.measure import usable_candle                          # noqa: E402
 from reaction.replay import (                                       # noqa: E402
-    BUNDLE_SCHEMA, BundleError, load_bundle, render_report, replay,
-    replay_file,
+    BUNDLE_SCHEMA, BUNDLE_SCHEMA_POOLED, BundleError, load_bundle,
+    render_report, replay, replay_file,
 )
 
 UTC = timezone.utc
@@ -523,10 +523,6 @@ class ReplayCliTest(_CliDriver, unittest.TestCase):
         _, text = self._run(["--replay", str(write(bundle()))])
         for secret in ("apiKey", "api_key", "Bearer", "SECRET"):
             self.assertNotIn(secret, text)
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class MissingTargetObservationTest(unittest.TestCase):
@@ -1092,3 +1088,175 @@ class FeasibilityCliTest(_CliDriver, unittest.TestCase):
         code, text = self._run(["--replay", str(write(bundle()))])
         self.assertEqual(code, 0)
         self.assertIn("insufficient_observable_events", text)
+
+
+def after_kickoff(minutes: float) -> datetime:
+    return START + timedelta(minutes=minutes)
+
+
+class InPlayExclusionTest(unittest.TestCase):
+    """A snapshot after kickoff is IN-PLAY, and this is a PREGAME study.
+
+    The parser keeps every event in a response, games under way included, and
+    nothing downstream asked whether a quote was pregame. A score-driven swing
+    after kickoff was detected as a book move, measured against the
+    exchange's own in-play repricing, and entered the feasibility verdict --
+    with coverage reported clean.
+    """
+
+    INPLAY = [
+        lambda: odds_payload(at(20), 120, -140, at(21)),
+        lambda: odds_payload(at(10), 120, -140, at(11)),
+        lambda: odds_payload(after_kickoff(10), 400, -600, after_kickoff(9)),
+        lambda: odds_payload(after_kickoff(15), 900, -2000, after_kickoff(14)),
+    ]
+
+    def _run(self, snapshots):
+        games, report = load_bundle(write(bundle(odds_snapshots=snapshots)))
+        ledger = replay(games)
+        return ledger, report, {s.stage: s for s in ledger.stages}
+
+    def test_a_swing_after_kickoff_is_never_detected(self):
+        ledger, report, stages = self._run([f() for f in self.INPLAY])
+        self.assertEqual(stages["moves detected"].total, 0)
+        self.assertEqual(ledger.feasibility.book_moves, 0)
+        self.assertEqual(report.in_play_excluded, 2)
+
+    def test_the_same_swing_before_kickoff_is_detected(self):
+        """The control: the exclusion must be about TIME, not about size."""
+        _, _, stages = self._run([
+            odds_payload(at(20), 120, -140, at(21)),
+            odds_payload(at(10), 400, -600, at(11))])
+        self.assertEqual(stages["moves detected"].total, 1)
+
+    def test_the_kickoff_instant_itself_is_the_closing_pregame_sample(self):
+        """Matching the manifest's window, closed at both ends."""
+        _, report, stages = self._run([
+            odds_payload(at(10), 120, -140, at(11)),
+            odds_payload(START, 400, -600, at(1))])
+        self.assertEqual(report.in_play_excluded, 0)
+        self.assertEqual(stages["moves detected"].total, 1)
+
+    def test_an_exclusion_is_counted_and_rendered_not_graded(self):
+        """In-play data is expected in any real pull; it is not a loss."""
+        _, report, _ = self._run([f() for f in self.INPLAY])
+        self.assertTrue(report.complete)
+        self.assertIn("in-play pairs excluded", render_report(report))
+        self.assertEqual(report.as_dict()["in_play_pairs_excluded"], 2)
+
+
+def slate_payload(snapshot: datetime, events: list[tuple]) -> dict:
+    """One sport-wide snapshot: every listed game in a single response.
+
+    `events` is (event_id, away_price, home_price, observed, commence).
+    """
+    data = []
+    for event_id, away, home, observed, commence in events:
+        body = odds_payload(snapshot, away, home, observed, event_id=event_id)
+        body["data"][0]["commence_time"] = iso(commence)
+        data.extend(body["data"])
+    return {"timestamp": iso(snapshot), "data": data}
+
+
+LATE_EVENT, LATE_TICKER = "evt-nfl-late", "KXNFLGAME-26SEP13LVDEN"
+LATE_START = START + timedelta(hours=3, minutes=25)
+
+
+def pooled_bundle(pool: list, *, games=None) -> dict:
+    """A v2 bundle: one root pool, two games in different kickoff clusters."""
+    early = _base_game()
+    early.pop("odds_snapshots")
+    late = _base_game()
+    late.pop("odds_snapshots")
+    late.update({"provider_event_id": LATE_EVENT, "event_ticker": LATE_TICKER,
+                 "start": iso(LATE_START)})
+    for contract in late["contracts"]:
+        contract["market_ticker"] = contract["market_ticker"].replace(
+            TICKER, LATE_TICKER)
+    return {"schema": BUNDLE_SCHEMA_POOLED, "odds_snapshots": pool,
+            "games": games if games is not None else [early, late]}
+
+
+class PooledBundleTest(unittest.TestCase):
+    """v2: one shared pool, each game windowed to its own pregame span.
+
+    A snapshot is sport-wide, so v1's per-game lists stored each payload
+    once per game -- ~90 MB of duplicated JSON for a 5-minute NFL Sunday. And
+    a shared pool is only safe with the in-play exclusion: after the early
+    kickoff, every snapshot carries the early game IN PLAY.
+    """
+
+    def _pool(self):
+        """Early game quiet until kickoff then swinging in play; late game
+        quiet throughout. Five instants spanning both kickoffs."""
+        instants = [START - timedelta(minutes=20), START - timedelta(minutes=10),
+                    START + timedelta(minutes=30), START + timedelta(hours=2),
+                    LATE_START]
+        early_prices = [(120, -140), (120, -140), (400, -600), (900, -2000),
+                        (900, -2000)]
+        pool = []
+        for moment, (away, home) in zip(instants, early_prices):
+            events = [(EVENT, away, home, moment - timedelta(minutes=1), START),
+                      (LATE_EVENT, 120, -140, moment - timedelta(minutes=1),
+                       LATE_START)]
+            pool.append(slate_payload(moment, events))
+        return pool
+
+    def test_a_shared_payload_is_counted_once_however_many_games_read_it(self):
+        _, report = load_bundle(write(pooled_bundle(self._pool())))
+        self.assertEqual(report.snapshot_payloads, 5)
+        self.assertEqual(report.snapshots_parsed, 5)
+        self.assertEqual(report.games, 2)
+
+    def test_each_game_sees_only_its_own_pregame_window(self):
+        games, report = load_bundle(write(pooled_bundle(self._pool())))
+        by_id = {g.provider_event_id: g for g in games}
+        self.assertEqual(len(by_id[EVENT].quotes), 2)       # before 00:20
+        self.assertEqual(len(by_id[LATE_EVENT].quotes), 5)  # all pregame
+        self.assertEqual(report.in_play_excluded, 3)
+
+    def test_an_early_games_in_play_swing_cannot_trigger_from_the_pool(self):
+        games, _ = load_bundle(write(pooled_bundle(self._pool())))
+        ledger = replay(games)
+        stages = {s.stage: s for s in ledger.stages}
+        self.assertEqual(stages["moves detected"].total, 0)
+
+    def test_observe_from_bounds_the_window_from_below(self):
+        payload = pooled_bundle(self._pool())
+        payload["games"][1]["observe_from"] = iso(START + timedelta(hours=1))
+        games, report = load_bundle(write(payload))
+        late = [g for g in games if g.provider_event_id == LATE_EVENT][0]
+        self.assertEqual(len(late.quotes), 2)
+        self.assertEqual(report.before_window_excluded, 3)
+
+    def test_a_game_may_not_bring_its_own_odds_into_a_pooled_bundle(self):
+        payload = pooled_bundle(self._pool())
+        payload["games"][0]["odds_snapshots"] = []
+        with self.assertRaises(BundleError) as caught:
+            load_bundle(write(payload))
+        self.assertIn("may not carry their own", str(caught.exception))
+
+    def test_a_pooled_bundle_without_a_pool_is_refused(self):
+        payload = pooled_bundle(self._pool())
+        del payload["odds_snapshots"]
+        with self.assertRaises(BundleError):
+            load_bundle(write(payload))
+
+    def test_a_window_that_opens_after_kickoff_is_refused(self):
+        payload = pooled_bundle(self._pool())
+        payload["games"][0]["observe_from"] = iso(START + timedelta(hours=1))
+        with self.assertRaises(BundleError) as caught:
+            load_bundle(write(payload))
+        self.assertIn("no pregame window", str(caught.exception))
+
+    def test_a_pooled_bundle_replays_through_the_cli(self):
+        from unittest import mock
+        import run_reaction
+        with mock.patch("builtins.print"):
+            code = run_reaction.main(
+                ["--replay", str(write(pooled_bundle(self._pool())))])
+        self.assertEqual(code, 0)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

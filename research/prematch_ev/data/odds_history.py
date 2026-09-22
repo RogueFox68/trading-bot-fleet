@@ -32,7 +32,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from .cache import CreditCapReached, ResponseCache, key_for, redact
+from .cache import (
+    CreditCapReached, ResponseCache, key_for, redact, resolve_key,
+)
 from .kalshi_history import Coverage
 
 BASE_URL = "https://api.the-odds-api.com/v4"
@@ -97,9 +99,12 @@ class CreditLedger:
 
     def spend_or_raise(self, credits: int = CREDITS_PER_HISTORICAL_CALL) -> None:
         if self.cap is not None and self.spent_this_run + credits > self.cap:
+            # "Reserved", not "spent": the debit is taken before each attempt,
+            # so a run whose every request was REFUSED (a bad key) reaches the
+            # cap too, and saying "spent" there reads as money gone.
             raise CreditCapReached(
                 f"paid-request budget reached: {self.spent_this_run} credits "
-                f"spent of a {self.cap} cap; refusing the next call"
+                f"reserved of a {self.cap} cap; refusing the next call"
             )
         self.spent_this_run += credits
 
@@ -203,6 +208,13 @@ class SnapshotResult:
     quotes_without_update_time: int = 0
     quotes_stale: int = 0
     events_without_id: int = 0
+    #: The response body exactly as received, or None when nothing arrived.
+    #: A replay bundle stores RAW payloads so a parser fix reaches it (see
+    #: reaction/replay.py), and the cache keeps only COMPLETE parses -- so an
+    #: unreadable body, which a bundle must still carry to count it as a loss,
+    #: would otherwise be unrecoverable. Nothing in the checkpoint study reads
+    #: it; it exists for the reaction collector.
+    raw: Any = None
 
     def fresh_quotes(self, max_age: float = MAX_QUOTE_AGE_SECONDS) -> list[SharpQuote]:
         return [q for q in self.quotes if q.is_fresh(max_age)]
@@ -382,10 +394,11 @@ def fetch_snapshot(
     is the point: debugging a local join must not cost money twice.
     """
     if cache is not None and cache.enabled:
-        key = key_for(sport, at, bookmakers or "", "h2h")
-        hit = cache.get(key)
+        hit = cache.get(resolve_key(cache, sport, at, bookmakers or "", "h2h"))
         if hit is not None:
-            return parse_snapshot(hit)
+            result = parse_snapshot(hit)
+            result.raw = hit
+            return result
 
     url = build_snapshot_url(sport, at, api_key, bookmakers, regions, base_url)
 
@@ -410,6 +423,7 @@ def fetch_snapshot(
                     raise OddsFetchError(f"HTTP {resp.status}")
                 payload = json.loads(resp.read().decode("utf-8"))
                 result = parse_snapshot(payload)
+                result.raw = payload
                 # Only a successful, parseable response is stored; caching a
                 # failure would make a transient outage permanent on replay.
                 if (cache is not None and cache.enabled

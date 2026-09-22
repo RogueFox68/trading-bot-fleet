@@ -257,32 +257,11 @@ def _numeric(item: dict, *keys: str) -> float:
     return 0.0
 
 
-def fetch_candlesticks(
-    ticker: str,
-    series: str,
-    start: datetime,
-    end: datetime,
-    period_interval: int = PERIOD_MINUTE,
-    base_url: str = BASE_URL,
-    use_archive: bool | None = None,
-) -> tuple[list[Candle], Coverage]:
-    """Candles for one market over [start, end].
-
-    `use_archive=None` picks the archive for windows older than ~90 days, which
-    is roughly where Kalshi's live/historical split sits. Pass it explicitly if
-    the cutoff has moved.
-    """
-    if use_archive is None:
-        # NO AGE HEURISTIC. `now - end > 90 days` was the rule this module was
-        # told to stop using, and letting an unroutable market fall back to it
-        # quietly reinstates it for exactly the markets whose partition could
-        # not be established -- the ones most likely to be routed wrongly.
-        return [], Coverage().fail(
-            f"{ticker}: candlestick partition could not be established "
-            "(no enumeration provenance and no readable settlement time); "
-            "refusing to guess an endpoint"
-        )
-
+def candlestick_url(ticker: str, series: str, start: datetime,
+                    end: datetime, period_interval: int = PERIOD_MINUTE,
+                    base_url: str = BASE_URL,
+                    use_archive: bool = False) -> str:
+    """The exact URL a candlestick fetch requests, for one partition."""
     path = (
         HISTORICAL_PATH.format(ticker=ticker)
         if use_archive
@@ -295,10 +274,61 @@ def fetch_candlesticks(
             "period_interval": period_interval,
         }
     )
+    return f"{base_url}{path}?{query}"
+
+
+def fetch_candlestick_payload(
+    ticker: str,
+    series: str,
+    start: datetime,
+    end: datetime,
+    period_interval: int = PERIOD_MINUTE,
+    base_url: str = BASE_URL,
+    use_archive: bool | None = None,
+) -> tuple[Any, Coverage]:
+    """The RAW candlestick body for one market over [start, end].
+
+    Split out of `fetch_candlesticks` so a replay bundle can store the body
+    exactly as received and run it through the same parser later, rather
+    than storing already-parsed candles against a second reading of the
+    wire format. `fetch_candlesticks` calls this; there is one HTTP path.
+    """
+    if use_archive is None:
+        # NO AGE HEURISTIC. `now - end > 90 days` was the rule this module was
+        # told to stop using, and letting an unroutable market fall back to it
+        # quietly reinstates it for exactly the markets whose partition could
+        # not be established -- the ones most likely to be routed wrongly.
+        return None, Coverage().fail(
+            f"{ticker}: candlestick partition could not be established "
+            "(no enumeration provenance and no readable settlement time); "
+            "refusing to guess an endpoint"
+        )
     try:
-        payload = _get(f"{base_url}{path}?{query}")
+        return _get(candlestick_url(ticker, series, start, end,
+                                    period_interval, base_url,
+                                    use_archive)), Coverage()
     except KalshiFetchError as exc:
-        return [], Coverage().fail(str(exc))
+        return None, Coverage().fail(str(exc))
+
+
+def fetch_candlesticks(
+    ticker: str,
+    series: str,
+    start: datetime,
+    end: datetime,
+    period_interval: int = PERIOD_MINUTE,
+    base_url: str = BASE_URL,
+    use_archive: bool | None = None,
+) -> tuple[list[Candle], Coverage]:
+    """Candles for one market over [start, end].
+
+    `use_archive` must say which partition holds the market: None is a
+    refusal, not a default (see `fetch_candlestick_payload`).
+    """
+    payload, coverage = fetch_candlestick_payload(
+        ticker, series, start, end, period_interval, base_url, use_archive)
+    if not coverage.complete:
+        return [], coverage
     return parse_candles(payload)
 
 

@@ -79,11 +79,23 @@ FORBIDDEN_CAPABILITIES = (
 # not a side effect of whatever a URL builder happens to produce.
 ALLOWED_ENDPOINTS = (
     "api.the-odds-api.com/v4/historical/sports/{sport}/odds",
-    "api.elections.kalshi.com/trade-api/v2/series/{series}/markets",
+    "api.elections.kalshi.com/trade-api/v2/markets",
+    "api.elections.kalshi.com/trade-api/v2/historical/markets",
+    "api.elections.kalshi.com/trade-api/v2/historical/cutoff",
     "api.elections.kalshi.com/trade-api/v2/series/{series}/markets/"
+    "{ticker}/candlesticks",
+    "api.elections.kalshi.com/trade-api/v2/historical/markets/"
     "{ticker}/candlesticks",
     "site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard",
 )
+# THIS LIST IS THE SET THE FETCHERS ACTUALLY CALL, and a test builds every one
+# of those URLs through the real code and checks it against this list, in both
+# directions. The first version was written from a reading of the providers'
+# APIs rather than from `data/`: it named `/series/{series}/markets`, which no
+# fetcher requests, and omitted `/markets`, `/historical/markets`,
+# `/historical/cutoff` and the archive candlesticks -- so a collector enforcing
+# it would have refused its own enumeration. An allow-list nothing enforced
+# could be wrong in both directions without anyone noticing.
 
 
 class CaptureRefused(RuntimeError):
