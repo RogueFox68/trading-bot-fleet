@@ -132,6 +132,7 @@ class LiveNetwork:
       absent_at        odds polls in this window omit the game entirely
       listing_status   the open-market listing fails with this status
       listing_fail_after  the listing answers this many times, then fails
+      no_open_markets  the listing answers, with no open market in it
       extra_in_play    add a game already under way, re-priced every poll
       extra_pre_match  add a second, later game, re-priced every poll, with
                        no Kalshi market to join
@@ -169,6 +170,7 @@ class LiveNetwork:
         self.absent_at = knobs.get("absent_at")
         self.listing_status = knobs.get("listing_status")
         self.listing_fail_after = knobs.get("listing_fail_after")
+        self.no_open_markets = knobs.get("no_open_markets", False)
         during = knobs.get("fail_books_during")
         self.fail_books_during = ([] if during is None else
                                   [during] if isinstance(during[0], datetime)
@@ -216,7 +218,9 @@ class LiveNetwork:
                     raise urllib.error.HTTPError(url, 503, "Unavailable",
                                                  {}, None)
                 self.listings_served += 1
-                return Response({"markets": _open_markets(), "cursor": ""})
+                return Response({"markets": ([] if self.no_open_markets
+                                             else _open_markets()),
+                                 "cursor": ""})
         if parts.netloc == "api.the-odds-api.com":
             return self._odds(url, at)
         raise AssertionError(f"no answer for {url}")
@@ -395,6 +399,24 @@ class PlanFirstTest(MonitorHarness):
         self.assertEqual(net.odds_calls, [])
         self.assertIn("could not be read", text)
         self.assertIn("Nothing was spent", text)
+
+    def test_a_plan_with_no_open_market_says_so_and_fails(self):
+        """Nothing open: no book to check the shape on, and a paid session
+        would stop in its preflight. The plan says both and exits 1, rather
+        than inviting a `--spend` on a check it never made."""
+        code, text, net = self.run_monitor(no_open_markets=True)
+        self.assertEqual(code, 1, text)
+        self.assertEqual(net.odds_calls, [])
+        self.assertEqual(net.book_calls, [])
+        self.assertIn("no open KXNFLGAME market", text)
+        self.assertIn("Nothing was spent", text)
+        self.assertNotIn("re-run with --spend", text)
+
+    def test_a_paid_session_with_no_open_market_stops_before_paying(self):
+        code, text, net = self.paid(no_open_markets=True)
+        self.assertEqual(code, 1, text)
+        self.assertEqual(net.odds_calls, [])
+        self.assertEqual(self.end(self.records())["reason"], "no_open_markets")
 
     def test_a_paid_session_reads_the_shape_once_in_its_preflight(self):
         """Not twice: the plan's read is for a plan; a session's preflight

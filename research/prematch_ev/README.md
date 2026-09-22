@@ -1182,7 +1182,10 @@ python3 shadow_monitor.py --report study_output/shadow/<session>.jsonl
   is read — free — before the first paid poll, and a shape the parser
   refuses stops the session with nothing bought. The plan reads one too,
   through the same function, so the shape can be checked without buying
-  anything: a plan whose book does not parse exits 1. The provider's observation
+  anything: a plan whose book does not parse exits 1, and so does one with no
+  open market to read a book from, since a paid session would stop on that
+  too — a plan that invited `--spend` there would pass a check it never
+  made. The provider's observation
   stamp is transcribed too, and the detector refuses a price without one, so
   a first answer in which no pre-match quote carries a stamp stops the
   session after one credit instead of paying for one that could never

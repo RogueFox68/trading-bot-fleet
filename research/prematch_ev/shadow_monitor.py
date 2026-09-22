@@ -1220,6 +1220,15 @@ def main(argv: Sequence[str] | None = None, *, clock: Any = None,
     # be checked before anything is paid for. A paid session reads it again
     # in its own preflight, through the same function, and stops there.
     shape_ok = True
+    if args.spend is None and slate.coverage.complete and not slate.markets:
+        # The preflight's own stop, in the plan. With nothing open there is
+        # no book to check the shape on, so a plan that said "re-run with
+        # --spend" here would pass a check it never made.
+        shape_ok = False
+        print(f"\n  *** no open {args.series} market in the next "
+              f"{SLATE_DAYS} days: nothing to watch, and no book to check "
+              f"the transcribed shape on. A paid session would stop here, "
+              f"before its first poll.", file=sys.stderr)
     if args.spend is None and slate.coverage.complete and slate.markets:
         ticker = sorted(slate.markets)[0]
         with only_declared_endpoints():
@@ -1242,8 +1251,8 @@ def main(argv: Sequence[str] | None = None, *, clock: Any = None,
         return EXIT_STOPPED
     if args.spend is None:
         if not shape_ok:
-            print("\n  Nothing was spent. The book parser has to read the "
-                  "real shape before a session is worth running.",
+            print("\n  Nothing was spent. A session is worth running only "
+                  "once the book parser has read a real book.",
                   file=sys.stderr)
             return EXIT_STOPPED
         print(f"\n  Nothing was spent. To run, re-run with --spend {price}.")
