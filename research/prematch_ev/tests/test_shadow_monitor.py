@@ -147,6 +147,9 @@ class LiveNetwork:
                        every request, so polls in between repeat it
       follow_at        when Kalshi re-prices (default FOLLOW_AT); None:
                        never
+      kalshi_path      [(from, yes_bid), ...]: NYG's YES bid from each
+                       instant on (0.56 before the first), a 2c spread
+                       throughout; replaces follow_at when given
       odds_body_delay  each odds body takes this long to arrive after its
                        headers; `odds_bodies_done` records when each did
       book_body_delay  the same for every order-book body
@@ -182,6 +185,7 @@ class LiveNetwork:
         self.older_copy_at = knobs.get("older_copy_at")
         self.refresh_every = knobs.get("refresh_every")
         self.follow_at = knobs.get("follow_at", FOLLOW_AT)
+        self.kalshi_path = knobs.get("kalshi_path")
         self.odds_body_delay = knobs.get("odds_body_delay")
         self.book_body_delay = knobs.get("book_body_delay")
         self.odds_chunks = knobs.get("odds_chunks")
@@ -311,9 +315,16 @@ class LiveNetwork:
             raise urllib.error.HTTPError(url, 500, "Error", {}, None)
         if not self.book_shape_ok:
             return Response({"book": {"bids": [[56, 100]]}})
-        followed = ((self.follow_at is not None and at >= self.follow_at)
-                    or (self.follow_on_execution and self.moved_served))
-        yes_bid, no_bid = (0.70, 0.28) if followed else (0.56, 0.42)
+        if self.kalshi_path is not None:
+            yes_bid = 0.56
+            for since, bid in sorted(self.kalshi_path):
+                if at >= since:
+                    yes_bid = bid
+            no_bid = round(0.98 - yes_bid, 4)
+        else:
+            followed = ((self.follow_at is not None and at >= self.follow_at)
+                        or (self.follow_on_execution and self.moved_served))
+            yes_bid, no_bid = (0.70, 0.28) if followed else (0.56, 0.42)
         if ticker == DAL:
             yes_bid, no_bid = no_bid, yes_bid
         # TRANSCRIBED from Kalshi's documentation, not observed.
@@ -810,6 +821,52 @@ class TruncatedBodyTest(MonitorHarness):
         for book in cut:
             self.assertIsNone(book["payload"])
             self.assertIn("IncompleteRead", " ".join(book["coverage"]))
+
+
+class PriorMoveLiveTest(MonitorHarness):
+    """Kalshi's moves before the trigger, through a whole session and its
+    report: judged by what was still in place when we could act.
+
+    Before a move the monitor reads each book once a poll, a minute apart,
+    and the session's own limit on going unseen is 30s. So a move Kalshi
+    kept is dated only to the read at the trigger, which leaves its ordering
+    against the book indeterminate -- the honest resolution of that data.
+    """
+
+    def responses(self, **knobs):
+        code, text, _ = self.paid(**knobs)
+        self.assertEqual(code, 0, text)
+        figures = shadow_monitor.report(self.records())
+        return {r["ticker"]: r for r in figures["responses"]}, figures
+
+    def test_a_move_kalshi_made_and_undid_does_not_hide_its_response(self):
+        """Up at 20:02, back at 20:04, up again at 20:08: the move at 20:05
+        found the old price in place, and the 20:08 move is its response."""
+        by, _ = self.responses(kalshi_path=[
+            (MOVE_AT - timedelta(minutes=3), 0.70),
+            (MOVE_AT - timedelta(minutes=1), 0.56),
+            (FOLLOW_AT, 0.70)])
+        self.assertEqual(by[NYG]["outcome"], "responded")
+        self.assertIsNone(by[NYG]["prior_move"])
+        low, _ = by[NYG]["lag_seconds"]
+        self.assertGreater(low, 0)
+
+    def test_a_move_kalshi_kept_is_still_its_moving_first(self):
+        by, _ = self.responses(
+            kalshi_path=[(MOVE_AT - timedelta(minutes=3), 0.70)])
+        self.assertEqual(by[NYG]["outcome"], "exchange_moved_before_trigger")
+        self.assertAlmostEqual(by[NYG]["prior_move"]["delta"], 0.14, places=9)
+        self.assertIsNone(by[NYG]["lag_seconds"])
+        self.assertEqual(by[NYG]["ordering"], "indeterminate")
+        self.assertNotIn("no discrepancy", by[NYG]["detail"])
+
+    def test_a_partial_move_then_a_further_one_is_a_response_on_top(self):
+        by, figures = self.responses(kalshi_path=[
+            (MOVE_AT - timedelta(minutes=3), 0.63), (FOLLOW_AT, 0.70)])
+        self.assertEqual(by[NYG]["outcome"], "responded")
+        self.assertAlmostEqual(by[NYG]["prior_move"]["delta"], 0.07, places=9)
+        self.assertIn("came on top of a move Kalshi",
+                      shadow_monitor.render_report(figures))
 
 
 class ReceiptClockTest(MonitorHarness):

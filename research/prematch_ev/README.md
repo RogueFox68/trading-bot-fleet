@@ -933,6 +933,23 @@ them is the temptation and "the book led by 90 seconds" is neither:
 search sees the exchange already adjusted and reports `NO_RESPONSE` — filing
 the thesis being falsified under the same name as the thesis holding.
 
+**It is judged at the trigger, and it does not end the measurement.** The
+first version returned `exchange_moved_before_trigger` on the first move the
+book's way anywhere in the lookback, so an exchange that went up and came
+back before we could act was filed as having moved first, voted Kalshi-led,
+described as "no discrepancy left to trade" — and the response it made after
+the trigger was never measured. Now the pre-trigger move counts only if it
+is still in place at the trigger (a hole in the reads widens when it can be
+said to have been made, rather than letting it date from before the hole),
+and what the exchange did after the trigger is always searched for. A move
+in place with nothing further after it is `exchange_moved_before_trigger`;
+a further move is a response, with the earlier one reported beside it
+(`prior_adjustment`), and the feasibility verdict counts whichever came
+**first**, since a response on top of an earlier move does not make the book
+the leader. Neither is a claim about the opportunity: a partial move leaves
+a discrepancy, and whether anything was left to trade is the screen's call,
+at the decision book (`prior_move` rides on its rows too).
+
 **A response located only across the trigger is not a reaction.** The lag's
 lower end used to be clamped at zero, on the reasoning that a candle period
 straddling the trigger "cannot imply a negative wait". It can: the change
@@ -1165,7 +1182,10 @@ python3 shadow_monitor.py --report study_output/shadow/<session>.jsonl
   that did not show it. Only a bracket that opens after the move was
   actionable is `responded`; one that straddles it is
   `moved_around_trigger` — Kalshi may have moved first — and a move in the
-  half hour before is `exchange_moved_before_trigger`. A window the reads
+  half hour before that is still in place at the trigger, with nothing
+  further after it, is `exchange_moved_before_trigger` (one that came undone
+  is not; a further move on top of one is a response, reported with its
+  `prior_move`). A window the reads
   did not cover to its end — reads that failed, a session interrupted or
   ended inside it, no reads at all — is `blind_interval`, never a quiet
   market; the limit is three follow intervals, one lost read, recorded on

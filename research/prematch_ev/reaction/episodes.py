@@ -290,8 +290,9 @@ _DETERMINATE = (Ordering.BOOK_LED, Ordering.KALSHI_LED)
 
 
 def _response_key(reaction: Reaction) -> tuple:
-    """One exchange response on one contract: the thing counted once."""
-    bracket = reaction.exchange_change
+    """One exchange movement on one contract: the thing counted once. The
+    movement that votes -- the exchange's first move the book's way."""
+    bracket = reaction.first_move_change
     return (reaction.market_ticker, bracket.earliest, bracket.latest)
 
 
@@ -312,6 +313,11 @@ def judge_feasibility(reactions: Sequence[Reaction],
     Reactions are grouped by the trigger that produced them, processed in
     detection order, and each exchange response is credited to the first
     book move that claimed it. Refuses an unreachable rule outright.
+
+    A reaction votes by the exchange's FIRST move the book's way
+    (`first_move_ordering`): a response that came on top of a move already
+    in place at the trigger does not make the book the leader, because the
+    exchange had begun first.
     """
     rule = rule or FeasibilityRule()
     policy = policy or ReactionPolicy()
@@ -335,13 +341,13 @@ def judge_feasibility(reactions: Sequence[Reaction],
     claimed: set[tuple] = set()
     for key in sorted(by_move, key=_move_order):
         move = by_move[key]
-        ordered = [r for r in move if r.ordering in _DETERMINATE]
+        ordered = [r for r in move if r.first_move_ordering in _DETERMINATE]
         fresh = [r for r in ordered if _response_key(r) not in claimed]
         claimed.update(_response_key(r) for r in ordered)
         if ordered and not fresh:
             tally["shared_response"] += 1
             continue
-        kinds = {r.ordering for r in fresh}
+        kinds = {r.first_move_ordering for r in fresh}
         if len(kinds) > 1:
             # One contract says the book led and its mirror says the exchange
             # did. That is contradictory evidence about ONE move, and it is
@@ -353,7 +359,8 @@ def judge_feasibility(reactions: Sequence[Reaction],
         elif kinds == {Ordering.KALSHI_LED}:
             tally["kalshi_led"] += 1
             games.add(fresh[0].event_id)
-        elif any(r.ordering is Ordering.INDETERMINATE for r in move):
+        elif any(r.first_move_ordering is Ordering.INDETERMINATE
+                 for r in move):
             tally["indeterminate"] += 1
         else:
             tally["unknown_ordering"] += 1

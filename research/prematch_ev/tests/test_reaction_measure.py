@@ -730,6 +730,169 @@ class LiveReadingTest(unittest.TestCase):
         self.assertAlmostEqual(reaction.lag_latest_seconds, 50.0, places=6)
 
 
+class PriorAdjustmentTest(unittest.TestCase):
+    """A move the exchange made before the trigger is judged by whether it
+    was still there AT the trigger, and it never ends the measurement.
+
+    The first version returned `exchange_moved_before_trigger` on the first
+    move the book's way anywhere in the lookback -- one that had come back
+    before we could act included -- called it "no discrepancy left to
+    trade", and never looked at what the exchange did next. The owner's
+    reproduction below is exactly that: reads every 10s, each taking 0.2s.
+    SYNTHETIC mids; the reading type is the monitor's own.
+    """
+
+    T = START - timedelta(hours=3)
+    POLICY = ReactionPolicy(max_wait=timedelta(seconds=180),
+                            max_unobserved=timedelta(seconds=30))
+    BOOK = +0.05
+
+    def at(self, seconds):
+        return self.T + timedelta(seconds=seconds)
+
+    def reads(self, path, *, first=-300, last=180, every=10, skip=()):
+        """A read every `every` seconds from `first` to `last`; `path` maps
+        the second a price takes effect to the mid from then on (0.50
+        before the first)."""
+        out, second = [], first
+        while second <= last:
+            if second not in skip:
+                mid = 0.50
+                for since in sorted(path):
+                    if second >= since:
+                        mid = path[since]
+                out.append(read(self.at(second), mid))
+            second += every
+        return out
+
+    def measure(self, readings):
+        return measure_response(
+            event_id=EVENT, stream_id="s", market_ticker=TICKER,
+            detected_at=self.T, book_delta=self.BOOK,
+            book_change=Bracket(self.at(-20), self.T), readings=readings,
+            policy=self.POLICY)
+
+    def test_the_owners_reproduction_a_reversed_move_then_a_response(self):
+        """0.50, up to 0.55 at -90s, back to 0.50 at -30s and through the
+        trigger, up to 0.55 again at +60s. Nothing was in place when we
+        could act; the move at +60s is the response."""
+        reaction = self.measure(self.reads({-90: 0.55, -30: 0.50, 60: 0.55}))
+        self.assertIs(reaction.outcome, ReactionOutcome.RESPONDED)
+        self.assertAlmostEqual(reaction.lag_earliest_seconds, 49.8, places=6)
+        self.assertAlmostEqual(reaction.lag_latest_seconds, 60.0, places=6)
+        self.assertIs(reaction.ordering, Ordering.BOOK_LED)
+        self.assertIsNone(reaction.prior)
+        self.assertIs(reaction.first_move_ordering, Ordering.BOOK_LED)
+
+    def test_a_sustained_adjustment_is_still_the_exchange_moving_first(self):
+        reaction = self.measure(self.reads({-60: 0.55}))
+        self.assertIs(reaction.outcome, ReactionOutcome.ALREADY_PRICED)
+        self.assertIs(reaction.ordering, Ordering.KALSHI_LED)
+        self.assertIsNone(reaction.lag_earliest_seconds)
+        self.assertAlmostEqual(reaction.prior.delta, 0.05, places=9)
+        self.assertEqual(reaction.exchange_change,
+                         Bracket(self.at(-70.2), self.at(-60)))
+        self.assertEqual(reaction.prior.change, reaction.exchange_change)
+        self.assertIn("still there at the trigger", reaction.detail)
+        self.assertIn("moved no further", reaction.detail)
+
+    def test_a_partial_adjustment_then_a_further_move_is_measured(self):
+        """0.03 of a 0.05 move before the trigger, 0.03 more after it. The
+        second is a response and is measured from the price at the trigger;
+        the first is reported beside it, and it is the one that says who
+        moved first."""
+        reaction = self.measure(self.reads({-60: 0.53, 60: 0.56}))
+        self.assertIs(reaction.outcome, ReactionOutcome.RESPONDED)
+        self.assertAlmostEqual(reaction.lag_earliest_seconds, 49.8, places=6)
+        self.assertAlmostEqual(reaction.lag_latest_seconds, 60.0, places=6)
+        self.assertAlmostEqual(reaction.exchange_before, 0.53, places=9)
+        self.assertAlmostEqual(reaction.exchange_delta, 0.03, places=9)
+        self.assertAlmostEqual(reaction.prior.delta, 0.03, places=9)
+        self.assertEqual(reaction.prior.change,
+                         Bracket(self.at(-70.2), self.at(-60)))
+        self.assertIs(reaction.ordering, Ordering.BOOK_LED)
+        self.assertIs(reaction.prior.ordering, Ordering.KALSHI_LED)
+        self.assertIs(reaction.first_move_ordering, Ordering.KALSHI_LED)
+        self.assertEqual(reaction.first_move_change, reaction.prior.change)
+        self.assertEqual(reaction.as_dict()["prior_adjustment"]["ordering"],
+                         Ordering.KALSHI_LED.value)
+
+    def test_a_move_that_partly_came_back_is_judged_by_what_remained(self):
+        reaction = self.measure(self.reads({-90: 0.55, -30: 0.52}))
+        self.assertIs(reaction.outcome, ReactionOutcome.ALREADY_PRICED)
+        self.assertAlmostEqual(reaction.prior.delta, 0.02, places=9)
+        self.assertAlmostEqual(reaction.exchange_after, 0.52, places=9)
+        self.assertEqual(reaction.prior.change,
+                         Bracket(self.at(-100.2), self.at(-90)))
+
+    def test_a_drift_under_the_threshold_is_not_pre_pricing(self):
+        """Half a cent the book's way, in place at the trigger: under the
+        declared `min_response`, the same bar a response has to clear."""
+        reaction = self.measure(self.reads({-60: 0.505}))
+        self.assertIsNone(reaction.prior)
+        self.assertIs(reaction.outcome, ReactionOutcome.NO_RESPONSE)
+
+    def test_a_move_the_other_way_is_not_pre_pricing(self):
+        reaction = self.measure(self.reads({-60: 0.45}))
+        self.assertIsNone(reaction.prior)
+        self.assertIs(reaction.outcome, ReactionOutcome.NO_RESPONSE)
+
+    def test_a_hole_inside_the_move_widens_when_it_was_made(self):
+        """No reads from -90s to -10s: the move may have come undone inside
+        the hole and been made again, so it is only known to be in place
+        from the read after it -- which is inside the book's bracket."""
+        readings = self.reads({-120: 0.55},
+                              skip=tuple(range(-90, 0, 10)))
+        reaction = self.measure(readings)
+        self.assertIs(reaction.outcome, ReactionOutcome.ALREADY_PRICED)
+        self.assertEqual(reaction.prior.change,
+                         Bracket(self.at(-130.2), self.T))
+        self.assertIs(reaction.ordering, Ordering.INDETERMINATE)
+
+    def test_a_declared_unchanged_gap_does_not_widen_it(self):
+        """Under a policy that reads a gap as an unchanged price -- declared,
+        and recorded on the output -- the move dates from where it was
+        first seen."""
+        from dataclasses import replace
+        policy = replace(self.POLICY, treat_missing_candles_as_unchanged=True)
+        reaction = measure_response(
+            event_id=EVENT, stream_id="s", market_ticker=TICKER,
+            detected_at=self.T, book_delta=self.BOOK,
+            book_change=Bracket(self.at(-20), self.T),
+            readings=self.reads({-120: 0.55}, skip=tuple(range(-90, 0, 10))),
+            policy=policy)
+        self.assertEqual(reaction.prior.change,
+                         Bracket(self.at(-130.2), self.at(-120)))
+        self.assertIs(reaction.ordering, Ordering.KALSHI_LED)
+
+    def test_a_blind_window_after_it_is_said_not_guessed(self):
+        reaction = self.measure(self.reads({-60: 0.55}, last=60))
+        self.assertIs(reaction.outcome, ReactionOutcome.ALREADY_PRICED)
+        self.assertEqual(reaction.blind_to, self.at(180))
+        self.assertIn("not known", reaction.detail)
+
+    def test_a_further_move_seen_only_after_a_hole_is_blind_with_it(self):
+        """A further move the book's way, but a gap in the reads comes
+        first: the response exists and its lag is not bounded. The earlier
+        move still rides beside it."""
+        readings = self.reads({-60: 0.55, 100: 0.60},
+                              skip=tuple(range(10, 100, 10)))
+        reaction = self.measure(readings)
+        self.assertIs(reaction.outcome, ReactionOutcome.BLIND_INTERVAL)
+        self.assertAlmostEqual(reaction.exchange_delta, 0.05, places=9)
+        self.assertAlmostEqual(reaction.prior.delta, 0.05, places=9)
+        self.assertIs(reaction.first_move_ordering, Ordering.KALSHI_LED)
+
+    def test_no_claim_about_the_opportunity_is_made(self):
+        for path in ({-60: 0.55}, {-60: 0.53}):
+            with self.subTest(path=path):
+                reaction = self.measure(self.reads(path))
+                self.assertIs(reaction.outcome,
+                              ReactionOutcome.ALREADY_PRICED)
+                self.assertNotIn("no discrepancy", reaction.detail)
+                self.assertIn("screen's question", reaction.detail)
+
+
 class RequestSpanTest(unittest.TestCase):
     """The interval a read answered over -- for good reads and failed ones
     alike, which is why it is a function of two times and not of a book."""

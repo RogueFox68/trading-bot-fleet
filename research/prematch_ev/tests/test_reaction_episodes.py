@@ -405,6 +405,63 @@ def _moves(ordering, count, *, first=0, outcome=None, contracts=("KXT-Y",)):
             for i in range(count) for c in contracts]
 
 
+class FirstMoveVoteTest(unittest.TestCase):
+    """The verdict asks who moved FIRST. A response that came on top of a
+    move the exchange had already made before the trigger does not make the
+    book the leader, and one exchange move is counted once however many book
+    moves find it in place."""
+
+    def with_prior(self, reaction, ordering, change=None):
+        from dataclasses import replace
+        from reaction.measure import Bracket, PriorAdjustment
+        change = change or Bracket(
+            reaction.detected_at - timedelta(minutes=40),
+            reaction.detected_at - timedelta(minutes=39))
+        return replace(reaction, prior=PriorAdjustment(
+            delta=0.03, change=change, ordering=ordering, reference=0.50,
+            at_trigger=0.53))
+
+    def test_a_response_on_top_of_an_earlier_move_votes_by_the_earlier(self):
+        rows = [self.with_prior(r, Ordering.KALSHI_LED)
+                for r in _moves(Ordering.BOOK_LED, 3)]
+        verdict = judge_feasibility(rows)
+        self.assertEqual(verdict.book_led, 0)
+        self.assertEqual(verdict.kalshi_led, 3)
+
+    def test_an_indeterminate_earlier_move_does_not_let_the_response_vote(
+            self):
+        rows = [self.with_prior(r, Ordering.INDETERMINATE)
+                for r in _moves(Ordering.BOOK_LED, 3)]
+        verdict = judge_feasibility(rows)
+        self.assertEqual(verdict.determinate, 0)
+        self.assertEqual(verdict.indeterminate, 3)
+
+    def test_an_earlier_move_votes_when_the_later_cannot_be_ordered(self):
+        """A further move seen only after a hole has no ordering of its own;
+        the move in place before the trigger still says who moved first."""
+        from reaction.measure import ReactionOutcome
+        rows = [self.with_prior(r, Ordering.KALSHI_LED)
+                for r in _moves(Ordering.UNKNOWN, 3,
+                                outcome=ReactionOutcome.BLIND_INTERVAL)]
+        verdict = judge_feasibility(rows)
+        self.assertEqual(verdict.kalshi_led, 3)
+        self.assertEqual(verdict.unknown_ordering, 0)
+
+    def test_without_an_earlier_move_the_response_votes(self):
+        verdict = judge_feasibility(_moves(Ordering.BOOK_LED, 3))
+        self.assertEqual(verdict.book_led, 3)
+
+    def test_one_earlier_move_found_by_two_book_moves_counts_once(self):
+        from reaction.measure import Bracket
+        shared = Bracket(START - timedelta(hours=12),
+                         START - timedelta(hours=12) + timedelta(minutes=1))
+        rows = [self.with_prior(r, Ordering.KALSHI_LED, shared)
+                for r in _moves(Ordering.BOOK_LED, 2)]
+        verdict = judge_feasibility(rows)
+        self.assertEqual(verdict.kalshi_led, 1)
+        self.assertEqual(verdict.shared_response, 1)
+
+
 class FeasibilityRuleTest(unittest.TestCase):
     """The stop rule must be satisfiable, evaluated, and honest when thin.
 

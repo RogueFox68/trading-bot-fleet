@@ -102,9 +102,11 @@ class ScreenRefusal(str, Enum):
 
 # Reaction outcomes that can be screened at all. `ALREADY_PRICED` is
 # deliberately screenable: the exchange having moved first does not make the
-# observation unreal, it makes its EV small, and dropping it would remove
-# exactly the rows that falsify the thesis from the denominator. The same goes
-# for `AROUND_TRIGGER`, a response that may have come first.
+# observation unreal, and dropping it would remove exactly the rows that
+# falsify the thesis from the denominator. Whether its move left anything to
+# trade is decided HERE, at the decision book -- a partial move can leave a
+# discrepancy -- never inferred from the movement. The same goes for
+# `AROUND_TRIGGER`, a response that may have come first.
 SCREENABLE = frozenset({
     ReactionOutcome.RESPONDED,
     ReactionOutcome.AROUND_TRIGGER,
@@ -132,6 +134,10 @@ class ScreenedReaction:
     survives_delay: bool | None
     entry_delay_seconds: float
     detail: str = ""
+    # The exchange's move the book's way already in place at the trigger, as
+    # the measurement saw it: reported beside this row's opportunity, which
+    # is judged here at the decision book -- never inferred from that move.
+    prior_move: dict | None = None
 
     @property
     def predicted_ev(self) -> float | None:
@@ -162,6 +168,7 @@ class ScreenedReaction:
             "survives_delay": self.survives_delay,
             "entry_delay_seconds": self.entry_delay_seconds,
             "detail": self.detail,
+            "prior_move": self.prior_move,
             "predicted": None,
             "realized": None,
             "settlement_known": self.settlement_known,
@@ -386,7 +393,8 @@ def screen_reaction(reaction: Reaction, trigger: MoveTrigger,
         reaction_outcome=reaction.outcome.value,
         ordering=reaction.ordering.value,
         survives_delay=reaction.discrepancy_survives(entry_delay),
-        entry_delay_seconds=entry_delay.total_seconds())
+        entry_delay_seconds=entry_delay.total_seconds(),
+        prior_move=reaction.prior.as_dict() if reaction.prior else None)
     if observation is None:
         return ScreenedReaction(refusal=refusal, observation=None,
                                 admitted=False, trade=None, detail=detail,

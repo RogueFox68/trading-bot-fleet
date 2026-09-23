@@ -807,6 +807,77 @@ def responding_bundle(response_minutes: float, *, move_at: int = 195,
                     "candlesticks": [candle_payload(rows)]}])
 
 
+FLAT, PARTIAL, MOVED = (0.56, 0.58), (0.63, 0.65), (0.70, 0.72)
+
+
+def path_bundle(path: dict, *, move_at: int = 195, first: int = 215,
+                last: int = 100) -> dict:
+    """One contract whose exchange follows `path` -- minute-before-start to
+    the (bid, ask) from that minute on, FLAT before the first -- and one
+    detected book move at `move_at`."""
+    rows = []
+    for minute in range(first, last - 1, -1):
+        bid, ask = FLAT
+        for since in sorted(path, reverse=True):    # minutes count DOWN
+            if minute <= since:
+                bid, ask = path[since]
+        rows.append((at(minute), bid, ask))
+    return bundle(
+        odds_snapshots=[odds_payload(at(200), 120, -140, at(201)),
+                        odds_payload(at(move_at), 260, -320, at(move_at + 1))],
+        contracts=[{"market_ticker": f"{TICKER}-NYG", "yes_is_home": True,
+                    "settled_yes": 1,
+                    "candlesticks": [candle_payload(rows)]}])
+
+
+class PriorMoveReplayTest(unittest.TestCase):
+    """The exchange's moves before a book move, through a whole bundle: the
+    replay's reaction, its screened row and its verdict judge them by what
+    was still in place at the trigger."""
+
+    def ledger(self, path):
+        games, report = load_bundle(write(path_bundle(path)))
+        self.assertTrue(report.complete)
+        return replay(games)
+
+    def outcomes(self, ledger):
+        stages = {s.stage: s for s in ledger.stages}
+        return stages["reactions measured"].breakdown
+
+    def test_a_move_the_exchange_undid_leaves_its_response_to_measure(self):
+        """Up from 205, back by 198, the book move at 195, up again from
+        190. The first version filed this as the exchange moving first and
+        voted it Kalshi-led."""
+        ledger = self.ledger({205: MOVED, 198: FLAT, 190: MOVED})
+        self.assertEqual(self.outcomes(ledger), {"responded": 1})
+        self.assertEqual(ledger.feasibility.book_led, 1)
+        self.assertEqual(ledger.feasibility.kalshi_led, 0)
+
+    def test_a_move_the_exchange_kept_is_its_moving_first(self):
+        ledger = self.ledger({205: MOVED})
+        self.assertEqual(self.outcomes(ledger),
+                         {"exchange_moved_before_trigger": 1})
+        self.assertEqual(ledger.feasibility.kalshi_led, 1)
+        row = ledger.episodes[0].as_dict()["screened"][0]
+        self.assertAlmostEqual(row["prior_move"]["delta"], 0.14, places=9)
+        self.assertIsNone(row["refusal"])
+
+    def test_a_partial_move_then_a_further_one_is_measured_and_voted_first(
+            self):
+        """0.07 before the book move, 0.07 more after it: the response is
+        measured, and the verdict counts the move that came first."""
+        ledger = self.ledger({205: PARTIAL, 190: MOVED})
+        self.assertEqual(self.outcomes(ledger), {"responded": 1})
+        self.assertEqual(ledger.feasibility.kalshi_led, 1)
+        self.assertEqual(ledger.feasibility.book_led, 0)
+        reaction = ledger.episodes[0].as_dict()["reactions"][0]
+        self.assertAlmostEqual(reaction["prior_adjustment"]["delta"], 0.07,
+                               places=9)
+        self.assertEqual(reaction["ordering"], "book_led")
+        self.assertEqual(reaction["prior_adjustment"]["ordering"],
+                         "kalshi_led")
+
+
 class UnusableCandleCoverageTest(unittest.TestCase):
     """A PARSED candle is not a USABLE exchange quote.
 

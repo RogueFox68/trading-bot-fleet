@@ -75,6 +75,27 @@ minute". Such a response is `MOVED_AROUND_TRIGGER`: neither a reaction we
 could have traded ahead of nor demonstrated pre-pricing. Only a bracket that
 opens at or after the trigger is `RESPONDED`.
 
+A MOVE BEFORE THE TRIGGER IS JUDGED AT THE TRIGGER
+--------------------------------------------------
+Whether the exchange had already moved the book's way is decided by its
+price AT the trigger against its price at the start of the lookback -- not by
+any crossing on the way. The first version returned
+`exchange_moved_before_trigger` on the first move the book's way anywhere in
+the lookback: an exchange that went up and came back before we could act was
+filed as having moved first, voted Kalshi-led, called "no discrepancy left
+to trade", and the response it then made was never measured.
+
+So the lookback no longer ends the measurement. What the exchange did after
+the trigger is always searched for, from its price at the trigger. A move
+still in place at the trigger (`PriorAdjustment`) is the outcome only when
+nothing further the book's way follows it; a further move is a response, and
+the earlier one rides beside it -- and, being first, it is the one that says
+who moved first (`first_move_ordering`). A move that came undone is neither.
+
+None of this is a claim about the opportunity. A partial adjustment leaves a
+discrepancy, and a spread can hide one; whether anything was left to trade
+is the screen's question, answered at the decision book.
+
 DIRECTION IS PART OF THE DEFINITION
 -----------------------------------
 A reaction is the exchange moving the SAME WAY as the book. An exchange price
@@ -84,7 +105,7 @@ negative sign would put it in the same average as the real ones.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Iterable, Sequence
@@ -120,7 +141,7 @@ class ReactionOutcome(str, Enum):
 
     RESPONDED = "responded"                      # moved the same way, in window
     AROUND_TRIGGER = "moved_around_trigger"      # ...located only across the trigger
-    ALREADY_PRICED = "exchange_moved_before_trigger"   # nothing left to react to
+    ALREADY_PRICED = "exchange_moved_before_trigger"   # moved first, kept at T
     OPPOSITE_DIRECTION = "opposite_direction"    # moved AGAINST the book
     NO_RESPONSE = "no_response_in_window"        # right-censored at max_wait
     BLIND_INTERVAL = "blind_interval"            # a data hole covers the window
@@ -147,7 +168,9 @@ class ReactionPolicy:
                       ALREADY priced the move reports `NO_RESPONSE` -- the
                       exchange leading and the exchange never following are
                       recorded as the same outcome, and they are opposite
-                      findings. The lookback runs first, for that reason.
+                      findings. What it finds is judged by the exchange AT
+                      the trigger, and it never ends the measurement (see
+                      the module docstring).
       candle_period   60s, the exchange's finest published interval. Used as
                       the width of the Kalshi bracket AND as the hole
                       threshold, so the two cannot drift.
@@ -296,6 +319,29 @@ def order_brackets(book: Bracket, exchange: Bracket) -> Ordering:
 
 
 @dataclass(frozen=True)
+class PriorAdjustment:
+    """A move the book's way that the exchange had ALREADY made when we could
+    act: made inside the lookback, and still in place at the trigger.
+
+    Reported beside the outcome, as what the exchange's price did -- never as
+    a claim about the opportunity, which is the screen's to judge at the
+    decision book. `delta` is the exchange at the trigger less the exchange
+    at the start of the lookback; `change` brackets when that move was made.
+    """
+
+    delta: float
+    change: Bracket
+    ordering: Ordering                 # the book's bracket against `change`
+    reference: float                   # the exchange at the lookback's start
+    at_trigger: float                  # the exchange at the trigger
+
+    def as_dict(self) -> dict:
+        return {"delta": self.delta, "change": self.change.as_dict(),
+                "ordering": self.ordering.value,
+                "reference": self.reference, "at_trigger": self.at_trigger}
+
+
+@dataclass(frozen=True)
 class Reaction:
     """One measured response (or non-response) to one detected book move."""
 
@@ -323,6 +369,10 @@ class Reaction:
     blind_from: datetime | None = None         # for BLIND_INTERVAL
     blind_to: datetime | None = None
     detail: str = ""
+    # A move the book's way already in place at the trigger, whatever the
+    # outcome: on `ALREADY_PRICED` it IS the outcome; on a response it came
+    # first, and the response is what the exchange did on top of it.
+    prior: PriorAdjustment | None = None
 
     @property
     def lag_width_seconds(self) -> float | None:
@@ -363,6 +413,21 @@ class Reaction:
         return (self.outcome is ReactionOutcome.RESPONDED
                 and self.lag_earliest_seconds is not None)
 
+    @property
+    def first_move_change(self) -> Bracket:
+        """When the exchange began moving the book's way, as far as this
+        reaction shows: the move already in place at the trigger if there was
+        one, else the move this reaction reports."""
+        return self.prior.change if self.prior else self.exchange_change
+
+    @property
+    def first_move_ordering(self) -> Ordering:
+        """Which moved first, the book or the exchange -- decided by the
+        exchange's FIRST move the book's way. A response that came on top of
+        a move already made before the trigger does not make the book the
+        leader: the exchange had begun first."""
+        return self.prior.ordering if self.prior else self.ordering
+
     def as_dict(self) -> dict:
         return {
             "event_id": self.event_id,
@@ -398,6 +463,7 @@ class Reaction:
                 "to": _iso(self.blind_to),
             } if self.blind_from else None,
             "detail": self.detail,
+            "prior_adjustment": self.prior.as_dict() if self.prior else None,
             "policy": self.policy.as_dict(),
         }
 
@@ -632,47 +698,142 @@ def measure_response(*, event_id: str, stream_id: str, market_ticker: str,
                         **base)
     baseline = before[-1]
 
-    # THE NULL HYPOTHESIS, CHECKED FIRST AND ON ITS OWN EVIDENCE.
-    #
-    # If the exchange had already moved the book's way before we could act on
-    # the book, there was nothing left to react to. A forward-only search
-    # cannot see that -- it looks at candles AFTER the trigger, finds the
-    # exchange sitting at its already-adjusted price, and reports
-    # `NO_RESPONSE`. So "the exchange led us" and "the exchange never
-    # followed" would be filed under one name, and they are opposite
-    # findings: the first kills the thesis, the second is the thesis.
-    #
-    # Note the two answers this can produce. The ORDERING may still be
-    # BOOK_LED -- the book can change, the provider observe it, and the
-    # exchange re-price before our snapshot ever carries it to us. The book
-    # led and we had no opportunity anyway, because the delivery lag ate it.
-    # That is not the same as the exchange leading the book, and reporting
-    # outcome and ordering separately is what keeps them apart.
+    # THE NULL HYPOTHESIS, ON ITS OWN EVIDENCE: had the exchange already
+    # moved the book's way when we could act? A forward-only search cannot
+    # see that -- it finds the exchange sitting at its adjusted price and
+    # reports `NO_RESPONSE` -- so "the exchange led us" and "the exchange
+    # never followed" would be filed under one name, and they are opposite
+    # findings. Judged by the exchange AT THE TRIGGER (`_prior_adjustment`).
+    prior = _prior_adjustment(before, decided_at=decided_at,
+                              book_delta=book_delta,
+                              book_bracket=book_bracket, policy=policy)
+    # ...and the search runs regardless. A move made before the trigger does
+    # not end the question of what the exchange did after it: an adjustment
+    # that came undone, or a partial one, leaves a response to measure.
+    after = _search_after(baseline, usable, decided_at=decided_at,
+                          book_delta=book_delta, book_bracket=book_bracket,
+                          policy=policy, base=base)
+    further = (after.outcome in (ReactionOutcome.RESPONDED,
+                                 ReactionOutcome.AROUND_TRIGGER)
+               or (after.outcome is ReactionOutcome.BLIND_INTERVAL
+                   and after.exchange_delta is not None))
+    if further:
+        # A further move the book's way -- timed, or seen only after a hole.
+        # The one already in place, if any, rides along as its own record
+        # rather than as a verdict.
+        return replace(after, prior=prior)
+    if prior is None:
+        return after
+    return _already_priced(prior, after, decided_at=decided_at,
+                           book_delta=book_delta, policy=policy, base=base)
+
+
+def _already_priced(prior: "PriorAdjustment", after: Reaction, *,
+                    decided_at: datetime, book_delta: float,
+                    policy: ReactionPolicy, base: dict) -> Reaction:
+    """The exchange had moved the book's way before we could act, the move
+    was still there at the trigger, and nothing further the book's way was
+    seen after it.
+
+    An OBSERVATION about the exchange's price, never a verdict on the trade.
+    Whether an executable discrepancy remained -- a partial adjustment
+    leaves one, a spread can hide one -- is the screen's question, answered
+    at the decision book.
+
+    The ORDERING, from when this move was made, may still be BOOK_LED: the
+    book can change, the provider observe it, and the exchange re-price
+    before our snapshot carries it to us. The book led and the delivery lag
+    ate the head start -- not the same as the exchange leading the book, and
+    reporting outcome and ordering separately is what keeps them apart.
+    """
+    earliest = (prior.change.earliest - decided_at).total_seconds()
+    latest = (prior.change.latest - decided_at).total_seconds()
+    then = {ReactionOutcome.NO_RESPONSE:
+            (f"it moved no further, by {policy.min_response} or more, within "
+             f"{policy.max_wait.total_seconds():.0f}s"),
+            ReactionOutcome.OPPOSITE_DIRECTION:
+            (f"after the trigger it moved {after.exchange_delta or 0.0:+.4f} "
+             f"back against the book"),
+            }.get(after.outcome)
+    if after.outcome is ReactionOutcome.BLIND_INTERVAL:
+        then = ("whether it moved further after the trigger is not known: "
+                "a hole in its readings falls inside the window, and no "
+                "further move was seen")
+    return Reaction(
+        outcome=ReactionOutcome.ALREADY_PRICED,
+        ordering=prior.ordering, exchange_change=prior.change,
+        book_delta=book_delta, exchange_before=prior.reference,
+        exchange_after=prior.at_trigger, exchange_delta=prior.delta,
+        blind_from=after.blind_from, blind_to=after.blind_to, prior=prior,
+        detail=(f"the exchange moved {prior.delta:+.4f} the book's way "
+                f"somewhere from {earliest:+.0f}s to {latest:+.0f}s of the "
+                f"trigger -- BEFORE the book move became actionable to us -- "
+                f"and was still there at the trigger"
+                + (f"; {then}" if then else "")
+                + ". Whether an executable discrepancy remained is the "
+                  "screen's question, not this measurement's"),
+        **base)
+
+
+def _prior_adjustment(before: Sequence, *, decided_at: datetime,
+                      book_delta: float, book_bracket: Bracket,
+                      policy: ReactionPolicy) -> "PriorAdjustment | None":
+    """The exchange's move the book's way that was STILL IN PLACE at the
+    trigger, or None.
+
+    Judged against the exchange at the trigger -- the baseline -- and never
+    against a crossing on the way to it. An exchange that moved the book's
+    way and came back before we could act left the whole discrepancy in
+    place; the first version of this returned on the first aligned crossing
+    in the lookback, called that "no discrepancy left to trade", and never
+    measured the response that followed.
+
+    `reference` is the first reading inside the lookback. The move dates
+    from the run of readings, ending at the trigger, that all show it: it
+    was made between the reading before that run and the first reading of
+    it. A hole inside the run widens that: the move may have come undone
+    inside the hole and been made again, so it is only known to be in place
+    from the first reading after the LAST hole.
+    """
     lookback_start = decided_at - policy.lookback
     prior = [r for r in before if r.ts > lookback_start]
-    if len(prior) >= 2:
-        pre = prior[0]
-        for previous, reading in zip(prior, prior[1:]):
-            delta = reading.mid - pre.mid
-            if abs(delta) < policy.min_response:
-                continue
-            if (delta > 0) != (book_delta > 0):
-                # A prior move the OTHER way is not pre-pricing. It leaves the
-                # discrepancy wider, not narrower.
-                continue
-            exchange_bracket = _change_bracket(previous, reading)
-            return Reaction(
-                outcome=ReactionOutcome.ALREADY_PRICED,
-                ordering=order_brackets(book_bracket, exchange_bracket),
-                exchange_change=exchange_bracket,
-                book_delta=book_delta, exchange_before=pre.mid,
-                exchange_after=reading.mid, exchange_delta=delta,
-                detail=(f"the exchange moved {delta:+.4f} the book's way "
-                        f"{(decided_at - reading.ts).total_seconds():.0f}s "
-                        f"BEFORE the book move became actionable to us: there "
-                        f"was no discrepancy left to trade"),
-                **base)
+    if len(prior) < 2:
+        return None
+    reference, baseline = prior[0], prior[-1]
 
+    def moved(reading) -> bool:
+        change = reading.mid - reference.mid
+        return (abs(change) >= policy.min_response
+                and (change > 0) == (book_delta > 0))
+
+    if not moved(baseline):
+        # Nothing the book's way in place at the trigger. A move the OTHER
+        # way is not pre-pricing either: it leaves the discrepancy wider.
+        return None
+    first = len(prior) - 1
+    while moved(prior[first - 1]):       # the reference never has moved
+        first -= 1
+    run = prior[first:]
+    in_place_by = run[0]
+    if not policy.treat_missing_candles_as_unchanged:
+        limit = policy.unobserved_limit
+        for previous, reading in zip(run, run[1:]):
+            if (reading_span(reading)[1] - reading_span(previous)[0]) > limit:
+                in_place_by = reading
+    change = Bracket(earliest=reading_span(prior[first - 1])[0],
+                     latest=reading_span(in_place_by)[1])
+    return PriorAdjustment(
+        delta=baseline.mid - reference.mid, change=change,
+        ordering=order_brackets(book_bracket, change),
+        reference=reference.mid, at_trigger=baseline.mid)
+
+
+def _search_after(baseline, usable: Sequence, *, decided_at: datetime,
+                  book_delta: float, book_bracket: Bracket,
+                  policy: ReactionPolicy, base: dict) -> Reaction:
+    """What the exchange did after the trigger, measured from the baseline:
+    the first reading inside the window whose mid has moved far enough, or
+    the reason there is none."""
     deadline = decided_at + policy.max_wait
     limit = policy.unobserved_limit
 

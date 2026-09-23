@@ -1014,8 +1014,11 @@ def _response(decision: dict, trigger: dict | None,
     One rule for both paths (rule 19). Each read describes the book somewhere
     between its request and its answer, so a change is bracketed by
     `sent_at` as well as the receipt; a change located only across the
-    trigger is `moved_around_trigger`, not a reaction; a move before it is
-    `exchange_moved_before_trigger`; and a window the reads did not cover
+    trigger is `moved_around_trigger`, not a reaction; a move before it
+    that was still in place at the trigger, with nothing further after, is
+    `exchange_moved_before_trigger` -- one that came undone is not, and a
+    further move on top of one is a response, the earlier move reported
+    beside it; and a window the reads did not cover
     to its end -- reads that failed, stopped, or never came -- is
     `blind_interval`, never a quiet market. Coverage rides along: the reads
     inside the window, the ones that failed, and whether the session itself
@@ -1044,7 +1047,13 @@ def _response(decision: dict, trigger: dict | None,
            "blind": ({"from": _iso(reaction.blind_from),
                       "to": _iso(reaction.blind_to)}
                      if reaction.blind_from else None),
-           "detail": reaction.detail}
+           "detail": reaction.detail,
+           # Kalshi's move the book's way already in place at the trigger:
+           # on `exchange_moved_before_trigger` it is the outcome; on a
+           # response, the response came on top of it. Movement, not a
+           # verdict on the opportunity -- that is the decision's screen.
+           "prior_move": (reaction.prior.as_dict()
+                          if reaction.prior else None)}
     if decided is not None:
         deadline = decided + policy.max_wait
         inside = [book for span, book in reads
@@ -1111,6 +1120,11 @@ def render_report(figures: dict) -> str:
     if lags:
         lines.append(f"    responded within   "
                      f"{', '.join(f'{a:.0f}-{b:.0f}s' for a, b in lags[:12])}")
+    on_top = sum(1 for r in responses if r.get("prior_move")
+                 and r["outcome"] != ReactionOutcome.ALREADY_PRICED.value)
+    if on_top:
+        lines.append(f"    {on_top} response(s) came on top of a move Kalshi "
+                     f"had already made before the trigger (prior_move)")
     cut = sum(1 for r in responses if r.get("session_ended_inside_window"))
     if cut:
         lines.append(f"    {cut} window(s) outlived the session: censored "
