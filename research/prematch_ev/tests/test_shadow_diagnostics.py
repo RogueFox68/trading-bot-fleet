@@ -185,6 +185,10 @@ class OwnerFiguresTest(unittest.TestCase):
                                        76.06, delta=0.01)
                 self.assertEqual(coverage["horizon_hours"], 73.0)
                 self.assertFalse(coverage["lead_time_gate_at_trigger"]["admits"])
+                lead = item["assessment"]["screen"]["gates"]["lead_time"]
+                self.assertFalse(lead["passes"])
+                self.assertAlmostEqual(lead["minutes_to_start"], 76.06 * 60,
+                                       delta=1.0)
                 self.assertEqual(item["decision"]["refusal"],
                                  "no_exchange_book_at_the_trigger")
                 self.assertIn("by design, not by failure", coverage["note"])
@@ -292,6 +296,56 @@ class RecordedAgainstRecomputedTest(unittest.TestCase):
         self.assertEqual(diff["ticker"], SEA)
         self.assertEqual(diff["differences"][0]["field"], "book.decision_ask")
         self.assertIn("DISAGREES", diag.render_diagnostics(figures))
+
+
+class BookMemoryMirrorTest(unittest.TestCase):
+    """The offline walk holds exactly the books the monitor held.
+
+    Memory is pruned against each new read's receipt, so an old usable book
+    disappears only when newer reads keep arriving -- and if those are
+    one-sided, the monitor then has NO decision book. A replay that kept the
+    old one would screen a stale price the monitor never used.
+    """
+
+    def test_the_rebuilt_memory_is_the_monitors_own(self):
+        from data.odds_history import CreditLedger
+        from reaction.screen import decision_book
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        clock = syn.FakeClock(datetime(2026, 9, 24, 12, tzinfo=UTC))
+        recorder = shadow_monitor.Recorder(tmp / "s.jsonl")
+        monitor = shadow_monitor.ShadowMonitor(
+            sport="NFL", series="KXNFLGAME", api_key="k",
+            cadence=timedelta(seconds=30), hours=1.0,
+            ledger=CreditLedger(cap=1), recorder=recorder, clock=clock,
+            slate_source=lambda: None)
+        watched = shadow_monitor.Watched(
+            ticker="KXNFLGAME-26SEP27TENJAX-JAX",
+            event_ticker="KXNFLGAME-26SEP27TENJAX", provider_event_id="e",
+            yes_is_home=True, start=datetime(2026, 9, 27, 17, tzinfo=UTC))
+        two_sided = {"orderbook_fp": {"yes_dollars": [["0.5500", "60.00"]],
+                                      "no_dollars": [["0.4300", "75.00"]]}}
+        one_sided = {"orderbook_fp": {"yes_dollars": [["0.5500", "60.00"]],
+                                      "no_dollars": []}}
+        from data.kalshi_history import Coverage
+        for payload in [two_sided] + [one_sided] * 5:
+            with mock.patch.object(shadow_monitor.kalshi_history,
+                                   "fetch_orderbook_payload",
+                                   return_value=(payload, Coverage())):
+                monitor.read_book(watched, "decision")
+            clock.t += timedelta(minutes=30)
+        recorder.close()
+        rows, _ = shadow_monitor.read_records(tmp / "s.jsonl")
+        rebuilt = diag.replay(rows).memory[watched.ticker]
+
+        def shape(books):
+            return [(b.ts, b.bid_close, b.ask_close) for b in books]
+
+        self.assertEqual(shape(rebuilt), shape(monitor.books[watched.ticker]))
+        # The case that matters: the usable book aged out, so neither the
+        # monitor nor the replay has a decision book now.
+        self.assertEqual(len(rebuilt), 5)
+        self.assertIsNone(decision_book(rebuilt, clock.t))
 
 
 class OfflineTest(unittest.TestCase):

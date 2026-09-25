@@ -553,7 +553,24 @@ def _grid(seed=11, n=4000):
             outcome=rng.randint(0, 1), exchange_bid=bid, exchange_ask=ask,
             entry_delay_minutes=delay, entry_bid=entry_bid,
             entry_ask=entry_ask))
+    # NaN in each field a gate reads: every comparison with it is False,
+    # so a gate written as its own negation decides differently.
+    nan = float("nan")
+    for i, change in enumerate((dict(exchange_ask=nan), dict(exchange_bid=nan),
+                                dict(p_exchange=nan), dict(minutes_to_start=nan),
+                                dict(p_sharp=nan))):
+        fields = dict(game_id=f"N{i}", market_id=f"N{i}", decision_at=when[2],
+                      minutes_to_start=600.0, p_sharp=0.7, p_exchange=0.5,
+                      outcome=0, exchange_bid=0.49, exchange_ask=0.51)
+        fields.update(change)
+        out.append(Observation(**fields))
     return out
+
+
+def _nan_equal(fields):
+    """NaN compares unequal to itself; the grid's NaN rows must still match."""
+    return {k: ([("nan" if x != x else x) for x in v] if isinstance(v, list)
+                else v) for k, v in fields.items()}
 
 
 def _outcome(call):
@@ -591,7 +608,8 @@ class VerdictEquivalenceTest(unittest.TestCase):
                     new = screen_diagnostics(grid, policy, series=series)
                     old = _legacy_screen_diagnostics(grid, policy,
                                                      series=series)
-                    self.assertEqual(vars(new), vars(old))
+                    self.assertEqual(_nan_equal(vars(new)),
+                                     _nan_equal(vars(old)))
                     self.assertGreater(new.admitted, 0)
                     self.assertGreater(new.rejected_below_ev, 0)
 

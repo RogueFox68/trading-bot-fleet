@@ -256,6 +256,9 @@ class Replay:
     reads: dict = field(default_factory=dict)
     odds: list = field(default_factory=list)
     last_seen: datetime | None = None
+    #: The monitor's book memory as the walk left it -- exposed so a test
+    #: can hold it against the live monitor's own.
+    memory: dict = field(default_factory=dict)
 
 
 def replay(rows: Sequence[dict]) -> Replay:
@@ -344,6 +347,7 @@ def replay(rows: Sequence[dict]) -> Replay:
                 continue
             out.assessments.append(_reassess(
                 row, index, trigger, trigger_row, join, memory, tick, out))
+    out.memory = memory
     return out
 
 
