@@ -46,6 +46,7 @@ import random
 import textwrap
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from typing import Sequence
 
 from core.fees import (
@@ -323,18 +324,98 @@ class Eligibility:
     min_minutes_to_start: float = 5.0
     max_spread: float = 0.10          # a book this wide is not executable
 
+    # --- the gates, one statement each ------------------------------------
+    # PUBLIC, and on plain values, so a diagnostic can report every gate --
+    # including one it evaluates without an Observation, such as the lead
+    # time of a move whose book was never read -- without a second copy of
+    # its comparison (rule 19). `verdict` is the only place their ORDER is
+    # decided.
+
+    def price_in_band(self, p_exchange: float) -> bool:
+        return self.price_band[0] <= p_exchange <= self.price_band[1]
+
+    def lead_in_window(self, minutes_to_start: float) -> bool:
+        return (self.min_minutes_to_start <= minutes_to_start
+                <= self.max_minutes_to_start)
+
+    @staticmethod
+    def quotes_present(bid: float | None, ask: float | None) -> bool:
+        return bid is not None and ask is not None
+
+    def spread_ok(self, bid: float, ask: float) -> bool:
+        """Only meaningful once both quotes exist. Written as the negation of
+        the refusal, so a NaN spread passes exactly as it always did."""
+        return not ask - bid > self.max_spread
+
+    def clears_ev_floor(self, predicted_ev: float) -> bool:
+        return not predicted_ev < self.min_net_ev
+
+    def verdict(self, o: "Observation", venue: str = "kalshi",
+                role: str = "taker", series: str | None = None,
+                route: str = DEFAULT_ROUTE) -> "ScreenVerdict":
+        """The screen's answer AND its reason: the first gate that refused.
+
+        `admits` is this verdict's `admitted`, so a named rejection can never
+        disagree with the admission it explains. Sides are priced only once
+        the book gates pass, exactly as before: pricing can raise on an
+        unresolvable fee schedule, and a price-band refusal must not start
+        raising because a diagnostic wanted more detail.
+        """
+        if not self.price_in_band(o.p_exchange):
+            return ScreenVerdict(ScreenRejection.PRICE_BAND)
+        if not self.lead_in_window(o.minutes_to_start):
+            return ScreenVerdict(ScreenRejection.LEAD_TIME)
+        if not self.quotes_present(o.exchange_bid, o.exchange_ask):
+            return ScreenVerdict(ScreenRejection.NO_DECISION_QUOTES)
+        if not self.spread_ok(o.exchange_bid, o.exchange_ask):
+            return ScreenVerdict(ScreenRejection.SPREAD_TOO_WIDE)
+        quotes = tuple(side_quotes(o, venue, role, series, route))
+        if not quotes:
+            return ScreenVerdict(ScreenRejection.NO_EXECUTABLE_SIDE)
+        best = max(quotes, key=lambda q: q.predicted_ev)
+        if not self.clears_ev_floor(best.predicted_ev):
+            return ScreenVerdict(ScreenRejection.BELOW_EV_FLOOR, quotes)
+        return ScreenVerdict(None, quotes)
+
     def admits(self, o: "Observation", venue: str = "kalshi",
                role: str = "taker", series: str | None = None,
                route: str = DEFAULT_ROUTE) -> bool:
-        if not self.price_band[0] <= o.p_exchange <= self.price_band[1]:
-            return False
-        if not self.min_minutes_to_start <= o.minutes_to_start <= self.max_minutes_to_start:
-            return False
-        if o.exchange_bid is None or o.exchange_ask is None:
-            return False
-        if o.exchange_ask - o.exchange_bid > self.max_spread:
-            return False
-        return as_trade(o, venue, role, self, series, route) is not None
+        return self.verdict(o, venue, role, series, route).admitted
+
+
+class ScreenRejection(str, Enum):
+    """Why the frozen screen refused an observation: the FIRST gate it failed.
+
+    In gate order. `no_decision_quotes` is a bid or ask absent at the
+    decision; `no_executable_side` is a two-sided book `side_quotes` still
+    could not price -- crossed, out of bounds, or under a delay with no
+    execution book. `ScreenDiagnostics` has always counted both as "no
+    quotes" and still does; a per-assessment record keeps them apart.
+    """
+
+    PRICE_BAND = "price_band"
+    LEAD_TIME = "lead_time"
+    NO_DECISION_QUOTES = "no_decision_quotes"
+    SPREAD_TOO_WIDE = "spread_too_wide"
+    NO_EXECUTABLE_SIDE = "no_executable_side"
+    BELOW_EV_FLOOR = "below_ev_floor"
+
+
+@dataclass(frozen=True)
+class ScreenVerdict:
+    """One screen decision. `quotes` is empty unless the book gates passed."""
+
+    rejection: ScreenRejection | None
+    quotes: tuple["SideQuote", ...] = ()
+
+    @property
+    def admitted(self) -> bool:
+        return self.rejection is None
+
+    @property
+    def best(self) -> "SideQuote | None":
+        return (max(self.quotes, key=lambda q: q.predicted_ev)
+                if self.quotes else None)
 
 
 @dataclass(frozen=True)
@@ -557,34 +638,34 @@ def screen_diagnostics(observations: list["Observation"],
                        venue: str = "kalshi", role: str = "taker",
                        series: str | None = None,
                        route: str = DEFAULT_ROUTE) -> ScreenDiagnostics:
-    """Count why each observation passed or failed the frozen policy."""
+    """Count why each observation passed or failed the frozen policy.
+
+    Through `Eligibility.verdict`, the admission's own decision: an earlier
+    version re-stated every gate here, a second screen that only agreed with
+    the first because nobody had changed either yet.
+    """
     eligibility = eligibility or Eligibility()
     d = ScreenDiagnostics(considered=len(observations))
     for o in observations:
-        if not eligibility.price_band[0] <= o.p_exchange <= eligibility.price_band[1]:
+        verdict = eligibility.verdict(o, venue, role, series, route)
+        rejection = verdict.rejection
+        if rejection is ScreenRejection.PRICE_BAND:
             d.rejected_price_band += 1
-            continue
-        if not (eligibility.min_minutes_to_start <= o.minutes_to_start
-                <= eligibility.max_minutes_to_start):
+        elif rejection is ScreenRejection.LEAD_TIME:
             d.rejected_lead_time += 1
-            continue
-        if o.exchange_bid is None or o.exchange_ask is None:
+        elif rejection in (ScreenRejection.NO_DECISION_QUOTES,
+                           ScreenRejection.NO_EXECUTABLE_SIDE):
             d.rejected_no_quotes += 1
-            continue
-        if o.exchange_ask - o.exchange_bid > eligibility.max_spread:
+        elif rejection is ScreenRejection.SPREAD_TOO_WIDE:
             d.rejected_spread += 1
-            continue
-        quotes = side_quotes(o, venue, role, series, route)
-        if not quotes:
-            d.rejected_no_quotes += 1
-            continue
-        best = max(quotes, key=lambda q: q.predicted_ev)
-        d.best_net_ev.append(best.predicted_ev)
-        d.best_gross_edge.append(best.win_probability - best.entry_price)
-        if best.predicted_ev < eligibility.min_net_ev:
-            d.rejected_below_ev += 1
         else:
-            d.admitted += 1
+            best = verdict.best
+            d.best_net_ev.append(best.predicted_ev)
+            d.best_gross_edge.append(best.win_probability - best.entry_price)
+            if rejection is ScreenRejection.BELOW_EV_FLOOR:
+                d.rejected_below_ev += 1
+            else:
+                d.admitted += 1
     return d
 
 

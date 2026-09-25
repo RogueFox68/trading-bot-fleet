@@ -72,7 +72,8 @@ from typing import Iterable, Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from analysis.scoring import (                                  # noqa: E402
-    Eligibility, Observation, Trade, as_trade, side_quotes,
+    Eligibility, Observation, ScreenRejection, ScreenVerdict, Trade, as_trade,
+    side_quotes,
 )
 from .detector import MoveTrigger                               # noqa: E402
 from .measure import Reaction, ReactionOutcome, usable_candle    # noqa: E402
@@ -138,6 +139,13 @@ class ScreenedReaction:
     # the measurement saw it: reported beside this row's opportunity, which
     # is judged here at the decision book -- never inferred from that move.
     prior_move: dict | None = None
+    # The screen's own verdict: `admitted` is its `admitted`, and a refused
+    # row carries the gate that refused it. None when nothing was screened.
+    verdict: ScreenVerdict | None = None
+
+    @property
+    def rejection(self) -> ScreenRejection | None:
+        return self.verdict.rejection if self.verdict else None
 
     @property
     def predicted_ev(self) -> float | None:
@@ -163,6 +171,7 @@ class ScreenedReaction:
             if self.decision_at else None,
             "refusal": self.refusal.value if self.refusal else None,
             "admitted": self.admitted,
+            "rejection": self.rejection.value if self.rejection else None,
             "reaction_outcome": self.reaction_outcome,
             "ordering": self.ordering,
             "survives_delay": self.survives_delay,
@@ -400,21 +409,26 @@ def screen_reaction(reaction: Reaction, trigger: MoveTrigger,
                                 admitted=False, trade=None, detail=detail,
                                 **common)
 
-    admitted, trade = _admit(observation, eligibility, venue=venue, role=role,
-                             series=series, route=route)
+    verdict, trade = _admit(observation, eligibility, venue=venue, role=role,
+                            series=series, route=route)
     return ScreenedReaction(refusal=None, observation=observation,
-                            admitted=admitted, trade=trade,
-                            detail=detail, **common)
+                            admitted=verdict.admitted, trade=trade,
+                            detail=detail, verdict=verdict, **common)
 
 
 def _admit(observation: Observation, eligibility: Eligibility, *, venue: str,
            role: str, series: str | None, route: str | None
-           ) -> tuple[bool, Trade | None]:
-    """The checkpoint study's own admission and pricing, called one way."""
+           ) -> tuple[ScreenVerdict, Trade | None]:
+    """The checkpoint study's own admission and pricing, called one way.
+
+    The VERDICT, not a bare boolean: `Eligibility.admits` is its
+    `admitted`, so the named reason recorded beside a refusal is the
+    decision's own and cannot disagree with it.
+    """
     kwargs = dict(venue=venue, role=role, series=series)
     if route is not None:
         kwargs["route"] = route
-    return (eligibility.admits(observation, **kwargs),
+    return (eligibility.verdict(observation, **kwargs),
             as_trade(observation, eligibility=eligibility, **kwargs))
 
 
@@ -440,6 +454,13 @@ class LiveDecision:
     trade: Trade | None
     entry_delay_seconds: float
     detail: str = ""
+    verdict: ScreenVerdict | None = None
+
+    @property
+    def rejection(self) -> ScreenRejection | None:
+        """The gate that refused a SCREENED move; None when admitted, and
+        None when nothing could be screened (that is `refusal`)."""
+        return self.verdict.rejection if self.verdict else None
 
     def as_dict(self) -> dict:
         row = {
@@ -449,6 +470,7 @@ class LiveDecision:
                             if self.decision_at else None),
             "refusal": self.refusal.value if self.refusal else None,
             "admitted": self.admitted,
+            "rejection": self.rejection.value if self.rejection else None,
             "entry_delay_seconds": self.entry_delay_seconds,
             "detail": self.detail,
             "predicted": None,
@@ -504,11 +526,11 @@ def screen_live(trigger: MoveTrigger, books: Sequence, *, market_ticker: str,
     if observation is None:
         return LiveDecision(refusal=refusal, observation=None, admitted=False,
                             trade=None, detail=detail, **common)
-    admitted, trade = _admit(observation, eligibility, venue=venue, role=role,
-                             series=series, route=route)
+    verdict, trade = _admit(observation, eligibility, venue=venue, role=role,
+                            series=series, route=route)
     return LiveDecision(refusal=None, observation=observation,
-                        admitted=admitted, trade=trade, detail=detail,
-                        **common)
+                        admitted=verdict.admitted, trade=trade, detail=detail,
+                        verdict=verdict, **common)
 
 
 def screen_all(items: Iterable[tuple], **kwargs) -> ScreenResult:

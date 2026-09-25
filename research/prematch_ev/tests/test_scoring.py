@@ -10,9 +10,10 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from analysis.scoring import (
-    Eligibility, MIN_GAMES, MIN_TRADED_GAMES, Observation, as_trade, brier,
-    build_report, cluster, compare, conditional_scores, decay_series, log_loss,
-    realized_return, side_quotes,
+    Eligibility, MIN_GAMES, MIN_TRADED_GAMES, Observation, ScreenDiagnostics,
+    ScreenRejection, as_trade, brier, build_report, cluster, compare,
+    conditional_scores, decay_series, log_loss, realized_return,
+    screen_diagnostics, side_quotes,
 )
 from data.kalshi_history import Coverage
 
@@ -457,6 +458,176 @@ class ReportTest(unittest.TestCase):
                              bootstrap_rounds=self.ROUNDS).render()
         self.assertIn("no depth", text)
         self.assertIn("NOT included", text)
+
+
+# --- the screen's named verdict against the screen it replaced ---------------
+#
+# FROZEN COPIES of `Eligibility.admits` and `screen_diagnostics` exactly as
+# they stood before `Eligibility.verdict` existed. They are the oracle: the
+# refactor that named each rejection is only admissible if it changed no
+# admission, no count, and no exception -- the checkpoint result has to stay
+# reproducible.
+
+def _legacy_admits(el, o, venue="kalshi", role="taker", series=None,
+                   route="non_direct"):
+    if not el.price_band[0] <= o.p_exchange <= el.price_band[1]:
+        return False
+    if not el.min_minutes_to_start <= o.minutes_to_start <= el.max_minutes_to_start:
+        return False
+    if o.exchange_bid is None or o.exchange_ask is None:
+        return False
+    if o.exchange_ask - o.exchange_bid > el.max_spread:
+        return False
+    return as_trade(o, venue, role, el, series, route) is not None
+
+
+def _legacy_screen_diagnostics(observations, el, venue="kalshi",
+                               role="taker", series=None, route="non_direct"):
+    d = ScreenDiagnostics(considered=len(observations))
+    for o in observations:
+        if not el.price_band[0] <= o.p_exchange <= el.price_band[1]:
+            d.rejected_price_band += 1
+            continue
+        if not (el.min_minutes_to_start <= o.minutes_to_start
+                <= el.max_minutes_to_start):
+            d.rejected_lead_time += 1
+            continue
+        if o.exchange_bid is None or o.exchange_ask is None:
+            d.rejected_no_quotes += 1
+            continue
+        if o.exchange_ask - o.exchange_bid > el.max_spread:
+            d.rejected_spread += 1
+            continue
+        quotes = side_quotes(o, venue, role, series, route)
+        if not quotes:
+            d.rejected_no_quotes += 1
+            continue
+        best = max(quotes, key=lambda q: q.predicted_ev)
+        d.best_net_ev.append(best.predicted_ev)
+        d.best_gross_edge.append(best.win_probability - best.entry_price)
+        if best.predicted_ev < el.min_net_ev:
+            d.rejected_below_ev += 1
+        else:
+            d.admitted += 1
+    return d
+
+
+def _grid(seed=11, n=4000):
+    """Observations spread across every gate's boundary, both sides of it."""
+    rng = random.Random(seed)
+    edges_p = [0.10, 0.149999, 0.15, 0.5, 0.85, 0.850001, 0.95]
+    edges_m = [0.0, 4.999, 5.0, 60.0, 4380.0, 4380.001, 9000.0]
+    spreads = [0.0, 0.01, 0.0999999, 0.10, 0.1000001, 0.3, -0.02]
+    when = [datetime(2025, 1, 1, tzinfo=timezone.utc),       # before MLB's schedule
+            datetime(2026, 7, 1, tzinfo=timezone.utc),
+            datetime(2026, 9, 24, 17, tzinfo=timezone.utc)]
+    out = []
+    for i in range(n):
+        mid = rng.choice(edges_p) if rng.random() < 0.4 else rng.uniform(0.02, 0.98)
+        spread = rng.choice(spreads)
+        bid, ask = round(mid - spread / 2, 6), round(mid + spread / 2, 6)
+        roll = rng.random()
+        if roll < 0.04:
+            bid = None
+        elif roll < 0.08:
+            ask = None
+        elif roll < 0.10:
+            bid, ask = 0.0, 1.0
+        delay = rng.choice([0.0, 0.0, 2.0])
+        entry_bid = entry_ask = None
+        if delay:
+            shape = rng.random()
+            if shape < 0.6:
+                entry_bid, entry_ask = bid, ask
+                if bid is not None and ask is not None:
+                    shift = rng.uniform(-0.05, 0.05)
+                    entry_bid, entry_ask = bid + shift, ask + shift
+            elif shape < 0.75:
+                entry_bid, entry_ask = 0.62, 0.55      # crossed at execution
+        out.append(Observation(
+            game_id=f"G{i}", market_id=f"M{i}",
+            decision_at=rng.choice(when),
+            minutes_to_start=(rng.choice(edges_m) if rng.random() < 0.4
+                              else rng.uniform(0.0, 6000.0)),
+            p_sharp=rng.uniform(0.01, 0.99), p_exchange=mid,
+            outcome=rng.randint(0, 1), exchange_bid=bid, exchange_ask=ask,
+            entry_delay_minutes=delay, entry_bid=entry_bid,
+            entry_ask=entry_ask))
+    return out
+
+
+def _outcome(call):
+    try:
+        return ("value", call())
+    except Exception as exc:                       # noqa: BLE001 -- compared
+        return ("raises", type(exc).__name__)
+
+
+class VerdictEquivalenceTest(unittest.TestCase):
+    """Naming a rejection changed no decision the screen makes."""
+
+    POLICIES = (Eligibility(), Eligibility(min_net_ev=0.0),
+                Eligibility(min_net_ev=-0.05, max_spread=0.2),
+                Eligibility(price_band=(0.3, 0.7), max_minutes_to_start=600.0))
+
+    def test_admission_and_exceptions_match_the_screen_it_replaced(self):
+        for policy in self.POLICIES:
+            for series in (None, "KXNFLGAME", "KXMLBGAME"):
+                for route in ("direct", "non_direct"):
+                    for o in _grid(n=600):
+                        with self.subTest(policy=policy, series=series,
+                                          route=route, market=o.market_id):
+                            self.assertEqual(
+                                _outcome(lambda: policy.admits(
+                                    o, series=series, route=route)),
+                                _outcome(lambda: _legacy_admits(
+                                    policy, o, series=series, route=route)))
+
+    def test_the_diagnostic_counts_match_the_screen_they_replaced(self):
+        grid = _grid(n=4000)
+        for policy in self.POLICIES:
+            for series in (None, "KXNFLGAME"):
+                with self.subTest(policy=policy, series=series):
+                    new = screen_diagnostics(grid, policy, series=series)
+                    old = _legacy_screen_diagnostics(grid, policy,
+                                                     series=series)
+                    self.assertEqual(vars(new), vars(old))
+                    self.assertGreater(new.admitted, 0)
+                    self.assertGreater(new.rejected_below_ev, 0)
+
+    def test_every_rejection_is_the_first_gate_that_refused(self):
+        el = Eligibility()
+        base = dict(game_id="G", market_id="M",
+                    decision_at=datetime(2026, 9, 24, 17, tzinfo=timezone.utc),
+                    minutes_to_start=600.0, p_sharp=0.62, p_exchange=0.50,
+                    outcome=0, exchange_bid=0.49, exchange_ask=0.51)
+
+        def verdict(**changes):
+            return el.verdict(Observation(**{**base, **changes}))
+
+        self.assertIsNone(verdict().rejection)
+        self.assertTrue(verdict().admitted)
+        cases = {
+            ScreenRejection.PRICE_BAND: dict(p_exchange=0.90,
+                                             minutes_to_start=9000.0),
+            ScreenRejection.LEAD_TIME: dict(minutes_to_start=4380.5),
+            ScreenRejection.NO_DECISION_QUOTES: dict(exchange_ask=None),
+            ScreenRejection.SPREAD_TOO_WIDE: dict(exchange_bid=0.40,
+                                                  exchange_ask=0.60),
+            ScreenRejection.NO_EXECUTABLE_SIDE: dict(exchange_bid=0.52,
+                                                     exchange_ask=0.51),
+            ScreenRejection.BELOW_EV_FLOOR: dict(p_sharp=0.52),
+        }
+        for rejection, changes in cases.items():
+            with self.subTest(rejection=rejection):
+                result = verdict(**changes)
+                self.assertIs(result.rejection, rejection)
+                self.assertFalse(result.admitted)
+        # A refused trade keeps its priced sides once the book gates passed.
+        below = verdict(p_sharp=0.52)
+        self.assertEqual({q.side for q in below.quotes}, {"YES", "NO"})
+        self.assertEqual(below.best.side, "YES")
+        self.assertEqual(verdict(p_exchange=0.90).quotes, ())
 
 
 if __name__ == "__main__":
