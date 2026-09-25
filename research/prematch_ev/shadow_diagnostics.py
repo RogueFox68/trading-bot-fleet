@@ -60,7 +60,7 @@ from core.fees import DEFAULT_ROUTE, fee_provenance                # noqa: E402
 from data.kalshi_history import parse_orderbook                    # noqa: E402
 from reaction.adjustment import (                                  # noqa: E402
     FILL_LIMITS, HYPOTHETICAL, SCREEN_ADMITTED, CapturePolicy, Read,
-    SharpReading, capture, summarize,
+    SharpReading, capture, screen_entry, summarize,
 )
 from reaction.assessment import (                                  # noqa: E402
     TickContext, TickRead, assess, read_status,
@@ -375,14 +375,20 @@ def _reassess(row: dict, index: int, trigger: MoveTrigger | None,
     rebuilt = tick.context(out.horizon) if tick is not None else None
     recorded_tick = (TickContext.from_dict(row["tick"])
                      if isinstance(row.get("tick"), dict) else None)
+    books = list(memory.get(ticker, []))
     decision, assessment = assess(
-        trigger, list(memory.get(ticker, [])), market_ticker=ticker,
+        trigger, books, market_ticker=ticker,
         yes_is_home=yes_is_home, start=start, entry_delay=delay,
         entry_tolerance=out.tolerance, series=out.series,
         eligibility=out.eligibility, route=out.route,
         tick=recorded_tick or rebuilt)
+    # The admitted trade's own entry, from the screen's own inputs: what a
+    # `screen_admitted` capture enters at, and the only thing it may.
+    entry = screen_entry(decision, books, entry_delay=delay,
+                         entry_tolerance=out.tolerance, series=out.series,
+                         route=out.route)
     item.update(trigger=trigger, start=start, yes_is_home=yes_is_home,
-                decision=decision, assessment=assessment,
+                decision=decision, assessment=assessment, screen_entry=entry,
                 agreement=_agreement(row, decision),
                 tick_agreement=_tick_agreement(recorded_tick, rebuilt))
     return item
@@ -486,15 +492,19 @@ def diagnose(rows: Sequence[dict], *,
             route=replayed.route, sharp=sharp,
             why=("the side the sharp move favoured, entered at the first "
                  "usable read after the move whether or not the screen "
-                 "admitted it: was there room behind the move?"))]
-        decision = item["decision"]
-        if decision.admitted and decision.trade is not None:
+                 "admitted it: was there room behind the move? NOT the "
+                 "screen's entry"))]
+        entry = item["screen_entry"]
+        if entry is not None:
             scenarios.append(capture(
-                kind=SCREEN_ADMITTED, side=decision.trade.side, reads=reads,
+                kind=SCREEN_ADMITTED, side=entry.side, reads=reads,
                 detected_at=trigger.detected_at, start=item["start"],
                 session_end=session_end, series=replayed.series,
                 policy=policy, route=replayed.route, sharp=sharp,
-                why="the side the frozen screen admitted"))
+                entry=entry,
+                why=("the frozen screen's own entry: the execution quote it "
+                     "priced, at the price and fee the admitted trade "
+                     "paid")))
         for scenario in scenarios:
             capture_rows.append((item["event_id"] or trigger.event_id,
                                  scenario))
@@ -518,9 +528,12 @@ def diagnose(rows: Sequence[dict], *,
             "limits": list(FILL_LIMITS),
             "summary": summarize(capture_rows, policy),
             "note": ("hypothetical rows are NOT entries: they ask whether "
-                     "the move left executable room, on every assessment. "
-                     "Only screen_admitted rows are the frozen policy's "
-                     "own entries"),
+                     "the move left executable room, on every assessment, "
+                     "from the first usable read after it. Only "
+                     "screen_admitted rows are the frozen policy's own "
+                     "entries, and they enter at the admitted trade's own "
+                     "execution quote, price and fee -- never at a read the "
+                     "capture chose"),
         },
         "fees": _fees(replayed),
         "assessments": items,
@@ -530,7 +543,8 @@ def diagnose(rows: Sequence[dict], *,
 def _public(item: dict) -> dict:
     """An assessment item without the in-memory objects."""
     out = {k: v for k, v in item.items()
-           if k not in ("trigger", "decision", "recorded", "start")}
+           if k not in ("trigger", "decision", "recorded", "start",
+                        "screen_entry")}
     if "decision" in item:
         out["decision"] = item["decision"].as_dict()
     out["recorded_decision_had_assessment"] = isinstance(
@@ -848,9 +862,13 @@ def _render_scenario(scenario: dict) -> list[str]:
     entry = scenario["entry"]
     paid = "ask" if scenario["side"] == "YES" else "1 - bid"
     got = "bid" if scenario["side"] == "YES" else "1 - ask"
+    when = (f"the admitted trade's own entry, paid {entry['paid']:.4f} "
+            f"(execution read {entry['delay_after_move_seconds']:+.1f}s from "
+            f"the move)" if scenario["kind"] == SCREEN_ADMITTED else
+            f"{entry['delay_after_move_seconds']:.1f}s after the move")
     lines = [f"      capture ({label}): {scenario['side']} bought at "
              f"{entry['price']:.4f} ({paid}) + fee {entry['fee']:.4f}, "
-             f"{entry['delay_after_move_seconds']:.1f}s after the move",
+             f"{when}",
              f"        {'markout':>8}  {'exit (' + got + ')':>13}  "
              f"{'gross':>8}  {'fees':>7}  {'net':>8}  sharp"]
     for m in scenario["markouts"]:

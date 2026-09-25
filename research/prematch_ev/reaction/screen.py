@@ -274,6 +274,27 @@ def execution_candle(candles: Iterable, target: datetime,
     return after[0] if after else None
 
 
+def screen_books(candles: Iterable, decided_at: datetime,
+                 entry_delay: timedelta, entry_tolerance: timedelta):
+    """`(decision book, execution book)` for one decision: the two quotes the
+    screen prices.
+
+    The decision book is the newest usable candle at or before the decision.
+    The execution book is the first usable one at or after the decision plus
+    the delay, within the tolerance -- and at zero delay it IS the decision
+    book, the same candle. The screen takes its books from here, and so does
+    anything that must describe or follow the screen's own entry (the
+    assessment record, the admitted capture): a second copy of this rule is
+    how a capture came to enter at a cheaper read the screen never saw
+    (rule 19).
+    """
+    book = decision_book(candles, decided_at)
+    if entry_delay > timedelta(0):
+        return book, execution_candle(candles, decided_at + entry_delay,
+                                      entry_tolerance)
+    return book, book
+
+
 def observation_for(reaction: Reaction, trigger: MoveTrigger, candles: Sequence,
                     *, market_ticker: str, yes_is_home: bool,
                     start: datetime | None,
@@ -323,7 +344,8 @@ def observation_at(trigger: MoveTrigger, candles: Sequence, *,
             "the move became visible at or after kickoff: not a pre-match "
             "opportunity")
 
-    book = decision_book(candles, decided_at)
+    book, execution = screen_books(candles, decided_at, entry_delay,
+                                   entry_tolerance)
     if book is None:
         return None, ScreenRefusal.NO_DECISION_BOOK, (
             "no usable exchange candle at or before the trigger")
@@ -338,18 +360,14 @@ def observation_at(trigger: MoveTrigger, candles: Sequence, *,
             f"crossed book at the trigger: bid {book.bid_close} > ask "
             f"{book.ask_close}")
 
-    entry = book
-    entry_at = book.ts
+    # At zero delay `execution` IS `book`. Under a delay, A MISSING DELAYED
+    # QUOTE IS NOT A FILL AT THE DECISION PRICE. Left as None,
+    # `Observation.execution_book` returns None under a delay and
+    # `side_quotes` drops the side, which is the correct outcome: there was
+    # no fill. That is why this does not fall back.
+    entry = execution
+    entry_at = execution.ts if execution is not None else None
     delay_minutes = entry_delay.total_seconds() / 60.0
-    if entry_delay > timedelta(0):
-        found = execution_candle(candles, decided_at + entry_delay,
-                                 entry_tolerance)
-        # A MISSING DELAYED QUOTE IS NOT A FILL AT THE DECISION PRICE. Left
-        # as None, `Observation.execution_book` returns None under a delay
-        # and `side_quotes` drops the side, which is the correct outcome:
-        # there was no fill. That is why this does not fall back.
-        entry = found
-        entry_at = found.ts if found else None
 
     # p_sharp is the fair probability AFTER the move, oriented to this
     # contract's YES participant. An unoriented probability is a silently

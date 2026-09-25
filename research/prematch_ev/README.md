@@ -1290,8 +1290,18 @@ numbers. `--report` now rebuilds every assessment from the raw records:
   A markout with no such read is censored with its reason; the best exit
   seen is printed only as a labelled hindsight diagnostic. Every assessment
   gets a `hypothetical_follow_move` scenario (the side the move favoured,
-  whether or not the screen would enter); only `screen_admitted` rows are
-  the policy's own. Each markout also says whether the sharp move had
+  entered at the first usable read after it, whether or not the screen
+  would enter); only `screen_admitted` rows are the policy's own, and they
+  enter where the admitted trade entered -- the screen's own execution
+  quote, at the price and fee the trade paid, whatever its delay. They
+  never pick a read of their own: one that did entered a review's example
+  at a +0.2s read quoting 0.60 while the trade paid 0.65 + 0.02 a second
+  later. **Pre-match means the read, not the target:** every quote a round
+  trip uses -- the entry, each exit, each hindsight point -- must have been
+  received before kickoff (a read AT kickoff does not count) and no later
+  than the session's end; a markout whose target precedes kickoff but whose
+  first read arrives after it is censored `game_started`, never filled.
+  Each markout also says whether the sharp move had
   `persisted`, `reversed` (given back at least the detector's threshold)
   or become `unobservable`, from the polls READ by then. The markouts were
   declared after the owner's summary of 2026-09-24 was read, so that

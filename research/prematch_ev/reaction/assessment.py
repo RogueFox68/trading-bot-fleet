@@ -62,7 +62,7 @@ from core.fees import (                                         # noqa: E402
 )
 from .detector import MoveTrigger                               # noqa: E402
 from .screen import (                                           # noqa: E402
-    LiveDecision, decision_book, execution_candle, screen_live,
+    LiveDecision, screen_books, screen_live,
 )
 
 SCHEMA = "shadow-assessment/1"
@@ -426,11 +426,10 @@ def describe(decision: LiveDecision, trigger: MoveTrigger, books: Sequence, *,
     """The assessment record for one screened (or unscreenable) contract."""
     route = route or DEFAULT_ROUTE
     decided_at = trigger.detected_at
-    # The screen's own helpers, on the screen's own inputs: the same two
-    # books `observation_at` found.
-    dbook = decision_book(books, decided_at)
-    ebook = (execution_candle(books, decided_at + entry_delay, entry_tolerance)
-             if entry_delay > timedelta(0) else dbook)
+    # The screen's own rule, on the screen's own inputs: the same two books
+    # `observation_at` priced.
+    dbook, ebook = screen_books(books, decided_at, entry_delay,
+                                entry_tolerance)
     move_for_yes = trigger.delta_for(yes_is_home)
     minutes = (None if start is None
                else (start - decided_at).total_seconds() / 60.0)

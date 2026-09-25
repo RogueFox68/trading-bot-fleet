@@ -35,15 +35,17 @@ from unittest import mock
 import shadow_diagnostics as diag
 import shadow_monitor
 from analysis.scoring import Eligibility
-from data.kalshi_history import BookQuote
+from data.kalshi_history import BookQuote, parse_orderbook
 from reaction.adjustment import (
-    HYPOTHETICAL, CapturePolicy, Read, SharpReading, capture, sharp_state,
+    HYPOTHETICAL, SCREEN_ADMITTED, CapturePolicy, Read, ScreenEntry,
+    ScreenEntryMismatch, SharpReading, capture, screen_entry, sharp_state,
     summarize,
 )
 from reaction.assessment import (
     CoverageClass, TickContext, TickRead, assess, classify_coverage,
 )
 from reaction.detector import MovePolicy, MoveTrigger, fair_probabilities
+from reaction.screen import screen_live
 from tests import synthetic_session as syn
 from tests.test_shadow_monitor import (
     MOVE_AT, T0 as MONITOR_T0, MonitorHarness,
@@ -788,6 +790,431 @@ class CaptureTest(unittest.TestCase):
             with self.subTest(markouts=bad):
                 with self.assertRaises(ValueError):
                     CapturePolicy(markouts=bad)
+
+
+class PreMatchBoundTest(unittest.TestCase):
+    """Every quote a round trip uses must be RECEIVED before kickoff and no
+    later than the session's end -- the read, not just its target (review
+    5833183856, P2). Synthetic reads; nothing here was observed."""
+
+    MOVE = CaptureTest.MOVE
+    ONE = CaptureTest.ONE
+    TWO = CapturePolicy(markouts=(timedelta(seconds=30),
+                                  timedelta(seconds=120)))
+
+    def at(self, seconds):
+        return self.MOVE + timedelta(seconds=seconds)
+
+    def run_capture(self, reads, **kwargs):
+        options = dict(kind=HYPOTHETICAL, side="YES", reads=reads,
+                       detected_at=self.MOVE, start=self.at(3600),
+                       session_end=self.at(7200), series="KXNFLGAME",
+                       policy=self.ONE)
+        options.update(kwargs)
+        return capture(**options)
+
+    def entry(self, seconds=0):
+        return _book(self.at(seconds), 0.59, 0.60)
+
+    def test_a_target_before_kickoff_filled_after_it_is_censored(self):
+        # The review's case: entry ask 0.60, markout +60s, kickoff +65s, the
+        # next read at +70s bidding 0.80 -- priced at +0.16 before the fix.
+        result = self.run_capture(
+            _reads(self.entry(), _book(self.at(70), 0.80, 0.81)),
+            start=self.at(65))
+        (m,) = result["markouts"]
+        self.assertNotIn("net", m)
+        self.assertEqual(m["censored"]["reason"], "game_started")
+        self.assertEqual(m["censored"]["read_received_at"],
+                         self.at(70).isoformat())
+        # The same read a second inside kickoff is an exit, and is priced.
+        inside = self.run_capture(
+            _reads(self.entry(), _book(self.at(64), 0.80, 0.81)),
+            start=self.at(65))
+        self.assertAlmostEqual(inside["markouts"][0]["net"], 0.16)
+
+    def test_a_read_exactly_at_kickoff_is_not_pre_match(self):
+        exit_at = self.run_capture(
+            _reads(self.entry(), _book(self.at(65), 0.80, 0.81)),
+            start=self.at(65))
+        self.assertEqual(exit_at["markouts"][0]["censored"]["reason"],
+                         "game_started")
+        entry_at = self.run_capture(_reads(self.entry(10)), start=self.at(10))
+        self.assertNotIn("markouts", entry_at)
+        self.assertTrue(entry_at["entry_missing_because"].startswith(
+            "game_started"), entry_at["entry_missing_because"])
+
+    def test_an_entry_read_crossing_kickoff_is_no_entry(self):
+        crossed = self.run_capture(
+            _reads(self.entry(15), _book(self.at(80), 0.80, 0.81)),
+            start=self.at(10))
+        self.assertNotIn("markouts", crossed)
+        self.assertTrue(crossed["entry_missing_because"].startswith(
+            "game_started (the entry read"), crossed["entry_missing_because"])
+        self.assertEqual(crossed["entry"]["at"], self.at(15).isoformat(),
+                         "the read that was refused is still shown")
+        self.assertNotIn("entered_at", crossed, "but nothing was entered")
+        moved_late = self.run_capture(_reads(self.entry(25)),
+                                      detected_at=self.at(20),
+                                      start=self.at(10))
+        self.assertTrue(moved_late["entry_missing_because"].startswith(
+            "game_started (the move"), moved_late["entry_missing_because"])
+        self.assertEqual(
+            summarize([("g", crossed), ("g", moved_late)],
+                      self.ONE)[HYPOTHETICAL]["entry_missing"],
+            {"game_started": 2})
+
+    def test_the_session_end_bounds_the_read_and_includes_its_last_instant(self):
+        read_after = self.run_capture(
+            _reads(self.entry(), _book(self.at(80), 0.80, 0.81)),
+            session_end=self.at(75))
+        (m,) = read_after["markouts"]
+        self.assertEqual(m["censored"]["reason"], "session_ended")
+        self.assertEqual(m["censored"]["read_received_at"],
+                         self.at(80).isoformat())
+        read_at_end = self.run_capture(
+            _reads(self.entry(), _book(self.at(75), 0.80, 0.81)),
+            session_end=self.at(75))
+        self.assertAlmostEqual(read_at_end["markouts"][0]["net"], 0.16)
+        target_at_end = self.run_capture(
+            _reads(self.entry(), _book(self.at(60), 0.80, 0.81)),
+            session_end=self.at(60))
+        self.assertAlmostEqual(target_at_end["markouts"][0]["net"], 0.16)
+        entry_after = self.run_capture(_reads(self.entry(20)),
+                                       session_end=self.at(10))
+        self.assertTrue(entry_after["entry_missing_because"].startswith(
+            "session_ended (the entry read"),
+            entry_after["entry_missing_because"])
+
+    def test_hindsight_keeps_the_same_bounds(self):
+        kicked = self.run_capture(
+            _reads(self.entry(), _book(self.at(30), 0.61, 0.62),
+                   _book(self.at(65), 0.90, 0.91)),
+            start=self.at(65), policy=self.TWO)
+        best = kicked["hindsight"]["max_favourable"]
+        self.assertEqual((best["exit_price"], best["at"]),
+                         (0.61, self.at(30).isoformat()),
+                         "a read AT kickoff is not a hindsight exit either")
+        self.assertEqual(kicked["hindsight"]["before_kickoff"],
+                         self.at(65).isoformat())
+        just_before = self.run_capture(
+            _reads(self.entry(), _book(self.at(30), 0.61, 0.62),
+                   _book(self.at(64.999), 0.90, 0.91)),
+            start=self.at(65), policy=self.TWO)
+        self.assertEqual(just_before["hindsight"]["max_favourable"]
+                         ["exit_price"], 0.90)
+        ended = self.run_capture(
+            _reads(self.entry(), _book(self.at(30), 0.61, 0.62),
+                   _book(self.at(55), 0.95, 0.96)),
+            session_end=self.at(50), policy=self.TWO)
+        self.assertEqual(ended["hindsight"]["through"],
+                         self.at(50).isoformat())
+        self.assertEqual(ended["hindsight"]["max_favourable"]["exit_price"],
+                         0.61)
+
+    def test_an_admitted_entry_read_after_kickoff_is_named_as_the_screens(self):
+        book = self.entry(15)
+        entry = ScreenEntry(side="YES", book=book, price=0.60, fee=0.02,
+                            paid=0.62, entry_delay=timedelta(seconds=15),
+                            fee_basis="synthetic")
+        result = self.run_capture(_reads(book), kind=SCREEN_ADMITTED,
+                                  entry=entry, start=self.at(10))
+        self.assertNotIn("markouts", result)
+        self.assertIn("the SCREEN admitted it",
+                      result["entry_missing_because"])
+
+
+def _admitted_trigger(at):
+    """A move the screen admits on YES at a 0.60 ask: Shin fair home 0.6774
+    after (0.6481 before). SYNTHETIC odds."""
+    return _trigger(at, (170, -200), (190, -233))
+
+
+class AdmittedEntryTest(unittest.TestCase):
+    """A `screen_admitted` capture enters where the admitted trade entered:
+    the screen's own execution quote, time, price and fee (review
+    5833183856, P1) -- and a hypothetical keeps asking its own question from
+    its own read. Synthetic books; nothing here was observed."""
+
+    MOVE = datetime(2026, 10, 4, 12, 0, tzinfo=UTC)
+    START = MOVE + timedelta(hours=5)
+    TOLERANCE = shadow_monitor.ENTRY_TOLERANCE
+
+    def at(self, seconds):
+        return self.MOVE + timedelta(seconds=seconds)
+
+    def decide(self, books, delay, *, route=None):
+        return screen_live(_admitted_trigger(self.MOVE), books,
+                           market_ticker="T", yes_is_home=True,
+                           start=self.START, entry_delay=delay,
+                           entry_tolerance=self.TOLERANCE,
+                           series="KXNFLGAME", route=route)
+
+    def both(self, books, delay, policy=CaptureTest.ONE):
+        decision = self.decide(books, delay)
+        self.assertTrue(decision.admitted, decision.detail)
+        entry = screen_entry(decision, books, entry_delay=delay,
+                             entry_tolerance=self.TOLERANCE,
+                             series="KXNFLGAME")
+        common = dict(reads=_reads(*books), detected_at=self.MOVE,
+                      start=self.START,
+                      session_end=self.MOVE + timedelta(hours=2),
+                      series="KXNFLGAME", policy=policy)
+        return (decision,
+                capture(kind=SCREEN_ADMITTED, side=entry.side, entry=entry,
+                        **common),
+                capture(kind=HYPOTHETICAL, side="YES", **common))
+
+    def assert_is_the_trade(self, decision, admitted):
+        entry, trade = admitted["entry"], decision.trade
+        self.assertEqual(admitted["side"], trade.side)
+        self.assertEqual(entry["price"] + entry["fee"], trade.paid,
+                         "the admitted capture's entry cost IS the trade's")
+        self.assertEqual(entry["paid"], trade.paid)
+        self.assertEqual(entry["at"], decision.observation.entry_at.isoformat(),
+                         "and it is the screen's execution read")
+
+    def test_an_earlier_cheaper_read_is_not_the_admitted_entry(self):
+        # The review's example: the decision book 0.59/0.60; a read at
+        # +0.2s still 0.59/0.60; the screen's execution read, one second
+        # after the move, 0.64/0.65. The trade paid 0.65 + 0.02.
+        books = [_book(self.at(-1.5), 0.59, 0.60),
+                 _book(self.at(0.2), 0.59, 0.60),
+                 _book(self.at(1), 0.64, 0.65),
+                 _book(self.at(61), 0.66, 0.67)]
+        decision, admitted, hypothetical = self.both(
+            books, timedelta(seconds=1))
+        self.assertEqual(decision.trade.side, "YES")
+        self.assertAlmostEqual(decision.trade.paid, 0.67)
+        self.assert_is_the_trade(decision, admitted)
+        self.assertEqual((admitted["entry"]["price"], admitted["entry"]["fee"]),
+                         (0.65, 0.02))
+        self.assertEqual(admitted["entered_at"], self.at(1).isoformat())
+        self.assertEqual(admitted["markouts"][0]["target"],
+                         self.at(61).isoformat(),
+                         "markouts run from the screen's entry, not the move")
+        self.assertAlmostEqual(admitted["markouts"][0]["net"], -0.03)
+        # The hypothetical is its own question: the first read after the
+        # move, labelled, five cents cheaper than anything the screen paid.
+        hyp = hypothetical["entry"]
+        self.assertEqual(hyp["at"], self.at(0.2).isoformat())
+        self.assertAlmostEqual(hyp["price"] + hyp["fee"], 0.62)
+        self.assertIn("not the screen's", hyp["source"])
+        self.assertAlmostEqual(hypothetical["markouts"][0]["net"]
+                               - admitted["markouts"][0]["net"], 0.05)
+
+    def test_a_delay_past_the_hypothetical_entry_window_is_still_the_entry(self):
+        # 45s, past the capture's 30s `entry_within`, with nothing read in
+        # between: the hypothetical finds no entry; the admitted trade had one.
+        books = [_book(self.at(-1.5), 0.59, 0.60),
+                 _book(self.at(45), 0.64, 0.65),
+                 _book(self.at(105), 0.66, 0.67)]
+        decision, admitted, hypothetical = self.both(
+            books, timedelta(seconds=45))
+        self.assert_is_the_trade(decision, admitted)
+        self.assertAlmostEqual(
+            admitted["entry"]["delay_after_move_seconds"], 45.0)
+        self.assertEqual(admitted["entry"]["screen_entry_delay_seconds"], 45.0)
+        self.assertIn("net", admitted["markouts"][0])
+        self.assertNotIn("markouts", hypothetical)
+        self.assertIn("no usable read within 30s",
+                      hypothetical["entry_missing_because"])
+
+    def test_the_fee_is_the_screens_execution_fee_not_its_decision_fee(self):
+        # Decided at a 0.50 ask (fee 0.02), executed at 0.85 (fee 0.01).
+        books = [_book(self.at(-1.5), 0.49, 0.50),
+                 _book(self.at(2), 0.84, 0.85)]
+        decision, admitted, _ = self.both(books, timedelta(seconds=2))
+        self.assertEqual(decision.trade.fee, 0.02)
+        self.assert_is_the_trade(decision, admitted)
+        self.assertEqual((admitted["entry"]["price"], admitted["entry"]["fee"]),
+                         (0.85, 0.01))
+        self.assertIn("execution fee", admitted["entry"]["fee_basis"])
+
+    def test_at_zero_delay_the_entry_is_the_decision_book_held_from_the_move(self):
+        books = [_book(self.at(-1.5), 0.59, 0.60),
+                 _book(self.at(0.2), 0.70, 0.71),
+                 _book(self.at(61), 0.66, 0.67)]
+        decision, admitted, _ = self.both(books, timedelta(0))
+        self.assert_is_the_trade(decision, admitted)
+        self.assertEqual(admitted["entry"]["at"], self.at(-1.5).isoformat())
+        self.assertIn("decision fee", admitted["entry"]["fee_basis"])
+        # Nothing is held from before it was decided.
+        self.assertEqual(admitted["entered_at"], self.MOVE.isoformat())
+        self.assertEqual(admitted["markouts"][0]["target"],
+                         self.at(60).isoformat())
+
+    def test_the_admitted_entry_keeps_the_fill_assumption_on_depth(self):
+        # The screen admits without looking at depth; the capture's fill
+        # assumption still applies to the book the screen paid.
+        thin = replace(_book(self.at(1), 0.64, 0.65), ask_size=0.5)
+        books = [_book(self.at(-1.5), 0.59, 0.60), thin]
+        decision, admitted, _ = self.both(books, timedelta(seconds=1))
+        self.assertNotIn("markouts", admitted)
+        self.assertIn("observed depth 0.5 is below the 1 contract",
+                      admitted["entry_missing_because"])
+        self.assertEqual(admitted["entry"]["paid"], decision.trade.paid)
+
+    def test_an_admitted_capture_cannot_choose_its_own_entry(self):
+        book = _book(self.at(0.4), 0.59, 0.60)
+        entry = ScreenEntry(side="YES", book=book, price=0.60, fee=0.02,
+                            paid=0.62, entry_delay=timedelta(seconds=0.4),
+                            fee_basis="synthetic")
+        common = dict(reads=_reads(book), detected_at=self.MOVE,
+                      start=self.START, session_end=None,
+                      series="KXNFLGAME")
+        for bad in (dict(kind=SCREEN_ADMITTED, side="YES"),
+                    dict(kind=HYPOTHETICAL, side="YES", entry=entry),
+                    dict(kind=SCREEN_ADMITTED, side="NO", entry=entry),
+                    dict(kind=SCREEN_ADMITTED, side="YES", entry=entry,
+                         policy=CapturePolicy(contracts=10)),
+                    dict(kind="screen_adjacent", side="YES")):
+            with self.subTest(**{k: v for k, v in bad.items()
+                                 if k != "entry"}):
+                with self.assertRaises(ValueError):
+                    capture(**common, **bad)
+
+    def test_screen_entry_refuses_inputs_that_are_not_the_screens(self):
+        books = [_book(self.at(-1.5), 0.59, 0.60),
+                 _book(self.at(0.2), 0.59, 0.60),
+                 _book(self.at(1), 0.64, 0.65)]
+        decision = self.decide(books, timedelta(seconds=1))
+        kwargs = dict(entry_tolerance=self.TOLERANCE, series="KXNFLGAME")
+        with self.assertRaises(ScreenEntryMismatch):     # another delay
+            screen_entry(decision, books, entry_delay=timedelta(seconds=0.2),
+                         **kwargs)
+        with self.assertRaises(ScreenEntryMismatch):     # another route
+            screen_entry(decision, books, entry_delay=timedelta(seconds=1),
+                         route="direct", **kwargs)
+        refused = self.decide([_book(self.at(-1.5), 0.66, 0.67),
+                               _book(self.at(1), 0.66, 0.67)],
+                              timedelta(seconds=1))
+        self.assertFalse(refused.admitted)
+        self.assertIsNone(screen_entry(refused, [], entry_delay=timedelta(
+            seconds=1), **kwargs))
+
+
+def _payload(bid, ask):
+    """A book as the monitor records one: Kalshi's bids-only shape."""
+    return {"orderbook_fp": {
+        "yes_dollars": [[f"{bid - 0.02:.4f}", "25.00"],
+                        [f"{bid:.4f}", "100.00"]],
+        "no_dollars": [[f"{1 - ask:.4f}", "150.00"]]}}
+
+
+def _admitted_session(delay, reads, *, trigger=None, decision_book=(0.59,
+                                                                  0.60)):
+    """SYNTHETIC session rows, shaped as the monitor writes them, for one
+    move the screen admits: the review's P1 example when `reads` holds the
+    +0.2s read. `reads` is `(seconds after the move, bid, ask, purpose)`;
+    the decision row carries the live screen's own decision, as recorded."""
+    move = AdmittedEntryTest.MOVE
+    start = AdmittedEntryTest.START
+    trigger = trigger or _admitted_trigger(move)
+    rows = [{"kind": "session_start", "at": move - timedelta(hours=1),
+             "series": "KXNFLGAME", "book_horizon_seconds": 73 * 3600.0,
+             "book_memory_seconds": 7200.0, "entry_tolerance_seconds": 1.0},
+            {"kind": "join", "contracts": {"T": {
+                "event": "evt", "yes_is_home": True, "start": start}}}]
+    memory = []
+    for seconds, bid, ask, purpose in [(-1.5, *decision_book, "decision")] + [
+            r for r in reads if r[0] <= delay.total_seconds()]:
+        received = move + timedelta(seconds=seconds)
+        sent = received - timedelta(milliseconds=200)
+        rows.append({"kind": "book", "ticker": "T", "purpose": purpose,
+                     "sent_at": sent, "received_at": received,
+                     "payload": _payload(bid, ask)})
+        memory.append(parse_orderbook(_payload(bid, ask), ticker="T",
+                                      received_at=received, sent_at=sent)[0])
+        if purpose == "decision":
+            rows.append({"kind": "trigger", **trigger.as_dict()})
+    decision = screen_live(trigger, memory, market_ticker="T",
+                           yes_is_home=True, start=start, entry_delay=delay,
+                           entry_tolerance=timedelta(seconds=1),
+                           series="KXNFLGAME")
+    rows.append({"kind": "decision", "stream_id": trigger.stream_id,
+                 "yes_is_home": True, "entered": decision.admitted,
+                 **decision.as_dict()})
+    for seconds, bid, ask, purpose in reads:
+        if seconds > delay.total_seconds():
+            received = move + timedelta(seconds=seconds)
+            rows.append({"kind": "book", "ticker": "T", "purpose": purpose,
+                         "sent_at": received - timedelta(milliseconds=200),
+                         "received_at": received,
+                         "payload": _payload(bid, ask)})
+    rows.append({"kind": "session_end", "at": move + timedelta(hours=2)})
+    return json.loads(json.dumps(rows, default=shadow_monitor._jsonable))
+
+
+class AdmittedCaptureSessionTest(unittest.TestCase):
+    """The same rule end to end: `diagnose` on a session file enters the
+    admitted capture at the trade's own execution quote. SYNTHETIC rows."""
+
+    def figures(self, delay, reads, **kwargs):
+        return diag.diagnose(_admitted_session(delay, reads, **kwargs),
+                             capture_policy=CaptureTest.ONE)
+
+    def scenarios(self, item):
+        return {s["kind"]: s for s in item["adjustment_capture"]}
+
+    def test_the_admitted_row_enters_where_the_trade_entered(self):
+        figures = self.figures(timedelta(seconds=1), [
+            (0.2, 0.59, 0.60, "follow"), (1, 0.64, 0.65, "execution"),
+            (61, 0.66, 0.67, "follow")])
+        (item,) = figures["assessments"]
+        self.assertTrue(item["agreement"]["agrees"], item["agreement"])
+        predicted = item["decision"]["predicted"]
+        execution = item["assessment"]["sides"]["YES"]["execution"]
+        admitted = self.scenarios(item)[SCREEN_ADMITTED]
+        entry = admitted["entry"]
+        self.assertEqual(entry["price"] + entry["fee"],
+                         predicted["paid_at_execution"])
+        self.assertEqual((entry["price"], entry["fee"], entry["paid"]),
+                         (execution["price"], execution["fee"],
+                          execution["paid"]))
+        self.assertEqual(entry["at"], item["assessment"]["execution_book"]
+                         ["received_at"])
+        self.assertEqual(admitted["side"], predicted["side"])
+        hypothetical = self.scenarios(item)[HYPOTHETICAL]
+        self.assertAlmostEqual(hypothetical["entry"]["price"], 0.60)
+        text = diag.render_diagnostics(figures)
+        self.assertIn("the admitted trade's own entry, paid 0.6700", text)
+        json.dumps(figures, default=diag.jsonable)
+
+    def test_the_admitted_side_is_the_screens_not_the_moves(self):
+        # The move favours YES (home 0.323 -> 0.352), but YES is quoted far
+        # above it, so the screen buys NO at 1 - bid. The admitted row
+        # follows the TRADE; the hypothetical follows the move.
+        move = AdmittedEntryTest.MOVE
+        figures = self.figures(
+            timedelta(seconds=1),
+            [(0.2, 0.59, 0.60, "follow"), (1, 0.54, 0.55, "execution"),
+             (61, 0.50, 0.51, "follow")],
+            trigger=_trigger(move, (-233, 190), (-200, 170)))
+        (item,) = figures["assessments"]
+        self.assertEqual(item["assessment"]["move"]["favoured_side"], "YES")
+        predicted = item["decision"]["predicted"]
+        self.assertEqual(predicted["side"], "NO")
+        scenarios = self.scenarios(item)
+        admitted = scenarios[SCREEN_ADMITTED]
+        self.assertEqual(admitted["side"], "NO")
+        self.assertAlmostEqual(admitted["entry"]["price"], 1 - 0.54)
+        self.assertEqual(admitted["entry"]["price"] + admitted["entry"]["fee"],
+                         predicted["paid_at_execution"])
+        self.assertEqual(scenarios[HYPOTHETICAL]["side"], "YES")
+
+    def test_a_slow_execution_read_still_enters_the_admitted_row(self):
+        figures = self.figures(timedelta(seconds=45), [
+            (45, 0.64, 0.65, "execution"), (105, 0.66, 0.67, "follow")])
+        (item,) = figures["assessments"]
+        scenarios = self.scenarios(item)
+        self.assertIn("markouts", scenarios[SCREEN_ADMITTED])
+        self.assertEqual(scenarios[SCREEN_ADMITTED]["entry"]["paid"],
+                         item["decision"]["predicted"]["paid_at_execution"])
+        self.assertNotIn("markouts", scenarios[HYPOTHETICAL])
+        summary = figures["adjustment_capture"]["summary"]
+        self.assertEqual(summary[SCREEN_ADMITTED]["entered"], 1)
+        self.assertEqual(summary[HYPOTHETICAL]["entered"], 0)
 
 
 class PlanHorizonTest(MonitorHarness):

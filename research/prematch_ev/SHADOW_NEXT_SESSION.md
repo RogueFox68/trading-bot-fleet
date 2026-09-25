@@ -154,8 +154,11 @@ commit.
 - **What changed since the first session:** decisions record their tick
   and assessment; `session_start` records the fee route, entry tolerance,
   book memory and commit; and the hourly rejoin no longer sits between a
-  move and its execution read. The screen, the detector, the thresholds and
-  the cadence are unchanged.
+  move and its execution read. In the analysis, an admitted capture enters
+  at the admitted trade's own execution quote, price and fee, and every
+  read a round trip uses must arrive before kickoff and by the session's
+  end. The screen, the detector, the thresholds and the cadence are
+  unchanged.
 
 ## What it will not answer
 

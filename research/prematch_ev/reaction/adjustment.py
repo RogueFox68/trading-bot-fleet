@@ -15,6 +15,21 @@ the screen's EV language or its admission. Every result carries its scenario:
 `hypothetical_follow_move` for the question "was there room behind the move",
 asked of every assessment whether or not the screen would have entered.
 
+THE TWO SCENARIOS ENTER DIFFERENTLY, ON PURPOSE
+-----------------------------------------------
+* A `hypothetical_follow_move` finds its own entry: the first usable read at
+  or after the move, within `entry_within`. It is a question about the
+  book, not a trade anyone took.
+* A `screen_admitted` capture NEVER finds its own entry. It is handed the
+  screen's (`screen_entry`): the execution book the screen priced, at the
+  price and fee the admitted trade paid, so its entry cost IS the trade's
+  `paid`. Re-selecting it -- the first read after the move, as the
+  hypothetical does -- entered one review's example at a +0.2s read still
+  quoting 0.60 when the screen's one-second-delayed execution read quoted
+  0.65: 0.62 paid against the trade's 0.67, and every markout measured from
+  the wrong instant. `capture` refuses a `screen_admitted` call without the
+  screen's entry, and a hypothetical with one.
+
 THE RULES THAT KEEP IT AN EXECUTION MEASURE
 -------------------------------------------
 * Entry pays the ASK for YES and (1 - bid) for NO; exit receives the BID for
@@ -28,6 +43,14 @@ THE RULES THAT KEEP IT AN EXECUTION MEASURE
   Picking the most favourable later quote is picking with hindsight.
 * A markout with no usable read is CENSORED, with its reason -- never filled
   from an earlier read, never silently dropped.
+* PRE-MATCH ONLY, judged on the READ, not just the target. Every quote a
+  round trip uses -- the entry and each exit -- must have been RECEIVED
+  before kickoff and no later than the session's end (`_outside`, one rule
+  for targets, entries, exits and hindsight). A markout whose target
+  precedes kickoff but whose first read arrives after it is censored
+  `game_started`, never filled: checking only the target once priced an
+  exit read 5s after kickoff at +0.16. A read received exactly AT kickoff
+  is not pre-match.
 * The best and worst exits seen are reported only as a HINDSIGHT DIAGNOSTIC,
   and labelled so.
 * A fill is ASSUMED: one contract at the top of the book as read. The depth
@@ -60,11 +83,12 @@ from typing import Any, Iterable, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from analysis.scoring import side_quotes                        # noqa: E402
 from core.fees import (                                         # noqa: E402
     DEFAULT_ROUTE, FeeScheduleUnresolved, fee_for,
 )
 from .measure import usable_candle                              # noqa: E402
-from .screen import execution_candle                            # noqa: E402
+from .screen import execution_candle, screen_books              # noqa: E402
 
 HYPOTHETICAL = "hypothetical_follow_move"
 SCREEN_ADMITTED = "screen_admitted"
@@ -80,8 +104,10 @@ FILL_LIMITS = (
     "the time between our read and an order reaching the exchange is not "
     "modelled; the read's own span (request to receipt) is recorded",
     "each leg's fee is the model's taker fee at its price and instant, with "
-    "the fee provenance's unresolved inputs (route, series multiplier)",
-    "exits are pre-match only: a markout at or after kickoff is censored",
+    "the fee provenance's unresolved inputs (route, series multiplier); a "
+    "screen_admitted entry carries the screen's own fee, unrecomputed",
+    "pre-match only: a markout target, entry read or exit read at or after "
+    "kickoff, or after the session ended, is censored",
 )
 
 
@@ -96,8 +122,10 @@ class CapturePolicy:
 
     markouts: tuple[timedelta, ...] = tuple(
         timedelta(seconds=s) for s in (30, 60, 120, 300, 600, 900, 1800))
-    #: Entry is the first usable read at or after the move was actionable,
-    #: within this: the monitor's own hole limit (three follow intervals).
+    #: A HYPOTHETICAL entry is the first usable read at or after the move
+    #: was actionable, within this: the monitor's own hole limit (three
+    #: follow intervals). An admitted entry is the screen's, whatever its
+    #: delay: this bounds nothing about it.
     entry_within: timedelta = timedelta(seconds=30)
     #: An exit is the first usable read at or after its markout, within this.
     exit_tolerance: timedelta = timedelta(seconds=30)
@@ -118,8 +146,14 @@ class CapturePolicy:
     def as_dict(self) -> dict:
         return {"label": self.label,
                 "markout_seconds": [m.total_seconds() for m in self.markouts],
-                "measured_from": "the entry read's receipt",
+                "measured_from": ("the entry: its read's receipt, or the "
+                                  "move's detection when that is later (a "
+                                  "zero-delay screen entry prices the "
+                                  "decision book, read before the move)"),
                 "entry_within_seconds": self.entry_within.total_seconds(),
+                "entry_within_applies_to": (
+                    f"{HYPOTHETICAL} only: a {SCREEN_ADMITTED} entry is the "
+                    f"screen's own execution quote, at its own delay"),
                 "exit_tolerance_seconds": self.exit_tolerance.total_seconds(),
                 "contracts": self.contracts,
                 "declared": ("2026-09-25, after the 2026-09-24 session's "
@@ -152,6 +186,92 @@ class SharpReading:
     fair_home: float | None = None
     fair_away: float | None = None
     observed_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class ScreenEntry:
+    """The frozen screen's own entry, as the screen made it.
+
+    `book` is the execution book the screen priced (`screen.screen_books`);
+    `price` and `fee` are the screen's execution price and fee for `side`
+    (`side_quotes`, the function the screen prices with), and `paid` is
+    their sum -- the admitted trade's `paid`, checked, not assumed. A
+    `screen_admitted` capture enters here and nowhere else.
+    """
+
+    side: str
+    book: Any
+    price: float
+    fee: float
+    paid: float
+    entry_delay: timedelta
+    fee_basis: str
+
+
+class ScreenEntryMismatch(ValueError):
+    """The entry rebuilt from the screen's inputs is not the trade it
+    admitted: an admitted capture must never be reported off it."""
+
+
+def screen_entry(decision: Any, books: Sequence, *, entry_delay: timedelta,
+                 entry_tolerance: timedelta, series: str | None,
+                 venue: str = "kalshi", role: str = "taker",
+                 route: str = DEFAULT_ROUTE) -> ScreenEntry | None:
+    """The admitted trade's entry; None when the screen admitted nothing.
+
+    `decision` is `screen.screen_live`'s, and every other argument must be
+    what that call was given. The book comes from `screen_books` on those
+    inputs, the price and fee from `side_quotes` on the screen's own
+    Observation -- the quotes `as_trade` chose the side from. Both are
+    checked against what the screen recorded (the execution read's time,
+    the trade's `paid`), and a disagreement is REFUSED, loudly: it would
+    mean these are not the screen's inputs, and a capture priced off them
+    would be a round trip the policy did not take.
+    """
+    trade, o = decision.trade, decision.observation
+    if not decision.admitted or trade is None or o is None:
+        return None
+    _, book = screen_books(books, o.decision_at, entry_delay, entry_tolerance)
+    quote = next((q for q in side_quotes(o, venue, role, series, route)
+                  if q.side == trade.side), None)
+    if book is None or book.ts != o.entry_at:
+        raise ScreenEntryMismatch(
+            f"{decision.market_ticker}: the execution book found from these "
+            f"inputs ({None if book is None else _iso(book.ts)}) is not the "
+            f"one the screen priced ({_iso(o.entry_at)})")
+    if quote is None or quote.paid != trade.paid:
+        raise ScreenEntryMismatch(
+            f"{decision.market_ticker}: {trade.side} re-priced from the "
+            f"screen's observation pays "
+            f"{None if quote is None else quote.paid}, the admitted trade "
+            f"paid {trade.paid}")
+    if quote.delayed:
+        price, fee = quote.exec_price, quote.exec_fee
+        basis = ("the screen's execution fee (side_quotes exec_fee), on the "
+                 "execution price")
+    else:
+        price, fee = quote.entry_price, quote.fee
+        basis = ("the screen's decision fee (side_quotes fee): at zero delay "
+                 "the execution book is the decision book")
+    return ScreenEntry(side=trade.side, book=book, price=price, fee=fee,
+                       paid=quote.paid, entry_delay=entry_delay,
+                       fee_basis=basis)
+
+
+def _outside(moment: datetime, *, start: datetime | None,
+             session_end: datetime | None) -> str | None:
+    """Why an instant is outside the pre-match session, or None.
+
+    One rule for every instant a round trip depends on -- the move, the
+    entry read, each markout target, each exit read, each hindsight read.
+    Kickoff is EXCLUSIVE (a quote received at kickoff is not pre-match);
+    the session's end is inclusive (the last read it recorded counts).
+    """
+    if session_end is not None and moment > session_end:
+        return "session_ended"
+    if start is not None and moment >= start:
+        return "game_started"
+    return None
 
 
 def entry_price(book: Any, side: str) -> float | None:
@@ -199,12 +319,38 @@ def _leg(book: Any, side: str, *, entering: bool, policy: CapturePolicy,
     fee, error = _fee(price, book.ts, contracts=policy.contracts, venue=venue,
                       role=role, series=series, route=route)
     leg["fee"] = fee
+    short = _depth_short(depth, policy)
     if error:
         leg["unusable_because"] = f"fee could not be charged: {error}"
-    elif depth is not None and depth < policy.contracts:
-        leg["unusable_because"] = (f"observed depth {depth:g} is below the "
-                                   f"{policy.contracts} contract(s) priced: "
-                                   f"no fill can be assumed")
+    elif short:
+        leg["unusable_because"] = short
+    return leg
+
+
+def _depth_short(depth: float | None, policy: CapturePolicy) -> str | None:
+    if depth is not None and depth < policy.contracts:
+        return (f"observed depth {depth:g} is below the {policy.contracts} "
+                f"contract(s) priced: no fill can be assumed")
+    return None
+
+
+def _screen_leg(entry: ScreenEntry, policy: CapturePolicy) -> dict:
+    """The admitted entry as a leg: the screen's book, price and fee,
+    carried over -- never re-priced here."""
+    book = entry.book
+    depth = _depth(book, entry.side, entering=True)
+    leg: dict[str, Any] = {
+        "at": _iso(book.ts), "sent_at": _iso(getattr(book, "sent_at", None)),
+        "price": entry.price, "fee": entry.fee, "paid": entry.paid,
+        "depth": depth, "depth_observed": depth is not None,
+        "bid": book.bid_close, "ask": book.ask_close,
+        "source": ("the frozen screen's own entry: the execution quote it "
+                   "priced, at the price and fee the admitted trade paid"),
+        "fee_basis": entry.fee_basis,
+        "screen_entry_delay_seconds": entry.entry_delay.total_seconds()}
+    short = _depth_short(depth, policy)
+    if short:
+        leg["unusable_because"] = short
     return leg
 
 
@@ -254,48 +400,88 @@ def capture(*, kind: str, side: str, reads: Sequence[Read],
             session_end: datetime | None, series: str | None,
             policy: CapturePolicy = CapturePolicy(), venue: str = "kalshi",
             role: str = "taker", route: str = DEFAULT_ROUTE,
-            sharp: dict | None = None, why: str = "") -> dict:
+            sharp: dict | None = None, why: str = "",
+            entry: ScreenEntry | None = None) -> dict:
     """One scenario's round trips: an entry, and an exit at every markout.
 
+    A `hypothetical_follow_move` finds its own entry read; a
+    `screen_admitted` capture is given the screen's (`entry`, from
+    `screen_entry`) and is refused without it -- see the module docstring.
     `sharp`, when given, is the keyword arguments for `sharp_state` other
     than `at`, so each markout reports the signal as it stood then.
     """
+    if kind not in (HYPOTHETICAL, SCREEN_ADMITTED):
+        raise ValueError(f"unknown capture scenario {kind!r}")
+    if (kind == SCREEN_ADMITTED) != (entry is not None):
+        raise ValueError(
+            f"a {SCREEN_ADMITTED} capture enters at the screen's own entry "
+            f"and only it does: a {HYPOTHETICAL} finds its own read, and an "
+            f"admitted one never may")
+    if entry is not None and entry.side != side:
+        raise ValueError(f"the screen admitted {entry.side}, not {side}")
+    if entry is not None and policy.contracts != 1:
+        raise ValueError(f"the screen prices one contract; a "
+                         f"{policy.contracts}-contract capture would not be "
+                         f"the admitted trade")
     usable = [r.book for r in reads if r.book is not None
               and usable_candle(r.book)]
     out: dict[str, Any] = {"kind": kind, "side": side, "why": why,
                            "policy": policy.label}
-    if session_end is not None and detected_at > session_end:
-        out["entry_missing_because"] = "session_ended"
-        return out
-    entry_book = execution_candle(usable, detected_at, policy.entry_within)
-    if entry_book is None:
-        seen = _reads_between(reads, detected_at,
-                              detected_at + policy.entry_within)
+    bounds = dict(start=start, session_end=session_end)
+    outside = _outside(detected_at, **bounds)
+    if outside:
         out["entry_missing_because"] = (
-            f"no usable read within {policy.entry_within.total_seconds():g}s "
-            f"of the move (reads in that span by status: {seen or 'none'})")
+            f"{outside} (the move was detected at {_iso(detected_at)}; "
+            f"kickoff {_iso(start)}, session end {_iso(session_end)})")
         return out
-    entry = _leg(entry_book, side, entering=True, policy=policy, venue=venue,
-                 role=role, series=series, route=route)
-    entry["delay_after_move_seconds"] = (entry_book.ts
-                                         - detected_at).total_seconds()
-    out["entry"] = entry
-    if "unusable_because" in entry:
-        out["entry_missing_because"] = entry["unusable_because"]
+    if entry is not None:
+        entry_book = entry.book
+        leg = _screen_leg(entry, policy)
+    else:
+        entry_book = execution_candle(usable, detected_at, policy.entry_within)
+        if entry_book is None:
+            seen = _reads_between(reads, detected_at,
+                                  detected_at + policy.entry_within)
+            out["entry_missing_because"] = (
+                f"no usable read within "
+                f"{policy.entry_within.total_seconds():g}s of the move (reads "
+                f"in that span by status: {seen or 'none'})")
+            return out
+        leg = _leg(entry_book, side, entering=True, policy=policy,
+                   venue=venue, role=role, series=series, route=route)
+        leg["source"] = (f"the first usable read at or after the move, "
+                         f"within {policy.entry_within.total_seconds():g}s: "
+                         f"a hypothetical entry, not the screen's")
+    leg["delay_after_move_seconds"] = (entry_book.ts
+                                       - detected_at).total_seconds()
+    out["entry"] = leg
+    outside = _outside(entry_book.ts, **bounds)
+    if outside:
+        out["entry_missing_because"] = (
+            f"{outside} (the entry read was received at "
+            f"{_iso(entry_book.ts)}; kickoff {_iso(start)}, session end "
+            f"{_iso(session_end)}): not a pre-match entry"
+            + (" -- the SCREEN admitted it" if entry is not None else ""))
         return out
-    cost = entry["price"] + entry["fee"]
+    if "unusable_because" in leg:
+        out["entry_missing_because"] = leg["unusable_because"]
+        return out
+    # A zero-delay screen entry prices the decision book, read BEFORE the
+    # move: nothing can be held from before it was decided.
+    entered_at = max(entry_book.ts, detected_at)
+    out["entered_at"] = _iso(entered_at)
+    cost = leg["price"] + leg["fee"]
     markouts = []
     for offset in policy.markouts:
-        target = entry_book.ts + offset
+        target = entered_at + offset
         row: dict[str, Any] = {"seconds": offset.total_seconds(),
                                "target": _iso(target)}
         if sharp is not None:
             row["sharp"] = sharp_state(at=target, **sharp)
         censored = None
-        if session_end is not None and target > session_end:
-            censored = {"reason": "session_ended"}
-        elif start is not None and target >= start:
-            censored = {"reason": "game_started"}
+        outside = _outside(target, **bounds)
+        if outside:
+            censored = {"reason": outside}
         else:
             found = execution_candle(usable, target, policy.exit_tolerance)
             if found is None:
@@ -308,6 +494,14 @@ def capture(*, kind: str, side: str, reads: Sequence[Read],
                                                          window_end),
                     "note": ("an earlier read is never used as the exit, and "
                              "neither is a later one")}
+            elif _outside(found.ts, **bounds):
+                censored = {
+                    "reason": _outside(found.ts, **bounds),
+                    "read_received_at": _iso(found.ts),
+                    "note": ("the first usable read at or after the markout "
+                             "was received outside the pre-match session: "
+                             "not a pre-match exit, and no other read is used "
+                             "in its place")}
             else:
                 exit_leg = _leg(found, side, entering=False, policy=policy,
                                 venue=venue, role=role, series=series,
@@ -318,38 +512,39 @@ def capture(*, kind: str, side: str, reads: Sequence[Read],
                                 "detail": exit_leg["unusable_because"],
                                 "exit": exit_leg}
                 else:
-                    gross = exit_leg["price"] - entry["price"]
+                    gross = exit_leg["price"] - leg["price"]
+                    net = gross - leg["fee"] - exit_leg["fee"]
                     row.update(exit=exit_leg, gross=gross,
-                               fees=entry["fee"] + exit_leg["fee"],
-                               net=gross - entry["fee"] - exit_leg["fee"],
-                               return_on_cost=((gross - entry["fee"]
-                                                - exit_leg["fee"]) / cost),
-                               depth_observed=(entry["depth_observed"]
+                               fees=leg["fee"] + exit_leg["fee"], net=net,
+                               return_on_cost=net / cost,
+                               depth_observed=(leg["depth_observed"]
                                                and exit_leg["depth_observed"]))
         if censored is not None:
             row["censored"] = censored
         markouts.append(row)
     out["markouts"] = markouts
-    out["hindsight"] = _hindsight(usable, entry_book, entry, side,
+    out["hindsight"] = _hindsight(usable, entered_at, leg, side,
                                   policy=policy, start=start,
                                   session_end=session_end, venue=venue,
                                   role=role, series=series, route=route)
     return out
 
 
-def _hindsight(usable: Sequence, entry_book: Any, entry: dict, side: str, *,
-               policy: CapturePolicy, start: datetime | None,
+def _hindsight(usable: Sequence, entered_at: datetime, entry: dict, side: str,
+               *, policy: CapturePolicy, start: datetime | None,
                session_end: datetime | None, venue: str, role: str,
                series: str | None, route: str) -> dict:
     """The best and worst net exits the reads showed -- labelled, because
-    choosing either needs the future."""
-    horizon = entry_book.ts + policy.markouts[-1]
-    for bound in (start, session_end):
-        if bound is not None:
-            horizon = min(horizon, bound)
+    choosing either needs the future. Only reads a markout could have used:
+    after the entry, within the last markout, and inside the pre-match
+    session by `_outside`'s rule -- a read at kickoff is not one."""
+    through = entered_at + policy.markouts[-1]
+    if session_end is not None:
+        through = min(through, session_end)
     best = worst = None
     for book in usable:
-        if not entry_book.ts < book.ts <= horizon:
+        if (not entered_at < book.ts <= through
+                or _outside(book.ts, start=start, session_end=session_end)):
             continue
         leg = _leg(book, side, entering=False, policy=policy, venue=venue,
                    role=role, series=series, route=route)
@@ -358,12 +553,13 @@ def _hindsight(usable: Sequence, entry_book: Any, entry: dict, side: str, *,
         net = leg["price"] - entry["price"] - entry["fee"] - leg["fee"]
         point = {"at": leg["at"], "exit_price": leg["price"], "net": net,
                  "after_entry_seconds": (book.ts
-                                         - entry_book.ts).total_seconds()}
+                                         - entered_at).total_seconds()}
         if best is None or net > best["net"]:
             best = point
         if worst is None or net < worst["net"]:
             worst = point
-    return {"label": HINDSIGHT_LABEL, "through": _iso(horizon),
+    return {"label": HINDSIGHT_LABEL, "after": _iso(entered_at),
+            "through": _iso(through), "before_kickoff": _iso(start),
             "max_favourable": best, "max_adverse": worst}
 
 
