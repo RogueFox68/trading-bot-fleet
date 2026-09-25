@@ -15,6 +15,7 @@ from analysis.scoring import (
     conditional_scores, decay_series, log_loss, realized_return,
     screen_diagnostics, side_quotes,
 )
+from core.fees import series_schedule
 from data.kalshi_history import Coverage
 
 
@@ -602,11 +603,19 @@ class VerdictEquivalenceTest(unittest.TestCase):
 
     def test_the_diagnostic_counts_match_the_screen_they_replaced(self):
         grid = _grid(n=4000)
+        # A series with no dated schedule prices every decision at the
+        # generic rate. A DATED one refuses a decision before its first
+        # entry -- KXNFLGAME's starts 2026-01-01, after the grid's 2025
+        # decisions -- so it is compared over the decisions it can price.
+        priced = {None: grid, "KXNCAAFGAME": grid}
+        first = min(e.effective_from for e in series_schedule("KXNFLGAME"))
+        priced["KXNFLGAME"] = [o for o in grid if o.decision_at >= first]
         for policy in self.POLICIES:
-            for series in (None, "KXNFLGAME"):
+            for series, observations in priced.items():
                 with self.subTest(policy=policy, series=series):
-                    new = screen_diagnostics(grid, policy, series=series)
-                    old = _legacy_screen_diagnostics(grid, policy,
+                    new = screen_diagnostics(observations, policy,
+                                             series=series)
+                    old = _legacy_screen_diagnostics(observations, policy,
                                                      series=series)
                     self.assertEqual(_nan_equal(vars(new)),
                                      _nan_equal(vars(old)))

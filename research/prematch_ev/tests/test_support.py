@@ -210,10 +210,15 @@ class SupportReportTest(unittest.TestCase):
         self.assertIn("AZ->ARI", caveats)
 
     def test_a_series_without_a_dated_fee_schedule_is_flagged(self):
-        self.assertFalse(support_report("NFL", "KXNFLGAME").fee_schedule)
-        self.assertIn("no dated fee schedule",
-                      " ".join(support_report("NFL", "KXNFLGAME").caveats()))
+        self.assertFalse(support_report("NCAAF", "KXNCAAFGAME").fee_schedule)
+        self.assertIn("no dated fee schedule", " ".join(
+            support_report("NCAAF", "KXNCAAFGAME").caveats()))
         self.assertTrue(support_report("MLB", "KXMLBGAME").fee_schedule)
+        # NFL was this test's example until its dated schedule was read
+        # (2026-09-25, PR #27 comment 5833183856) and recorded.
+        nfl = support_report("NFL", "KXNFLGAME")
+        self.assertTrue(nfl.fee_schedule)
+        self.assertNotIn("no dated fee schedule", " ".join(nfl.caveats()))
 
     def test_a_roster_less_sport_reports_its_blocker(self):
         for league in ("NBA", "NHL"):

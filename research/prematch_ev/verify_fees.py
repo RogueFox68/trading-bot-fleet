@@ -5,16 +5,24 @@
 
 WHY THIS EXISTS
 ---------------
-Every NFL figure in this study is priced at Kalshi's GENERIC taker
-coefficient, because no dated schedule for KXNFLGAME is recorded in
-`core/fees.py`. That is an assumption, and at one contract it is most of the
-cost: the 2026-09-24 session's Green Bay quote cleared the gross edge the
-floor needs by 0.0142 per contract and was refused over a fee of 0.02 --
-refused at multiplier 1, admitted at 0.5 (`reaction.assessment`'s
+A series without a dated schedule in `core/fees.py` is priced at Kalshi's
+GENERIC taker coefficient. That is an assumption, and at one contract it is
+most of the cost: the 2026-09-24 session's Green Bay quote cleared the gross
+edge the floor needs by 0.0142 per contract and was refused over a fee of
+0.02 -- refused at multiplier 1, admitted at 0.5 (`reaction.assessment`'s
 sensitivity). KXMLBGAME's multiplier was halved on 2026-08-07, so "the
 generic rate" is not a safe default for a sports series. The sessions that
 wrote this code cannot reach api.elections.kalshi.com; this command is the
 check, for a machine that can.
+
+It has been run once for KXNFLGAME, on the owner's machine on 2026-09-25
+(PR #27 comment 5833183856): both reads HTTP 200, one dated change
+(`babedc22-e303-4aaf-8e0b-5016f1239786`, multiplier 1,
+`quadratic_with_maker_fees`, effective 2026-01-01T08:00:00Z), the current
+series fields in agreement. That entry is now recorded in `core/fees.py`,
+transcribed with its provenance, and Green Bay is refused on either route at
+it. Run this again before a result built on it is promoted, and for any
+window it has not yet been read for.
 
 WHAT IT DOES
 ------------

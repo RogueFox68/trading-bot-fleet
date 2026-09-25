@@ -34,9 +34,11 @@ sessions. This proposal is for the first validation session, not the last.
   - `CapturePolicy`: markouts at 30s, 1m, 2m, 5m, 10m, 15m and 30m from the
     entry, entry within 30s of the move, exit tolerance 30s, one contract;
   - the book horizon: 73h, the screen's own lead-time ceiling;
-  - the fee model, including any KXNFLGAME schedule verified by
-    `verify_fees.py`. A verified schedule is recorded before the freeze,
-    never after looking at the session.
+  - the fee model, including KXNFLGAME's dated schedule: multiplier 1
+    from 2026-01-01T08:00Z (change `babedc22-e303-4aaf-8e0b-5016f1239786`),
+    read by `verify_fees.py` on the owner's machine on 2026-09-25 and
+    recorded in `core/fees.py`. A change found later is recorded before a
+    freeze, never after looking at the session.
 - A validation session is analysed **once, at the frozen commit**. If
   anything is changed after that read, the session becomes development data
   and the next untouched session is the validation set.
@@ -100,20 +102,22 @@ moves with it. The same offsets work on any Friday.
    `outside_observation_horizon`. Any disagreement between a recorded
    decision and its recomputation is printed rather than resolved.
 
-2. **Verify the NFL fee**, for the old session's window and for the new
-   one:
+2. **Re-check the NFL fee for the new window.** The old session's window
+   was verified on 2026-09-25: one dated change, multiplier 1 from
+   2026-01-01T08:00Z, the current series fields in agreement. That entry
+   is recorded. Re-read it for the new window, and the old one beside it:
 
    ```
-   python3 verify_fees.py --series KXNFLGAME \
-       --window 2026-09-24T01:44:22Z 2026-09-25T01:44:22Z
    python3 verify_fees.py --series KXNFLGAME \
        --window 2026-10-02T14:00:00Z 2026-10-03T14:00:00Z
+   python3 verify_fees.py --series KXNFLGAME \
+       --window 2026-09-24T01:44:22Z 2026-09-25T01:44:22Z
    ```
 
-   If it finds a dated schedule, a person records it in `core/fees.py` from
-   the printed snippet before the freeze. If it finds none, the report keeps
-   saying ASSUMED, and the sensitivity table in each assessment shows what
-   the verdict hangs on. The account route stays unresolved either way.
+   Both should report the same entry in force at each end and no change
+   inside. If a new change appears, a person records it in `core/fees.py`
+   from the printed snippet before the freeze. The account route stays
+   unresolved either way: no public endpoint answers it.
 
 3. **Plan the window on Thursday 2026-10-01 or later.** The slate covers
    today-1 to today+7, and the week's markets must already be listed:
@@ -167,6 +171,7 @@ commit.
 - **Settlement value.** The games settle after the session ends. Realised
   figures need `--report --settlements`, and there are none until the
   screen admits something.
-- **The fee.** If `verify_fees.py` cannot date the KXNFLGAME multiplier,
-  every net figure carries that assumption, and each assessment's
-  sensitivity table shows how much it matters.
+- **The account route.** The KXNFLGAME multiplier is dated; the account
+  route and the rounding source are not. Every net figure is priced on the
+  dearer non-direct route, the direct route is priced beside it, and each
+  assessment's sensitivity table shows when the route decides a verdict.

@@ -574,14 +574,19 @@ spent, and `--support` exits non-zero.
 time.** Those are separate questions, and conflating them is exactly how "we
 could not see it" becomes "there was nothing there".
 
-Two caveats the report raises for NFL specifically:
+One caveat the report raises for NFL specifically:
 
 - **No exchange-code aliases are recorded.** That is an unverified assumption,
   not evidence there are none — MLB needed `AZ→ARI`, and a missing alias shows
   up as a team contributing no data, never as an error.
-- **No dated fee schedule for `KXNFLGAME`.** The generic coefficients would be
-  assumed, and every return figure would inherit that. The MLB schedule *halved*
-  the taker coefficient, so this is not a rounding concern.
+
+It used to raise a second: **no dated fee schedule for `KXNFLGAME`**. That was
+settled on 2026-09-25, when `verify_fees.py` read Kalshi's dated record on the
+owner's machine — multiplier 1 from 2026-01-01T08:00Z — and the entry was
+recorded in `core/fees.py` (see *Verifying the NFL fee*). Any series still
+without one is flagged the same way: the generic coefficients would be
+assumed, and the MLB schedule *halved* the taker coefficient, so it is not a
+rounding concern.
 
 The ticker parser and the identity path are league-agnostic — identity comes
 from the YES suffixes rather than splitting the concatenated team tail — so an
@@ -1307,16 +1312,24 @@ numbers. `--report` now rebuilds every assessment from the raw records:
   declared after the owner's summary of 2026-09-24 was read, so that
   session is development data for them too.
 - **What the fee is, and what it is not.** Each assessment carries
-  `fees.provenance` -- `generic_coefficient` for KXNFLGAME: no dated
-  schedule is recorded, so multiplier 1 is ASSUMED -- with an `unresolved`
-  list (series schedule, account route, the rounding source's
-  inconsistency, order size), and a sensitivity table: the best side
-  re-priced at both routes, 1/10/100 contracts and multipliers 1 and 0.5
-  (KXMLBGAME's, labelled as not known to apply), plus the largest
-  multiplier at which the quote would still clear the floor. Green Bay's
-  YES cleared the floor's gross requirement by 0.0142 and was refused over
-  a 0.02 fee: it clears at multiplier <= 0.680 on the non-direct route at
-  one contract, <= 0.959 direct. No scenario is presented as the charge.
+  `fees.provenance` -- for KXNFLGAME, `dated_series_schedule`: multiplier 1
+  from 2026-01-01T08:00Z, change `babedc22-e303-4aaf-8e0b-5016f1239786`
+  (`quadratic_with_maker_fees`), read by `verify_fees.py` on the owner's
+  machine on 2026-09-25 with both reads HTTP 200 and the current series
+  fields in agreement. The dated multiplier settles the multiplier and
+  nothing else: the `unresolved` list still carries the account route, the
+  rounding source's inconsistency and order size, and a sensitivity table
+  re-prices the best side at both routes, 1/10/100 contracts and
+  multipliers 1 and 0.5 (KXMLBGAME's, labelled as not known to apply),
+  with the largest multiplier at which the quote would still clear the
+  floor. Green Bay's YES cleared the floor's gross requirement by 0.0142:
+  it clears only at multiplier <= 0.680 on the non-direct route at one
+  contract, <= 0.959 direct. Both are below the dated 1, so at the recorded
+  rate it is refused on either route (direct: fee 0.0147, net +0.0095
+  against the 0.01 floor) -- the unresolved route cannot change that
+  verdict. An NFL decision before 2026-01-01T08:00Z is refused rather than
+  priced: nothing dated says what applied then. No scenario is presented
+  as the charge.
 
 The fixture these tests run on is SYNTHETIC (`tests/synthetic_session.py`):
 the real monitor driven over a scripted network that reproduces the figures
@@ -1369,6 +1382,16 @@ past date; it says so, and exits 1 when nothing about the window is
 established. The response shapes are transcribed, not observed -- nothing
 that wrote this could reach Kalshi -- so an unexpected body is refused with
 its keys named, and the raw body is kept either way.
+
+**Run on 2026-09-25, on the owner's machine** (PR #27 comment 5833183856),
+over the 2026-09-24 session's window: both reads HTTP 200; one dated change,
+`babedc22-e303-4aaf-8e0b-5016f1239786`, multiplier 1,
+`quadratic_with_maker_fees`, effective 2026-01-01T08:00:00Z; the current
+series fields in agreement. That entry is now in `KALSHI_SERIES_SCHEDULES`,
+transcribed with its provenance (the raw bodies and their SHA-256s stay in
+that machine's gitignored `study_output/fee_evidence/`). The account route
+and the rounding source stay unresolved beside it. Re-run it for any new
+window, and before a result built on it is promoted.
 
 ### The next session
 

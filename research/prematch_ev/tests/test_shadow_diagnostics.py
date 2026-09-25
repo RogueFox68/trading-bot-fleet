@@ -387,6 +387,11 @@ class OfflineTest(unittest.TestCase):
                         "ASSESSMENTS", "SETTLEMENT VALUE",
                         "ADJUSTMENT CAPTURE", "FEES", "UNRESOLVED"):
             self.assertIn(section, report)
+        # The fee block names the dated entry it priced with, and still
+        # lists the route as unresolved beside it.
+        self.assertIn("basis              dated_series_schedule", report)
+        self.assertIn("change babedc22-e303-4aaf-8e0b-5016f1239786", report)
+        self.assertIn("account_route: unknown", report)
 
     def test_realized_figures_are_withheld_without_settlement(self):
         value = _session()["older"]["settlement_value"]
@@ -511,22 +516,60 @@ class AssessmentTest(unittest.TestCase):
         self.assertTrue(any(m.startswith("execution_book")
                             for m in record["missing"]))
 
-    def test_the_fee_provenance_says_what_is_assumed(self):
+    def test_the_fee_provenance_names_the_dated_nfl_entry(self):
+        # Read by verify_fees.py on the owner's machine, 2026-09-25 (PR #27
+        # comment 5833183856), and transcribed into core/fees.py.
         _, record = self.assessed([_book(AT - timedelta(seconds=1), 0.74, 0.75),
                                    _book(AT + timedelta(milliseconds=400),
                                          0.74, 0.75)])
         provenance = record["fees"]["provenance"]
-        self.assertEqual(provenance["basis"], "generic_coefficient")
+        self.assertEqual(provenance["basis"], "dated_series_schedule")
         self.assertEqual(provenance["multiplier"], 1.0)
+        entry = provenance["schedule_entry"]
+        self.assertEqual(entry["source_id"],
+                         "babedc22-e303-4aaf-8e0b-5016f1239786")
+        self.assertEqual(entry["effective_from"], "2026-01-01T08:00:00+00:00")
+        self.assertEqual((entry["fee_type"], entry["observed_on"]),
+                         ("quadratic_with_maker_fees", "2026-09-25"))
+        self.assertIn("5833183856", entry["observed_by"])
+        # The dated multiplier settles the multiplier and nothing else: the
+        # route and the rounding source stay unresolved, beside it.
         self.assertFalse(provenance["rounding"]["route_resolved"])
         joined = " ".join(provenance["unresolved"])
-        for topic in ("series_schedule", "account_route", "rounding_source",
-                      "order_size"):
+        self.assertNotIn("series_schedule", joined)
+        for topic in ("account_route", "rounding_source", "order_size"):
             self.assertIn(topic, joined)
         labels = {s["multiplier_basis"] for s in
                   record["fees"]["sensitivity"]["scenarios"]}
-        self.assertIn("as priced: generic coefficient, ASSUMED", labels)
+        self.assertIn("as priced: dated series schedule, effective "
+                      "2026-01-01T08:00:00+00:00 (change "
+                      "babedc22-e303-4aaf-8e0b-5016f1239786, read 2026-09-25)",
+                      labels)
         self.assertTrue(any("not known to apply" in label for label in labels))
+        routes = {s["route"] for s in
+                  record["fees"]["sensitivity"]["scenarios"]}
+        self.assertEqual(routes, {"direct", "non_direct"})
+
+    def test_an_nfl_decision_before_the_dated_entry_is_refused_not_priced(self):
+        from core.fees import FeeScheduleUnresolved, fee_for, fee_provenance
+        before = datetime(2025, 12, 31, 23, 59, tzinfo=UTC)
+        with self.assertRaises(FeeScheduleUnresolved):
+            fee_for("kalshi", 1, 0.70, "taker", "KXNFLGAME", before)
+        early = fee_provenance("KXNFLGAME", before)
+        self.assertEqual((early["basis"], early["multiplier"]),
+                         ("unresolved", None))
+        with self.assertRaises(FeeScheduleUnresolved):   # makers unverified
+            fee_for("kalshi", 1, 0.70, "maker", "KXNFLGAME", AT)
+
+    def test_green_bay_is_refused_on_both_routes_at_the_dated_multiplier(self):
+        from core.fees import fee_for
+        gross = GB_GROSS
+        for route, fee in (("non_direct", 0.02), ("direct", 0.0147)):
+            with self.subTest(route=route):
+                charged = fee_for("kalshi", 1, 0.70, "taker", "KXNFLGAME", AT,
+                                  route).dollars
+                self.assertAlmostEqual(charged, fee, places=10)
+                self.assertLess(gross - charged, Eligibility().min_net_ev)
 
     def test_a_dated_schedule_is_named_as_one(self):
         from core.fees import fee_provenance

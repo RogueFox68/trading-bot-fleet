@@ -388,6 +388,18 @@ def side_records(o: Observation, eligibility: Eligibility, *, venue: str,
     return out, problems
 
 
+def _in_force_label(provenance: dict) -> str:
+    """What the as-priced multiplier rests on, in the sensitivity table."""
+    entry = provenance.get("schedule_entry")
+    if provenance["basis"] == "generic_coefficient":
+        return "as priced: generic coefficient, ASSUMED"
+    if provenance["basis"] == "dated_series_schedule" and entry:
+        return (f"as priced: dated series schedule, effective "
+                f"{entry['effective_from']} (change {entry['source_id']}, "
+                f"read {entry['observed_on']})")
+    return "as priced: " + provenance["basis"]
+
+
 def _gates(o: Observation | None, eligibility: Eligibility,
            minutes: float | None, best_ev: float | None) -> dict:
     """Every gate's value and whether it passes, each through the gate's own
@@ -462,9 +474,7 @@ def describe(decision: LiveDecision, trigger: MoveTrigger, books: Sequence, *,
         sensitivity = fee_sensitivity(
             row["decision_price"], row["gross_edge"], eligibility.min_net_ev,
             in_force=provenance["multiplier"],
-            in_force_label=("as priced: generic coefficient, ASSUMED"
-                            if provenance["basis"] == "generic_coefficient"
-                            else "as priced: " + provenance["basis"]))
+            in_force_label=_in_force_label(provenance))
         sensitivity["side"] = side
     verdict = decision.verdict
     return {

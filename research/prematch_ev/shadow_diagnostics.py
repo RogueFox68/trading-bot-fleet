@@ -949,8 +949,15 @@ def _render_fees(fees: dict) -> list[str]:
              f"{p['generic_taker_coefficient']} x multiplier {p['multiplier']}",
              f"  rounding           {p['rounding']['route_label']} "
              f"(route resolved: "
-             f"{'yes' if p['rounding']['route_resolved'] else 'NO'})",
-             "  UNRESOLVED -- every net figure above inherits these:"]
+             f"{'yes' if p['rounding']['route_resolved'] else 'NO'})"]
+    entry = p.get("schedule_entry")
+    if entry:
+        lines += [f"  dated entry        effective {entry['effective_from']}, "
+                  f"change {entry['source_id'] or 'none'}, "
+                  f"{entry['fee_type']}",
+                  f"                     read {entry['observed_on']} by "
+                  f"{entry['observed_by']}"]
+    lines.append("  UNRESOLVED -- every net figure above inherits these:")
     for item in fees["unresolved"]:
         lines.append(f"    - {item}")
     lines.append(f"  verify (free, on a machine that can reach Kalshi): "

@@ -123,19 +123,35 @@ class FeeScheduleEntry:
 
 # HOW THESE ENTRIES GOT HERE, because it bounds what they are worth:
 #
-# Both were read from the PUBLIC endpoint
-#   GET /trade-api/v2/series/fee_changes?series_ticker=KXMLBGAME&show_historical=true
-# on 2026-09-21, during PR #27's review, and the current series endpoint agreed
-# with the later of the two. THIS SESSION COULD NOT RE-READ THEM: egress to
-# api.elections.kalshi.com is blocked here, so what follows is a transcription
-# of that reading, not an independent confirmation of it. Re-read before any
-# result built on it is promoted.
+# Every entry was read from the PUBLIC endpoint
+#   GET /trade-api/v2/series/fee_changes?series_ticker=<S>&show_historical=true
+# with the current series endpoint (/trade-api/v2/series/<S>) read beside it.
+# THE SESSIONS THAT WROTE THIS CODE COULD NOT RE-READ EITHER: egress to
+# api.elections.kalshi.com is blocked here, so each entry is a transcription
+# of a reading made elsewhere, not an independent confirmation of it, and says
+# whose reading it was. Re-read before any result built on one is promoted.
 #
-# THE CONFLICT IS RETAINED, NOT RESOLVED. Kalshi's fee-schedule PDF dated
-# July 7 still lists multiplier 1 for this series. The dated API says 0.5 from
-# 2026-08-07. Those disagree for the September window this study covers, and
-# nothing here adjudicates them -- `SCHEDULE_CONFLICTS` carries the dissent
-# into `describe()` so a report cannot print "verified" over an open question.
+#   KXMLBGAME  read 2026-09-21 during PR #27's review; the current series
+#              endpoint agreed with the later entry.
+#   KXNFLGAME  read 2026-09-25 on the owner's machine by `verify_fees.py`
+#              (PR #27 comment 5833183856): both reads HTTP 200, one dated
+#              change on record, the current series fields in agreement. The
+#              raw bodies and their SHA-256s stay in that machine's
+#              gitignored `study_output/fee_evidence/`.
+#
+# WHAT A DATED ENTRY SETTLES, AND WHAT IT DOES NOT: the MULTIPLIER in force
+# at a decision, from the earliest recorded change on. Before that change it
+# settles nothing, and a decision there is refused (`resolve_schedule`), not
+# priced at the oldest entry. It never settles the ACCOUNT ROUTE or the
+# rounding source's inconsistency -- those stay unresolved in every
+# provenance record, beside the dated multiplier, not behind it.
+#
+# THE KXMLBGAME CONFLICT IS RETAINED, NOT RESOLVED. Kalshi's fee-schedule PDF
+# dated July 7 still lists multiplier 1 for that series. The dated API says
+# 0.5 from 2026-08-07. Those disagree for the September window this study
+# covers, and nothing here adjudicates them -- `SCHEDULE_CONFLICTS` carries
+# the dissent into `describe()` so a report cannot print "verified" over an
+# open question.
 KALSHI_SERIES_SCHEDULES: dict[str, tuple[FeeScheduleEntry, ...]] = {
     "KXMLBGAME": (
         FeeScheduleEntry(
@@ -161,6 +177,28 @@ KALSHI_SERIES_SCHEDULES: dict[str, tuple[FeeScheduleEntry, ...]] = {
             observed_on="2026-09-21",
             observed_by="PR #27 review; transcribed, not re-read in-session",
             note="the live series endpoint agreed at 0.5 when this was read",
+        ),
+    ),
+    "KXNFLGAME": (
+        FeeScheduleEntry(
+            effective_from=datetime(2026, 1, 1, 8, 0, tzinfo=timezone.utc),
+            multiplier=1.0,
+            fee_type="quadratic_with_maker_fees",
+            source="api.elections.kalshi.com/trade-api/v2/series/fee_changes"
+                   "?series_ticker=KXNFLGAME&show_historical=true",
+            source_id="babedc22-e303-4aaf-8e0b-5016f1239786",
+            observed_on="2026-09-25",
+            observed_by="the owner's machine, by verify_fees.py (PR #27 "
+                        "comment 5833183856): fee_changes and series both "
+                        "HTTP 200; transcribed, not re-read in-session",
+            note="the only dated change on record for this series, and the "
+                 "current series fields agreed (multiplier 1, "
+                 "quadratic_with_maker_fees). It confirms the GENERIC "
+                 "multiplier for decisions from 2026-01-01T08:00Z on; nothing "
+                 "dated says what applied before, so an earlier decision is "
+                 "refused rather than priced here. The account route and the "
+                 "rounding source remain unresolved: this entry is the "
+                 "multiplier only",
         ),
     ),
 }
