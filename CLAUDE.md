@@ -798,6 +798,33 @@ backtest harness. Two dependencies are not installable everywhere: `ta` is sdist
 fails to build on some toolchains (`test_risk_exits` stubs it when absent), and the suites
 need a `config.py` — copy `config.example.py` for a local run.
 
+**CI runs all of this on every pull request and every push to `main`**
+(`.github/workflows/tests.yml`), which until
+2026-09-21 nothing did — the suites only ran when someone remembered, including the ones
+written specifically to fail the build on a known defect. `test_bar_freshness` is the clearest
+case: it parses every bar request and fails if `limit` is paired with `start`, a bug that
+produces a plausible frame rather than an error. That guard is only a guard if something runs
+it. The `fleet` job seeds `config.py` from `config.example.py` (placeholder keys — **no real
+credential is needed and none should ever be added**; a suite that genuinely required a live
+key would be testing the broker, not the fleet, and belongs in `fleet_doctor`), installs the
+pinned `requirements.txt` — so a `ta` build failure surfaces in CI rather than during a
+rebuild on the Beelink — then runs `compileall`, an import check, and the suites, in that
+order so the most basic failure is reported first. The import check is the one that catches
+what a bot's own main-loop `try/except` cannot, and it takes its process list from
+`deploy/ecosystem.config.js` evaluated as real JavaScript, so a newly added bot is covered
+without a per-bot list anywhere (rule 2). The suites run by **discovery**, so a new
+`test_*.py` is picked up without being added to a list — verified to find the same tests as
+the explicit invocation above, and not to descend into `research/`. A second job runs the
+`research/prematch_ev` study suite twice, on a bare interpreter and again with `rapidfuzz`,
+because its matcher has two fuzzy backends and an assertion that only ever exercises the
+installed one is half a test.
+
+CI is deliberately **not** `fleet_doctor`. The doctor checks the *running fleet* — live
+Alpaca, an InfluxDB round-trip, each VIX source, pm2 state, whether a process is running the
+code on disk — none of which exists on a runner, and a check that cannot reach its dependency
+is worse than no check (rule 25). CI owns what is decidable from the source; the doctor owns
+everything else, and neither substitutes for the other.
+
 **`fleet_doctor.py`** is the diagnostic entry point — run it *in the container* against the code
 the fleet actually runs:
 `docker exec -w /app/code trading-fleet python3 fleet_doctor.py`. It verifies location, syntax +

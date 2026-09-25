@@ -1,0 +1,7 @@
+# Credentials and study artifacts never get committed.
+.env
+study_output/
+*.db
+*.sqlite
+observations.json
+report.txt
