@@ -55,8 +55,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_CEILING
-from typing import Literal
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+from typing import Literal, Sequence
 
 Role = Literal["maker", "taker"]
 AccountRoute = Literal["direct", "non_direct"]
@@ -214,15 +214,27 @@ def resolve_schedule(series: str | None, at: datetime | None) -> FeeScheduleEntr
             "UTC and a naive timestamp silently resolves to whatever the "
             "reader assumes"
         )
-    in_force = [e for e in entries if e.effective_from <= at]
-    if not in_force:
+    in_force = entry_in_force(entries, at)
+    if in_force is None:
         earliest = min(e.effective_from for e in entries)
         raise FeeScheduleUnresolved(
             f"{at.isoformat()} precedes the earliest recorded fee schedule for "
             f"{series!r} ({earliest.isoformat()}). The schedule then in force "
             "was never recorded; it is not the oldest one on file."
         )
-    return max(in_force, key=lambda e: e.effective_from)
+    return in_force
+
+
+def entry_in_force(entries: Sequence[FeeScheduleEntry],
+                   at: datetime) -> FeeScheduleEntry | None:
+    """The newest entry that took force at or before `at`, or None.
+
+    The one statement of "in force", shared by the pricing path and by
+    `verify_fees.py`, which applies it to entries it has just read -- so a
+    fetched schedule is judged by exactly the rule that would price with it.
+    """
+    started = [e for e in entries if e.effective_from <= at]
+    return max(started, key=lambda e: e.effective_from) if started else None
 
 
 def schedule_changes_within(series: str | None, start: datetime,
@@ -530,6 +542,158 @@ def describe_lines(series: str | None = None, at: datetime | None = None,
         for conflict in SCHEDULE_CONFLICTS.get(series, ()):
             parts.append(f"UNRESOLVED CONFLICT: {conflict}")
     return parts
+
+
+def fee_provenance(series: str | None, at: datetime | None,
+                   route: AccountRoute = DEFAULT_ROUTE) -> dict:
+    """Where a Kalshi taker fee priced at `at` came from, as a record.
+
+    `describe_lines` is the same facts for a human; this is them for a
+    machine-readable assessment, including the list of what is NOT known.
+    `basis` is `dated_series_schedule` only when a recorded, dated entry
+    priced it; `generic_coefficient` is an ASSUMPTION the series has no
+    schedule of its own, never a verification that it has none.
+
+    Never raises: an unresolvable schedule is reported as `unresolved`,
+    because a record that cannot say why has lost the one fact it needed.
+    """
+    error = None
+    try:
+        entry = resolve_schedule(series, at)
+    except FeeScheduleUnresolved as exc:
+        entry, error = None, str(exc)
+    basis = ("unresolved" if error else
+             "dated_series_schedule" if entry else "generic_coefficient")
+    multiplier = None if error else (entry.multiplier if entry else 1.0)
+    unresolved: list[str] = []
+    if basis == "generic_coefficient":
+        unresolved.append(
+            f"series_schedule: no dated fee schedule is recorded for "
+            f"{series or 'this series'}; the generic multiplier 1 is ASSUMED, "
+            f"not verified (verify_fees.py reads Kalshi's dated record)")
+    elif basis == "unresolved":
+        unresolved.append(f"series_schedule: {error}")
+    if not ROUTE_RESOLVED:
+        unresolved.append(
+            f"account_route: unknown; priced on the {route} route "
+            f"(${ROUTE_ALIGNMENT.get(route, '?')} alignment), the dearer "
+            f"default -- a conservative choice, not an established fact")
+    unresolved.append(
+        "rounding_source: Kalshi's fee-rounding page is not self-consistent "
+        "(centicent prose, cent examples); both steps are modelled as ceilings")
+    unresolved.append(
+        "order_size: priced as one 1-contract order; alignment is per ORDER, "
+        "so a larger order pays less per contract (see the sensitivity)")
+    for conflict in SCHEDULE_CONFLICTS.get(series or "", ()):
+        unresolved.append(f"conflict: {conflict}")
+    return {
+        "venue": "kalshi",
+        "role": "taker",
+        "series": series,
+        "priced_at": at.astimezone(timezone.utc).isoformat() if at else None,
+        "basis": basis,
+        "generic_taker_coefficient": KALSHI_TAKER_COEFF,
+        "generic_verified_on": KALSHI_VERIFIED_ON,
+        "multiplier": multiplier,
+        "taker_coefficient": (None if multiplier is None
+                              else KALSHI_TAKER_COEFF * multiplier),
+        "schedule_entry": None if entry is None else {
+            "effective_from": entry.effective_from.isoformat(),
+            "multiplier": entry.multiplier,
+            "fee_type": entry.fee_type,
+            "source": entry.source,
+            "source_id": entry.source_id,
+            "observed_on": entry.observed_on,
+            "observed_by": entry.observed_by,
+            "note": entry.note,
+        },
+        "series_schedules_recorded": sorted(KALSHI_SERIES_SCHEDULES),
+        "rounding": {
+            "model_precision": MODEL_FEE_PRECISION,
+            "route": route,
+            "alignment": ROUTE_ALIGNMENT.get(route),
+            "route_label": ROUTE_LABELS.get(route, route),
+            "route_resolved": ROUTE_RESOLVED,
+            "routes_known": dict(ROUTE_ALIGNMENT),
+            "recorded_on": FEE_ROUNDING_VERIFIED_ON,
+            "reading": "model fee ceiled, then the account alignment ceiled: "
+                       "the conservative reading of signed alignment",
+        },
+        "contracts_per_order": 1,
+        "error": error,
+        "unresolved": unresolved,
+    }
+
+
+#: Multipliers a sensitivity table prices beside the one in force. 0.5 is
+#: KXMLBGAME's dated value, included because it is the only per-series
+#: reduction on record -- NOT because anything says it applies elsewhere.
+SENSITIVITY_MULTIPLIERS = (1.0, 0.5)
+SENSITIVITY_CONTRACTS = (1, 10, 100)
+
+
+def fee_sensitivity(price: float, gross_edge: float, min_net_ev: float, *,
+                    in_force: float | None,
+                    in_force_label: str = "as priced",
+                    multipliers: Sequence[float] = SENSITIVITY_MULTIPLIERS,
+                    contracts: Sequence[int] = SENSITIVITY_CONTRACTS,
+                    routes: Sequence[str] = ("direct", "non_direct")) -> dict:
+    """How the verdict on one quote moves with each unresolved fee input.
+
+    Every scenario is a HYPOTHESIS about the fee, labelled with where its
+    multiplier came from; none is presented as the charge. The break-even
+    multiplier is the largest one at which the quote would still clear the
+    floor for a route and an order size -- the question a verified schedule
+    would answer, stated so the answer can be read off without re-running.
+    """
+    _validate(1, price)
+    budget = gross_edge - min_net_ev
+    ordered: list[tuple[float, str]] = []
+    if in_force is not None:
+        ordered.append((in_force, in_force_label))
+    for m in multipliers:
+        if all(m != seen for seen, _ in ordered):
+            ordered.append((m, "generic coefficient" if m == 1.0 else
+                            "hypothetical: KXMLBGAME's dated value, not "
+                            "known to apply to this series"))
+    scenarios, break_even = [], []
+    parabola = _dec(price) * (Decimal(1) - _dec(price))
+    for route in routes:
+        quantum = Decimal(ROUTE_ALIGNMENT[route])
+        for n in contracts:
+            for m, basis in ordered:
+                raw = raw_kalshi_fee(KALSHI_TAKER_COEFF * m, n, price)
+                per = round_fee(raw, route) / n
+                net = gross_edge - per
+                scenarios.append({
+                    "route": route, "contracts": n, "multiplier": m,
+                    "multiplier_basis": basis, "fee_per_contract": per,
+                    "net_ev": net, "margin_to_floor": net - min_net_ev,
+                    "clears_floor": not net < min_net_ev})
+            if budget < 0:
+                ceiling = None
+                why = ("the gross edge is below the floor before any fee: "
+                       "no multiplier clears it")
+            else:
+                charge = (_dec(n) * _dec(budget) / quantum).to_integral_value(
+                    rounding=ROUND_FLOOR) * quantum
+                ceiling = float(charge / (_dec(KALSHI_TAKER_COEFF) * _dec(n)
+                                          * parabola))
+                why = ("only a zero fee clears it on this route and size"
+                       if ceiling == 0 else
+                       "clears the floor at any multiplier up to this one")
+            break_even.append({"route": route, "contracts": n,
+                               "multiplier_at_most": ceiling, "note": why})
+    return {
+        "label": ("SENSITIVITY: hypothetical fee scenarios. None of them is "
+                  "the established charge; see provenance.unresolved"),
+        "price": price,
+        "gross_edge": gross_edge,
+        "min_net_ev": min_net_ev,
+        "break_even_fee_per_contract": budget,
+        "scenarios": scenarios,
+        "break_even_multiplier": break_even,
+    }
 
 
 def describe(series: str | None = None, at: datetime | None = None,

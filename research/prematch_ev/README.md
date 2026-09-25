@@ -1223,9 +1223,147 @@ python3 shadow_monitor.py --report study_output/shadow/<session>.jsonl
   response with the clocks around it, every move, decision, gap and stop,
   and each poll's detector refusals. `--report` reads it offline; the key is
   in no record.
-- **Not yet:** scoring shadow entries against settlement. A live session
-  ends before its games do, so its figures are *predicted*; realised
-  results need the settled markets joined back in, which is not built.
+- **Every decision carries its assessment.** Since 2026-09-25 each
+  `decision` record also holds the tick it was made on and a
+  `shadow-assessment/1` record (below): the named reason, both sides'
+  prices and costs, the quote's age and depth, the execution read, and the
+  fee's provenance -- written after the screen has decided, unable to
+  change it, and never allowed to end a paid session (a failure is
+  recorded and counted; `--report` rebuilds it offline either way).
+- **Settlement:** a live session ends before its games do, so its figures
+  are *predicted*. `--report --settlements results.json` attaches realised
+  results to admitted entries; without it every realised figure is
+  withheld.
+
+### Re-analysing a session offline (`--report`)
+
+```
+python3 shadow_monitor.py --report study_output/shadow/<session>.jsonl \
+    --json study_output/shadow/<session>-diagnostics.json
+```
+
+The first 24-hour session (2026-09-24, development data) detected 5 moves
+on 4 games: 10 contract assessments, 8 screened and all 8 refused, no
+entry. Each refusal was recorded as `admitted: false` beside a null
+`predicted` block -- the prices, fee, margin, quote age and depth that say
+*why* were computed and thrown away, because only an admitted trade kept its
+numbers. `--report` now rebuilds every assessment from the raw records:
+
+- **One screen, and it names its reason.** `Eligibility.verdict` is the
+  screen: `admits` is its boolean, and its `rejection` is the first gate
+  that refused -- `price_band`, `lead_time`, `no_decision_quotes`,
+  `spread_too_wide`, `no_executable_side`, `below_ev_floor`.
+  `screen_diagnostics` used to re-state every gate; it counts through the
+  verdict now, and a test holds both against a frozen copy of the screen
+  they replaced across 14,400 cases, exceptions included. No admission,
+  count or threshold changed.
+- **Rebuilt, then checked.** The report walks the file in the order the
+  monitor wrote it and rebuilds exactly what the monitor held at each
+  decision: the books in its two-hour memory (same parser, same pruning),
+  the join in force, the trigger, the measured entry delay, and the tick.
+  It runs `reaction.assessment.assess` on those inputs and compares the
+  decision with the one RECORDED; a disagreement is printed, never resolved
+  for either side. A file from before assessments existed -- the one the
+  owner holds -- gets them this way; a newer file carries them live, and a
+  test asserts the live record equals the offline recomputation.
+- **Offline, enforced.** `--report` runs inside `no_network()`, which
+  replaces every way the process could open a connection with one that
+  raises. The output names the file by name and SHA-256, never its path.
+- **Where a missing book came from.** "No decision book" had three causes
+  and one name. Each assessment is now classed from the tick its move
+  arrived on: `outside_observation_horizon` (the monitor reads books only
+  within its horizon of kickoff -- by design, and the screen's own
+  lead-time gate is evaluated at the trigger beside it), `no_two_sided_book`
+  (the exchange answered, one-sided: a market state), or
+  `collection_failure` (a watched, in-horizon contract whose read failed,
+  was abandoned behind another failed read, or was joined after the tick's
+  reads began). Houston-Indianapolis, detected ~76h before kickoff, is the
+  first: 3.1h beyond the 73h horizon, and refused by the lead-time gate
+  anyway.
+- **Two questions, kept apart.** SETTLEMENT VALUE is the frozen screen's:
+  predicted EV at the decision book, realised only with settlement.
+  ADJUSTMENT CAPTURE (`reaction.adjustment`) asks what a round trip paid:
+  YES buys the ask and sells the bid, NO buys (1 - bid) and sells (1 - ask),
+  each leg pays its own taker fee, and the exit at each declared markout
+  (30s, 1m, 2m, 5m, 10m, 15m, 30m from the entry) is the FIRST usable read
+  at or after it, within 30s -- never an earlier read, never the best one.
+  A markout with no such read is censored with its reason; the best exit
+  seen is printed only as a labelled hindsight diagnostic. Every assessment
+  gets a `hypothetical_follow_move` scenario (the side the move favoured,
+  whether or not the screen would enter); only `screen_admitted` rows are
+  the policy's own. Each markout also says whether the sharp move had
+  `persisted`, `reversed` (given back at least the detector's threshold)
+  or become `unobservable`, from the polls READ by then. The markouts were
+  declared after the owner's summary of 2026-09-24 was read, so that
+  session is development data for them too.
+- **What the fee is, and what it is not.** Each assessment carries
+  `fees.provenance` -- `generic_coefficient` for KXNFLGAME: no dated
+  schedule is recorded, so multiplier 1 is ASSUMED -- with an `unresolved`
+  list (series schedule, account route, the rounding source's
+  inconsistency, order size), and a sensitivity table: the best side
+  re-priced at both routes, 1/10/100 contracts and multipliers 1 and 0.5
+  (KXMLBGAME's, labelled as not known to apply), plus the largest
+  multiplier at which the quote would still clear the floor. Green Bay's
+  YES cleared the floor's gross requirement by 0.0142 and was refused over
+  a 0.02 fee: it clears at multiplier <= 0.680 on the non-direct route at
+  one contract, <= 0.959 direct. No scenario is presented as the charge.
+
+The fixture these tests run on is SYNTHETIC (`tests/synthetic_session.py`):
+the real monitor driven over a scripted network that reproduces the figures
+the owner reported for 2026-09-24 -- Seattle 0.74/0.75 against a sharp
+0.7616627132, Green Bay 0.69/0.70 against 0.7241734676 and its opposite move
+15 minutes later, Houston 76h out -- with everything the owner did not report
+invented and marked as such. It is a regression fixture, not evidence.
+
+Building it found one defect in the monitor: the hourly slate rejoin ran
+between a move's detection and its execution read, so on a rejoin tick the
+monitor's own housekeeping (a dozen free requests, ~2.4s) was recorded as
+entry delay. The rejoin now runs after the tick's moves are handled.
+
+**Horizon, as a setting.** `--book-horizon-hours` (default 73, the screen's
+own lead-time ceiling) sets which games get decision reads. It is
+collection only: the screen is unchanged, so a move beyond 73h is still
+refused, now with full diagnostics instead of a missing book. Its cost is
+operational -- each extra game in the horizon adds two free reads to every
+tick's read phase before the paid poll, which ages every decision book by
+their duration, and one failed read abandons the rest of that phase -- and a
+non-default value is printed by the plan and recorded on the session.
+`--starts-at` (plan only) lists each game on the slate, when it enters the
+horizon, and how many hours of a proposed session would watch it.
+
+The JSON (`shadow-diagnostics/1`): `session` (the policies the session
+recorded, the fee route and its source, the commits that recorded and
+analysed it), `coverage` (moves, games, contract assessments, within and
+outside the horizon, collection failures, usable, the screen's rejections,
+refusals, entries, and recomputation disagreements), `settlement_value`,
+`adjustment_capture` (policy, limits, per-markout summary by scenario),
+`fees`, and `assessments` -- each with its `shadow-assessment/1` record,
+its capture scenarios, any opposite sharp moves, and its settlement status.
+
+### Verifying the NFL fee (`verify_fees.py`)
+
+```
+python3 verify_fees.py --series KXNFLGAME \
+    --window 2026-09-24T01:44:22Z 2026-09-25T01:44:22Z
+```
+
+Free and read-only: two public GETs per series (`/series/fee_changes`,
+`/series/{series}`), saved raw with status, `Date` and SHA-256 under
+`study_output/fee_evidence/`. It reports every dated change on record, the
+entry in force at each end of the window by the pricing path's own rule
+(`core.fees.entry_in_force`), and the series' current fee fields, and prints
+a `KALSHI_SERIES_SCHEDULES` entry for a person to review -- it never edits
+`core/fees.py`. It cannot settle the account route (no public endpoint
+answers it) or, from an empty history, that today's multiplier held on a
+past date; it says so, and exits 1 when nothing about the window is
+established. The response shapes are transcribed, not observed -- nothing
+that wrote this could reach Kalshi -- so an unexpected body is refused with
+its keys named, and the raw body is kept either way.
+
+### The next session
+
+`SHADOW_NEXT_SESSION.md`: a proposed 24-hour session, not started and not
+authorised, and the development/validation split it is meant to respect.
 
 ### The pilot proposal (`REACTION_PILOT.md`)
 
@@ -1297,9 +1435,9 @@ book-leads-with-a-surviving-discrepancy, indeterminate ordering, Kalshi-first,
 no response, the delay that misses the gap, a quote beyond the allowed wait,
 and a move-plus-full-reaction between two coarse checkpoints.
 
-**Not built:** anything that places an order, and scoring shadow entries
-against settlement. `capture.py` is the contract both paid commands run
-under, with no transport of its own.
+**Not built:** anything that places an order, and fetching settlement for
+shadow entries (`--report --settlements` takes it as a file). `capture.py`
+is the contract both paid commands run under, with no transport of its own.
 
 No orders: none is authorised and none can be placed — nothing in the study
 holds an exchange credential, and the read-only scan fails a run if anything

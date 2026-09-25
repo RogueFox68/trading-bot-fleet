@@ -91,6 +91,10 @@ ALLOWED_ENDPOINTS = (
     "api.elections.kalshi.com/trade-api/v2/historical/markets/"
     "{ticker}/candlesticks",
     "site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard",
+    # verify_fees.py: Kalshi's own dated record of a series' fees. Public
+    # market data, read by hand on a machine that can reach Kalshi.
+    "api.elections.kalshi.com/trade-api/v2/series/fee_changes",
+    "api.elections.kalshi.com/trade-api/v2/series/{series}",
 )
 # THIS LIST IS THE SET THE FETCHERS ACTUALLY CALL, and a test builds every one
 # of those URLs through the real code and checks it against this list, in both

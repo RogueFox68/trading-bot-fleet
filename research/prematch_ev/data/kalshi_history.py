@@ -765,6 +765,58 @@ def fetch_orderbook_payload(ticker: str, base_url: str = BASE_URL
         return None, Coverage().fail(str(exc))
 
 
+# --- fee evidence: Kalshi's own dated record of a series' fees ---------------
+#
+# PUBLIC reads, no credential. `verify_fees.py` keeps what comes back RAW --
+# status, Date header, body -- because what it verifies is a number the whole
+# cost basis rests on, and a parsed value with no body behind it cannot be
+# re-checked by anyone who doubts the parser.
+
+SERIES_FEE_CHANGES_PATH = "/series/fee_changes"
+SERIES_PATH = "/series/{series}"
+
+
+def series_fee_changes_url(series: str, base_url: str = BASE_URL) -> str:
+    query = urllib.parse.urlencode({"series_ticker": series,
+                                    "show_historical": "true"})
+    return f"{base_url}{SERIES_FEE_CHANGES_PATH}?{query}"
+
+
+def series_url(series: str, base_url: str = BASE_URL) -> str:
+    return f"{base_url}{SERIES_PATH.format(series=series)}"
+
+
+def fetch_evidence(url: str, now) -> dict:
+    """One GET, kept raw. Never retried: evidence is what one read returned.
+
+    Returns `{url, requested_at, received_at, status, date_header, body,
+    error}`. An HTTP error keeps its status and body -- a 404 is an answer --
+    and a transport failure has neither, which is a different fact.
+    """
+    record: dict[str, Any] = {"url": url, "requested_at": now(),
+                              "received_at": None, "status": None,
+                              "date_header": None, "body": None,
+                              "error": None}
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            body = resp.read()
+            record.update(status=resp.status,
+                          date_header=resp.headers.get("Date"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read() if exc.fp is not None else b""
+        record.update(status=exc.code,
+                      date_header=(exc.headers or {}).get("Date"),
+                      error=f"HTTP {exc.code}")
+    except (urllib.error.URLError, TimeoutError, OSError,
+            http.client.HTTPException) as exc:
+        record.update(received_at=now(), error=f"{type(exc).__name__}: {exc}")
+        return record
+    record.update(received_at=now(),
+                  body=body.decode("utf-8", errors="replace"))
+    return record
+
+
 def uses_archive(market: dict, cutoff: datetime | None) -> bool | None:
     """Which candlestick partition holds this market's data.
 

@@ -37,8 +37,13 @@ EACH TICK, IN THIS ORDER
    the EXECUTION books, and how long they took is the entry delay, measured.
    Then the study's own screen -- the checkpoint study's eligibility and fee
    model, unchanged -- and the decision is written down before anything that
-   follows is known.
-4. A moved game is then followed every few seconds, free, for the declared
+   follows is known, with its assessment (`reaction.assessment`): the named
+   reason, both sides' prices and costs, the books' ages and depth, the
+   fee's provenance, and whether a missing book was never due, a one-sided
+   market or a failed collection.
+4. The hourly slate rejoin, if one is due -- AFTER the moves, so its dozen
+   requests never sit between a move and its execution read.
+5. A moved game is then followed every few seconds, free, for the declared
    response window. `--report` measures Kalshi's response from those reads
    with the replay's own `measure_response`: only a change located after
    the move was actionable is a response, and a window the reads did not
@@ -92,6 +97,11 @@ the detector's refusals for each poll by reason, and the reason the session
 ended. `--report` reads it, and prints "0 moves" beside those refusals, so a
 detector that could not see is never mistaken for a quiet market. The API key
 is in no record: a recorded URL is its path, never its query.
+
+`--report` then rebuilds every assessment from those raw records, offline
+and unable to open a connection (`shadow_diagnostics`), so a session recorded
+before assessments existed gets them, and one recorded after gets them
+checked.
 """
 
 from __future__ import annotations
@@ -102,6 +112,7 @@ import math
 import os
 import signal
 import statistics
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -115,6 +126,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from analysis.scoring import Eligibility                          # noqa: E402
+from core.fees import DEFAULT_ROUTE                                # noqa: E402
 from collect import Ledger, join_markets, yes_side                 # noqa: E402
 from collect_reaction import (                                     # noqa: E402
     OUTPUT_DIR, Slate, assert_nothing_here_can_trade,
@@ -136,6 +148,9 @@ from reaction.detector import MoveDetector, MovePolicy, MoveTrigger  # noqa: E40
 from reaction.measure import (                                     # noqa: E402
     Bracket, ReactionOutcome, ReactionPolicy, inside_window, measure_response,
     request_span,
+)
+from reaction.assessment import (                                  # noqa: E402
+    SCHEMA as ASSESSMENT_SCHEMA, TickContext, describe, read_status,
 )
 from reaction.screen import screen_live                            # noqa: E402
 
@@ -176,6 +191,10 @@ QUOTA_FLOOR = 50
 #: How far back polled books are kept in memory for decisions. The records
 #: keep everything; this only bounds what a long session holds.
 BOOK_MEMORY = timedelta(hours=2)
+#: How far past the measured entry delay the execution read may land and
+#: still be the execution book: the read itself IS the delay, so the only
+#: slack needed is clock rounding.
+ENTRY_TOLERANCE = timedelta(seconds=1)
 
 EXIT_OK, EXIT_STOPPED, EXIT_USAGE = 0, 1, 2
 
@@ -185,6 +204,28 @@ SHADOW_DIR = OUTPUT_DIR / "shadow"
 def _iso(moment: datetime | None) -> str | None:
     return (moment.astimezone(timezone.utc).isoformat()
             if moment is not None else None)
+
+
+def code_version() -> dict:
+    """The commit this study's code is at, and whether it has local edits.
+
+    Recorded on every session and every analysis, so a validation session
+    can SHOW which frozen policies it was collected and analysed under
+    rather than assert it. Unknown -- no git, not a checkout -- is None,
+    never a guess.
+    """
+    def git(*args: str) -> str | None:
+        try:
+            done = subprocess.run(["git", "-C", str(HERE), *args],
+                                  capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return done.stdout if done.returncode == 0 else None
+
+    head, status = git("rev-parse", "HEAD"), git("status", "--porcelain",
+                                                 "--", ".")
+    return {"commit": head.strip() or None if head is not None else None,
+            "dirty": None if status is None else bool(status.strip())}
 
 
 def _jsonable(value: Any) -> Any:
@@ -361,9 +402,16 @@ class ShadowMonitor:
         self.cost_verified = False
         self.dates_verified = False
         self.next_rejoin: datetime | None = None
+        self.last_read_status = None
+        #: What this tick knew when its decision reads began: the horizon
+        #: judged from its start, the join then, and each read's status.
+        #: Every decision records it, so a missing book can be told apart
+        #: from a book that was never due.
+        self.tick_context: TickContext | None = None
         self.counts = {"polls": 0, "polls_failed": 0, "triggers": 0,
                        "decisions": 0, "entries": 0, "book_reads": 0,
-                       "book_failures": 0, "in_play_skipped": 0}
+                       "book_failures": 0, "in_play_skipped": 0,
+                       "assessment_errors": 0}
 
     # --- the Kalshi side (free) -------------------------------------------
 
@@ -381,6 +429,7 @@ class ShadowMonitor:
         self.counts["book_reads"] += 1
         if not coverage.complete:
             self.counts["book_failures"] += 1
+        self.last_read_status = read_status(payload is not None, book)
         self.recorder.write(
             "book", ticker=watched.ticker, purpose=purpose, sent_at=sent,
             received_at=received, payload=payload,
@@ -488,8 +537,14 @@ class ShadowMonitor:
 
     def tick(self) -> Stop | None:
         now = self.clock.now()
+        joined = frozenset(w.ticker for contracts in self.watched.values()
+                           for w in contracts)
+        reads: dict[str, str] = {}
+        abandoned = None
         for watched in self.contracts_in_horizon(now):
-            if self.read_book(watched, "decision") is None:
+            book = self.read_book(watched, "decision")
+            reads[watched.ticker] = self.last_read_status.value
+            if book is None:
                 # ONE failed read abandons the rest of this tick's reads: a
                 # stalled exchange must not hold the paid poll behind two
                 # dozen timeouts. A move this tick then has no decision book
@@ -497,7 +552,11 @@ class ShadowMonitor:
                 self.recorder.write("decision_reads_abandoned",
                                     at=self.clock.now(),
                                     after=watched.ticker)
+                abandoned = watched.ticker
                 break
+        self.tick_context = TickContext(at=now, horizon=self.book_horizon,
+                                        joined=joined, reads=reads,
+                                        abandoned_after=abandoned)
 
         live = fetch_live_odds(self.sport, self.api_key, ledger=self.ledger,
                                now=self.clock.now)
@@ -554,9 +613,7 @@ class ShadowMonitor:
         quotes_by_event: dict[str, list] = {}
         for quote in parsed.quotes:
             quotes_by_event.setdefault(quote.provider_event_id, []).append(quote)
-        if self.next_rejoin is None or now >= self.next_rejoin:
-            self.rejoin(quotes_by_event)
-            self.next_rejoin = now + REJOIN_EVERY
+        rejoin_due = self.next_rejoin is None or now >= self.next_rejoin
 
         present: set[str] = set()
         for quote in parsed.quotes:
@@ -582,6 +639,16 @@ class ShadowMonitor:
             self.detector.note_gap(stream, live.received_at,
                                    "absent from the live response")
         self.seen = (self.seen | present) - self.started
+        # THE HOURLY REJOIN COMES AFTER THIS ANSWER'S MOVES, never between a
+        # move and its execution read. It is a dozen free requests; an
+        # execution read that waited behind them recorded the monitor's
+        # housekeeping as entry delay -- 2.4s of it in the synthetic session
+        # that found this. A move on a rejoin tick is screened on the join
+        # before it, at most an hour old; the first tick cannot move, since
+        # every stream's first quote is only its baseline.
+        if rejoin_due:
+            self.rejoin(quotes_by_event)
+            self.next_rejoin = now + REJOIN_EVERY
         return None
 
     def _drain_rejections(self) -> dict[str, int]:
@@ -620,6 +687,7 @@ class ShadowMonitor:
         if not contracts:
             self.recorder.write("decision", event_id=trigger.event_id,
                                 stream_id=trigger.stream_id,
+                                decision_at=trigger.detected_at,
                                 refusal="not_joined_to_an_open_contract",
                                 admitted=False)
             return
@@ -636,13 +704,15 @@ class ShadowMonitor:
             # than a zero delay, which would price it at the decision book.
             delay = ((book.ts if book is not None else self.clock.now())
                      - trigger.detected_at)
+            books = self.books.get(watched.ticker, [])
             decision = screen_live(
-                trigger, self.books.get(watched.ticker, []),
-                market_ticker=watched.ticker,
+                trigger, books, market_ticker=watched.ticker,
                 yes_is_home=watched.yes_is_home, start=watched.start,
-                entry_delay=delay, entry_tolerance=timedelta(seconds=1),
+                entry_delay=delay, entry_tolerance=ENTRY_TOLERANCE,
                 series=self.series)
-            decisions.append((watched, book, decision))
+            decisions.append((watched, book, decision,
+                              self._assessment(decision, trigger, books,
+                                               watched, delay)))
 
         # ONE ENTRY PER GAME, as in the checkpoint study: the two contracts of
         # a game are one outcome seen from two sides. The admitted contract
@@ -656,7 +726,7 @@ class ShadowMonitor:
         if entry is not None:
             self.entered.add(trigger.event_id)
             self.counts["entries"] += 1
-        for watched, book, decision in decisions:
+        for watched, book, decision, assessment in decisions:
             self.counts["decisions"] += 1
             self.recorder.write(
                 "decision", stream_id=trigger.stream_id,
@@ -666,7 +736,10 @@ class ShadowMonitor:
                 execution_depth=(None if book is None else {
                     "yes_bid_size": book.bid_size,
                     "no_bid_size": book.ask_size}),
-                **decision.as_dict())
+                **decision.as_dict(),
+                tick=(self.tick_context.as_dict()
+                      if self.tick_context else None),
+                assessment=assessment)
 
         until = trigger.detected_at + self.follow_for
         current = self.follows.get(trigger.event_id)
@@ -675,6 +748,29 @@ class ShadowMonitor:
                 until=until, next_at=self.clock.now() + self.follow_every)
         else:
             current.until = max(current.until, until)
+
+    def _assessment(self, decision: Any, trigger: MoveTrigger, books: Sequence,
+                    watched: Watched, delay: timedelta) -> dict:
+        """Why the screen decided what it did, recorded with the decision.
+
+        AFTER the decision and unable to change it: the screen ran first.
+        A failure here is recorded and counted, never allowed to end a paid
+        session -- every input is in the raw records, so `--report`
+        rebuilds this assessment offline either way.
+        """
+        try:
+            return describe(decision, trigger, books,
+                            yes_is_home=watched.yes_is_home,
+                            start=watched.start, entry_delay=delay,
+                            entry_tolerance=ENTRY_TOLERANCE,
+                            eligibility=Eligibility(), series=self.series,
+                            tick=self.tick_context)
+        except Exception as exc:                    # noqa: BLE001 -- recorded
+            self.counts["assessment_errors"] += 1
+            return {"schema": ASSESSMENT_SCHEMA,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "note": "recomputed offline by --report from the raw "
+                            "records"}
 
     def follow_due(self) -> None:
         now = self.clock.now()
@@ -701,6 +797,10 @@ class ShadowMonitor:
             follow_every_seconds=self.follow_every.total_seconds(),
             follow_for_seconds=self.follow_for.total_seconds(),
             book_horizon_seconds=self.book_horizon.total_seconds(),
+            book_memory_seconds=BOOK_MEMORY.total_seconds(),
+            entry_tolerance_seconds=ENTRY_TOLERANCE.total_seconds(),
+            fee_route=DEFAULT_ROUTE,
+            code=code_version(),
             credit_cap=self.ledger.cap,
             credits_per_call=CREDITS_PER_LIVE_CALL,
             move_policy=self.detector.policy.as_dict(),
@@ -787,6 +887,21 @@ def read_records(path: Path) -> tuple[list[dict], int]:
     return rows, bad
 
 
+def parse_odds_row(row: dict) -> Any:
+    """One recorded poll's answer, parsed as the monitor parsed it, or None
+    when the poll did not answer. The one reading of an `odds` record: the
+    report's sightings and the diagnostics' sharp path both come from it.
+    """
+    received, provider = _time(row.get("received_at")), _time(
+        row.get("provider_date"))
+    if row.get("payload") is None or received is None or row.get("coverage"):
+        return None
+    stamp = provider or received
+    parsed = parse_snapshot({"timestamp": stamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                             "data": row["payload"]})
+    return parsed if parsed.coverage.complete else None
+
+
 def report(rows: Sequence[dict], *, min_response: float | None = None,
            window: timedelta | None = None) -> dict:
     """What the session measured. Pure: records in, figures out.
@@ -819,13 +934,8 @@ def report(rows: Sequence[dict], *, min_response: float | None = None,
             skews.append((headers - provider).total_seconds())
         if isinstance(row.get("processing_seconds"), (int, float)):
             processing.append(float(row["processing_seconds"]))
-        parsed = None
-        if row.get("payload") is not None and received and not row.get(
-                "coverage"):
-            stamp = provider or received
-            parsed = parse_snapshot({"timestamp": stamp.strftime(
-                "%Y-%m-%dT%H:%M:%SZ"), "data": row["payload"]})
-        if parsed is None or not parsed.coverage.complete:
+        parsed = parse_odds_row(row)
+        if parsed is None:
             # A POLL THAT DID NOT ANSWER IS A HOLE, here as in the monitor.
             # Observations may have come and gone inside it, so the next one
             # of any game is a first sighting again: it measures neither how
@@ -1170,25 +1280,98 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key", default=None,
                         help="Odds API key (or set ODDS_API_KEY)")
     parser.add_argument("--out-dir", default=str(SHADOW_DIR))
+    parser.add_argument("--book-horizon-hours", type=float,
+                        default=BOOK_HORIZON.total_seconds() / 3600,
+                        help="read decision books for games this close to "
+                             "kickoff (default: the screen's own lead-time "
+                             "ceiling). Collection only: the screen is "
+                             "unchanged, so a move beyond its ceiling is "
+                             "still refused -- see the README before "
+                             "changing it")
+    parser.add_argument("--starts-at", default=None, metavar="UTC_ISO",
+                        help="plan only: list which games a session starting "
+                             "then would watch, and for how long")
     parser.add_argument("--report", default=None, metavar="SESSION_JSONL",
-                        help="summarise a recorded session. Free, offline")
+                        help="summarise a recorded session and rebuild every "
+                             "assessment in it. Free, offline: no network "
+                             "request is possible while it runs")
+    parser.add_argument("--json", default=None, metavar="OUT_JSON",
+                        help="with --report: also write the full diagnostics "
+                             "as JSON")
+    parser.add_argument("--settlements", default=None, metavar="JSON",
+                        help="with --report: {market_ticker: 1|0} results, "
+                             "so admitted entries can carry a realized "
+                             "figure. Without it every realized figure is "
+                             "withheld")
     return parser
+
+
+def _report(args: argparse.Namespace) -> int:
+    """The report and the diagnostics, offline. Imported here: the
+    diagnostics module rebuilds the monitor's state from this module's own
+    constants and parsers, so it depends on this one, not the reverse."""
+    from shadow_diagnostics import (
+        diagnose, jsonable, load_settlements, no_network, render_diagnostics,
+        source_of,
+    )
+    path = Path(args.report)
+    if not path.is_file():
+        print(f"no such session file: {path}", file=sys.stderr)
+        return EXIT_USAGE
+    settlements = None
+    if args.settlements:
+        try:
+            settlements = load_settlements(Path(args.settlements))
+        except (OSError, ValueError) as exc:
+            print(f"--settlements: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+    with no_network():
+        rows, bad = read_records(path)
+        print(render_report(report(rows)))
+        figures = diagnose(rows, settlements=settlements,
+                           source=source_of(path, len(rows), bad))
+        print(render_diagnostics(figures))
+    if bad:
+        print(f"\n  *** {bad} unreadable line(s) skipped (a session "
+              f"killed mid-write leaves one)")
+    if args.json:
+        out = Path(args.json)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(figures, default=jsonable, indent=1,
+                                  sort_keys=True) + "\n", encoding="utf-8")
+        print(f"\n  diagnostics written to {out}")
+    return EXIT_OK
+
+
+def _horizon_plan(kickoffs: dict, *, now: datetime, starts: datetime,
+                  hours: float, horizon: timedelta) -> list[str]:
+    """Which games a session over [starts, starts + hours] would read
+    decision books for, and for how long: a game is watched from `horizon`
+    before its kickoff until kickoff."""
+    ends = starts + timedelta(hours=hours)
+    lines = [f"  games on the slate (the exchange's listings with the "
+             f"schedule's kickoffs; which join to a sharp event is known "
+             f"only once a paid poll answers):"]
+    upcoming = sorted((k, e) for e, k in kickoffs.items() if k > now)
+    if not upcoming:
+        lines.append("    none")
+    for kickoff, event in upcoming:
+        enters = kickoff - horizon
+        watched = (min(ends, kickoff) - max(starts, enters)).total_seconds()
+        lines.append(f"    {event:<34} kickoff {kickoff:%a %Y-%m-%d %H:%MZ}  "
+                     f"in horizon from {enters:%a %m-%d %H:%MZ}  watched "
+                     f"{max(0.0, watched) / 3600:4.1f}h of the session")
+    return lines
 
 
 def main(argv: Sequence[str] | None = None, *, clock: Any = None,
          slate_source: Callable[[], Slate] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.report:
-        path = Path(args.report)
-        if not path.is_file():
-            print(f"no such session file: {path}", file=sys.stderr)
-            return EXIT_USAGE
-        rows, bad = read_records(path)
-        print(render_report(report(rows)))
-        if bad:
-            print(f"\n  *** {bad} unreadable line(s) skipped (a session "
-                  f"killed mid-write leaves one)")
-        return EXIT_OK
+        return _report(args)
+    if args.json or args.settlements:
+        print("--json and --settlements go with --report", file=sys.stderr)
+        return EXIT_USAGE
 
     if args.hours is None or not args.hours > 0:
         print("--hours must be given and positive", file=sys.stderr)
@@ -1198,6 +1381,21 @@ def main(argv: Sequence[str] | None = None, *, clock: Any = None,
         print(f"--cadence-seconds must be at least "
               f"{MIN_CADENCE.total_seconds():.0f}", file=sys.stderr)
         return EXIT_USAGE
+    if not args.book_horizon_hours > 0:
+        print("--book-horizon-hours must be positive", file=sys.stderr)
+        return EXIT_USAGE
+    horizon = timedelta(hours=args.book_horizon_hours)
+    starts = None
+    if args.starts_at is not None:
+        starts = _time(args.starts_at)
+        if starts is None:
+            print("--starts-at must be an ISO time with a UTC offset, e.g. "
+                  "2026-10-02T14:00:00Z", file=sys.stderr)
+            return EXIT_USAGE
+        if args.spend is not None:
+            print("--starts-at is plan-only: a paid session starts when it "
+                  "is run", file=sys.stderr)
+            return EXIT_USAGE
     clock = clock or SystemClock()
     price = session_price(args.hours, cadence)
 
@@ -1212,11 +1410,19 @@ def main(argv: Sequence[str] | None = None, *, clock: Any = None,
           f"{len(upcoming)} upcoming game(s) with a kickoff")
     if upcoming:
         print(f"  next kickoff {_iso(upcoming[0])}; "
-              f"{sum(1 for k in upcoming if k <= now + BOOK_HORIZON)} "
-              f"within the screen's {BOOK_HORIZON.total_seconds() / 3600:.0f}h "
-              f"ceiling")
+              f"{sum(1 for k in upcoming if k <= now + horizon)} "
+              f"within the {horizon.total_seconds() / 3600:g}h book horizon")
+    if horizon != BOOK_HORIZON:
+        print(f"  *** book horizon {horizon.total_seconds() / 3600:g}h is NOT "
+              f"the screen's {BOOK_HORIZON.total_seconds() / 3600:g}h "
+              f"lead-time ceiling. Collection only: the screen still refuses "
+              f"a move beyond its ceiling, and each extra game in the horizon "
+              f"adds two free book reads to every poll's read phase.")
     if not slate.coverage.complete:
         print(f"  *** slate retrieval incomplete: {slate.coverage}")
+    print("\n".join(_horizon_plan(slate.kickoffs, now=now,
+                                   starts=starts or now, hours=args.hours,
+                                   horizon=horizon)))
     print(f"\n  session {args.hours:g}h at one poll every "
           f"{cadence.total_seconds():g}s: {session_polls(args.hours, cadence):,}"
           f" poll(s), {price:,} credit(s) at {CREDITS_PER_LIVE_CALL} per call")
@@ -1293,7 +1499,7 @@ def main(argv: Sequence[str] | None = None, *, clock: Any = None,
         sport=args.sport, series=args.series, api_key=api_key,
         cadence=cadence, hours=args.hours,
         ledger=CreditLedger(cap=price), recorder=recorder, clock=clock,
-        slate_source=slate_source)
+        slate_source=slate_source, book_horizon=horizon)
     print(f"\n  recording to {path}")
     try:
         stop = monitor.run()

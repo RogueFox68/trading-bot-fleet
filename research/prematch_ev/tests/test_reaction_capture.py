@@ -242,6 +242,12 @@ class EndpointTest(unittest.TestCase):
             kalshi_history.enumerate_open_markets("KXNFLGAME", max_pages=1)
             kalshi_history.fetch_orderbook_payload(
                 "KXNFLGAME-26SEP13DALNYG-NYG")
+            # verify_fees.py's reads.
+            kalshi_history.fetch_evidence(
+                kalshi_history.series_fee_changes_url("KXNFLGAME"),
+                now=lambda: at)
+            kalshi_history.fetch_evidence(
+                kalshi_history.series_url("KXNFLGAME"), now=lambda: at)
         return seen
 
     def test_every_url_a_fetcher_requests_is_declared(self):
@@ -941,27 +947,51 @@ class ReadmeCurrencyTest(unittest.TestCase):
 
     def test_the_documented_commands_parse_exactly(self):
         """The commands in this section get pasted; each is parsed by the
-        real CLI with abbreviations off, so a stale flag fails here."""
-        import shlex
-        import collect_reaction
-        import run_reaction
-        import shadow_monitor
-        parsers = {"collect_reaction.py": collect_reaction.build_parser,
-                   "run_reaction.py": run_reaction.build_parser,
-                   "shadow_monitor.py": shadow_monitor.build_parser}
-        seen = 0
-        for line in self.section.splitlines():
-            line = line.split("#", 1)[0].strip()
-            for script, build in parsers.items():
-                if not line.startswith(f"python3 {script} "):
-                    continue
-                seen += 1
-                parser = build()
-                parser.allow_abbrev = False
-                with self.subTest(line=line):
-                    with contextlib.redirect_stderr(io.StringIO()):
-                        parser.parse_args(shlex.split(line)[2:])
-        self.assertGreaterEqual(seen, 8)
+        real CLI with abbreviations off, so a stale flag fails here. A
+        command continued over lines is joined first: it used to be skipped
+        -- or, with a trailing backslash, to break the parse."""
+        self.assertGreaterEqual(check_documented_commands(self, self.section),
+                                10)
+
+
+def documented_commands(text: str) -> list[str]:
+    """Every `python3 <script> ...` command in a document, continuation
+    lines joined and shell redirection dropped."""
+    out, pending = [], ""
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if line.endswith("\\"):
+            pending += line[:-1] + " "
+            continue
+        line, pending = (pending + line).strip(), ""
+        if line.startswith("python3 "):
+            out.append(line.split(" > ", 1)[0].strip())
+    return out
+
+
+def check_documented_commands(case: unittest.TestCase, text: str) -> int:
+    """Parse each documented command with the real CLI; return how many."""
+    import shlex
+    import collect_reaction
+    import run_reaction
+    import shadow_monitor
+    import verify_fees
+    parsers = {"collect_reaction.py": collect_reaction.build_parser,
+               "run_reaction.py": run_reaction.build_parser,
+               "shadow_monitor.py": shadow_monitor.build_parser,
+               "verify_fees.py": verify_fees.build_parser}
+    seen = 0
+    for line in documented_commands(text):
+        for script, build in parsers.items():
+            if not line.startswith(f"python3 {script} "):
+                continue
+            seen += 1
+            parser = build()
+            parser.allow_abbrev = False
+            with case.subTest(line=line):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    parser.parse_args(shlex.split(line)[2:])
+    return seen
 
 
 class ManifestTest(unittest.TestCase):
