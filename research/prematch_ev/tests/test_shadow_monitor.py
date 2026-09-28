@@ -601,10 +601,15 @@ class StopTest(MonitorHarness):
         self.assertNotIn(KEY, text)
         return text, rows, net
 
-    def test_a_refused_key_stops_after_three_polls_and_says_why(self):
-        text, rows, _ = self.assertStopped("failed_polls", polls=3,
+    def test_a_refused_key_stops_on_its_first_poll_and_says_why(self):
+        """A refused key is not an outage: no wait mends it, and the two
+        further polls the old three-in-a-row rule made each cost a credit
+        for the same refusal."""
+        text, rows, _ = self.assertStopped("auth_refused", polls=1,
                                            odds_status=401)
-        self.assertIn("HTTP Error 401", self.end(rows)["detail"])
+        self.assertIn("HTTP 401", self.end(rows)["detail"])
+        self.assertEqual(self.end(rows)["status"], "stopped_early")
+        self.assertFalse(self.kinds(rows, "recovery_probe"))
 
     def test_a_price_per_call_other_than_quoted_stops_at_once(self):
         self.assertStopped("cost_mismatch", polls=1, charged=2)

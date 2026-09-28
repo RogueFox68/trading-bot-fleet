@@ -38,11 +38,24 @@ retry, a minute later, with fresher data than a retried request could return.
 So a failed call is reported and not repeated, and never costs more than one
 reservation.
 
+A FAILURE IS DESCRIBED, NOT JUST REPORTED
+-----------------------------------------
+Every failed call carries `failure` (`data.failures.Failure`): its category,
+the phase it failed in -- connecting or sending, awaiting the status, an error
+status, the body, decoding, the shape -- the exception, the HTTP status and
+errno, the
+provider's Retry-After, and how long the attempt had run. The monitor decides
+between backing off and stopping on the category, and a later reader can
+reconstruct an outage's chronology from the fields rather than from English.
+An error response's quota headers are read like a success's: `remaining` is
+the account's, whatever the status.
+
 THE CREDENTIAL
 --------------
 It goes into the URL because the provider requires it there, and nowhere
 else: not the recorded URL (`recorded_url` strips the query), not a failure
-message (`redact`), not a log.
+message or detail (`redact`, and `failures.scrub` with the key itself), not a
+log. An `HTTPError` holds the request URL; nothing reads it.
 """
 
 from __future__ import annotations
@@ -57,7 +70,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from . import failures
 from .cache import redact
+from .failures import Failure
 from .kalshi_history import Coverage
 from .odds_history import (
     BASE_URL, DEFAULT_BOOKMAKERS, REQUEST_TIMEOUT, SPORT_KEYS, CreditLedger,
@@ -133,6 +148,11 @@ class LiveOdds:
     def ok(self) -> bool:
         return self.payload is not None and self.coverage.complete
 
+    @property
+    def failure(self) -> Failure | None:
+        """Why the call failed, as data; None when it did not."""
+        return None if self.ok else self.coverage.failure
+
     def snapshot_body(self) -> dict:
         """The body in the archive's envelope, so `parse_snapshot` reads it.
 
@@ -161,36 +181,91 @@ def fetch_live_odds(sport: str, api_key: str, *, ledger: CreditLedger,
     ledger.spend_or_raise(CREDITS_PER_LIVE_CALL)
     url = live_odds_url(sport, api_key, bookmakers, base_url)
     result = LiveOdds(sent_at=now())
+
+    def failed(reason: str, failure: Failure) -> LiveOdds:
+        result.received_at = result.received_at or now()
+        result.coverage.fail(redact(reason), failure)
+        return result
+
+    def elapsed() -> float:
+        return (now() - result.sent_at).total_seconds()
+
+    phase = failures.REQUEST
     try:
         request = urllib.request.Request(url,
                                          headers={"Accept": "application/json"})
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
             result.headers_at = now()
+            phase = failures.BODY
             headers = resp.headers
-            ledger.observe(headers)
+            _read_headers(result, headers, ledger)
             result.status = getattr(resp, "status", None)
-            result.provider_date = _header_date(headers)
-            result.charged = _header_int(headers, "x-requests-last")
-            result.used = _header_int(headers, "x-requests-used")
-            result.remaining = _header_int(headers, "x-requests-remaining")
             if result.status not in (None, 200):
-                result.received_at = now()
-                result.coverage.fail(f"HTTP {result.status}")
-                return result
+                category = failures.status_category(result.status)
+                return failed(f"HTTP {result.status}", Failure(
+                    category=category, phase=failures.RESPONSE,
+                    exception=None, detail=f"HTTP {result.status}",
+                    elapsed_seconds=elapsed(), status=result.status,
+                    retry_after_seconds=failures.retry_after_seconds(
+                        headers, now())))
             body = resp.read()
             # Not before: a response is not in hand until all of it is.
             result.received_at = now()
+        phase = failures.DECODE
         payload = json.loads(body.decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # An error STATUS: the provider answered, and its headers are facts
+        # -- its clock, its quota, its Retry-After. The URL is not read.
+        result.headers_at = result.headers_at or now()
+        result.status = exc.code
+        _read_headers(result, exc.headers, ledger)
+        return failed(f"live odds poll failed: {exc}", failures.describe(
+            exc, phase=failures.RESPONSE, elapsed_seconds=elapsed(),
+            secrets=(api_key,), headers=exc.headers, now=now(),
+            body=_error_body(exc)))
     # A body cut off partway is http.client's IncompleteRead -- an
     # HTTPException, not an OSError -- and a failed poll like any other.
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError,
             OSError, ValueError, http.client.HTTPException) as exc:
-        result.received_at = result.received_at or now()
-        result.coverage.fail(redact(f"live odds poll failed: {exc}"))
-        return result
+        if phase == failures.REQUEST and not isinstance(
+                exc, urllib.error.URLError):
+            # Unwrapped before any headers: the request had gone, and the
+            # wait for its status line is what failed.
+            phase = failures.AWAITING
+        return failed(f"live odds poll failed: {exc}", failures.describe(
+            exc, phase=phase, elapsed_seconds=elapsed(), secrets=(api_key,)))
     if not isinstance(payload, list):
         result.coverage.fail(
             f"live odds body was {type(payload).__name__}, expected a list of "
-            f"events")
+            f"events", Failure(
+                category="unexpected_shape", phase=failures.SHAPE,
+                exception=None,
+                detail=f"body was {type(payload).__name__}, expected a list",
+                elapsed_seconds=elapsed()))
     result.payload = payload
     return result
+
+
+def _read_headers(result: LiveOdds, headers: Any, ledger: CreditLedger) -> None:
+    """The provider's clock and quota, from any response that carried them."""
+    if headers is None:
+        return
+    ledger.observe(headers)
+    result.provider_date = _header_date(headers)
+    result.charged = _header_int(headers, "x-requests-last")
+    result.used = _header_int(headers, "x-requests-used")
+    result.remaining = _header_int(headers, "x-requests-remaining")
+
+
+#: How much of an error response's body is kept: the provider's own words
+#: for a refusal, not the whole page.
+ERROR_BODY_LIMIT = 512
+
+
+def _error_body(exc: urllib.error.HTTPError) -> bytes | None:
+    """The start of an error response's body, or None. Never raises: this is
+    context for a failure already being reported."""
+    try:
+        return exc.read(ERROR_BODY_LIMIT) if exc.fp is not None else None
+    except Exception:                         # noqa: BLE001 -- context only
+        return None

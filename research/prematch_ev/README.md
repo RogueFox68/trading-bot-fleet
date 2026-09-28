@@ -1199,10 +1199,57 @@ python3 shadow_monitor.py --report study_output/shadow/<session>.jsonl
   measurement's own `inside_window` (answered after the decision, requested
   by the deadline), so the counts are of the reads the outcome was measured
   on, and a failed read is placed in a window exactly as a good one is.
-- **It stops, and says why,** on the credit cap, three failed polls in a
-  row, a price per call other than quoted (checked against the provider's
-  own `x-requests-last` on the first answer), a clock more than 5s off the
-  provider's, a nearly empty account, or a request outside the allow-list.
+- **An outage is recovered from, within bounds, not a stop.** Three polls
+  failing in a row used to end the session: at a 30s cadence, a minute or
+  two of lost network ended the 2026-09-25 validation at 10h49m of 24h.
+  Now three consecutive *transient* failures — a timeout, a dropped
+  connection, DNS, a 5xx, a 429; `data/failures.py` classifies each — begin
+  an **outage**: paid polling pauses, and one recovery probe (an ordinary
+  tick) is made after 60s, then 120s, 240s, 480s and 600s thereafter, never
+  sooner than the cadence or a Retry-After. At most **6 probes**, and none
+  more than **45 minutes** after the first failure; past either bound the
+  session stops, `outage_unrecovered`. Every probe is reserved against the
+  session's one cap before it is sent, and the remaining budget and quota
+  floor are checked before each is scheduled; recovery never moves the
+  session's end, never makes a budget, never starts a second session. Each
+  probe stands in for at least one skipped poll and polling resumes on the
+  session's own grid, so an outage cannot add a poll the cap was not priced
+  for. A *terminal* failure stops at once, in or out of an outage: a refused
+  key (401/403, `auth_refused` — which used to cost three polls), any other
+  4xx (`request_rejected`), an untrusted certificate, or a body that is not
+  the documented list.
+- **An outage is missing observations, not a longer interval.** Every failed
+  poll declares a gap on every stream, so the first answer after recovery
+  re-anchors the detector instead of closing a move across the blind
+  interval. So does a stretch the monitor did not poll: consecutive polls
+  more than three cadences apart — a laptop asleep, a suspended process, a
+  loop held up behind reads — are declared exactly like a failed poll
+  (`not_polled`). Left to the detector's own 35-minute `max_gap`, set for the
+  5-minute archive, a machine's first poll on waking would have been
+  compared with the price from before it slept. After an outage or such a
+  stretch the Kalshi decision memory is dropped (`books_invalidated`), so a
+  decision is screened on books read since, or on none — never a stale one —
+  and the slate is rejoined. In the analysis, a markout inside a stretch not
+  polled is `unobservable: not_polled` on the sharp side, as a failed poll
+  already was, and its Kalshi exit is censored by the existing tolerance.
+- **Failures are described, and the session describes itself.** Each failed
+  poll's record carries `failure`: category, phase (connecting or sending,
+  awaiting the status, an error status, the body, decoding, the shape),
+  exception, HTTP status, errno, Retry-After, elapsed time, its attempt in
+  the run and the last answer before it — scrubbed of the key, and an
+  error body of any echo of it. `--report` lists every failed poll in order
+  with the Kalshi reads made meanwhile; for a session recorded before this,
+  it reads the same from the recorded messages and says it inferred them.
+  Beside the records, `<session>.status.json`: `complete`,
+  `recovered_with_gaps`, `ended_in_outage` or `stopped_early`, with the
+  reason, actual duration, polls, reserved credits, gaps and the path to
+  the records — written however the session ends, including a crash. Local
+  only; nothing is sent anywhere.
+- **It stops, and says why,** on the credit cap, an unrecovered outage, a
+  terminal failure (above), a price per call other than quoted (checked
+  against the provider's own `x-requests-last` on the first answer), a clock
+  more than 5s off the provider's, a nearly empty account, or a request
+  outside the allow-list.
   Kalshi's book shape is transcribed rather than observed, so one real book
   is read — free — before the first paid poll, and a shape the parser
   refuses stops the session with nothing bought. The plan reads one too,

@@ -27,6 +27,11 @@ On top of each assessment, and kept apart from it:
   unobservable, from the polls that had been read at each markout.
 * HORIZON AND COVERAGE -- whether a missing book was never due (outside the
   observation horizon), a market state, or a collection failure.
+* GAPS -- the blind intervals the monitor declared. Its book memory is
+  dropped wherever the monitor dropped its own (`books_invalidated`), so a
+  decision after an outage is rebuilt on the books it actually had; and a
+  markout inside a stretch the monitor did not poll is `not_polled` on the
+  sharp side, never the last price carried across.
 
 WHAT IT MAY NOT DO
 ------------------
@@ -259,6 +264,8 @@ class Replay:
     #: The monitor's book memory as the walk left it -- exposed so a test
     #: can hold it against the live monitor's own.
     memory: dict = field(default_factory=dict)
+    #: The blind intervals the monitor declared (`gap` records), in order.
+    gaps: list = field(default_factory=list)
 
 
 def replay(rows: Sequence[dict]) -> Replay:
@@ -322,6 +329,13 @@ def replay(rows: Sequence[dict]) -> Replay:
         elif kind == "decision_reads_abandoned":
             if tick is not None:
                 tick.abandoned_after = row.get("after")
+        elif kind == "books_invalidated":
+            # The monitor dropped its decision memory here -- after an
+            # outage, a probe, or a stretch it did not poll -- so nothing
+            # read before this record is a decision book after it.
+            memory.clear()
+        elif kind == "gap":
+            out.gaps.append(row)
         elif kind == "odds":
             if tick is None or tick.odds_seen:
                 tick = _Tick(at=_time(row.get("sent_at"))
@@ -396,6 +410,27 @@ def _reassess(row: dict, index: int, trigger: MoveTrigger | None,
 
 # --- the sharp path ---------------------------------------------------------
 
+def unpolled_intervals(gaps: Sequence[dict]) -> list[tuple[datetime, datetime]]:
+    """When the sharp book went UNPOLLED, as the monitor declared it.
+
+    A failed poll leaves a reading of its own -- `poll_unanswered` -- so the
+    sharp state after it is already unobservable. A poll the monitor never
+    made leaves nothing: the last answered poll would stand for the book
+    across the whole stretch, however long. Each `not_polled` gap is the
+    interval from when the next poll was due to when one was made, and no
+    earlier reading may speak for a markout inside it.
+    """
+    out = []
+    for gap in gaps:
+        if gap.get("cause") != "not_polled":
+            continue
+        start = _time(gap.get("unobserved_from")) or _time(gap.get("from"))
+        end = _time(gap.get("to"))
+        if start is not None and end is not None and end > start:
+            out.append((start, end))
+    return out
+
+
 def parsed_polls(odds_rows: Sequence[dict]) -> list[tuple]:
     """Every recorded poll as (ready, received, parsed answer or None),
     parsed once: a 24-hour session has thousands, and every moved game
@@ -465,6 +500,7 @@ def diagnose(rows: Sequence[dict], *,
     session_end = (_time(replayed.end.get("at")) if replayed.end
                    else replayed.last_seen)
     polls = parsed_polls(replayed.odds)
+    unpolled = unpolled_intervals(replayed.gaps)
     readings: dict[str, list[SharpReading]] = {}
     items = []
     capture_rows = []
@@ -483,7 +519,8 @@ def diagnose(rows: Sequence[dict], *,
                      yes_is_home=item["yes_is_home"],
                      fair_before_yes=move["fair_before_yes"],
                      fair_after_yes=move["fair_after_yes"],
-                     min_move=trigger.policy.min_move, session_end=session_end)
+                     min_move=trigger.policy.min_move, session_end=session_end,
+                     unpolled=unpolled)
         reads = replayed.reads.get(item["ticker"], [])
         scenarios = [capture(
             kind=HYPOTHETICAL, side=move["favoured_side"], reads=reads,
@@ -592,6 +629,14 @@ def _session(replayed: Replay, session_end: datetime | None) -> dict:
         "fee_route_source": replayed.route_source,
         "assessment_errors_live": ((end or {}).get("counts") or {}).get(
             "assessment_errors"),
+        "status": (end or {}).get("status"),
+        # The blind intervals the monitor declared: failed polls, outages,
+        # stretches not polled. A session recorded before they were
+        # declared has none listed, which is not the same as none happening.
+        "gaps": {"declared": len(replayed.gaps),
+                 "by_cause": dict(Counter(g.get("cause")
+                                          for g in replayed.gaps)),
+                 "monitor_declares_gaps": "recovery" in start},
     }
 
 
@@ -730,6 +775,11 @@ def render_diagnostics(figures: dict) -> str:
         f"spread <= {e['max_spread']:g}  ({s['eligibility_source']})",
         f"  book horizon       {s['book_horizon_hours']:g}h before kickoff",
         f"  fee route          {s['fee_route']}  ({s['fee_route_source']})",
+        f"  session status     {s.get('status') or 'not recorded'}; "
+        + (f"{s['gaps']['declared']} gap(s) declared"
+           + (f" {s['gaps']['by_cause']}" if s['gaps']['declared'] else "")
+           if s['gaps']['monitor_declares_gaps'] else
+           "gaps not declared by the monitor that recorded it"),
         "", "COVERAGE",
         f"  moves detected                  {c['moves']:>4}   across "
         f"{c['games']} game(s)",

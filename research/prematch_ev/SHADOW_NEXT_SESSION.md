@@ -143,8 +143,10 @@ python3 shadow_monitor.py --hours 24 --cadence-seconds 30 --spend 2881
 
 The machine must stay awake, on the network, and NTP-synchronised: a clock
 more than 5 seconds off the provider's stops the session. It writes one
-JSONL file under `study_output/shadow/` (gitignored), so there is nothing to
-commit.
+JSONL file under `study_output/shadow/` (gitignored), and beside it
+`<session>.status.json`, so there is nothing to commit. Read the status file
+first: `complete`, `recovered_with_gaps`, `ended_in_outage` or
+`stopped_early`, and why.
 
 ## What to expect operationally
 
@@ -155,6 +157,14 @@ commit.
   move arrives. Each assessment now records its decision book's age, so
   this is measured rather than hidden. One failed read abandons the rest of
   that tick's reads, and the next tick recovers.
+- **An outage no longer ends the session.** Three transient failures in a
+  row pause paid polling; probes follow at 60s, 120s, 240s, 480s, 600s and
+  600s, and the session stops only if none answers within those six or 45
+  minutes. Each probe is one reserved credit, inside the same cap; the
+  session's end does not move. A refused key stops on its first poll. A
+  laptop that sleeps is a declared gap, not a long interval: the first poll
+  on waking re-anchors rather than moves. Keeping the machine awake still
+  matters -- a gap is data the session does not have.
 - **What changed since the first session:** decisions record their tick
   and assessment; `session_start` records the fee route, entry tolerance,
   book memory and commit; and the hourly rejoin no longer sits between a

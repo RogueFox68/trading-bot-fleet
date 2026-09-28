@@ -35,6 +35,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
+from .failures import Failure, describe, status_category
+
 # Public market-data host. No authentication is required for market data,
 # candlesticks or settlements; only trading needs RSA-signed headers.
 BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
@@ -55,25 +57,43 @@ class KalshiFetchError(RuntimeError):
 
     The fleet's `OrderFetchError` rule, one layer out: only an ANSWER may be
     treated as data. A timeout is silence, and silence is not an empty market.
+    The last attempt's own exception is its `__cause__`, and `status` the
+    HTTP status when one arrived, so the failure can be classified
+    (`data.failures`) rather than read back out of the message.
     """
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass
 class Coverage:
-    """Whether a result can be concluded from, and why not if it cannot."""
+    """Whether a result can be concluded from, and why not if it cannot.
+
+    `failure`, when a READ failed, is the same fact as data
+    (`data.failures.Failure`): the category, phase and exception the reason
+    sentence describes, so a caller can act on it and a record can be
+    grouped by it without parsing English.
+    """
 
     complete: bool = True
     reasons: list[str] = field(default_factory=list)
+    failure: Any = None
 
-    def fail(self, reason: str) -> "Coverage":
+    def fail(self, reason: str, failure: Any = None) -> "Coverage":
         self.complete = False
         self.reasons.append(reason)
+        if failure is not None and self.failure is None:
+            self.failure = failure
         return self
 
     def merge(self, other: "Coverage") -> "Coverage":
         if not other.complete:
             self.complete = False
             self.reasons.extend(other.reasons)
+            if self.failure is None:
+                self.failure = other.failure
         return self
 
     def __str__(self) -> str:
@@ -116,7 +136,8 @@ def _get(url: str, retries: int = RETRIES,
             req = urllib.request.Request(url, headers={"Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 if resp.status != 200:
-                    raise KalshiFetchError(f"HTTP {resp.status} from {url}")
+                    raise KalshiFetchError(f"HTTP {resp.status} from {url}",
+                                           status=resp.status)
                 return json.loads(resp.read().decode("utf-8"))
         # A body cut off partway is http.client's IncompleteRead -- an
         # HTTPException, not an OSError -- and a lost read like any other.
@@ -125,7 +146,8 @@ def _get(url: str, retries: int = RETRIES,
             last = exc
             if attempt < retries - 1:
                 time.sleep(BACKOFF_SECONDS[attempt])
-    raise KalshiFetchError(f"{url} failed after {retries} attempts: {last}")
+    raise KalshiFetchError(f"{url} failed after {retries} attempts: {last}"
+                           ) from last
 
 
 # Kalshi serialises `*_dollars` as a fixed-point STRING ("0.5600"), not a JSON
@@ -757,12 +779,30 @@ LIVE_BOOK_TIMEOUT = 10
 
 def fetch_orderbook_payload(ticker: str, base_url: str = BASE_URL
                             ) -> tuple[Any, Coverage]:
-    """The RAW order-book body for one market. Free; public market data."""
+    """The RAW order-book body for one market. Free; public market data.
+
+    A failed read carries its classified cause in `coverage.failure`. Its
+    phase is not established here -- `_get` reads the body inside the same
+    call that connects -- so it is left unknown rather than guessed; the
+    caller holds the read's own clocks for its elapsed time.
+    """
     try:
         return (_get(orderbook_url(ticker, base_url), retries=1,
                      timeout=LIVE_BOOK_TIMEOUT), Coverage())
     except KalshiFetchError as exc:
-        return None, Coverage().fail(str(exc))
+        return None, Coverage().fail(str(exc), book_failure(exc))
+
+
+def book_failure(exc: KalshiFetchError) -> Any:
+    """The classified cause of a failed book read (`data.failures`)."""
+    if exc.__cause__ is not None:
+        return describe(exc.__cause__, phase=None)
+    if exc.status is not None:
+        return Failure(category=status_category(exc.status), phase="response",
+                       exception=type(exc).__name__, detail=str(exc),
+                       status=exc.status)
+    return Failure(category="network", phase=None,
+                   exception=type(exc).__name__, detail=str(exc))
 
 
 # --- fee evidence: Kalshi's own dated record of a series' fees ---------------

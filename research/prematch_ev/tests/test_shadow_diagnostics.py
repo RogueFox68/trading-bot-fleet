@@ -814,6 +814,33 @@ class CaptureTest(unittest.TestCase):
         self.assertEqual(sharp_state(at=self.at(29), **kwargs)["status"],
                          "persisted")
 
+    def test_a_reading_cannot_speak_for_a_stretch_not_polled(self):
+        """The monitor declared it did not poll from +40s to +200s (a
+        machine asleep): the +30s reading stands until +40s and for nothing
+        inside the stretch, and the reading that ended it is judged
+        normally. With no stretch declared, the old reading is carried."""
+        readings = [
+            SharpReading(self.at(0), "answered", fair_home=0.24,
+                         fair_away=0.76),
+            SharpReading(self.at(30), "answered", fair_home=0.24,
+                         fair_away=0.76),
+            SharpReading(self.at(200.5), "answered", fair_home=0.24,
+                         fair_away=0.76)]
+        kwargs = dict(readings=readings, detected_at=self.at(0),
+                      yes_is_home=False, fair_before_yes=0.74,
+                      fair_after_yes=0.76, min_move=0.01, session_end=None)
+        stretch = [(self.at(40), self.at(200))]
+        self.assertEqual(sharp_state(at=self.at(35), unpolled=stretch,
+                                     **kwargs)["status"], "persisted")
+        inside = sharp_state(at=self.at(120), unpolled=stretch, **kwargs)
+        self.assertEqual((inside["status"], inside["because"]),
+                         ("unobservable", "not_polled"))
+        self.assertEqual(inside["poll_age_seconds"], 90.0)
+        self.assertEqual(sharp_state(at=self.at(201), unpolled=stretch,
+                                     **kwargs)["status"], "persisted")
+        self.assertEqual(sharp_state(at=self.at(120), **kwargs)["status"],
+                         "persisted")
+
     def test_the_summary_counts_games_beside_rows_and_names_censoring(self):
         policy = CapturePolicy(markouts=(timedelta(seconds=60),
                                          timedelta(seconds=120)))

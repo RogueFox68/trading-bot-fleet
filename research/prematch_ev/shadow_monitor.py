@@ -67,9 +67,22 @@ not a cap. The cap enforced is the quoted price.
 
 STOPS, AND WHY EACH IS ONE
 --------------------------
-  credit cap             the session spent what it was allowed
-  3 failed polls         an outage or a refused key; the rest would buy the
-                         same answer
+  credit cap             the session spent what it was allowed -- or has too
+                         little left for a recovery probe, which is checked
+                         before each one is scheduled
+  refused key            HTTP 401/403 on any poll: the key was refused or the
+                         account is out, and no wait mends that
+                         (`auth_refused`, on the first one)
+  rejected request       any other 4xx: the request itself is wrong -- the
+                         sport key, a parameter, the endpoint
+                         (`request_rejected`)
+  untrusted certificate  this machine does not trust the certificate it was
+                         shown (`tls_certificate_refused`)
+  unexpected shape       a 200 whose JSON is not the documented list
+  unrecovered outage     an outage outlasted its bounds (`outage_unrecovered`,
+                         below)
+  rate limit             the provider asked for a wait longer than an outage
+                         may last (`rate_limited`)
   cost mismatch          see SPENDING
   clock skew             this machine and the provider disagree about the
                          time by more than MAX_CLOCK_SKEW, and every lag this
@@ -89,14 +102,75 @@ STOPS, AND WHY EACH IS ONE
   undeclared request     a request outside ALLOWED_ENDPOINTS, refused before
                          it was sent
 
+OUTAGES: BOUNDED RECOVERY, NOT A STOP
+-------------------------------------
+Three polls failing in a row used to END the session. At a 30s cadence that
+is a minute or two of lost network ending a 24-hour session, and the
+2026-09-25 validation stopped at 10h49m on exactly that. Now three
+consecutive TRANSIENT failures -- a timeout, a dropped connection, DNS, a
+5xx, a 429 (`data.failures` says which is which) -- begin an OUTAGE:
+
+  * paid polling PAUSES. Nothing is bought while the provider is
+    unreachable; the free Kalshi follow reads carry on.
+  * one recovery PROBE -- an ordinary tick: its decision reads, then one
+    paid poll -- is made after a backoff of 60s, then 120s, 240s, 480s and
+    600s from then on: never less than the cadence, and never before a
+    Retry-After the provider sent. Each probe therefore stands in for at
+    least one poll the session's grid skipped, and polling resumes on that
+    same grid afterwards, so an outage can never add a poll the session was
+    not priced for.
+  * the outage is BOUNDED: at most RECOVERY_MAX_PROBES (6) probes, and none
+    later than RECOVERY_MAX_OUTAGE (45 minutes) after its first failure.
+    Past either the session stops, `outage_unrecovered`, with the
+    chronology in its records. It never loops, and the failure threshold is
+    not raised.
+  * BOTH HARD LIMITS HOLD. Every probe is a paid attempt, reserved against
+    the session's one cap before it is sent -- a probe whose answer is lost
+    to a timeout included. The remaining budget and the account's quota
+    floor are checked before a probe is scheduled and again before it is
+    sent. Recovery never moves the session's end and never creates a
+    budget, and nothing starts a second session.
+  * a TERMINAL failure stops at once, in or out of an outage: waiting cannot
+    mend a refused key, a rejected request, an untrusted certificate or an
+    unexpected shape, and every further attempt costs a credit.
+
+AN OUTAGE IS MISSING OBSERVATIONS, NOT A LONGER INTERVAL
+--------------------------------------------------------
+  * every failed poll declares a gap on every stream (`note_gap`), so the
+    first answer after recovery re-establishes each baseline instead of
+    closing a move across the blind interval.
+  * so does a poll the monitor itself did not make. Consecutive polls more
+    than MAX_UNPOLLED_CADENCES (three) cadences apart -- the machine asleep,
+    the process suspended, the loop held up behind reads -- are a gap
+    declared exactly like a failed poll's. The detector's own 35-minute
+    `max_gap` was set for a 5-minute archive grid; left to it, a sleeping
+    laptop's first poll on waking would be compared with the price from
+    before it slept.
+  * after an outage or such a gap, every Kalshi book read before it leaves
+    the decision memory (`books_invalidated`): the next decision is
+    screened on books read since, and if those reads failed there is no
+    decision book -- the screen says so -- rather than a stale one.
+  * the slate is rejoined on the first answer after an outage or a gap.
+  * each blind interval is recorded as a `gap` -- its cause, its bounds, the
+    polls and probes inside it -- and summarised at the end.
+
 RECORDS
 -------
 One append-only JSONL file per session under `study_output/shadow/`: every
-raw response with the clocks around it, every move, every decision, every gap,
-the detector's refusals for each poll by reason, and the reason the session
-ended. `--report` reads it, and prints "0 moves" beside those refusals, so a
-detector that could not see is never mistaken for a quiet market. The API key
-is in no record: a recorded URL is its path, never its query.
+raw response with the clocks around it, every move, every decision, every
+gap, every failure described (`failure`: category, phase, elapsed, the
+attempt and the last answer before it), the detector's refusals for each
+poll by reason, and the reason the session ended. `--report` reads it, and
+prints "0 moves" beside those refusals, so a detector that could not see is
+never mistaken for a quiet market, and lists every failed poll in order, so
+an outage's chronology is read from the file rather than remembered. The API
+key is in no record: a recorded URL is its path, never its query.
+
+Beside it, `<session>.status.json`: whether the session was COMPLETE,
+RECOVERED WITH GAPS, ENDED IN AN OUTAGE or STOPPED EARLY, why, how long it
+actually ran, what it attempted and reserved, its gaps, and where its
+records are. Written however the session ends -- an unrecovered outage, an
+interrupt, a crash -- and local only: nothing is sent anywhere.
 
 `--report` then rebuilds every assessment from those raw records, offline
 and unable to open a connection (`shadow_diagnostics`), so a session recorded
@@ -134,6 +208,7 @@ from collect_reaction import (                                     # noqa: E402
 )
 from data import espn_schedule, kalshi_history                     # noqa: E402
 from data.cache import CreditCapReached, redact                    # noqa: E402
+from data.failures import scrub, status_category                   # noqa: E402
 from data.kalshi_history import BookQuote, Coverage, parse_orderbook  # noqa: E402
 from data.odds_history import (                                    # noqa: E402
     SHARP_BOOK, CreditLedger, parse_snapshot,
@@ -185,7 +260,28 @@ SLATE_DAYS = 7
 #: How often the slate and the join are rebuilt (free requests): new listings
 #: appear during the week, and a flexed kickoff moves.
 REJOIN_EVERY = timedelta(hours=1)
-STOP_AFTER_FAILED_POLLS = 3
+#: Consecutive transient failures that begin an outage. Not raised to ride
+#: out a longer one: an outage is handled by pausing and probing, below.
+OUTAGE_AFTER_FAILED_POLLS = 3
+#: The recovery backoff: the first probe this long after an outage begins,
+#: doubling after each failed probe up to RECOVERY_MAX_BACKOFF -- 60, 120,
+#: 240, 480, 600, 600s. Never less than the cadence (`recovery_backoff`).
+RECOVERY_FIRST_BACKOFF = timedelta(seconds=60)
+RECOVERY_MAX_BACKOFF = timedelta(minutes=10)
+#: Probes per outage. Six fit the backoff inside RECOVERY_MAX_OUTAGE with
+#: room for slow attempts, so this bounds the credits one outage can spend
+#: and the duration bounds its wall time -- a probe that is slow, or a
+#: machine that slept, reaches that one first.
+RECOVERY_MAX_PROBES = 6
+#: The longest an outage may last, from its first failed poll to the last
+#: probe it may make. Past it the session stops, recorded, however many
+#: probes remain.
+RECOVERY_MAX_OUTAGE = timedelta(minutes=45)
+#: Consecutive polls further apart than this many cadences leave a GAP the
+#: detector is told about, as a failed poll's is: at least two planned polls
+#: were never made. The line MAX_UNOBSERVED draws for followed contracts --
+#: one lost read inside it, two in a row not -- drawn for the sharp feed.
+MAX_UNPOLLED_CADENCES = 3
 MAX_CLOCK_SKEW = timedelta(seconds=5)
 QUOTA_FLOOR = 50
 #: How far back polled books are kept in memory for decisions. The records
@@ -298,6 +394,93 @@ class Stop:
     ok: bool = False
 
 
+#: The stop each TERMINAL failure category ends the session with.
+TERMINAL_STOPS = {
+    "auth": "auth_refused",
+    "request_rejected": "request_rejected",
+    "tls_certificate": "tls_certificate_refused",
+    "unexpected_shape": "unexpected_shape",
+}
+
+
+def recovery_backoff(probes_made: int, cadence: timedelta) -> timedelta:
+    """How long an outage waits before its next probe: RECOVERY_FIRST_BACKOFF,
+    doubling per failed probe up to RECOVERY_MAX_BACKOFF -- and never less
+    than the cadence, so recovery never polls faster than the session was
+    priced at."""
+    wait = RECOVERY_FIRST_BACKOFF * (2 ** min(probes_made, 16))
+    return max(cadence, min(wait, RECOVERY_MAX_BACKOFF))
+
+
+def recovery_policy() -> dict:
+    """The recovery bounds, as every session records them."""
+    return {"outage_after_failed_polls": OUTAGE_AFTER_FAILED_POLLS,
+            "first_backoff_seconds": RECOVERY_FIRST_BACKOFF.total_seconds(),
+            "max_backoff_seconds": RECOVERY_MAX_BACKOFF.total_seconds(),
+            "max_probes": RECOVERY_MAX_PROBES,
+            "max_outage_seconds": RECOVERY_MAX_OUTAGE.total_seconds(),
+            "max_unpolled_cadences": MAX_UNPOLLED_CADENCES,
+            "terminal": sorted(TERMINAL_STOPS)}
+
+
+@dataclass
+class FailureRun:
+    """Consecutive failed polls, from the first to the answer that ends them.
+
+    Every run is a gap. One that reaches OUTAGE_AFTER_FAILED_POLLS becomes an
+    OUTAGE: paid polling pauses and recovery probes take over.
+    """
+
+    started: datetime                   # the first failed poll's request
+    last_answer: datetime | None        # the answered poll before it, if any
+    failed_polls: int = 0
+    categories: Counter = field(default_factory=Counter)
+    last_failure: dict | None = None
+    outage_at: datetime | None = None   # when it became an outage
+    probes: int = 0
+    next_probe_at: datetime | None = None
+
+    @property
+    def is_outage(self) -> bool:
+        return self.outage_at is not None
+
+
+def blind_seconds(gaps: Iterable[dict]) -> float:
+    """The time the gaps cover, overlaps counted once. A failed poll after a
+    suspension is recorded under both causes; it was blind once."""
+    spans = sorted((start, end) for start, end in (
+        (_time(g.get("from")) if isinstance(g.get("from"), str)
+         else g.get("from"),
+         _time(g.get("to")) if isinstance(g.get("to"), str) else g.get("to"))
+        for g in gaps) if start is not None and end is not None
+        and end > start)
+    total, reach = 0.0, None
+    for start, end in spans:
+        if reach is None or start > reach:
+            total += (end - start).total_seconds()
+            reach = end
+        elif end > reach:
+            total += (end - reach).total_seconds()
+            reach = end
+    return total
+
+
+def session_status(*, reason: str, in_outage: bool, gaps: int) -> str:
+    """The session's verdict on itself, in one word.
+
+    `complete`: it ran to its authorized end and every interval was
+    observed. `recovered_with_gaps`: it ran to its end, with the blind
+    intervals its gaps list. `ended_in_outage`: its end arrived while an
+    outage was unrecovered, so it ran the whole window without seeing the
+    last of it. `stopped_early`: any stop before the authorized end.
+    """
+    if reason != "end_of_session":
+        return "stopped_early"
+    if in_outage:
+        return "ended_in_outage"
+    return "recovered_with_gaps" if gaps else "complete"
+
+
 def read_one_book(ticker: str, now: Callable[[], datetime]
                   ) -> tuple[BookQuote | None, Coverage, Any]:
     """Read one real order book and parse it: whether the book's TRANSCRIBED
@@ -312,6 +495,21 @@ def read_one_book(ticker: str, now: Callable[[], datetime]
                                        received_at=now(), sent_at=sent)
         coverage.merge(parsed)
     return book, coverage, payload
+
+
+def _book_failure(coverage: Coverage, sent: datetime,
+                  received: datetime) -> dict:
+    """A failed book read described, for its record: the classified cause
+    when the fetcher established one, and the read's own elapsed time."""
+    failure = coverage.failure
+    if hasattr(failure, "as_dict"):
+        row = failure.as_dict()
+    else:
+        # An answer that arrived and did not parse: the transcribed shape.
+        row = {"category": "unexpected_shape", "phase": "shape",
+               "detail": "; ".join(coverage.reasons)}
+    row["elapsed_seconds"] = (received - sent).total_seconds()
+    return row
 
 
 def live_slate(today: date, *, league: str, series: str,
@@ -377,7 +575,8 @@ class ShadowMonitor:
                  slate_source: Callable[[], Slate] | None = None,
                  follow_every: timedelta = FOLLOW_EVERY,
                  follow_for: timedelta = FOLLOW_FOR,
-                 book_horizon: timedelta = BOOK_HORIZON):
+                 book_horizon: timedelta = BOOK_HORIZON,
+                 status_path: Path | None = None):
         self.sport = sport.upper()
         self.series = series
         self.api_key = api_key
@@ -398,7 +597,22 @@ class ShadowMonitor:
         self.entered: set[str] = set()
         self.seen: set[str] = set()
         self.started: set[str] = set()
-        self.failed_polls = 0
+        #: The run of consecutive failed polls under way, if one is: a gap,
+        #: and an outage once it reaches OUTAGE_AFTER_FAILED_POLLS.
+        self.failures: FailureRun | None = None
+        #: Every blind interval closed so far, as recorded.
+        self.gaps: list[dict] = []
+        self.last_poll_ready: datetime | None = None
+        self.last_answer: datetime | None = None
+        #: The provider's Retry-After, as an instant: no paid poll before it.
+        self.not_before: datetime | None = None
+        self.max_poll_spacing = MAX_UNPOLLED_CADENCES * cadence
+        #: True while the tick under way is a recovery probe.
+        self.probing = False
+        self.ends: datetime | None = None
+        self.status_path = status_path or recorder.path.with_suffix(
+            ".status.json")
+        self.status: dict | None = None
         self.cost_verified = False
         self.dates_verified = False
         self.next_rejoin: datetime | None = None
@@ -411,7 +625,8 @@ class ShadowMonitor:
         self.counts = {"polls": 0, "polls_failed": 0, "triggers": 0,
                        "decisions": 0, "entries": 0, "book_reads": 0,
                        "book_failures": 0, "in_play_skipped": 0,
-                       "assessment_errors": 0}
+                       "assessment_errors": 0, "outages": 0,
+                       "recovery_probes": 0, "gaps": 0}
 
     # --- the Kalshi side (free) -------------------------------------------
 
@@ -427,13 +642,16 @@ class ShadowMonitor:
                                            received_at=received, sent_at=sent)
             coverage.merge(parsed)
         self.counts["book_reads"] += 1
+        failure = None
         if not coverage.complete:
             self.counts["book_failures"] += 1
+            failure = _book_failure(coverage, sent, received)
         self.last_read_status = read_status(payload is not None, book)
         self.recorder.write(
             "book", ticker=watched.ticker, purpose=purpose, sent_at=sent,
             received_at=received, payload=payload,
-            coverage=coverage.reasons, **(context or {}))
+            coverage=coverage.reasons, **(context or {}),
+            **({"failure": failure} if failure else {}))
         if book is not None:
             history = self.books.setdefault(watched.ticker, [])
             history.append(book)
@@ -567,6 +785,11 @@ class ShadowMonitor:
         # opportunity as though a bot could have traded during it.
         ready_at = self.clock.now()
         self.counts["polls"] += 1
+        # CONTINUITY BEFORE CONTENT: a hole the monitor left by not polling
+        # is declared before this answer's quotes reach the detector, and
+        # written before this poll's record, so every reader meets it first.
+        self._check_continuity(live, ready_at)
+        failure = self._describe_failure(live, parsed)
         self.recorder.write(
             "odds", url=recorded_url(live_odds_url(self.sport, "")),
             sent_at=live.sent_at, headers_at=live.headers_at,
@@ -576,8 +799,9 @@ class ShadowMonitor:
                 if live.received_at else None),
             provider_date=live.provider_date, status=live.status,
             charged=live.charged, used=live.used, remaining=live.remaining,
-            payload=live.payload, coverage=live.coverage.reasons)
-        stop = self.absorb(live, parsed, ready_at, now)
+            payload=live.payload, coverage=live.coverage.reasons,
+            **({"failure": failure} if failure else {}))
+        stop = self.absorb(live, parsed, ready_at, now, failure)
         # WHY NOTHING TRIGGERED, for THIS answer: recorded once its quotes
         # have been through the detector, so every count sits beside the
         # poll it belongs to -- and a detector that refuses everything shows
@@ -586,25 +810,229 @@ class ShadowMonitor:
                             rejections=self._drain_rejections())
         return stop
 
-    def absorb(self, live: LiveOdds, parsed: Any, ready_at: datetime,
-               now: datetime) -> Stop | None:
-        """One answer through the stops, the join and the detector."""
-        if parsed is None or not parsed.coverage.complete:
-            self.counts["polls_failed"] += 1
-            self.failed_polls += 1
-            # THE INTERVAL WAS NOT OBSERVED. Every stream re-anchors on its
-            # next good quote rather than closing a move across the hole.
-            for stream in sorted(self.seen):
-                self.detector.note_gap(stream, live.received_at,
-                                       "the live poll did not answer")
-            if self.failed_polls >= STOP_AFTER_FAILED_POLLS:
-                reasons = live.coverage.reasons or (
-                    parsed.coverage.reasons if parsed else [])
-                return Stop("failed_polls",
-                            f"{self.failed_polls} polls in a row failed: "
-                            f"{'; '.join(reasons) or 'no response'}")
+    def _describe_failure(self, live: LiveOdds, parsed: Any) -> dict | None:
+        """A failed poll, described for its record -- None when it answered.
+
+        The fetcher's classification (`data.failures`), with the monitor's
+        own facts beside it: which attempt of the run of consecutive failures
+        this was, which recovery probe if it was one, and when the feed last
+        answered. Scrubbed at the source; nothing here carries the key.
+        """
+        if parsed is not None and parsed.coverage.complete:
             return None
-        self.failed_polls = 0
+        failure = live.failure
+        if failure is not None:
+            row = failure.as_dict()
+        elif live.ok:
+            # The body arrived as a list and the snapshot parser still
+            # refused it: the shape is not the one transcribed.
+            row = {"category": "unexpected_shape", "terminal": True,
+                   "phase": "parse", "exception": None, "status": live.status,
+                   "errno": None, "elapsed_seconds": None,
+                   "retry_after_seconds": None,
+                   "detail": "; ".join(parsed.coverage.reasons
+                                       if parsed else [])}
+        else:
+            row = {"category": "network", "terminal": False, "phase": None,
+                   "exception": None, "status": live.status, "errno": None,
+                   "elapsed_seconds": None, "retry_after_seconds": None,
+                   "detail": "; ".join(live.coverage.reasons)
+                   or "no response"}
+        run = self.failures
+        row["attempt"] = (run.failed_polls if run else 0) + 1
+        row["probe"] = run.probes if run is not None and self.probing else None
+        row["last_answer_at"] = self.last_answer
+        return row
+
+    def _check_continuity(self, live: LiveOdds, ready_at: datetime) -> None:
+        """Declare the hole if the sharp book went unpolled too long.
+
+        Measured from the last poll's readiness to this one's receipt, so a
+        machine that slept between polls and one that slept inside a poll
+        are caught alike. A recovery probe is exempt: its outage is already
+        the gap, declared by the failed polls that began it.
+        """
+        previous = self.last_poll_ready
+        self.last_poll_ready = ready_at
+        if previous is None or self.probing:
+            return
+        received = live.received_at or ready_at
+        if received - previous > self.max_poll_spacing:
+            self._unpolled(previous, ready_at)
+
+    def _unpolled(self, since: datetime, until: datetime) -> None:
+        span = (until - since).total_seconds()
+        why = (f"the sharp book was not polled for {span:,.0f}s, beyond "
+               f"{MAX_UNPOLLED_CADENCES} cadences "
+               f"({self.max_poll_spacing.total_seconds():g}s)")
+        for stream in sorted(self.seen):
+            self.detector.note_gap(stream, until, why)
+        self._record_gap({
+            "cause": "not_polled", "from": since, "to": until,
+            # The next poll was due one cadence after the last; from then
+            # on the last one no longer stood for the book.
+            "unobserved_from": since + self.cadence,
+            "seconds": span,
+            "limit_seconds": self.max_poll_spacing.total_seconds(),
+            "failed_polls": 0, "probes": 0, "recovered": True})
+        self._invalidate_books(until, why)
+        self.next_rejoin = None
+
+    def _record_gap(self, gap: dict) -> None:
+        self.gaps.append(gap)
+        self.counts["gaps"] += 1
+        self.recorder.write("gap", **gap)
+
+    def _invalidate_books(self, at: datetime, why: str) -> None:
+        """Nothing read before `at` may be a decision book after it.
+
+        The screen takes the newest book at or before a move; after a blind
+        interval that could be one read before it, however old. Dropping the
+        memory makes the next decision's book one read since -- or none,
+        which the screen reports -- never a stale one. Always recorded, even
+        when there was nothing to drop, because the offline rebuild clears
+        its own memory on this record (`shadow_diagnostics.replay`).
+        """
+        dropped = sum(len(history) for history in self.books.values())
+        self.books.clear()
+        self.recorder.write("books_invalidated", at=at, reason=why,
+                            dropped=dropped)
+
+    def _failed_poll(self, live: LiveOdds, failure: dict,
+                     ready_at: datetime) -> Stop | None:
+        """A poll that did not answer: a gap, and perhaps a stop or an outage."""
+        self.counts["polls_failed"] += 1
+        run = self.failures
+        if run is None:
+            run = self.failures = FailureRun(started=live.sent_at,
+                                             last_answer=self.last_answer)
+        run.failed_polls += 1
+        run.categories[failure["category"]] += 1
+        run.last_failure = failure
+        # THE INTERVAL WAS NOT OBSERVED. Every stream re-anchors on its next
+        # good quote rather than closing a move across the hole.
+        for stream in sorted(self.seen):
+            self.detector.note_gap(stream, live.received_at,
+                                   "the live poll did not answer")
+        if failure["terminal"]:
+            return Stop(TERMINAL_STOPS.get(failure["category"],
+                                           failure["category"]),
+                        f"{failure['detail']} ({failure['category']}, "
+                        f"phase {failure['phase']}): waiting cannot mend "
+                        f"this, and every further poll would cost a credit")
+        retry = failure.get("retry_after_seconds")
+        if retry is not None:
+            # RATE-LIMIT GUIDANCE IS OBEYED, not raced: no paid poll before
+            # the instant the provider named -- and a wait beyond what an
+            # outage may last is a stop, not a very long sleep.
+            if retry > RECOVERY_MAX_OUTAGE.total_seconds():
+                return Stop("rate_limited",
+                            f"the provider asked for {retry:,.0f}s before the "
+                            f"next request, beyond the "
+                            f"{RECOVERY_MAX_OUTAGE.total_seconds() / 60:g}-"
+                            f"minute outage bound")
+            wait_until = (live.received_at or ready_at) + timedelta(
+                seconds=retry)
+            self.not_before = max(wait_until, self.not_before or wait_until)
+        if run.is_outage:
+            return self._schedule_probe(ready_at)
+        if run.failed_polls >= OUTAGE_AFTER_FAILED_POLLS:
+            run.outage_at = ready_at
+            self.counts["outages"] += 1
+            # The first answer after it rejoins the slate: an outage can
+            # outlast the join the monitor was working from.
+            self.next_rejoin = None
+            self.recorder.write(
+                "outage_start", at=ready_at, first_failure_at=run.started,
+                last_answer_at=run.last_answer,
+                failed_polls=run.failed_polls,
+                categories=dict(run.categories), policy=recovery_policy(),
+                credits_reserved=self.ledger.spent_this_run)
+            return self._schedule_probe(ready_at)
+        return None
+
+    def _schedule_probe(self, at: datetime) -> Stop | None:
+        """The outage's next probe -- or the stop its bounds call for."""
+        run = self.failures
+        if run.probes >= RECOVERY_MAX_PROBES:
+            return self._unrecovered(f"all {RECOVERY_MAX_PROBES} recovery "
+                                     f"probes failed")
+        wait = recovery_backoff(run.probes, self.cadence)
+        due = at + wait
+        if self.not_before is not None and self.not_before > due:
+            due = self.not_before
+        if due - run.started > RECOVERY_MAX_OUTAGE:
+            return self._unrecovered(
+                f"a further probe would fall "
+                f"{(due - run.started).total_seconds() / 60:.1f} minutes "
+                f"after the first failure, beyond the "
+                f"{RECOVERY_MAX_OUTAGE.total_seconds() / 60:g}-minute bound")
+        stop = self._probe_affordable()
+        if stop is not None:
+            return stop
+        run.next_probe_at = due
+        self.recorder.write("recovery_scheduled", probe=run.probes + 1,
+                            at=at, due=due, backoff_seconds=wait,
+                            retry_after_until=(
+                                self.not_before if self.not_before is not None
+                                and self.not_before > at else None))
+        return None
+
+    def _probe_affordable(self) -> Stop | None:
+        """A probe is a paid attempt: the budget and the account are checked
+        before one is scheduled, and again before it is sent."""
+        ledger = self.ledger
+        if (ledger.cap is not None
+                and ledger.spent_this_run + CREDITS_PER_LIVE_CALL > ledger.cap):
+            return Stop("credit_cap",
+                        f"no credit left for a recovery probe: "
+                        f"{ledger.spent_this_run} reserved of a {ledger.cap} "
+                        f"cap, and a probe reserves "
+                        f"{CREDITS_PER_LIVE_CALL}")
+        if ledger.remaining is not None and ledger.remaining <= QUOTA_FLOOR:
+            return Stop("quota_floor",
+                        f"the account reported {ledger.remaining} credits "
+                        f"left, at or below the floor of {QUOTA_FLOOR}; no "
+                        f"probe is made")
+        return None
+
+    def _unrecovered(self, why: str) -> Stop:
+        run = self.failures
+        last = run.last_failure or {}
+        return Stop("outage_unrecovered",
+                    f"{why}: {run.failed_polls} failed poll(s), "
+                    f"{run.probes} of them probes, since "
+                    f"{_iso(run.started)}; last failure "
+                    f"{last.get('category')} ({last.get('phase')}): "
+                    f"{last.get('detail')}")
+
+    def _close_failures(self, until: datetime, *, recovered: bool) -> None:
+        """The run of failed polls is over: its blind interval, recorded."""
+        run, self.failures = self.failures, None
+        self._record_gap({
+            "cause": "outage" if run.is_outage else "failed_polls",
+            "from": run.last_answer or run.started, "to": until,
+            "first_failure_at": run.started, "outage_at": run.outage_at,
+            "seconds": (until - (run.last_answer or run.started))
+            .total_seconds(),
+            "failed_polls": run.failed_polls, "probes": run.probes,
+            "categories": dict(run.categories), "recovered": recovered,
+            "last_failure": run.last_failure})
+
+    def absorb(self, live: LiveOdds, parsed: Any, ready_at: datetime,
+               now: datetime, failure: dict | None = None) -> Stop | None:
+        """One answer through the stops, the join and the detector."""
+        if failure is None and (parsed is None
+                                or not parsed.coverage.complete):
+            failure = self._describe_failure(live, parsed)
+        if failure is not None:
+            return self._failed_poll(live, failure, ready_at)
+        if self.failures is not None:
+            # THE FAILURES ARE OVER. The blind interval ends here, and every
+            # stream was gapped by them, so this answer re-anchors rather
+            # than moves.
+            self._close_failures(ready_at, recovered=True)
+        self.last_answer = ready_at
         stop = self.check_answer(live) or self.check_dates(parsed.quotes,
                                                            live.received_at)
         if stop:
@@ -790,7 +1218,7 @@ class ShadowMonitor:
 
     def run(self) -> Stop:
         started = self.clock.now()
-        end = started + timedelta(hours=self.hours)
+        end = self.ends = started + timedelta(hours=self.hours)
         self.recorder.write(
             "session_start", at=started, ends=end, sport=self.sport,
             series=self.series, cadence_seconds=self.cadence.total_seconds(),
@@ -805,7 +1233,11 @@ class ShadowMonitor:
             credits_per_call=CREDITS_PER_LIVE_CALL,
             move_policy=self.detector.policy.as_dict(),
             reaction_policy=REACTION_POLICY.as_dict(),
-            eligibility=vars(Eligibility()))
+            eligibility=vars(Eligibility()),
+            recovery=recovery_policy(),
+            max_poll_spacing_seconds=self.max_poll_spacing.total_seconds(),
+            status_file=self.status_path.name)
+        crash: Exception | None = None
         try:
             with only_declared_endpoints():
                 stop = self.preflight()
@@ -820,13 +1252,32 @@ class ShadowMonitor:
             stop = Stop("undeclared_request", str(exc))
         except KeyboardInterrupt:
             stop = Stop("interrupted", "stopped by the operator")
-        self.recorder.write("session_end", at=self.clock.now(),
+        except Exception as exc:                    # noqa: BLE001 -- re-raised
+            # A CRASH STILL ENDS WITH A STATUS. The records and the status
+            # file say it crashed, and how far it got; then the exception
+            # goes on, unchanged, to whoever ran it.
+            crash = exc
+            stop = Stop("crashed", scrub(f"{type(exc).__name__}: {exc}",
+                                         (self.api_key,)))
+        ended = self.clock.now()
+        in_outage = self.failures is not None and self.failures.is_outage
+        if self.failures is not None:
+            # A run of failures still open at the end: its blind interval
+            # ran to the end, unrecovered.
+            self._close_failures(ended, recovered=False)
+        self.status = self._final_status(stop, started, end, ended, in_outage)
+        self.recorder.write("session_end", at=ended,
                             reason=stop.reason, detail=stop.detail,
                             ok=stop.ok, counts=self.counts,
                             detector=self._drain_rejections(),
                             ledger=str(self.ledger),
                             credits_reserved=self.ledger.spent_this_run,
-                            account_remaining=self.ledger.remaining)
+                            account_remaining=self.ledger.remaining,
+                            status=self.status["status"],
+                            gaps=self.status["gaps"])
+        self._write_status(self.status)
+        if crash is not None:
+            raise crash
         return stop
 
     def _loop(self, end: datetime) -> Stop:
@@ -834,17 +1285,142 @@ class ShadowMonitor:
         while True:
             now = self.clock.now()
             if now >= end:
-                return Stop("end_of_session", ok=True)
-            if now >= next_tick:
+                return self._end_of_session()
+            run = self.failures
+            if run is not None and run.is_outage:
+                # PAID POLLING IS PAUSED. The one paid request an outage
+                # makes is its probe, when the backoff says it is due.
+                if now >= run.next_probe_at:
+                    stop = self._probe()
+                    if stop is not None:
+                        return stop
+                    while next_tick <= self.clock.now():
+                        next_tick += self.cadence
+            elif now >= self._due(next_tick):
                 stop = self.tick()
                 if stop is not None:
                     return stop
                 while next_tick <= self.clock.now():
                     next_tick += self.cadence
             self.follow_due()
-            wake = min([next_tick, end]
+            run = self.failures
+            due = (run.next_probe_at if run is not None and run.is_outage
+                   else self._due(next_tick))
+            wake = min([due, end]
                        + [f.next_at for f in self.follows.values()])
             self.clock.sleep((wake - self.clock.now()).total_seconds())
+
+    def _due(self, next_tick: datetime) -> datetime:
+        """The next poll's time: its tick, or the provider's Retry-After."""
+        if self.not_before is not None and self.not_before > next_tick:
+            return self.not_before
+        return next_tick
+
+    def _probe(self) -> Stop | None:
+        """One recovery probe: an ordinary tick, once the checks that make
+        it affordable have passed. Its decision reads are the fresh books
+        the next decision needs, so the memory is dropped before them."""
+        stop = self._probe_affordable()
+        if stop is not None:
+            return stop
+        run = self.failures
+        run.probes += 1
+        self.counts["recovery_probes"] += 1
+        now = self.clock.now()
+        self.recorder.write("recovery_probe", probe=run.probes, at=now,
+                            first_failure_at=run.started,
+                            credits_reserved=self.ledger.spent_this_run)
+        self._invalidate_books(now, f"recovery probe {run.probes}: every "
+                                    f"book read before it predates the "
+                                    f"outage's end")
+        self.probing = True
+        try:
+            return self.tick()
+        finally:
+            self.probing = False
+
+    def _end_of_session(self) -> Stop:
+        """The authorized end. Never extended -- including by an outage."""
+        run = self.failures
+        if run is not None and run.is_outage:
+            return Stop("end_of_session",
+                        f"the authorized end arrived during an unrecovered "
+                        f"outage ({run.failed_polls} failed poll(s), "
+                        f"{run.probes} probe(s), since {_iso(run.started)}): "
+                        f"the session ran its window without observing the "
+                        f"end of it")
+        return Stop("end_of_session", ok=True)
+
+    def _final_status(self, stop: Stop, started: datetime, ends: datetime,
+                      ended: datetime, in_outage: bool) -> dict:
+        """The session's own summary of itself, for `<session>.status.json`."""
+        polls, failed = self.counts["polls"], self.counts["polls_failed"]
+        authorized = (ends - started).total_seconds()
+        ran = (ended - started).total_seconds()
+        outages = [g for g in self.gaps if g["cause"] == "outage"]
+        return {
+            "schema": STATUS_SCHEMA,
+            "status": session_status(reason=stop.reason, in_outage=in_outage,
+                                     gaps=len(self.gaps)),
+            "reason": stop.reason, "detail": stop.detail, "ok": stop.ok,
+            "authorized": {"start": _iso(started), "end": _iso(ends),
+                           "hours": self.hours},
+            "actual": {"start": _iso(started), "end": _iso(ended),
+                       "duration_seconds": ran,
+                       "share_of_authorized": (ran / authorized
+                                               if authorized else None)},
+            "polls": {"attempted": polls, "answered": polls - failed,
+                      "failed": failed,
+                      "recovery_probes": self.counts["recovery_probes"]},
+            "credits": {"cap": self.ledger.cap,
+                        "reserved": self.ledger.spent_this_run,
+                        "account_remaining": self.ledger.remaining},
+            "gaps": {"count": len(self.gaps),
+                     "blind_seconds": blind_seconds(self.gaps),
+                     "longest_seconds": max((g["seconds"] for g in self.gaps),
+                                            default=0.0),
+                     "by_cause": dict(Counter(g["cause"] for g in self.gaps)),
+                     "outages": len(outages),
+                     "outages_recovered": sum(1 for g in outages
+                                              if g["recovered"])},
+            "observed": {"moves": self.counts["triggers"],
+                         "decisions": self.counts["decisions"],
+                         "entries": self.counts["entries"]},
+            "paths": {"records": _shown(self.recorder.path),
+                      "status": _shown(self.status_path)},
+            "next": (f"python3 shadow_monitor.py --report "
+                     f"{_shown(self.recorder.path)}"),
+            "code": code_version(),
+            "note": "local only: written for whoever ran the session; nothing "
+                    "was sent anywhere",
+        }
+
+    def _write_status(self, status: dict) -> None:
+        """Written whole or not at all: a reader never meets half a file."""
+        tmp = self.status_path.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(status, default=_jsonable, indent=1,
+                                      sort_keys=True) + "\n",
+                           encoding="utf-8")
+            tmp.replace(self.status_path)
+        except OSError as exc:
+            # The JSONL's session_end already carries the verdict; say the
+            # file is missing rather than let its absence pass unnoticed.
+            self.recorder.write("status_unwritten",
+                                error=scrub(f"{type(exc).__name__}: {exc}"))
+
+
+STATUS_SCHEMA = "shadow-status/1"
+
+
+def _shown(path: Path) -> str:
+    """A path as a status file may show it: relative to this study when it
+    is inside it, so the owner's home directory is not written into a file
+    that may be shared; as given otherwise."""
+    try:
+        return str(path.resolve().relative_to(HERE))
+    except ValueError:
+        return str(path)
 
 
 # --- the report ------------------------------------------------------------------
@@ -920,13 +1496,23 @@ def report(rows: Sequence[dict], *, min_response: float | None = None,
                       "record: the process did not finish writing",
                       "detail": end.get("detail") if end else None,
                       "credits_reserved": end.get("credits_reserved")
-                      if end else None}
+                      if end else None,
+                      **_recorded_status(rows, end)}
 
     odds = [r for r in rows if r["kind"] == "odds"]
     skews, ages, refresh, processing = [], [], [], []
     sightings: Counter = Counter()
     last_seen: dict[tuple[str, str], datetime] = {}
-    for row in odds:
+    for row in rows:
+        if row["kind"] == "gap" and row.get("cause") == "not_polled":
+            # A STRETCH THE MONITOR DID NOT POLL IS A HOLE, as a failed poll
+            # is: it is recorded before the poll that ended it, so that
+            # poll's sightings are first sightings again.
+            last_seen.clear()
+            sightings["unpolled_gaps"] += 1
+            continue
+        if row["kind"] != "odds":
+            continue
         received, provider = _time(row.get("received_at")), _time(
             row.get("provider_date"))
         headers = _time(row.get("headers_at")) or received
@@ -980,8 +1566,10 @@ def report(rows: Sequence[dict], *, min_response: float | None = None,
     out["age_when_received"] = _quantiles(ages)
     out["provider_refresh"] = _quantiles(refresh)
     out["sightings"] = {k: sightings.get(k, 0) for k in (
-        "first", "new", "repeat", "older_copy", "unanswered_polls")}
+        "first", "new", "repeat", "older_copy", "unanswered_polls",
+        "unpolled_gaps")}
     out["cadence_seconds"] = start.get("cadence_seconds")
+    out["failures"] = failure_chronology(rows)
 
     # Every refusal the detector made, summed from the per-poll records and
     # the remainder the session_end carries. "0 moves" means nothing until
@@ -1020,6 +1608,143 @@ def report(rows: Sequence[dict], *, min_response: float | None = None,
         for d in decisions if d.get("market_ticker")
         and d.get("book_move_for_yes") is not None]
     return out
+
+
+def _recorded_status(rows: Sequence[dict], end: dict | None) -> dict:
+    """The session's status as it recorded it -- or, for a session recorded
+    before it did, derived by the same function from what it did record: an
+    unanswered poll is a gap, and an outage is not something it could have
+    been in, since it stopped on its third failure."""
+    if end is not None and end.get("status"):
+        return {"status": end["status"], "status_source": "recorded",
+                "gaps": end.get("gaps")}
+    if end is None:
+        return {"status": None, "status_source": "no session_end record",
+                "gaps": None}
+    unanswered = sum(1 for r in rows if r["kind"] == "odds"
+                     and (r.get("payload") is None or r.get("coverage")))
+    return {"status": session_status(reason=end.get("reason") or "",
+                                     in_outage=False, gaps=unanswered),
+            "status_source": "derived: the session predates status records",
+            "gaps": None}
+
+
+#: Reading an older record's reason sentence, for a session recorded before
+#: failures were classified. Each is labelled INFERRED where it is used.
+_LEGACY_PATTERNS = (
+    ("timed out", "timeout"), ("Name or service not known", "dns"),
+    ("nodename nor servname", "dns"), ("Temporary failure in name", "dns"),
+    ("Connection refused", "connection"), ("Connection reset", "connection"),
+    ("Network is unreachable", "connection"),
+    ("No route to host", "connection"), ("IncompleteRead", "incomplete_body"),
+    ("CERTIFICATE_VERIFY_FAILED", "tls_certificate"),
+)
+
+
+def _legacy_failure(reason: str) -> dict:
+    """What an unclassified failure's recorded message shows, labelled as an
+    inference. `<urlopen error ...>` is the one phase the text proves:
+    CPython wraps an OSError in URLError only while connecting and sending,
+    before any response began."""
+    out: dict[str, Any] = {"inferred_from": "the recorded message"}
+    status = next((int(tok[:3]) for tok in reason.split("HTTP Error ")[1:]
+                   if tok[:3].isdigit()), None)
+    if status is not None:
+        out.update(category=status_category(status), status=status,
+                   phase="response")
+        return out
+    out["category"] = next((cat for text, cat in _LEGACY_PATTERNS
+                            if text in reason), None)
+    if "<urlopen error" in reason:
+        out["phase"] = "request"
+    if "[Errno " in reason:
+        number = reason.split("[Errno ", 1)[1].split("]", 1)[0]
+        out["errno"] = int(number) if number.isdigit() else None
+    return out
+
+
+def failure_chronology(rows: Sequence[dict]) -> dict:
+    """Every failed poll, in order: the outage's chronology, from the file.
+
+    Consecutive failures are grouped into RUNS. Each run gives the last
+    answer before it, every attempt -- when it was sent, how long it ran,
+    what it failed with, whether it was a recovery probe -- the Kalshi reads
+    made while it lasted and how many of those failed, and how it ended.
+    Built from the clocks and reasons every session has recorded, so a
+    session from before failures were classified is described too; what is
+    read from its message rather than recorded as a field says so. The
+    failed Kalshi reads beside a run are evidence about the path, never a
+    cause: nothing here names one.
+    """
+    books = [r for r in rows if r["kind"] == "book"]
+    runs: list[dict] = []
+    current: dict | None = None
+    last_answer: datetime | None = None
+    ended = None
+    for row in rows:
+        kind = row["kind"]
+        if kind == "session_end":
+            ended = _time(row.get("at"))
+        if current is not None and kind == "outage_start":
+            current["outage"] = True
+        if kind != "odds":
+            continue
+        sent, received = _time(row.get("sent_at")), _time(row.get("received_at"))
+        ready = _time(row.get("ready_at")) or received
+        if row.get("payload") is not None and not row.get("coverage"):
+            if current is not None:
+                current.update(ended="answered", answered_at=_iso(ready))
+                runs.append(current)
+                current = None
+            last_answer = ready
+            continue
+        reason = "; ".join(row.get("coverage") or []) or "no response"
+        failure = row.get("failure") or _legacy_failure(reason)
+        elapsed = failure.get("elapsed_seconds")
+        if elapsed is None and sent is not None and received is not None:
+            elapsed = (received - sent).total_seconds()
+        if current is None:
+            current = {"first_failure_at": row.get("sent_at"),
+                       "last_answer_at": _iso(last_answer), "attempts": [],
+                       "outage": False, "ended": None, "answered_at": None}
+        current["attempts"].append({
+            "sent_at": row.get("sent_at"), "elapsed_seconds": elapsed,
+            "category": failure.get("category"),
+            "phase": failure.get("phase"),
+            "status": failure.get("status", row.get("status")),
+            "errno": failure.get("errno"), "probe": failure.get("probe"),
+            "inferred": "inferred_from" in failure, "reason": reason})
+        current["last_failure_at"] = _iso(received or sent)
+    if current is not None:
+        current["ended"] = "unanswered_at_session_end"
+        runs.append(current)
+    sent_times = [(_time(b.get("sent_at")) or _time(b.get("received_at")), b)
+                  for b in books]
+    for run in runs:
+        begin = _time(run["first_failure_at"])
+        finish = (_time(run["answered_at"]) or ended
+                  or _time(run["last_failure_at"]))
+        inside = ([b for sent, b in sent_times
+                   if sent is not None and begin <= sent <= finish]
+                  if begin is not None and finish is not None else [])
+        run["kalshi_reads"] = len(inside)
+        run["kalshi_failed"] = sum(1 for b in inside
+                                   if b.get("payload") is None
+                                   or b.get("coverage"))
+        since = _time(run["last_answer_at"])
+        until = _time(run["answered_at"])
+        run["blind_seconds"] = ((until - since).total_seconds()
+                                if since is not None and until is not None
+                                else None)
+    return {"runs": runs,
+            "failed_polls": sum(len(r["attempts"]) for r in runs),
+            "book_reads": len(books),
+            "book_failures": sum(1 for b in books if b.get("payload") is None
+                                 or b.get("coverage")),
+            "unpolled": [{"from": g.get("from"), "to": g.get("to"),
+                          "seconds": g.get("seconds")}
+                         for g in rows if g["kind"] == "gap"
+                         and g.get("cause") == "not_polled"]}
 
 
 def _refresh_verdict(seen: dict, cadence: float | None) -> list[str]:
@@ -1177,11 +1902,86 @@ def _response(decision: dict, trigger: dict | None,
     return row
 
 
+def _stamp(value: Any) -> str:
+    moment = _time(value)
+    return (moment.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+            if moment is not None else "none")
+
+
+def _render_status(s: dict) -> str:
+    if not s.get("status"):
+        return f"not recorded ({s.get('status_source')})"
+    line = s["status"]
+    gaps = s.get("gaps")
+    if isinstance(gaps, dict):
+        line += (f"  ({gaps.get('count', 0)} gap(s), "
+                 f"{(gaps.get('blind_seconds') or 0) / 60:.1f} min blind, "
+                 f"{gaps.get('outages', 0)} outage(s), "
+                 f"{gaps.get('outages_recovered', 0)} recovered)")
+    if s.get("status_source") != "recorded":
+        line += f"  [{s.get('status_source')}]"
+    return line
+
+
+def _render_failures(chronology: dict, shown: int = 12) -> list[str]:
+    """The chronology, in the order it happened."""
+    runs = chronology["runs"]
+    lines = ["", "  FAILED POLLS AND GAPS (in order, from the records)"]
+    lines.append(f"    {chronology['failed_polls']} failed poll(s) in "
+                 f"{len(runs)} run(s); {chronology['book_failures']:,} of "
+                 f"{chronology['book_reads']:,} book read(s) failed")
+    listed = (list(enumerate(runs, 1)) if len(runs) <= shown else
+              list(enumerate(runs, 1))[:shown // 2]
+              + list(enumerate(runs, 1))[-(shown // 2):])
+    previous = 0
+    for number, run in listed:
+        if number != previous + 1:
+            lines.append(f"    ... {number - previous - 1} run(s) not shown")
+        previous = number
+        attempts = run["attempts"]
+        head = (f"    run {number}  {_stamp(run['first_failure_at'])}  "
+                f"{len(attempts)} failed poll(s)"
+                + (", an OUTAGE" if run["outage"] else ""))
+        if run["ended"] == "answered":
+            head += f"; answered again {_stamp(run['answered_at'])}"
+            if run["blind_seconds"] is not None:
+                head += (f", {run['blind_seconds']:,.0f}s after the last "
+                         f"answer")
+        else:
+            head += "; still unanswered when the session ended"
+        lines.append(head)
+        lines.append(f"      last answer before it: "
+                     f"{_stamp(run['last_answer_at'])}")
+        for attempt in attempts:
+            what = attempt["category"] or "unclassified"
+            if attempt["inferred"]:
+                what += " (inferred from the message)"
+            if attempt["phase"]:
+                what += f", phase {attempt['phase']}"
+            took = ("?" if attempt["elapsed_seconds"] is None
+                    else f"{attempt['elapsed_seconds']:.1f}s")
+            probe = (f" (probe {attempt['probe']})" if attempt["probe"]
+                     else "")
+            lines.append(f"      {_stamp(attempt['sent_at'])}{probe}  {what}"
+                         f" after {took}: {attempt['reason'][:110]}")
+        lines.append(f"      Kalshi reads while it lasted: "
+                     f"{run['kalshi_reads']}, {run['kalshi_failed']} failed")
+    for gap in chronology["unpolled"]:
+        lines.append(f"    NOT POLLED {_stamp(gap['from'])} to "
+                     f"{_stamp(gap['to'])} ({gap['seconds'] or 0:,.0f}s)")
+    if runs or chronology["unpolled"]:
+        lines.append("    (a category is how an attempt failed, not why; a "
+                     "Kalshi read failing alongside is evidence about the "
+                     "path, not a cause)")
+    return lines
+
+
 def render_report(figures: dict) -> str:
     s = figures["session"]
     lines = ["SHADOW SESSION", "",
              f"  started            {s['started']}",
              f"  ended              {s['ended']}   ({s['stop']})",
+             f"  status             {_render_status(s)}",
              f"  credits reserved   {s['credits_reserved']}", ""]
     polls = figures["polls"]
     seen = figures["sightings"]
@@ -1203,7 +2003,9 @@ def render_report(figures: dict) -> str:
               f"  sightings          {seen['new']} new, {seen['repeat']} "
               f"repeated, {seen['older_copy']} older copies, "
               f"{seen['first']} first, {seen['unanswered_polls']} "
-              f"unanswered poll(s)"]
+              f"unanswered poll(s)"
+              + (f", {seen['unpolled_gaps']} stretch(es) not polled"
+                 if seen.get("unpolled_gaps") else "")]
     lines += _refresh_verdict(seen, figures.get("cadence_seconds"))
     lines += ["", f"  moves detected     {figures['moves']}"]
     for key, count in sorted(figures["decisions"].items()):
@@ -1249,6 +2051,8 @@ def render_report(figures: dict) -> str:
         lines.append(f"    {key:<34} {count:,}")
     if not refused:
         lines.append("    none recorded")
+    if figures.get("failures") is not None:
+        lines += _render_failures(figures["failures"])
     lines += ["", "  No orders were placed. Predicted figures read the book "
               "at the decision; realised figures need settlement, which a "
               "live session does not have."]
@@ -1507,7 +2311,15 @@ def main(argv: Sequence[str] | None = None, *, clock: Any = None,
         recorder.close()
     print(f"\n  session ended: {stop.reason}"
           f"{': ' + stop.detail if stop.detail else ''}")
+    status = monitor.status or {}
+    gaps = status.get("gaps") or {}
+    print(f"  status: {status.get('status')} -- "
+          f"{(status.get('actual') or {}).get('duration_seconds', 0) / 3600:.2f}"
+          f"h of {args.hours:g}h, {gaps.get('count', 0)} gap(s) "
+          f"({gaps.get('blind_seconds', 0) / 60:.1f} min blind), "
+          f"{gaps.get('outages', 0)} outage(s)")
     print(f"  {monitor.ledger}")
+    print(f"  status file: {monitor.status_path}")
     print(f"  next: python3 shadow_monitor.py --report {path}")
     return EXIT_OK if stop.ok else EXIT_STOPPED
 

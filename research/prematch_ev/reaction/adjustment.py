@@ -365,7 +365,8 @@ def _reads_between(reads: Sequence[Read], lo: datetime, hi: datetime) -> dict:
 def sharp_state(readings: Sequence[SharpReading], at: datetime, *,
                 detected_at: datetime, yes_is_home: bool,
                 fair_before_yes: float, fair_after_yes: float,
-                min_move: float, session_end: datetime | None) -> dict:
+                min_move: float, session_end: datetime | None,
+                unpolled: Sequence[tuple[datetime, datetime]] = ()) -> dict:
     """Whether the move still stood at `at`, from the polls READ by then.
 
     `persisted`: the sharp price for this contract's side has given back
@@ -373,6 +374,11 @@ def sharp_state(readings: Sequence[SharpReading], at: datetime, *,
     has given back at least that much (`full_reversal` when it is back at or
     past the pre-move level). `unobservable`: the latest poll read by then
     could not say, and why.
+
+    `unpolled` are the stretches the monitor declared it did not poll the
+    book at all (`not_polled` gaps). A reading from before one cannot speak
+    for an instant inside it: that is `not_polled`, never the stale price
+    carried across.
     """
     if session_end is not None and at > session_end:
         return {"status": "unobservable", "because": "session_ended"}
@@ -383,6 +389,8 @@ def sharp_state(readings: Sequence[SharpReading], at: datetime, *,
     latest = max(known, key=lambda r: r.ready_at)
     base = {"poll_ready_at": _iso(latest.ready_at),
             "poll_age_seconds": (at - latest.ready_at).total_seconds()}
+    if any(latest.ready_at <= start < at <= end for start, end in unpolled):
+        return {**base, "status": "unobservable", "because": "not_polled"}
     if latest.status != "answered" or latest.fair_home is None:
         return {**base, "status": "unobservable", "because": latest.status}
     now_yes = latest.fair_home if yes_is_home else latest.fair_away
