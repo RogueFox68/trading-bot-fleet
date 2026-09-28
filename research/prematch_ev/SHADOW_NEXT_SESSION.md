@@ -160,11 +160,15 @@ first: `complete`, `recovered_with_gaps`, `ended_in_outage` or
 - **An outage no longer ends the session.** Three transient failures in a
   row pause paid polling; probes follow at 60s, 120s, 240s, 480s, 600s and
   600s, and the session stops only if none answers within those six or 45
-  minutes. Each probe is one reserved credit, inside the same cap; the
-  session's end does not move. A refused key stops on its first poll. A
-  laptop that sleeps is a declared gap, not a long interval: the first poll
-  on waking re-anchors rather than moves. Keeping the machine awake still
-  matters -- a gap is data the session does not have.
+  minutes -- judged when a probe actually leaves, so a laptop that slept
+  through a probe's due time stops rather than probing late. Each probe is
+  one reserved credit, inside the same cap; the session's end does not
+  move, and nothing is sent at or after it (the status file's `deadline`
+  block counts such requests: zero). A refused key stops on its first
+  poll. A laptop that sleeps is a declared gap, not a long interval: the
+  first poll on waking re-anchors rather than moves, and sleeping through
+  the end leaves a gap too. Keeping the machine awake still matters -- a
+  gap is data the session does not have.
 - **What changed since the first session:** decisions record their tick
   and assessment; `session_start` records the fee route, entry tolerance,
   book memory and commit; and the hourly rejoin no longer sits between a

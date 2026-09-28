@@ -1211,13 +1211,25 @@ python3 shadow_monitor.py --report study_output/shadow/<session>.jsonl
   session stops, `outage_unrecovered`. Every probe is reserved against the
   session's one cap before it is sent, and the remaining budget and quota
   floor are checked before each is scheduled; recovery never moves the
-  session's end, never makes a budget, never starts a second session. Each
+  session's end, never makes a budget, never starts a second session. The
+  outage bound is checked when a probe is scheduled, when it runs and again
+  right before its paid request — a machine asleep through a probe's due
+  time wakes past the bound, and the probe is then never sent. Each
   probe stands in for at least one skipped poll and polling resumes on the
   session's own grid, so an outage cannot add a poll the cap was not priced
   for. A *terminal* failure stops at once, in or out of an outage: a refused
   key (401/403, `auth_refused` — which used to cost three polls), any other
   4xx (`request_rejected`), an untrusted certificate, or a body that is not
   the documented list.
+- **The end is a hard stop, checked where a request leaves.** The authorized
+  end is exclusive: no read, poll, probe, follow or rejoin starts at or after
+  it, and the paid request is refused before anything is reserved — a tick's
+  book reads can otherwise carry its poll past the end (a review reproduced
+  one 51 seconds late). Beneath every fetcher a dispatch gate refuses any
+  request at or after the end and clips each timeout to the time left; an
+  answer that left before the end and arrived after it is recorded as in
+  flight and never acted on. The status file and `--report` count paid
+  requests sent at or after the end: zero.
 - **An outage is missing observations, not a longer interval.** Every failed
   poll declares a gap on every stream, so the first answer after recovery
   re-anchors the detector instead of closing a move across the blind
@@ -1226,7 +1238,10 @@ python3 shadow_monitor.py --report study_output/shadow/<session>.jsonl
   loop held up behind reads — are declared exactly like a failed poll
   (`not_polled`). Left to the detector's own 35-minute `max_gap`, set for the
   5-minute archive, a machine's first poll on waking would have been
-  compared with the price from before it slept. After an outage or such a
+  compared with the price from before it slept. The last stretch has no
+  poll after it, so it is checked when the session stops: a machine asleep
+  through the end leaves an unrecovered `not_polled` gap to the stop, not a
+  `complete` session. After an outage or such a
   stretch the Kalshi decision memory is dropped (`books_invalidated`), so a
   decision is screened on books read since, or on none — never a stale one —
   and the slate is rejoined. In the analysis, a markout inside a stretch not

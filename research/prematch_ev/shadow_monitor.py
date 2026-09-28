@@ -130,6 +130,34 @@ consecutive TRANSIENT failures -- a timeout, a dropped connection, DNS, a
     floor are checked before a probe is scheduled and again before it is
     sent. Recovery never moves the session's end and never creates a
     budget, and nothing starts a second session.
+  * THE BOUNDS ARE CHECKED WHERE A REQUEST LEAVES. A probe's outage bound
+    is checked when it is scheduled, again when it runs -- a machine that
+    slept through its due time wakes past the bound -- and again after its
+    book reads, immediately before the paid request, since reads can run
+    across it. The bound is inclusive: a probe may leave at exactly 45
+    minutes after the first failure, and not after.
+
+THE END IS A HARD STOP
+----------------------
+The authorized end is exclusive, and checked at dispatch, not only at the
+top of the loop: a tick's book reads block before its paid poll, and a
+review's slow-read reproduction sent a poll 51 seconds after the end that
+way. So:
+
+  * no new work starts at or after the end -- no book read, no paid poll or
+    probe, no follow, no rejoin -- and the paid request is refused BEFORE
+    anything is reserved (`dispatch_refused`);
+  * underneath every fetcher, the dispatch gate refuses any request at or
+    after the end (`AuthorizedEndReached`, raised before anything is sent)
+    and clips each request's timeout to the authorized time left, so one
+    sent just before the end cannot run on long after it;
+  * an answer to a request that left before the end but arrived after it is
+    IN FLIGHT, not late: it is recorded (`after_authorized_end`) and never
+    acted on -- no quote of it reaches the detector;
+  * the status file's `deadline` block shows the end, the last paid
+    request's send time, the paid requests sent at or after the end (zero)
+    and how long in-flight work ran past it, and `--report` counts late
+    dispatches from any session's own clocks.
   * a TERMINAL failure stops at once, in or out of an outage: waiting cannot
     mend a refused key, a rejected request, an untrusted certificate or an
     unexpected shape, and every further attempt costs a credit.
@@ -146,6 +174,10 @@ AN OUTAGE IS MISSING OBSERVATIONS, NOT A LONGER INTERVAL
     `max_gap` was set for a 5-minute archive grid; left to it, a sleeping
     laptop's first poll on waking would be compared with the price from
     before it slept.
+  * the LAST stretch has no poll after it to declare it, so it is checked
+    when the session stops: a machine asleep through the end, or reads that
+    ran to it, leave a `not_polled` gap to the stop, unrecovered -- and a
+    session that did not see its last twenty minutes is not `complete`.
   * after an outage or such a gap, every Kalshi book read before it leaves
     the decision memory (`books_invalidated`): the next decision is
     screened on books read since, and if those reads failed there is no
@@ -189,12 +221,14 @@ import statistics
 import subprocess
 import sys
 import time
+import urllib.request
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -394,6 +428,15 @@ class Stop:
     ok: bool = False
 
 
+class AuthorizedEndReached(RuntimeError):
+    """A request tried to leave at or after the session's authorized end.
+
+    Raised by the dispatch gate BEFORE anything is sent. Not an OSError or a
+    URLError, so no fetcher can mistake it for a transport failure and retry
+    or record it as one: it ends the session.
+    """
+
+
 #: The stop each TERMINAL failure category ends the session with.
 TERMINAL_STOPS = {
     "auth": "auth_refused",
@@ -437,7 +480,11 @@ class FailureRun:
     categories: Counter = field(default_factory=Counter)
     last_failure: dict | None = None
     outage_at: datetime | None = None   # when it became an outage
+    #: Probes begun -- each one's number -- and probes whose paid request
+    #: actually left. They differ only by a probe refused at dispatch, which
+    #: ends the session.
     probes: int = 0
+    probes_sent: int = 0
     next_probe_at: datetime | None = None
 
     @property
@@ -610,6 +657,14 @@ class ShadowMonitor:
         #: True while the tick under way is a recovery probe.
         self.probing = False
         self.ends: datetime | None = None
+        #: When the last paid request left, and how many left at or after
+        #: the authorized end -- none, by construction; the status file
+        #: carries the count so a session can SHOW it rather than claim it.
+        self.last_paid_sent: datetime | None = None
+        self.paid_after_end = 0
+        #: Answers to requests sent before the end that arrived after it:
+        #: in flight, recorded, never acted on.
+        self.answers_after_end = 0
         self.status_path = status_path or recorder.path.with_suffix(
             ".status.json")
         self.status: dict | None = None
@@ -751,6 +806,80 @@ class ShadowMonitor:
         self.dates_verified = True
         return None
 
+    # --- the time bounds, checked at dispatch ----------------------------------
+    #
+    # Checked where a request is about to LEAVE, not only where the loop
+    # decided to start the work. A tick's decision reads block before its
+    # paid poll, and a probe's before its paid probe; either can run long
+    # enough to cross a bound the loop checked on the way in.
+
+    def _past_end(self) -> bool:
+        """The authorized end is EXCLUSIVE: at it, or after, nothing new
+        starts -- no read, no poll, no probe, no rejoin."""
+        return self.ends is not None and self.clock.now() >= self.ends
+
+    def _paid_request_refused(self) -> Stop | None:
+        """Immediately before a paid request is reserved and sent: after the
+        reads that precede it. Nothing is reserved when this refuses."""
+        now = self.clock.now()
+        request = "probe" if self.probing else "poll"
+        if self.ends is not None and now >= self.ends:
+            self.recorder.write("dispatch_refused", at=now, request=request,
+                                reason="authorized_end", ends=self.ends)
+            return self._end_of_session()
+        run = self.failures
+        if (self.probing and run is not None
+                and now - run.started > RECOVERY_MAX_OUTAGE):
+            self.recorder.write("dispatch_refused", at=now, request=request,
+                                reason="outage_bound",
+                                first_failure_at=run.started)
+            return self._outage_expired(now, "its reads ended")
+        return None
+
+    def _outage_expired(self, now: datetime, when: str) -> Stop:
+        """The outage bound is INCLUSIVE: a probe may leave at exactly
+        RECOVERY_MAX_OUTAGE after the first failure, and never after."""
+        run = self.failures
+        return self._unrecovered(
+            f"the probe was not sent: {when} "
+            f"{(now - run.started).total_seconds() / 60:.1f} minutes after "
+            f"the first failure, beyond the "
+            f"{RECOVERY_MAX_OUTAGE.total_seconds() / 60:g}-minute bound")
+
+    @contextmanager
+    def _dispatch_gate(self) -> Iterator[None]:
+        """No request of ANY kind leaves at or after the authorized end.
+
+        The loop's own checks stop the session before this is reached; this
+        is the backstop for any path they miss, installed process-wide as
+        the endpoint gate is, and raising before anything is sent. It also
+        clips each request's timeout to the authorized time left, so one
+        sent just before the end cannot run on long after it.
+        """
+        real = urllib.request.urlopen
+
+        def gated(request: Any, *args: Any, **kwargs: Any) -> Any:
+            if self.ends is not None:
+                now = self.clock.now()
+                left = (self.ends - now).total_seconds()
+                if left <= 0:
+                    raise AuthorizedEndReached(
+                        f"a request at {_iso(now)} would leave at or after "
+                        f"the authorized end {_iso(self.ends)}; it was not "
+                        f"sent")
+                timeout = kwargs.get("timeout")
+                if not args and isinstance(timeout, (int, float)):
+                    kwargs["timeout"] = min(timeout, left)
+                elif not args and timeout is None:
+                    kwargs["timeout"] = left
+            return real(request, *args, **kwargs)
+
+        urllib.request.urlopen = gated
+        try:
+            yield
+        finally:
+            urllib.request.urlopen = real
+
     # --- one tick ----------------------------------------------------------
 
     def tick(self) -> Stop | None:
@@ -760,6 +889,10 @@ class ShadowMonitor:
         reads: dict[str, str] = {}
         abandoned = None
         for watched in self.contracts_in_horizon(now):
+            if self._past_end():
+                # NO NEW WORK AFTER THE END. The reads stop here, and the
+                # paid request below is refused before it is reserved.
+                break
             book = self.read_book(watched, "decision")
             reads[watched.ticker] = self.last_read_status.value
             if book is None:
@@ -776,8 +909,19 @@ class ShadowMonitor:
                                         joined=joined, reads=reads,
                                         abandoned_after=abandoned)
 
+        # THE BOUNDS AT DISPATCH: the reads above may have run past the
+        # authorized end, or past a probe's outage bound.
+        refused = self._paid_request_refused()
+        if refused is not None:
+            return refused
         live = fetch_live_odds(self.sport, self.api_key, ledger=self.ledger,
                                now=self.clock.now)
+        self.last_paid_sent = live.sent_at
+        if self.probing and self.failures is not None:
+            self.failures.probes_sent += 1
+            self.counts["recovery_probes"] += 1
+        if self.ends is not None and live.sent_at >= self.ends:
+            self.paid_after_end += 1
         parsed = parse_snapshot(live.snapshot_body()) if live.ok else None
         # DECISION READINESS: the answer has arrived in full AND been read.
         # Moves are dated here, never earlier. The time between the body
@@ -785,10 +929,12 @@ class ShadowMonitor:
         # opportunity as though a bot could have traded during it.
         ready_at = self.clock.now()
         self.counts["polls"] += 1
+        after_end = self.ends is not None and ready_at >= self.ends
         # CONTINUITY BEFORE CONTENT: a hole the monitor left by not polling
         # is declared before this answer's quotes reach the detector, and
         # written before this poll's record, so every reader meets it first.
-        self._check_continuity(live, ready_at)
+        if not after_end:
+            self._check_continuity(live, ready_at)
         failure = self._describe_failure(live, parsed)
         self.recorder.write(
             "odds", url=recorded_url(live_odds_url(self.sport, "")),
@@ -800,7 +946,17 @@ class ShadowMonitor:
             provider_date=live.provider_date, status=live.status,
             charged=live.charged, used=live.used, remaining=live.remaining,
             payload=live.payload, coverage=live.coverage.reasons,
-            **({"failure": failure} if failure else {}))
+            **({"failure": failure} if failure else {}),
+            **({"after_authorized_end": True} if after_end else {}))
+        if after_end:
+            # IN-FLIGHT COMPLETION, NOT LATE DISPATCH: this request left
+            # before the end and its answer arrived after it. Recorded -- it
+            # was paid for -- and never acted on: no quote of it reaches the
+            # detector, so no move, decision or read follows it.
+            self.answers_after_end += 1
+            if failure is not None:
+                self._note_failed_poll(live, failure)
+            return self._end_of_session()
         stop = self.absorb(live, parsed, ready_at, now, failure)
         # WHY NOTHING TRIGGERED, for THIS answer: recorded once its quotes
         # have been through the detector, so every count sits beside the
@@ -878,6 +1034,31 @@ class ShadowMonitor:
         self._invalidate_books(until, why)
         self.next_rejoin = None
 
+    def _unpolled_tail(self, ended: datetime) -> None:
+        """The stretch after the last poll, when the session ended inside it.
+
+        `_check_continuity` declares a hole when the poll that ends it
+        arrives; the last stretch of a session has no such poll. A machine
+        asleep through the end, or book reads that ran to it -- whose poll
+        the end then refused -- left it unobserved all the same, and a
+        session that did not see its last twenty minutes is not `complete`.
+        Measured to when the session stopped, as a run of failures still
+        open at the end is: the offline rebuild judges markouts up to that
+        same stop, and one inside the stretch must be `not_polled`, never
+        the last price carried across a machine asleep.
+        """
+        last = self.last_poll_ready
+        if last is None or ended - last <= self.max_poll_spacing:
+            return
+        self._record_gap({
+            "cause": "not_polled", "from": last, "to": ended,
+            "unobserved_from": last + self.cadence,
+            "seconds": (ended - last).total_seconds(),
+            "limit_seconds": self.max_poll_spacing.total_seconds(),
+            "failed_polls": 0, "probes": 0,
+            # No poll ended it: the session ended inside it.
+            "recovered": False})
+
     def _record_gap(self, gap: dict) -> None:
         self.gaps.append(gap)
         self.counts["gaps"] += 1
@@ -898,9 +1079,8 @@ class ShadowMonitor:
         self.recorder.write("books_invalidated", at=at, reason=why,
                             dropped=dropped)
 
-    def _failed_poll(self, live: LiveOdds, failure: dict,
-                     ready_at: datetime) -> Stop | None:
-        """A poll that did not answer: a gap, and perhaps a stop or an outage."""
+    def _note_failed_poll(self, live: LiveOdds, failure: dict) -> FailureRun:
+        """A poll that did not answer, counted into its run of failures."""
         self.counts["polls_failed"] += 1
         run = self.failures
         if run is None:
@@ -914,6 +1094,12 @@ class ShadowMonitor:
         for stream in sorted(self.seen):
             self.detector.note_gap(stream, live.received_at,
                                    "the live poll did not answer")
+        return run
+
+    def _failed_poll(self, live: LiveOdds, failure: dict,
+                     ready_at: datetime) -> Stop | None:
+        """A poll that did not answer: a gap, and perhaps a stop or an outage."""
+        run = self._note_failed_poll(live, failure)
         if failure["terminal"]:
             return Stop(TERMINAL_STOPS.get(failure["category"],
                                            failure["category"]),
@@ -1001,7 +1187,7 @@ class ShadowMonitor:
         last = run.last_failure or {}
         return Stop("outage_unrecovered",
                     f"{why}: {run.failed_polls} failed poll(s), "
-                    f"{run.probes} of them probes, since "
+                    f"{run.probes_sent} of them probes, since "
                     f"{_iso(run.started)}; last failure "
                     f"{last.get('category')} ({last.get('phase')}): "
                     f"{last.get('detail')}")
@@ -1015,7 +1201,7 @@ class ShadowMonitor:
             "first_failure_at": run.started, "outage_at": run.outage_at,
             "seconds": (until - (run.last_answer or run.started))
             .total_seconds(),
-            "failed_polls": run.failed_polls, "probes": run.probes,
+            "failed_polls": run.failed_polls, "probes": run.probes_sent,
             "categories": dict(run.categories), "recovered": recovered,
             "last_failure": run.last_failure})
 
@@ -1074,7 +1260,7 @@ class ShadowMonitor:
         # that found this. A move on a rejoin tick is screened on the join
         # before it, at most an hour old; the first tick cannot move, since
         # every stream's first quote is only its baseline.
-        if rejoin_due:
+        if rejoin_due and not self._past_end():
             self.rejoin(quotes_by_event)
             self.next_rejoin = now + REJOIN_EVERY
         return None
@@ -1120,9 +1306,18 @@ class ShadowMonitor:
                                 admitted=False)
             return
 
-        executions = {w.ticker: self.read_book(
-            w, "execution", {"stream_id": trigger.stream_id})
-            for w in contracts}
+        # An execution read is new work too: none leaves after the end. The
+        # side it would have priced then has no execution book, exactly as a
+        # failed read leaves it -- never a fill at the decision price.
+        executions: dict[str, BookQuote | None] = {}
+        unsent: set[str] = set()
+        for w in contracts:
+            if self._past_end():
+                executions[w.ticker] = None
+                unsent.add(w.ticker)
+                continue
+            executions[w.ticker] = self.read_book(
+                w, "execution", {"stream_id": trigger.stream_id})
         decisions = []
         for watched in contracts:
             book = executions.get(watched.ticker)
@@ -1167,7 +1362,10 @@ class ShadowMonitor:
                 **decision.as_dict(),
                 tick=(self.tick_context.as_dict()
                       if self.tick_context else None),
-                assessment=assessment)
+                assessment=assessment,
+                **({"execution_read": "not sent: the authorized end had "
+                                      "passed"}
+                   if watched.ticker in unsent else {}))
 
         until = trigger.detected_at + self.follow_for
         current = self.follows.get(trigger.event_id)
@@ -1210,6 +1408,8 @@ class ShadowMonitor:
             if now < follow.next_at:
                 continue
             for watched in self.watched.get(event_id, []):
+                if self._past_end():
+                    return
                 self.read_book(watched, "follow")
             while follow.next_at <= self.clock.now():
                 follow.next_at += self.follow_every
@@ -1239,10 +1439,17 @@ class ShadowMonitor:
             status_file=self.status_path.name)
         crash: Exception | None = None
         try:
-            with only_declared_endpoints():
+            with only_declared_endpoints(), self._dispatch_gate():
                 stop = self.preflight()
                 if stop is None:
                     stop = self._loop(end)
+        except AuthorizedEndReached as exc:
+            # The backstop refused a request the loop's own checks did not
+            # stop. Nothing was sent; the session is over.
+            self.recorder.write("dispatch_refused", at=self.clock.now(),
+                                request="backstop", reason="authorized_end",
+                                detail=str(exc))
+            stop = self._end_of_session()
         except CreditCapReached as exc:
             stop = Stop("credit_cap", str(exc))
         except CaptureRefused as exc:
@@ -1265,6 +1472,8 @@ class ShadowMonitor:
             # A run of failures still open at the end: its blind interval
             # ran to the end, unrecovered.
             self._close_failures(ended, recovered=False)
+        else:
+            self._unpolled_tail(ended)
         self.status = self._final_status(stop, started, end, ended, in_outage)
         self.recorder.write("session_end", at=ended,
                             reason=stop.reason, detail=stop.detail,
@@ -1274,7 +1483,8 @@ class ShadowMonitor:
                             credits_reserved=self.ledger.spent_this_run,
                             account_remaining=self.ledger.remaining,
                             status=self.status["status"],
-                            gaps=self.status["gaps"])
+                            gaps=self.status["gaps"],
+                            deadline=self.status["deadline"])
         self._write_status(self.status)
         if crash is not None:
             raise crash
@@ -1320,13 +1530,21 @@ class ShadowMonitor:
         """One recovery probe: an ordinary tick, once the checks that make
         it affordable have passed. Its decision reads are the fresh books
         the next decision needs, so the memory is dropped before them."""
+        run = self.failures
+        now = self.clock.now()
+        if now - run.started > RECOVERY_MAX_OUTAGE:
+            # AT EXECUTION, NOT ONLY WHEN SCHEDULED. A probe due inside the
+            # bound can come to run long after it -- the machine slept
+            # through its due time, or the loop was held up behind reads --
+            # and an answer then is not a recovery the bound allows.
+            self.recorder.write("dispatch_refused", at=now, request="probe",
+                                reason="outage_bound",
+                                first_failure_at=run.started)
+            return self._outage_expired(now, "it came due and the clock read")
         stop = self._probe_affordable()
         if stop is not None:
             return stop
-        run = self.failures
         run.probes += 1
-        self.counts["recovery_probes"] += 1
-        now = self.clock.now()
         self.recorder.write("recovery_probe", probe=run.probes, at=now,
                             first_failure_at=run.started,
                             credits_reserved=self.ledger.spent_this_run)
@@ -1346,7 +1564,8 @@ class ShadowMonitor:
             return Stop("end_of_session",
                         f"the authorized end arrived during an unrecovered "
                         f"outage ({run.failed_polls} failed poll(s), "
-                        f"{run.probes} probe(s), since {_iso(run.started)}): "
+                        f"{run.probes_sent} probe(s) sent, since "
+                        f"{_iso(run.started)}): "
                         f"the session ran its window without observing the "
                         f"end of it")
         return Stop("end_of_session", ok=True)
@@ -1383,6 +1602,18 @@ class ShadowMonitor:
                      "outages": len(outages),
                      "outages_recovered": sum(1 for g in outages
                                               if g["recovered"])},
+            "deadline": {
+                "authorized_end": _iso(ends),
+                "last_paid_request_sent": _iso(self.last_paid_sent),
+                "paid_requests_sent_at_or_after_end": self.paid_after_end,
+                "answers_completed_after_end": self.answers_after_end,
+                "finished_after_end_seconds": max(
+                    0.0, (ended - ends).total_seconds()),
+                "note": "the end is exclusive: nothing is sent at or after "
+                        "it. A request sent before it may complete after it, "
+                        "in flight, its timeout clipped to the time that was "
+                        "left; such an answer is recorded and never acted "
+                        "on"},
             "observed": {"moves": self.counts["triggers"],
                          "decisions": self.counts["decisions"],
                          "entries": self.counts["entries"]},
@@ -1558,6 +1789,17 @@ def report(rows: Sequence[dict], *, min_response: float | None = None,
         # A GAME MISSING FROM AN ANSWER IS A HOLE for that game.
         for key in [k for k in last_seen if k not in present]:
             del last_seen[key]
+    # THE END, CHECKED FROM THE RECORDS: every paid request's own send time
+    # against the end the session recorded when it began. A session from
+    # before the dispatch gate is checked the same way.
+    ends = _time(start.get("ends"))
+    sent = [_time(r.get("sent_at")) for r in odds]
+    out["session"].update(
+        authorized_end=start.get("ends"),
+        paid_after_end=(None if ends is None else
+                        sum(1 for t in sent if t is not None and t >= ends)),
+        answers_after_end=sum(1 for r in odds
+                              if r.get("after_authorized_end")))
     out["polls"] = {"total": len(odds),
                     "answered": sum(1 for r in odds if r.get("payload")
                                     is not None and not r.get("coverage")),
@@ -1742,7 +1984,8 @@ def failure_chronology(rows: Sequence[dict]) -> dict:
             "book_failures": sum(1 for b in books if b.get("payload") is None
                                  or b.get("coverage")),
             "unpolled": [{"from": g.get("from"), "to": g.get("to"),
-                          "seconds": g.get("seconds")}
+                          "seconds": g.get("seconds"),
+                          "recovered": g.get("recovered", True)}
                          for g in rows if g["kind"] == "gap"
                          and g.get("cause") == "not_polled"]}
 
@@ -1923,6 +2166,17 @@ def _render_status(s: dict) -> str:
     return line
 
 
+def _render_deadline(s: dict) -> str:
+    if s.get("authorized_end") is None:
+        return "not recorded: no session_start record gives the end"
+    line = (f"{s['authorized_end']}: {s.get('paid_after_end')} paid "
+            f"request(s) sent at or after it")
+    if s.get("answers_after_end"):
+        line += (f"; {s['answers_after_end']} answer(s) to earlier requests "
+                 f"arrived after it, in flight, and were not acted on")
+    return line
+
+
 def _render_failures(chronology: dict, shown: int = 12) -> list[str]:
     """The chronology, in the order it happened."""
     runs = chronology["runs"]
@@ -1968,7 +2222,9 @@ def _render_failures(chronology: dict, shown: int = 12) -> list[str]:
                      f"{run['kalshi_reads']}, {run['kalshi_failed']} failed")
     for gap in chronology["unpolled"]:
         lines.append(f"    NOT POLLED {_stamp(gap['from'])} to "
-                     f"{_stamp(gap['to'])} ({gap['seconds'] or 0:,.0f}s)")
+                     f"{_stamp(gap['to'])} ({gap['seconds'] or 0:,.0f}s)"
+                     + ("" if gap["recovered"] else
+                        ": the session ended inside it"))
     if runs or chronology["unpolled"]:
         lines.append("    (a category is how an attempt failed, not why; a "
                      "Kalshi read failing alongside is evidence about the "
@@ -1982,6 +2238,7 @@ def render_report(figures: dict) -> str:
              f"  started            {s['started']}",
              f"  ended              {s['ended']}   ({s['stop']})",
              f"  status             {_render_status(s)}",
+             f"  authorized end     {_render_deadline(s)}",
              f"  credits reserved   {s['credits_reserved']}", ""]
     polls = figures["polls"]
     seen = figures["sightings"]

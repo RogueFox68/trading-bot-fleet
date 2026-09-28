@@ -66,12 +66,20 @@ def wrong_shape():
 class OutageNetwork(LiveNetwork):
     """The story's network, with odds failures scripted by the time a
     request is SENT: `script` is [(from, until, failure)]. `kalshi_down`
-    windows time out every book read too, ten seconds each."""
+    windows time out every book read too, ten seconds each. Every request's
+    socket timeout is recorded in `timeouts`, as (sent, url, timeout)."""
 
     def __init__(self, clock, *, script=(), kalshi_down=(), **knobs):
         super().__init__(clock, **knobs)
         self.script = list(script)
         self.kalshi_down = list(kalshi_down)
+        self.timeouts: list[tuple] = []
+
+    def __call__(self, request, *args, **kwargs):
+        self.timeouts.append((self.clock.now(),
+                              getattr(request, "full_url", request),
+                              kwargs.get("timeout")))
+        return super().__call__(request, *args, **kwargs)
 
     def _odds(self, url, at):
         for start, end, fail in self.script:
@@ -86,6 +94,27 @@ class OutageNetwork(LiveNetwork):
             self.clock.t += timedelta(seconds=10)
             raise urllib.error.URLError(OSError(errno.ETIMEDOUT,
                                                 "Operation timed out"))
+        return super()._book(url, ticker, at)
+
+
+class SlowReads(OutageNetwork):
+    """Book reads sent inside `slow` take `takes` -- or fail at their socket
+    timeout when that comes first, as a real read would."""
+
+    def __init__(self, clock, *, slow=(), takes=timedelta(seconds=30),
+                 **knobs):
+        super().__init__(clock, **knobs)
+        self.slow = list(slow)
+        self.takes = takes
+
+    def _book(self, url, ticker, at):
+        if any(start <= at < end for start, end in self.slow):
+            limit = self.timeouts[-1][2]
+            if limit is not None and limit < self.takes.total_seconds():
+                self.book_calls.append((ticker, at))
+                self.clock.t += timedelta(seconds=limit)
+                raise TimeoutError("timed out")
+            self.clock.t += self.takes
         return super()._book(url, ticker, at)
 
 
@@ -352,6 +381,10 @@ class BoundsTest(OutageHarness):
         self.assertIn("beyond the 45-minute bound", end["detail"])
         self.assertLess(len(self.kinds(self.rows, "recovery_probe")),
                         shadow_monitor.RECOVERY_MAX_PROBES)
+        # Stopped when the next probe was known not to fit -- at the failed
+        # probe, not after waiting out a backoff for one it would refuse.
+        self.assertIn("a further probe would fall", end["detail"])
+        self.assertEqual(end["at"], self.failed()[-1]["ready_at"])
 
     def test_the_default_probes_fit_inside_the_default_duration(self):
         """Six probes at the declared backoff -- plus the three failures
@@ -601,6 +634,63 @@ class SleepAfterAMoveTest(OutageHarness):
                                 "not_polled", seconds)
 
 
+class BlindTailTest(OutageHarness):
+    """A session's LAST stretch has no poll after it to declare it. A
+    machine asleep through the end left it unobserved all the same, and the
+    session says so rather than calling itself complete."""
+
+    def test_a_machine_asleep_through_the_end_is_not_complete(self):
+        """Asleep from 20:40 until ten minutes past a 21:00 end: the last
+        twenty minutes of the window were never observed."""
+        self.clock = SleepyClock(naps=[(at(40), timedelta(minutes=30))])
+        self.session(1)
+        self.assertEqual(self.code, 0, self.text)
+        end = datetime.fromisoformat(
+            self.kinds(self.rows, "session_start")[0]["ends"])
+        stopped = self.end(self.rows)
+        gap, = self.kinds(self.rows, "gap")
+        self.assertEqual(gap["cause"], "not_polled")
+        self.assertFalse(gap["recovered"])
+        self.assertEqual(gap["from"], self.kinds(self.rows, "odds")[-1]
+                         ["ready_at"])
+        self.assertEqual(gap["to"], stopped["at"])
+        self.assertGreater(datetime.fromisoformat(stopped["at"]), end)
+        status = self.status()
+        self.assertEqual(status["status"], "recovered_with_gaps")
+        self.assertEqual(status["gaps"]["by_cause"], {"not_polled": 1})
+        # Nothing left on waking: the end had passed.
+        self.assertFalse([t for t in self.net.odds_calls if t >= end])
+        self.assertFalse([t for _, t in self.net.book_calls if t >= end])
+        self.assertIn("the session ended inside it",
+                      shadow_monitor.render_report(
+                          shadow_monitor.report(self.rows)))
+
+    def test_markouts_in_a_blind_tail_are_not_polled(self):
+        """The 20:05 move is seen, then the machine sleeps from 20:06:30
+        through the end of a quarter-hour session. Every sharp markout from
+        the next due poll to the stop is `not_polled` -- never the 20:06
+        price carried across the sleep."""
+        self.clock = SleepyClock(naps=[(at(6.5), timedelta(minutes=30))])
+        self.session(0.25)
+        self.assertEqual(len(self.kinds(self.rows, "trigger")), 1)
+        gap, = self.kinds(self.rows, "gap")
+        start = datetime.fromisoformat(gap["unobserved_from"])
+        stop = datetime.fromisoformat(gap["to"])
+        item = next(a for a in diag.diagnose(self.rows)["assessments"]
+                    if a.get("adjustment_capture"))
+        inside = [m for m in item["adjustment_capture"][0]["markouts"]
+                  if start < datetime.fromisoformat(m["target"]) <= stop]
+        self.assertGreaterEqual(len(inside), 3)
+        for markout in inside:
+            self.assertEqual(markout["sharp"]["status"], "unobservable")
+            self.assertEqual(markout["sharp"]["because"], "not_polled")
+
+    def test_a_session_polled_to_its_end_is_complete(self):
+        self.session(0.25)
+        self.assertEqual(self.kinds(self.rows, "gap"), [])
+        self.assertEqual(self.status()["status"], "complete")
+
+
 class StaleBookTest(OutageHarness):
     """After an outage the decision memory is dropped: a decision whose
     fresh reads failed has no decision book, not one from before it."""
@@ -636,6 +726,307 @@ class StaleBookTest(OutageHarness):
             {"no_exchange_book_at_the_trigger": len(
                 [d for d in self.kinds(self.rows, "decision")
                  if d.get("market_ticker")])})
+
+
+class DeadlineAtDispatchTest(OutageHarness):
+    """The authorized end is checked where a request LEAVES, not only where
+    the loop decides to start a tick: the reads before a paid request can
+    carry it past the end (review 5878533024, P1)."""
+
+    def deadline(self):
+        return datetime.fromisoformat(
+            self.kinds(self.rows, "session_start")[0]["ends"])
+
+    def assertNothingSentAfterTheEnd(self):
+        end = self.deadline()
+        self.assertFalse([t for t in self.net.odds_calls if t >= end])
+        self.assertFalse([t for _, t in self.net.book_calls if t >= end])
+        # Stopped by the loop's own checks, not caught by the backstop.
+        self.assertFalse([r for r in self.kinds(self.rows, "dispatch_refused")
+                          if r["request"] == "backstop"])
+        deadline = self.status()["deadline"]
+        self.assertEqual(deadline["paid_requests_sent_at_or_after_end"], 0)
+        self.assertEqual(self.end(self.rows)["credits_reserved"],
+                         len(self.net.odds_calls))
+
+    def test_reads_crossing_the_end_stop_the_paid_request(self):
+        """The review's reproduction: a 72-second session whose second
+        tick's book reads are slow. The end falls while they run; the poll
+        after them is refused before anything is reserved."""
+        self.session(0.02, net=SlowReads(self.clock, slow=[(at(1), at(60))]))
+        self.assertEqual(self.code, 0, self.text)
+        self.assertNothingSentAfterTheEnd()
+        refused, = self.kinds(self.rows, "dispatch_refused")
+        self.assertEqual((refused["request"], refused["reason"]),
+                         ("poll", "authorized_end"))
+        self.assertEqual(len(self.net.odds_calls), 1)
+        end = self.end(self.rows)
+        self.assertEqual(end["reason"], "end_of_session")
+
+    def test_every_timeout_is_clipped_to_the_time_left(self):
+        """A read sent before the end cannot run on past it: its socket
+        timeout is the authorized time left, where that is shorter."""
+        self.session(0.02, net=SlowReads(self.clock, slow=[(at(1), at(60))]))
+        start = datetime.fromisoformat(
+            self.kinds(self.rows, "session_start")[0]["at"])
+        end = self.deadline()
+        inside = [(sent, timeout) for sent, _, timeout in self.net.timeouts
+                  if sent >= start]
+        self.assertTrue(inside)
+        for sent, timeout in inside:
+            self.assertLessEqual(timeout, (end - sent).total_seconds())
+        clipped = [t for sent, t in inside
+                   if (end - sent).total_seconds() < 10]
+        self.assertTrue(clipped, "no read was sent near the end")
+        # So the late read failed at the end, rather than 30s past it.
+        self.assertLess(self.status()["deadline"]
+                        ["finished_after_end_seconds"], 1.0)
+
+    def test_reads_ending_exactly_at_the_end_are_too_late(self):
+        """The end is exclusive. Reads that finish exactly at it leave no
+        time for the poll: refused."""
+        net = SlowReads(self.clock, slow=[(at(1), at(60))])
+        # The second tick's reads start at 20:01:05; the end is 72s after
+        # the session starts at 20:00:02.4, at 20:01:14.4. One read of
+        # 9.2s (plus the network's 0.2s) ends exactly there.
+        net.takes = timedelta(seconds=9.2)
+        with mock.patch.object(shadow_monitor.kalshi_history,
+                               "LIVE_BOOK_TIMEOUT", 60):
+            self.session(0.02, net=net)
+        end = self.deadline()
+        reads = [datetime.fromisoformat(b["received_at"])
+                 for b in self.kinds(self.rows, "book")]
+        self.assertIn(end, reads)
+        refused, = self.kinds(self.rows, "dispatch_refused")
+        self.assertEqual(datetime.fromisoformat(refused["at"]), end)
+        self.assertEqual(refused["request"], "poll")
+        # The tick's second read was never started: NYG's ended at the end.
+        crossing = [b for b in self.kinds(self.rows, "book")
+                    if datetime.fromisoformat(b["sent_at"]) >= at(1)]
+        self.assertEqual(len(crossing), 1)
+        self.assertNothingSentAfterTheEnd()
+
+    def test_a_probe_whose_reads_cross_the_end_is_never_sent(self):
+        """Nothing answers from 20:20. The outage's first probe comes due at
+        20:23:35, fourteen seconds before the end of a 23.8-minute session,
+        and its book reads run until the end."""
+        net = SlowReads(self.clock, slow=[(at(23.5), at(60))],
+                        takes=timedelta(minutes=2),
+                        script=[(at(20), at(600), timeout())])
+        with mock.patch.object(shadow_monitor.kalshi_history,
+                               "LIVE_BOOK_TIMEOUT", 600):
+            self.session(23.8 / 60, net=net)
+        self.assertEqual(self.code, 1, self.text)
+        end = self.end(self.rows)
+        self.assertEqual(end["reason"], "end_of_session")
+        self.assertEqual(end["status"], "ended_in_outage")
+        refused, = self.kinds(self.rows, "dispatch_refused")
+        self.assertEqual((refused["request"], refused["reason"]),
+                         ("probe", "authorized_end"))
+        self.assertNothingSentAfterTheEnd()
+        # Begun, never sent, and counted as what it was.
+        self.assertEqual(len(self.kinds(self.rows, "recovery_probe")), 1)
+        self.assertEqual(self.status()["polls"]["recovery_probes"], 0)
+        self.assertEqual(self.kinds(self.rows, "gap")[-1]["probes"], 0)
+
+    def test_an_answer_that_arrives_after_the_end_is_not_acted_on(self):
+        """In flight, not late: the last poll leaves before the end and its
+        body trickles in after it. It is recorded as such, and nothing --
+        no move, no decision, no read -- follows from it."""
+        class LateBody(OutageNetwork):
+            def _odds(self, url, at_):
+                answer = super()._odds(url, at_)
+                if at_ >= at(29):
+                    answer._on_read = lambda: setattr(
+                        self.clock, "t", self.clock.t + timedelta(minutes=2))
+                return answer
+
+        self.session(0.5, net=LateBody(self.clock, extra_pre_match=True))
+        end = self.deadline()
+        last = self.kinds(self.rows, "odds")[-1]
+        self.assertTrue(last.get("after_authorized_end"))
+        self.assertGreater(datetime.fromisoformat(last["ready_at"]), end)
+        self.assertLess(datetime.fromisoformat(last["sent_at"]), end)
+        kinds = [r["kind"] for r in self.rows]
+        self.assertEqual(kinds[kinds.index("odds", len(kinds) - 5) + 1:],
+                         ["session_end"])
+        self.assertFalse([t for t in self.kinds(self.rows, "trigger")
+                          if datetime.fromisoformat(t["detected_at"]) >= end])
+        self.assertNothingSentAfterTheEnd()
+        self.assertEqual(self.status()["deadline"]
+                         ["answers_completed_after_end"], 1)
+
+    def test_follow_reads_crossing_the_end_stop_there(self):
+        """Kalshi is followed every ten seconds after the 20:05 move, past
+        the end of a 30-minute session. The last round's first read is slow
+        and runs to the end; the round's second read is never started."""
+        net = SlowReads(self.clock, slow=[(at(29.8), at(60))])
+        self.session(0.5, net=net)
+        self.assertEqual(self.code, 0, self.text)
+        end = self.deadline()
+        follows = [datetime.fromisoformat(b["sent_at"])
+                   for b in self.kinds(self.rows, "book")
+                   if b["purpose"] == "follow"]
+        self.assertTrue(follows)
+        last = [b for b in self.kinds(self.rows, "book")
+                if datetime.fromisoformat(b["sent_at"]) >= at(29.8)]
+        self.assertEqual(len(last), 1)
+        self.assertGreaterEqual(datetime.fromisoformat(last[0]["received_at"]),
+                                end)
+        self.assertNothingSentAfterTheEnd()
+
+    def test_the_report_counts_paid_requests_against_the_end(self):
+        self.session(0.02, net=SlowReads(self.clock, slow=[(at(1), at(60))]))
+        figures = shadow_monitor.report(self.rows)
+        self.assertEqual(figures["session"]["paid_after_end"], 0)
+        self.assertIn("0 paid request(s) sent at or after it",
+                      shadow_monitor.render_report(figures))
+
+    def test_the_report_finds_a_late_paid_request_in_any_session(self):
+        """What the review found, as a session recorded before the gate
+        would show it: a poll sent 51s after the end. SYNTHETIC: the rows
+        are this suite's, with that one poll's clocks moved past the end."""
+        self.session(0.02, net=SlowReads(self.clock, slow=[(at(1), at(60))]))
+        end = self.deadline()
+        rows = [dict(r) for r in self.rows if r["kind"] != "dispatch_refused"]
+        late = dict(next(r for r in rows if r["kind"] == "odds"))
+        for key in ("sent_at", "headers_at", "received_at", "ready_at"):
+            late[key] = (end + timedelta(seconds=51)).isoformat()
+        rows.insert(len(rows) - 1, late)
+        figures = shadow_monitor.report(rows)
+        self.assertEqual(figures["session"]["paid_after_end"], 1)
+        self.assertIn("1 paid request(s) sent at or after it",
+                      shadow_monitor.render_report(figures))
+
+    def test_a_file_without_its_start_does_not_count_against_nothing(self):
+        """A file that lost its first record gives no end to check against:
+        the report says so, rather than printing a count of nothing."""
+        self.session(0.02, net=SlowReads(self.clock, slow=[(at(1), at(60))]))
+        rows = [r for r in self.rows if r["kind"] != "session_start"]
+        figures = shadow_monitor.report(rows)
+        self.assertIsNone(figures["session"]["paid_after_end"])
+        self.assertIn("authorized end     not recorded",
+                      shadow_monitor.render_report(figures))
+
+
+class OutageBoundAtDispatchTest(OutageHarness):
+    """The 45-minute outage bound is checked when a probe RUNS and again
+    just before it is sent -- not only when it was scheduled
+    (review 5878533024, P2)."""
+
+    def test_a_probe_delayed_past_the_bound_by_a_sleep_is_never_sent(self):
+        """The review's reproduction: the machine sleeps an hour at 20:05,
+        mid-outage. The probe was due inside the bound; when the loop wakes
+        it is 63 minutes after the first failure. The provider would answer
+        by then -- and never receives the probe."""
+        self.clock = SleepyClock(naps=[(at(5), timedelta(minutes=60))])
+        net = OutageNetwork(self.clock, script=[(at(2), at(10), timeout())])
+        self.session(2, net=net)
+        self.assertEqual(self.code, 1, self.text)
+        end = self.end(self.rows)
+        self.assertEqual(end["reason"], "outage_unrecovered")
+        self.assertEqual(end["status"], "stopped_early")
+        self.assertIn("came due and the clock read", end["detail"])
+        self.assertIn("beyond the 45-minute bound", end["detail"])
+        self.assertFalse(self.kinds(self.rows, "recovery_probe"))
+        self.assertFalse([t for t in net.odds_calls if t > at(10)])
+        refused, = self.kinds(self.rows, "dispatch_refused")
+        self.assertEqual((refused["request"], refused["reason"]),
+                         ("probe", "outage_bound"))
+
+    def test_probe_reads_crossing_the_bound_stop_the_probe(self):
+        """The probe starts inside the bound; its book reads run across it,
+        so the paid request is refused -- though the provider has been
+        answering since 20:05."""
+        net = SlowReads(self.clock, slow=[(at(5.5), at(60))],
+                        script=[(at(2), at(5), timeout())])
+        with mock.patch.object(shadow_monitor, "RECOVERY_MAX_OUTAGE",
+                               timedelta(minutes=3, seconds=36)):
+            self.session(1.0, net=net)
+        end = self.end(self.rows)
+        self.assertEqual(end["reason"], "outage_unrecovered")
+        self.assertIn("its reads ended", end["detail"])
+        probe, = self.kinds(self.rows, "recovery_probe")
+        refused, = self.kinds(self.rows, "dispatch_refused")
+        self.assertEqual((refused["request"], refused["reason"]),
+                         ("probe", "outage_bound"))
+        started = datetime.fromisoformat(probe["at"])
+        self.assertFalse([t for t in net.odds_calls if t >= started])
+        self.assertEqual(self.end(self.rows)["credits_reserved"],
+                         len(net.odds_calls))
+
+
+class BoundaryTest(OutageHarness):
+    """The exact edges, pinned: the authorized end is EXCLUSIVE -- nothing
+    is sent at it -- and the outage bound INCLUSIVE -- a probe may leave at
+    exactly 45 minutes after the first failure, and not a microsecond
+    later."""
+
+    def monitor(self):
+        recorder = shadow_monitor.Recorder(self.tmp / "shadow_edges.jsonl")
+        self.addCleanup(recorder.close)
+        monitor = shadow_monitor.ShadowMonitor(
+            sport="NFL", series="KXNFLGAME", api_key=KEY, cadence=CADENCE,
+            hours=1.0, ledger=CreditLedger(cap=10), recorder=recorder,
+            clock=self.clock)
+        monitor.ends = at(60)
+        return monitor
+
+    def test_the_end_is_exclusive(self):
+        monitor = self.monitor()
+        self.clock.t = at(60) - timedelta(microseconds=1)
+        self.assertIsNone(monitor._paid_request_refused())
+        self.clock.t = at(60)
+        stop = monitor._paid_request_refused()
+        self.assertEqual(stop.reason, "end_of_session")
+
+    def test_the_outage_bound_is_inclusive(self):
+        monitor = self.monitor()
+        first = at(10)
+        monitor.failures = shadow_monitor.FailureRun(
+            started=first, last_answer=None, failed_polls=3,
+            outage_at=at(12))
+        monitor.probing = True
+        self.clock.t = first + shadow_monitor.RECOVERY_MAX_OUTAGE
+        self.assertIsNone(monitor._paid_request_refused())
+        self.clock.t += timedelta(microseconds=1)
+        self.assertEqual(monitor._paid_request_refused().reason,
+                         "outage_unrecovered")
+
+    def test_a_probe_runs_at_the_bound_and_not_after_it(self):
+        monitor = self.monitor()
+        first = at(10)
+        monitor.failures = shadow_monitor.FailureRun(
+            started=first, last_answer=None, failed_polls=3,
+            outage_at=at(12))
+        self.clock.t = first + shadow_monitor.RECOVERY_MAX_OUTAGE
+        with mock.patch.object(monitor, "tick", return_value=None) as tick:
+            self.assertIsNone(monitor._probe())
+            self.assertEqual(tick.call_count, 1)
+            self.clock.t += timedelta(microseconds=1)
+            self.assertEqual(monitor._probe().reason, "outage_unrecovered")
+            self.assertEqual(tick.call_count, 1)
+
+    def test_the_backstop_refuses_any_request_at_the_end(self):
+        """The gate below every fetcher: at the end nothing leaves, and
+        before it every timeout is clipped to the time left."""
+        monitor = self.monitor()
+        sent = []
+
+        def urlopen(request, *args, **kwargs):
+            sent.append(kwargs.get("timeout"))
+            return "answered"
+
+        with mock.patch("urllib.request.urlopen", side_effect=urlopen):
+            with monitor._dispatch_gate():
+                import urllib.request
+                self.clock.t = at(60) - timedelta(seconds=4)
+                urllib.request.urlopen("https://example.invalid", timeout=10)
+                self.clock.t = at(60)
+                with self.assertRaises(shadow_monitor.AuthorizedEndReached):
+                    urllib.request.urlopen("https://example.invalid",
+                                           timeout=10)
+        self.assertEqual(sent, [4.0])
 
 
 class InterruptAndCrashTest(OutageHarness):
