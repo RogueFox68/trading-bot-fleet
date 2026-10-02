@@ -69,7 +69,8 @@ every respect:
   Nothing measured on either is evidence for the channels.
 - **The freeze** fixes, beside everything listed above: `research-drift-v1`
   (60-minute trailing window, 1pp, episodes merged within 60 minutes, the
-  interruption rules, the spacing backstop at three cadences) and
+  interruption rules -- a re-served copy more than 900s old when ready among
+  them, review 5959548662 -- the spacing backstop at three cadences) and
   `research-return-v1` (1pp, gap at most 300s, return at most 120s old,
   the judging order, the same episode rule), and the research read bounds
   (a fresh execution read per newly opened episode, follows every 10s for

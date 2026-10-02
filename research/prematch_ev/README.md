@@ -1450,13 +1450,21 @@ module; recorded on every session and every signal with
   classifies each quote: declared book, event, orientation, two-sided,
   de-viggable, dated, clock-coherent, at most 900s old when actionable. Its
   triggers are therefore the adjacent detector's, and `--report` checks
-  them against the recorded ones.
+  them against the recorded ones. One exception: the detector recognises a
+  **re-served copy** before it ages anything (to it a repeat means the feed
+  did not stop), so it never calls one stale. Here a copy is aged on its own
+  provider stamp and readiness by the same bound, clock and order
+  (`repeat_freshness`, held to the detector's answer at the bound by a
+  test): within 900s it is a sighting, recorded as a re-served copy with its
+  own receipt and age; past it, it is not (review 5959548662).
 - **Interruptions are never bridged.** A failed poll and the outage it
   becomes, a stretch not polled, the game missing from an answered poll
-  (which covers an HTTP 200 with no sharp quote), an unusable quote, an
-  **older copy** (stricter than the adjacent detector), or more than three
-  cadences between sightings. After one, only a new valid observation
-  restarts anything.
+  (which covers an HTTP 200 with no sharp quote), an unusable quote, a
+  **re-served copy past 900s** (`re_served:stale_at_decision`) or an
+  **older copy** (both stricter than the adjacent detector, which keeps its
+  baseline across either), or more than three cadences between sightings.
+  After one, only a new valid observation restarts anything; a re-served
+  copy never does, fresh or stale.
 - **`drift` (research-drift-v1).** Anchors are the valid observations since
   the stream's last interruption that were ready within the trailing
   **60 minutes**; older ones have expired, and none survives an
@@ -1469,7 +1477,9 @@ module; recorded on every session and every signal with
   qualifying observation the other way opens its own and names the one it
   reverses.
 - **`return` (research-return-v1).** An interruption opens a gap; the last
-  valid observation before it is the pre-gap reference. The first valid new
+  valid observation before it is the pre-gap reference, timed and recorded
+  by its last valid sighting -- a stale copy is never one, so it cannot
+  shorten the gap. The first valid new
   observation after it is the return, judged once: `gap_too_long` (over
   **300s** from the pre-gap sighting -- half the one measured exchange
   response, ~610s), `return_stale` (over **120s** old when ready),
@@ -1526,8 +1536,14 @@ largest single step of 0.1793pp and no adjacent trigger; the return comes
 back 1.5781pp away after an HTTP 200 whose event has `bookmakers: []`, gap
 60s; a move 73.8h out is recorded and left unread, beyond the horizon. Its
 480 research reads sat beside 1,676 adjacent reads, and every adjacent
-record was identical, byte for byte, with the channels off. On the owner's
-machine the real session can be read the same way, for free and offline:
+record was identical, byte for byte, with the channels off. A variant with
+LAR-PHI's provider stamp frozen from 23:00 (`StaleRepeatSessionTest`):
+the channels interrupt at the first copy past 900s and judge the changed
+quote as a return 210s after the last fresh copy, with no drift across the
+copies, while the adjacent detector, unchanged, fires on that quote across
+them; adjacent records again identical with the channels off. On the
+owner's machine the real session can be read the same way, for free and
+offline:
 
 ```
 python3 shadow_monitor.py --report study_output/shadow/shadow_20261001T044202Z.jsonl \

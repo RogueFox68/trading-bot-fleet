@@ -16,6 +16,7 @@ these are regression tests of the rules declared in `reaction.research`.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import sys
 import unittest
@@ -28,10 +29,12 @@ from data.odds_history import SHARP_BOOK, SharpQuote               # noqa: E402
 from reaction.detector import (                                    # noqa: E402
     MoveDetector, MovePolicy, Rejection, fair_probabilities,
 )
+from reaction.clocks import envelope_for_live_sharp_quote           # noqa: E402
 from reaction.research import (                                    # noqa: E402
     BELOW_THRESHOLD, CENSORED_IN_PLAY, CENSORED_SESSION_END, DRIFT,
-    GAP_TOO_LONG, RETURN, RETURN_NOT_NEWER, RETURN_STALE, SIGNAL,
-    DriftPolicy, ResearchChannels, ReturnPolicy, research_coverage,
+    GAP_TOO_LONG, RE_SERVED, RETURN, RETURN_NOT_NEWER, RETURN_STALE, SIGNAL,
+    DriftPolicy, ResearchChannels, ReturnPolicy, repeat_freshness,
+    research_coverage,
 )
 
 UTC = timezone.utc
@@ -65,9 +68,10 @@ class Feed:
     """The monitor's calls, one poll at a time, on a 30s grid."""
 
     def __init__(self, drift: DriftPolicy | None = None,
-                 ret: ReturnPolicy | None = None):
+                 ret: ReturnPolicy | None = None,
+                 move: MovePolicy | None = None):
         self.channels = ResearchChannels(
-            MovePolicy(book=SHARP_BOOK),
+            move or MovePolicy(book=SHARP_BOOK),
             drift=drift or DriftPolicy(max_spacing=3 * CADENCE),
             ret=ret or ReturnPolicy())
         self.opened: list = []
@@ -519,6 +523,218 @@ class ReturnTest(unittest.TestCase):
         self.assertEqual(len(feed.channels.adjacent), 1)
         [signal] = feed.signals(RETURN)
         self.assertTrue(signal.adjacent_trigger_here)
+
+
+READY = timedelta(milliseconds=5)          # Feed: ready this long after receipt
+STALE_REPEAT = f"{RE_SERVED}:{Rejection.STALE_AT_DECISION.value}"
+
+
+class StaleRepeatTest(unittest.TestCase):
+    """A re-served copy is a sighting only while it is fresh (review
+    5959548662). The adjacent detector recognises a repeat before it ages
+    anything -- to it a re-served copy means the feed did not stop -- so it
+    never calls one stale. These channels must: a provider re-serving one
+    observation for twenty minutes would otherwise carry a segment, and a
+    drift, across minutes in which nobody had seen the price."""
+
+    @staticmethod
+    def stream(feed: Feed):
+        [state] = feed.channels.streams.values()
+        return state
+
+    @staticmethod
+    def frozen(feed: Feed, copies: int, stamp: datetime = T0) -> None:
+        """One observation, then `copies` re-served copies of it, one a
+        poll: copy k is 30k seconds (and the Feed's 5ms) old when ready."""
+        for _ in range(copies + 1):
+            feed.price(-143, 129, observed=stamp)
+
+    def test_the_reviewed_reproduction(self):
+        """The owner's probe, verbatim, and what it now finds."""
+        f = Feed()
+        f.price(-143, 129, observed=T0)
+        for _ in range(40):
+            f.price(-143, 129, observed=T0)
+        f.price(-150, 135)
+        assert not f.signals("drift")
+        self.assertEqual(dict(f.channels.counts["observations"]),
+                         {"first_observation": 1, "unchanged_content": 40,
+                          "trigger": 1})
+        # THE FIRST COPY PAST 900s INTERRUPTED THE STREAM, once.
+        self.assertEqual(dict(f.channels.resets), {STALE_REPEAT: 1})
+        # The changed quote is judged once, as a return across the stale
+        # stretch, measured from the last copy that was still fresh.
+        [judged] = f.returns()
+        self.assertEqual(judged["verdict"], GAP_TOO_LONG)
+        self.assertEqual(judged["failed"], [GAP_TOO_LONG])
+        self.assertEqual(judged["gap"]["causes"],
+                         [{"cause": STALE_REPEAT, "count": 1}])
+        self.assertEqual(judged["pre_gap_last_seen"],
+                         (T0 + 29 * CADENCE + READY).isoformat())
+        self.assertEqual(judged["gap"]["opened_at"],
+                         (T0 + 30 * CADENCE + READY).isoformat())
+        self.assertAlmostEqual(judged["gap"]["seconds"], 360.0, places=6)
+        self.assertEqual(judged["gap"]["re_served_unchanged"], 10)
+        last = judged["pre_gap_last_sighting"]
+        self.assertTrue(last["re_served"])
+        self.assertAlmostEqual(last["age_at_decision_seconds"], 870.005,
+                               places=6)
+        self.assertEqual(last["provider_observed_at"], T0.isoformat())
+        self.assertEqual(judged["pre_gap"]["ready_at"],
+                         (T0 + READY).isoformat())
+        # THE ADJACENT DETECTOR IS UNCHANGED: it never aged the copies, kept
+        # its baseline, and fires on the same quote. The record says so.
+        self.assertEqual(len(f.channels.adjacent), 1)
+        self.assertTrue(judged["adjacent_trigger_on_this_quote"])
+
+    def test_copies_inside_the_bound_are_sightings_with_their_own_clocks(self):
+        """A fresh copy keeps the segment alive and can anchor a drift --
+        and an anchor that is a copy says so, with ITS receipt and ITS age
+        beside the provider stamp it shares with the first sighting."""
+        f = Feed()
+        self.frozen(f, 10)                          # the last is 300.005s old
+        for pair in DRIFT_PATH[1:]:
+            f.price(*pair)
+        self.assertEqual(dict(f.channels.resets), {})
+        self.assertEqual(f.channels.adjacent, [])
+        [signal] = f.signals(DRIFT)
+        anchor = signal.reference.as_dict()
+        self.assertTrue(anchor["re_served"])
+        self.assertEqual(anchor["ready_at"],
+                         (T0 + 10 * CADENCE + READY).isoformat())
+        self.assertEqual(anchor["received_at"],
+                         (T0 + 10 * CADENCE).isoformat())
+        self.assertEqual(anchor["provider_observed_at"], T0.isoformat())
+        self.assertAlmostEqual(anchor["age_at_decision_seconds"], 300.005,
+                               places=6)
+        self.assertEqual(signal.detail["window"]["anchor_age_seconds"],
+                         7 * CADENCE.total_seconds())
+        # A new value is still recorded as one.
+        self.assertFalse(signal.current.as_dict()["re_served"])
+
+    def test_a_copy_exactly_at_the_bound_is_still_a_sighting(self):
+        """The detector's bound is inclusive -- stale means `age > 900` --
+        and so is this one."""
+        f = Feed()
+        stamp = T0 + READY                          # copy k: 30k seconds old
+        self.frozen(f, 30, stamp)
+        state = self.stream(f)
+        self.assertEqual(dict(f.channels.resets), {})
+        self.assertIsNone(state.gap)
+        self.assertEqual(state.seen.age_at_decision, 900.0)
+        f.price(-143, 129, observed=stamp)          # 930s
+        self.assertEqual(dict(f.channels.resets), {STALE_REPEAT: 1})
+        self.assertEqual(state.gap.pre_seen.age_at_decision, 900.0)
+        self.assertEqual(state.gap.pre_last_seen, T0 + 30 * CADENCE + READY)
+
+    def test_stale_copies_after_the_bound_neither_restart_nor_close_the_gap(
+            self):
+        f = Feed()
+        self.frozen(f, 60)                          # half an hour of one stamp
+        state = self.stream(f)
+        self.assertEqual(dict(f.channels.resets), {STALE_REPEAT: 1})
+        self.assertEqual(state.segment, [])
+        self.assertIsNotNone(state.gap)
+        self.assertEqual(state.gap.re_served, 30)
+        self.assertEqual(f.channels.counts[RETURN]["re_served_inside_gap"], 30)
+        # NO STALE COPY IS A SIGHTING: the last valid one is still the last
+        # copy that was fresh, so the gap is not shortened by them.
+        self.assertEqual(state.last_seen, T0 + 29 * CADENCE + READY)
+        self.assertEqual(state.gap.pre_last_seen, T0 + 29 * CADENCE + READY)
+        self.assertEqual(f.channels.evaluations, 30)
+        self.assertEqual(f.returns(), [])
+        f.channels.finish(f.t)
+        [censored] = f.returns()
+        self.assertEqual(censored["verdict"], CENSORED_SESSION_END)
+        self.assertEqual(censored["gap"]["re_served_unchanged"], 30)
+
+    def test_a_fresh_changed_return_after_a_short_stale_stretch_is_a_signal(
+            self):
+        f = Feed()
+        self.frozen(f, 30)                          # the 30th: 900.005s, stale
+        f.price(-150, 135)                          # observed 14s before receipt
+        self.assertEqual(f.signals(DRIFT), [])      # nothing bridges the copy
+        [signal] = f.signals(RETURN)
+        self.assertAlmostEqual(signal.delta_home,
+                               cle(-150, 135) - cle(-143, 129), places=12)
+        gap = signal.detail["gap"]
+        self.assertEqual(gap["first_cause"], STALE_REPEAT)
+        self.assertAlmostEqual(gap["seconds"], 60.0, places=6)
+        # The reference is the last copy that was still fresh, with its own
+        # clocks; the value's first sighting is recorded beside it.
+        reference = signal.reference
+        self.assertFalse(reference.new)
+        self.assertEqual(reference.at, T0 + 29 * CADENCE + READY)
+        self.assertEqual(reference.received_at, T0 + 29 * CADENCE)
+        self.assertAlmostEqual(reference.age_at_decision, 870.005, places=6)
+        self.assertEqual(reference.observed_at, T0)
+        self.assertEqual(gap["pre_gap_value_first_seen"],
+                         (T0 + READY).isoformat())
+        self.assertTrue(signal.adjacent_trigger_here)
+        # DRIFT RE-ANCHORS ON THE RETURN, and only there.
+        self.assertEqual([p.at for p in self.stream(f).segment],
+                         [signal.current.at])
+
+    def test_after_a_stale_stretch_the_return_takes_every_declared_check(self):
+        """The first new observation is judged as any return is, and the
+        gap closes on it whatever the verdict."""
+        for copies, quote_age, pair, verdict in (
+                (40, 14, (-150, 135), GAP_TOO_LONG),        # 360s > 300s
+                (30, 200, (-150, 135), RETURN_STALE),       # 200s > 120s
+                (30, 14, (-144, 130), BELOW_THRESHOLD)):    # under a point
+            with self.subTest(verdict=verdict):
+                f = Feed()
+                self.frozen(f, copies)
+                f.price(*pair, observed=f.t - timedelta(seconds=quote_age))
+                [judged] = f.returns()
+                self.assertEqual(judged["verdict"], verdict)
+                self.assertEqual(judged["gap"]["first_cause"], STALE_REPEAT)
+                self.assertEqual(f.signals(RETURN), [])
+                self.assertEqual(f.signals(DRIFT), [])
+                self.assertIsNone(self.stream(f).gap)
+                self.assertEqual(len(self.stream(f).segment), 1)
+
+    def test_the_bound_is_the_sessions_own(self):
+        f = Feed(move=MovePolicy(book=SHARP_BOOK,
+                                 max_age_at_decision=timedelta(seconds=300)))
+        self.frozen(f, 10)                          # the 10th: 300.005s
+        self.assertEqual(dict(f.channels.resets), {STALE_REPEAT: 1})
+        self.assertAlmostEqual(self.stream(f).gap.pre_seen.age_at_decision,
+                               270.005, places=6)
+
+
+class RepeatFreshnessTest(unittest.TestCase):
+    """`repeat_freshness` gives a re-served copy the answer the detector
+    gives NEW content of the same age: one rule, applied in two places, held
+    to one answer (rule 19)."""
+
+    def test_the_detectors_answer_for_new_content_of_the_same_age(self):
+        at = T0 + timedelta(hours=1)
+        for require in (True, False):
+            policy = MovePolicy(book=SHARP_BOOK, require_content_age=require)
+            for age in (0.0, 14.0, 899.999, 900.0, 900.001, 5000.0, -1.0,
+                        None):
+                with self.subTest(require_content_age=require, age=age):
+                    stamp = (None if age is None else
+                             at + READY - timedelta(seconds=age))
+                    q = dataclasses.replace(quote(at, -143, 129),
+                                            last_update=stamp)
+                    envelope = envelope_for_live_sharp_quote(
+                        q, received_at=at,
+                        sent_at=at - timedelta(milliseconds=300),
+                        ready_at=at + READY)
+                    self.assertEqual(envelope.age_at_decision_seconds(), age)
+                    detector = MoveDetector(policy)
+                    self.assertIsNone(detector.observe(envelope))
+                    [rejection] = detector.result.rejections
+                    verdict = rejection.reason.value
+                    expected = (None if verdict
+                                == Rejection.FIRST_OBSERVATION.value
+                                else verdict)
+                    self.assertEqual(
+                        repeat_freshness(policy,
+                                         envelope.age_at_decision_seconds()),
+                        expected)
 
 
 class SameInputsTest(unittest.TestCase):

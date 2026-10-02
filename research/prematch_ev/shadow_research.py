@@ -739,6 +739,15 @@ def _render_channel(figures: dict, render_scenario: Any) -> list[str]:
                      + (f"; largest single step "
                         f"{signal['window']['largest_single_step'] * 100:.4f}pp"
                         if "window" in signal else ""))
+        reference = signal["reference"]
+        if reference.get("re_served"):
+            # The anchor or pre-gap sighting was a copy the provider
+            # re-served: its sighting time is not its observation time.
+            age = reference.get("age_at_decision_seconds")
+            lines.append(f"      reference is a re-served copy: provider stamp "
+                         f"{_when(reference['provider_observed_at'])}"
+                         + (f", {age:.1f}s old when ready"
+                            if age is not None else ""))
         if item["overlaps_adjacent"]:
             lines.append(f"      overlaps {len(item['overlaps_adjacent'])} "
                          f"adjacent trigger(s)")

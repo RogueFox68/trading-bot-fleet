@@ -154,11 +154,16 @@ class ResearchNetwork:
             return self._odds(at)
         raise AssertionError(f"no answer for {url}")
 
+    def observed_for(self, game: Game, at: datetime) -> datetime:
+        """The provider's observation stamp on `game`'s quote at `at`: a
+        fixed lag behind the poll, so every answer is a new observation."""
+        return at - PROVIDER_LAG
+
     def _odds(self, at: datetime) -> Response:
         self.odds_calls.append(at)
-        observed = at - PROVIDER_LAG
         events = []
         for game in self.games:
+            observed = self.observed_for(game, at)
             _, away_price, home_price = _at(game.pinnacle, at)
             event = {"id": game.odds_event,
                      "commence_time": _iso(game.kickoff),

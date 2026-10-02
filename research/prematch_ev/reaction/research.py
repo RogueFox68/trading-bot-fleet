@@ -36,6 +36,18 @@ triggers are by construction the adjacent detector's, the offline report
 checks them against the session's recorded triggers to prove the replay saw
 what the monitor saw.
 
+ONE EXCEPTION, AND WHY: A RE-SERVED COPY IS AGED HERE. The detector
+recognises unchanged content BEFORE it applies its freshness rule -- by
+design: to it a re-served copy means the feed did not stop, so continuity
+advances while the baseline stays put -- and therefore never says whether a
+repeat is still fresh. A provider re-serving one observation for twenty
+minutes would keep a segment alive here, on a price nobody had seen for most
+of them (owner's review 5959548662). So a repeat is judged by
+`repeat_freshness`: the detector's own bound, on the detector's own clock
+(`age_at_decision_seconds`: this copy's provider stamp to its readiness), in
+the order the detector applies them to new content. The adjacent detector is
+unchanged and still keeps its continuity across such copies.
+
 INTERRUPTIONS: THE ONE THING BOTH CHANNELS MAY NEVER CROSS
 -----------------------------------------------------------
 A stream is interrupted by:
@@ -45,6 +57,11 @@ A stream is interrupted by:
   covers an HTTP 200 whose event carries no usable sharp quote;
 * an unusable observation: one-sided, undeviggable, undated, stale at
   decision, or clock-incoherent;
+* a RE-SERVED COPY PAST THE AGE BOUND (`re_served:stale_at_decision`): the
+  same content again, now more than `max_age_at_decision` old when ready.
+  Stricter than the adjacent detector, which never ages a repeat (above).
+  The last copy still inside the bound is the last valid sighting; no stale
+  copy is one;
 * an OLDER COPY re-served (`regressed_content`). Stricter than the adjacent
   detector, which keeps its baseline across one: at that poll the current
   price was not observed, and these channels do not bridge what was not seen;
@@ -52,13 +69,15 @@ A stream is interrupted by:
   `max_gap`: backstops, since the monitor declares every hole it leaves.
 
 After an interruption, only a valid NEW observation restarts anything: a
-re-served copy of the old content does not, exactly as it cannot restart the
-adjacent detector's baseline.
+re-served copy of the old content does not, fresh or stale, exactly as it
+cannot restart the adjacent detector's baseline.
 
 CHANNEL 1 -- `drift` (DriftPolicy)
 ----------------------------------
-1. SEGMENT: a stream's valid observations -- new values and re-served
-   repeats -- since its last interruption. An interruption empties it.
+1. SEGMENT: a stream's valid observations -- new values, and re-served
+   repeats while they are still fresh -- since its last interruption. An
+   interruption empties it. Each records its own provider stamp, receipt and
+   age, so a repeat that anchors a signal says that it is one.
 2. ANCHORS: every observation in the segment whose decision-ready time is
    within `window` of the current one's. An anchor older than that has
    expired; none survives an interruption. There is no other age bound: each
@@ -84,10 +103,12 @@ CHANNEL 1 -- `drift` (DriftPolicy)
 CHANNEL 2 -- `return` (ReturnPolicy)
 ------------------------------------
 1. GAP: an interruption of a stream that has a valid observation opens one;
-   that observation is the PRE-GAP reference, timed by its latest sighting
-   (a re-served repeat before the gap is a sighting).
-2. INSIDE IT: a re-served copy of the pre-gap content keeps it open, as it
-   keeps the adjacent detector's baseline invalid; so does an unusable or
+   that observation is the PRE-GAP reference, timed by its latest VALID
+   sighting (a re-served repeat before the gap is one while it is fresh; a
+   stale one never is, so it cannot shorten the gap).
+2. INSIDE IT: a re-served copy of the pre-gap content keeps it open, fresh
+   or stale: it is not a new observation (after a declared hole it cannot
+   restore the adjacent detector's baseline either). So does an unusable or
    older observation, recorded as a refused return with its reason.
 3. THE RETURN is the first valid new observation after it -- the one the
    adjacent detector re-anchors on. It is judged once, in this order:
@@ -159,6 +180,11 @@ BELOW_THRESHOLD = "below_threshold"
 CENSORED_IN_PLAY = "censored_in_play"
 CENSORED_SESSION_END = "censored_session_end"
 
+#: A re-served copy that is no longer a valid sighting interrupts under this
+#: prefix and the rejection the detector would give NEW content of that age:
+#: `re_served:stale_at_decision`, chiefly.
+RE_SERVED = "re_served"
+
 #: The bins every distribution is reported in: the owner's 2026-10-01 drift
 #: audit used these, so a run with no signal is still comparable with it.
 BINS = (0.001, 0.0025, 0.005, 0.0075, 0.01)
@@ -167,6 +193,26 @@ DECLARED = ("2026-10-02, after the 2026-10-01 session's offline audit was read "
             "(PIT-CLE 1.1336pp inside an uninterrupted hour; LAR-PHI 1.5781pp "
             "across one missing quote): development-informed, not tuned on "
             "outcomes, not validated")
+
+
+def repeat_freshness(policy: MovePolicy, age: float | None) -> str | None:
+    """The detector's freshness rule, for a copy the detector does not age.
+
+    `MoveDetector.observe` recognises unchanged content before it reaches its
+    age checks, so a re-served copy is never judged stale there. This applies
+    those checks -- same `MovePolicy`, same clock (`age` is the copy's own
+    `age_at_decision_seconds`), same order -- and returns the rejection the
+    detector gives NEW content of that age, or None when it would accept it.
+    `test_research_channels` holds the two to the same answer at the bound.
+    """
+    if age is None:
+        return (Rejection.UNKNOWN_CONTENT_AGE.value
+                if policy.require_content_age else None)
+    if age < 0:
+        return Rejection.CLOCK_ORDER_INVALID.value
+    if age > policy.max_age_at_decision.total_seconds():
+        return Rejection.STALE_AT_DECISION.value
+    return None
 
 
 def _iso(moment: datetime | None) -> str | None:
@@ -261,7 +307,9 @@ class ReturnPolicy:
 
 @dataclass(frozen=True)
 class Point:
-    """One valid sighting of a stream's price."""
+    """One valid sighting of a stream's price, with that sighting's own
+    clocks: a re-served repeat carries ITS receipt and ITS age, beside the
+    provider stamp it shares with the first sighting of the value."""
 
     at: datetime                     # decision-ready: when it could be used
     fair_home: float
@@ -279,21 +327,30 @@ class Point:
                 "provider_observed_at": _iso(self.observed_at),
                 "received_at": _iso(self.received_at),
                 "age_at_decision_seconds": self.age_at_decision,
+                "re_served": not self.new,
                 "overround": self.overround,
                 "devig_disagreement": self.devig_disagreement}
 
 
 @dataclass
 class Gap:
-    """A stream's open interruption, as channel 2 holds it."""
+    """A stream's open interruption, as channel 2 holds it.
+
+    `pre` is the pre-gap value as first seen; `pre_seen` its last VALID
+    sighting before the gap (`pre` itself, or a fresh re-served copy of it),
+    which is where the gap is measured from."""
 
     pre: Point
-    pre_last_seen: datetime
+    pre_seen: Point
     opened_at: datetime | None
     causes: Counter = field(default_factory=Counter)
     order: list = field(default_factory=list)
     re_served: int = 0
     refused: list = field(default_factory=list)
+
+    @property
+    def pre_last_seen(self) -> datetime:
+        return self.pre_seen.at
 
     def add(self, cause: str) -> None:
         if cause not in self.causes:
@@ -422,13 +479,17 @@ class Stream:
     stream_id: str
     event_id: str
     segment: list = field(default_factory=list)       # channel 1's points
-    last_valid: Point | None = None
-    last_seen: datetime | None = None     # latest sighting of last_valid
+    last_valid: Point | None = None       # the latest valid VALUE, first seen
+    seen: Point | None = None   # its latest valid sighting: it, or a fresh copy
     last_sighting: datetime | None = None  # latest observation of any kind
     gap: Gap | None = None
     retired: bool = False
     max_excursion: float = 0.0
     max_excursion_at: datetime | None = None
+
+    @property
+    def last_seen(self) -> datetime | None:
+        return None if self.seen is None else self.seen.at
 
 
 class ResearchChannels:
@@ -472,11 +533,21 @@ class ResearchChannels:
                     "interruptions": sorted(_BREAK) + [
                         "declared:absent_from_answer", "declared:failed_poll",
                         "declared:not_polled", "declared:outage",
-                        Rejection.GAP.value, "spacing_exceeded"],
+                        Rejection.GAP.value, "spacing_exceeded"] + [
+                        f"{RE_SERVED}:{r.value}" for r in (
+                            Rejection.STALE_AT_DECISION,
+                            Rejection.UNKNOWN_CONTENT_AGE,
+                            Rejection.CLOCK_ORDER_INVALID)],
+                    "re_served_copies": (
+                        "a sighting while within the move policy's age bound "
+                        "when ready, judged on the copy's own provider stamp "
+                        "and readiness; past it, an interruption, and the last "
+                        "copy within it is the last valid sighting"),
                     "note": ("validity is the adjacent detector's own rule, "
                              "run privately on the same inputs; an older copy "
-                             "is an interruption here, though not to the "
-                             "adjacent detector")}}
+                             "and a re-served copy past the age bound are "
+                             "interruptions here, though not to the adjacent "
+                             "detector, which never ages a repeat")}}
 
     # --- what the monitor declares ----------------------------------------
 
@@ -582,7 +653,7 @@ class ResearchChannels:
             self._interrupt(state, available, verdict)
             return []
         if verdict in _REPEAT:
-            return self._repeat(state, available)
+            return self._repeat(state, envelope, available)
         quote = envelope.payload
         fair = fair_probabilities(getattr(quote, "away_price", None),
                                   getattr(quote, "home_price", None),
@@ -606,12 +677,23 @@ class ResearchChannels:
         if state.gap is not None:
             signals += self._returned(state, point, adjacent)
         signals += self._drift(state, point, adjacent)
-        state.last_valid, state.last_seen = point, available
+        state.last_valid = state.seen = point
         return [s for s in signals if s.opened]
 
-    def _repeat(self, state: Stream, at: datetime) -> list[ResearchSignal]:
-        """The provider re-served content already seen. Inside a gap it does
-        not end it; otherwise it is one more sighting of the same price."""
+    def _repeat(self, state: Stream, envelope: Any,
+                at: datetime) -> list[ResearchSignal]:
+        """The provider re-served content already seen.
+
+        Inside a gap it changes nothing, fresh or stale: it is not a new
+        observation, so it can neither close the gap nor restart anything.
+        Outside one it is one more sighting of the same price only while it
+        is still FRESH by the session's own bound, judged on this copy's own
+        provider stamp and readiness (`repeat_freshness`): the private
+        detector cannot say, because it recognises a repeat before it ages
+        anything. Past the bound the stream is interrupted, the anchors go,
+        and the gap opens from the last copy that was still fresh -- a stale
+        copy is never a sighting, so it cannot carry continuity or shorten a
+        gap."""
         if state.gap is not None:
             state.gap.re_served += 1
             self.counts[RETURN]["re_served_inside_gap"] += 1
@@ -620,14 +702,19 @@ class ResearchChannels:
         if last is None or not state.segment:
             self.counts[DRIFT]["repeat_outside_a_segment"] += 1
             return []
+        age = envelope.age_at_decision_seconds()
+        problem = repeat_freshness(self.move_policy, age)
+        if problem is not None:
+            self._interrupt(state, at, f"{RE_SERVED}:{problem}")
+            return []
         point = Point(at=at, fair_home=last.fair_home, fair_away=last.fair_away,
-                      observed_at=last.observed_at,
-                      received_at=last.received_at,
-                      age_at_decision=None, new=False,
+                      observed_at=envelope.provider_observed_at,
+                      received_at=envelope.response_received_at,
+                      age_at_decision=age, new=False,
                       overround=last.overround,
                       devig_disagreement=last.devig_disagreement)
         signals = self._drift(state, point, False)
-        state.last_seen = at
+        state.seen = point
         return [s for s in signals if s.opened]
 
     def _retire(self, stream: str, event_id: str, at: datetime) -> None:
@@ -660,10 +747,10 @@ class ResearchChannels:
         if state.gap is not None:
             state.gap.add(cause)
             return
-        if state.last_valid is None or state.last_seen is None:
+        if state.last_valid is None or state.seen is None:
             self.counts[RETURN]["interrupted_before_any_observation"] += 1
             return
-        state.gap = Gap(pre=state.last_valid, pre_last_seen=state.last_seen,
+        state.gap = Gap(pre=state.last_valid, pre_seen=state.seen,
                         opened_at=at)
         state.gap.add(cause)
         self.counts[RETURN]["gaps_opened"] += 1
@@ -678,6 +765,7 @@ class ResearchChannels:
             "stream_id": state.stream_id, "event_id": state.event_id,
             "verdict": verdict, "pre_gap": gap.pre.as_dict(),
             "pre_gap_last_seen": _iso(gap.pre_last_seen),
+            "pre_gap_last_sighting": gap.pre_seen.as_dict(),
             "gap": {**gap.as_dict(), "closed_at": _iso(at),
                     "seconds": (None if at is None else
                                 (at - gap.pre_last_seen).total_seconds())},
@@ -719,19 +807,17 @@ class ResearchChannels:
             "stream_id": state.stream_id, "event_id": state.event_id,
             "verdict": verdict, "pre_gap": gap.pre.as_dict(),
             "pre_gap_last_seen": _iso(gap.pre_last_seen),
+            "pre_gap_last_sighting": gap.pre_seen.as_dict(),
             "gap": detail["gap"], "return": point.as_dict(),
             "delta": {"home": delta,
                       "away": point.fair_away - gap.pre.fair_away},
             "failed": failed, "adjacent_trigger_on_this_quote": adjacent})
         if verdict != SIGNAL:
             return []
-        reference = Point(at=gap.pre_last_seen, fair_home=gap.pre.fair_home,
-                          fair_away=gap.pre.fair_away,
-                          observed_at=gap.pre.observed_at,
-                          received_at=gap.pre.received_at,
-                          age_at_decision=gap.pre.age_at_decision, new=True,
-                          overround=gap.pre.overround,
-                          devig_disagreement=gap.pre.devig_disagreement)
+        # The reference is the last VALID sighting before the gap, with its
+        # own clocks: the first sighting of the value if nothing re-served it,
+        # else the last copy that was still fresh.
+        reference = gap.pre_seen
         return [self._hit(RETURN, policy, state, reference, point,
                           1 if delta > 0 else -1, adjacent, detail)]
 

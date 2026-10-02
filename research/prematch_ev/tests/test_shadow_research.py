@@ -16,6 +16,9 @@ What these pin, beyond the channels' own rules (`test_research_channels`):
   authorized end, never starts within its guard of the next paid request,
   and costs no credit;
 * the declared read bounds hold when a whole slate returns at once;
+* a provider re-serving one observation past 900s interrupts the channels,
+  which judge the changed quote as a return from the last fresh copy, while
+  the adjacent path is unchanged and still bridges the copies;
 * a failure inside the channels stops the channels, never the session;
 * `--report` rebuilds the live signals from the raw polls, says when a
   session never ran the channels, and censors research markouts at kickoff
@@ -403,6 +406,91 @@ class OutageReturnTest(SessionCase):
         figures = analyse(self.rows)
         self.assertTrue(figures["inputs_check"]["agrees"])
         self.assertTrue(figures["recorded_check"]["agrees"])
+
+
+class StaleRepeatSessionTest(SessionCase):
+    """LAR-PHI's provider stamp freezes at 22:59:50 and the same observation
+    is re-served every poll until the price comes back moved (review
+    5959548662, end to end). The adjacent path is unchanged -- byte for byte
+    against the channels off, and still firing across the frozen copies,
+    which its detector never ages -- while the channels interrupt at the
+    first copy past 900s and judge the changed quote as a return measured
+    from the last copy that was still fresh."""
+
+    run_off = True
+    FREEZE = (datetime(2026, 10, 1, 23, 0, tzinfo=UTC), dev.LAR_PHI_RETURN)
+    STAMP = datetime(2026, 10, 1, 22, 59, 50, tzinfo=UTC)
+    STALE = "re_served:stale_at_decision"
+
+    @staticmethod
+    def session(out_dir):
+        freeze, stamp = StaleRepeatSessionTest.FREEZE, \
+            StaleRepeatSessionTest.STAMP
+
+        class Frozen(dev.ResearchNetwork):
+            def observed_for(self, game, at):
+                if (game.odds_event == "evt-lar-phi"
+                        and freeze[0] <= at < freeze[1]):
+                    return stamp
+                return super().observed_for(game, at)
+
+        # No empty answer: the frozen stamp is LAR-PHI's only hole.
+        games = tuple(dev.Game(g.event_ticker, g.bucket, g.kickoff, g.away,
+                               g.home, g.odds_event, g.pinnacle, g.books)
+                      for g in dev.GAMES)
+        return dev.run_session(out_dir, network=Frozen, games=games)
+
+    def age(self, iso: str) -> float:
+        return (datetime.fromisoformat(iso) - self.STAMP).total_seconds()
+
+    def test_every_adjacent_record_is_identical(self):
+        self.assertEqual(adjacent_records(self.rows),
+                         adjacent_records(self.off_rows))
+
+    def test_the_channels_interrupt_where_the_adjacent_detector_does_not(self):
+        lar_phi = [s for s in self.kinds("research_signal")
+                   if s["event_id"] == "evt-lar-phi"]
+        [signal] = lar_phi                          # a return; no drift
+        self.assertEqual(signal["channel"], RETURN)
+        self.assertAlmostEqual(signal["delta"]["home"], -0.0157813457,
+                               places=9)
+        gap = signal["gap"]
+        self.assertEqual(gap["causes"], [{"cause": self.STALE, "count": 1}])
+        # The gap opened at the first copy past the bound, and is measured
+        # from the last copy inside it, which is the reference.
+        self.assertGreater(self.age(gap["opened_at"]), 900)
+        reference = signal["reference"]
+        self.assertTrue(reference["re_served"])
+        self.assertEqual(reference["provider_observed_at"],
+                         self.STAMP.isoformat())
+        self.assertLessEqual(reference["age_at_decision_seconds"], 900)
+        self.assertEqual(reference["age_at_decision_seconds"],
+                         self.age(reference["ready_at"]))
+        self.assertEqual(reference["ready_at"], gap["pre_gap_last_seen"])
+        self.assertLessEqual(gap["seconds"], 300)
+        self.assertGreaterEqual(gap["re_served_unchanged"], 1)
+        # The adjacent detector, unchanged, never aged a copy: it kept its
+        # baseline across them and fires on the same quote.
+        triggers = [t for t in self.kinds("trigger")
+                    if t["event_id"] == "evt-lar-phi"]
+        self.assertEqual(len(triggers), 1)
+        self.assertTrue(signal["adjacent_trigger_on_this_quote"])
+        start = self.kinds("session_start")[0]
+        self.assertIn(self.STALE, start["research"]["policies"][
+            "observation_rules"]["interruptions"])
+
+    def test_the_report_rebuilds_it(self):
+        figures = analyse(self.rows)
+        self.assertTrue(figures["inputs_check"]["agrees"])
+        self.assertTrue(figures["recorded_check"]["agrees"])
+        summary = self.kinds("session_end")[0]["research"]["summary"]
+        self.assertEqual(summary[DRIFT]["resets_by_cause"], {self.STALE: 1})
+        self.assertEqual(summary[RETURN]["gap_causes"], {self.STALE: 1})
+        text = render_research(figures)
+        self.assertIn(f"window reset by: {self.STALE} 1", text)
+        self.assertIn(f"gap causes: {self.STALE} 1", text)
+        self.assertIn("reference is a re-served copy: provider stamp "
+                      "2026-10-01 22:59:50Z, ", text)
 
 
 class SlateReturnsAtOnceTest(SessionCase):
