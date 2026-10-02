@@ -54,6 +54,52 @@ sessions. This proposal is for the first validation session, not the last.
     across validation sessions only. The floor is the reaction pilot's, for
     the same reason: below it, one lucky afternoon is the result.
 
+## The research channels: development now, validation later
+
+The 2026-10-01 session showed two shapes the adjacent detector cannot see:
+PIT-CLE's 1.1336pp drift inside an hour in sub-point steps, and LAR-PHI's
+1.5781pp change across one quote missing under HTTP 200. Two research-only
+channels now watch for them (`reaction/research.py`, README "Research
+channels"). They are kept apart from the frozen screen's validation in
+every respect:
+
+- **Development data for them:** the 2026-10-01 session -- both examples
+  were read before the rules were written, and each threshold rests on one
+  example -- and the synthetic development fixture built from its figures.
+  Nothing measured on either is evidence for the channels.
+- **The freeze** fixes, beside everything listed above: `research-drift-v1`
+  (60-minute trailing window, 1pp, episodes merged within 60 minutes, the
+  interruption rules, the spacing backstop at three cadences) and
+  `research-return-v1` (1pp, gap at most 300s, return at most 120s old,
+  the judging order, the same episode rule), and the research read bounds
+  (a fresh execution read per newly opened episode, follows every 10s for
+  30 minutes, at most 4 games read per answer and 4 followed at once, no
+  read within 10s of the next paid request). A validation session records
+  them (`session_start.research`).
+- **The read-out is declared now,** in the same terms as the adjacent one
+  and reported beside it, never pooled with it:
+  - the unit is one **game-level episode** per channel; its contract is the
+    one whose YES the move favoured, its mirror reported beside it and
+    never counted again; an episode overlapping an adjacent trigger or the
+    other channel is counted, and named, as overlapping;
+  - for each declared markout: priced and censored counts (by reason), the
+    median, minimum and maximum net after both fees on the non-direct
+    route, the number positive, and the sharp state; the counterfactual
+    screen's verdicts at the fresh quote, as counts, labelled as never an
+    admission;
+  - every run reports its distributions whatever it finds: excursions and
+    return changes in the 0.1/0.25/0.5/0.75/1pp bins, gap causes and
+    lengths, refusals by reason, and the research read load;
+  - **no claim that a channel repeats on fewer than 20 game-level
+    episodes** of that channel, pooled across validation sessions only.
+- **The extra free load** is bounded and disclosed: per newly opened
+  in-horizon episode, two execution reads and at most two reads per 10s for
+  30 minutes (fewer when slots fall inside the 10s guard, about a third at
+  a 30s cadence, or the adjacent path is already following the game), at
+  most 4 games at once -- no more than 0.8 reads a second in the worst
+  case, none of them paid. The synthetic development session made 480
+  research reads beside 1,676 adjacent ones over 2.5 hours on 3 games.
+
 ## The window, and why this one
 
 **24 hours at a 30-second cadence: 2,881 polls, 2,881 credits** at one credit
@@ -85,10 +131,24 @@ moves with it. The same offsets work on any Friday.
 
 ## Before it runs (all free)
 
-1. **Re-analyse 2026-09-24 offline, on the new commit:**
+1. **Re-analyse the two development sessions offline, on the new
+   commit.** 2026-10-01 first: it shows both research channels on the
+   session that motivated them, as development evidence (its research
+   captures enter at its decision reads, since it predates research reads):
 
    ```
    cd research/prematch_ev
+   python3 shadow_monitor.py \
+       --report study_output/shadow/shadow_20261001T044202Z.jsonl \
+       --json study_output/shadow/shadow-20261001-diagnostics.json \
+       > study_output/shadow/shadow-20261001-diagnostics.txt
+   ```
+
+   The research section's `inputs check` should read "agrees": the
+   channels' private detector rebuilds the session's recorded triggers (0),
+   which shows the replay saw what the monitor saw. Then 2026-09-24:
+
+   ```
    python3 shadow_monitor.py \
        --report study_output/shadow_24h/shadow_20260924T014422Z.jsonl \
        --json study_output/shadow_24h/shadow-24h-diagnostics.json \

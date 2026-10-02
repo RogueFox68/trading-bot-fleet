@@ -64,8 +64,9 @@ from analysis.scoring import Eligibility                          # noqa: E402
 from core.fees import DEFAULT_ROUTE, fee_provenance                # noqa: E402
 from data.kalshi_history import parse_orderbook                    # noqa: E402
 from reaction.adjustment import (                                  # noqa: E402
-    FILL_LIMITS, HYPOTHETICAL, SCREEN_ADMITTED, CapturePolicy, Read,
-    SharpReading, capture, screen_entry, summarize,
+    FILL_LIMITS, HYPOTHETICAL, RESEARCH_DRIFT, RESEARCH_RETURN,
+    SCREEN_ADMITTED, CapturePolicy, Read, SharpReading, capture, screen_entry,
+    summarize,
 )
 from reaction.assessment import (                                  # noqa: E402
     TickContext, TickRead, assess, read_status,
@@ -75,8 +76,8 @@ from reaction.detector import (                                    # noqa: E402
 )
 from reaction.measure import request_span                          # noqa: E402
 from shadow_monitor import (                                       # noqa: E402
-    BOOK_HORIZON, BOOK_MEMORY, ENTRY_TOLERANCE, _time, code_version,
-    parse_odds_row,
+    BOOK_HORIZON, BOOK_MEMORY, ENTRY_TOLERANCE, RESEARCH_PURPOSES, _time,
+    code_version, parse_odds_row,
 )
 
 SCHEMA = "shadow-diagnostics/1"
@@ -266,6 +267,10 @@ class Replay:
     memory: dict = field(default_factory=dict)
     #: The blind intervals the monitor declared (`gap` records), in order.
     gaps: list = field(default_factory=list)
+    #: EVERY read of every contract, research reads included: what a
+    #: research capture may use. `reads` above is the adjacent path's only,
+    #: so its captures are what they were before research reads existed.
+    all_reads: dict = field(default_factory=dict)
 
 
 def replay(rows: Sequence[dict]) -> Replay:
@@ -313,8 +318,13 @@ def replay(rows: Sequence[dict]) -> Replay:
                                           received_at=received, sent_at=sent)
             status = read_status(payload is not None, book)
             span = request_span(sent, received)
-            out.reads.setdefault(ticker, []).append(
-                Read(span[0], span[1], status.value, book))
+            read = Read(span[0], span[1], status.value, book)
+            out.all_reads.setdefault(ticker, []).append(read)
+            if row.get("purpose") in RESEARCH_PURPOSES:
+                # NEVER A DECISION BOOK, never an adjacent read: the monitor
+                # kept it out of its memory, and so does the rebuild.
+                continue
+            out.reads.setdefault(ticker, []).append(read)
             if book is not None:
                 # `read_book`'s memory, exactly: appended, then pruned
                 # against the newest receipt.
@@ -903,9 +913,16 @@ def _render_assessment(number: int, item: dict) -> list[str]:
     return lines
 
 
+#: How each capture scenario is named where it is printed. A research
+#: capture is never labelled as the screen's.
+SCENARIO_LABELS = {HYPOTHETICAL: "hypothetical",
+                   SCREEN_ADMITTED: "SCREEN-ADMITTED",
+                   RESEARCH_DRIFT: "research: drift",
+                   RESEARCH_RETURN: "research: return after a gap"}
+
+
 def _render_scenario(scenario: dict) -> list[str]:
-    label = ("hypothetical" if scenario["kind"] == HYPOTHETICAL
-             else "SCREEN-ADMITTED")
+    label = SCENARIO_LABELS[scenario["kind"]]
     if "markouts" not in scenario:
         return [f"      capture ({label}, {scenario['side']}): no entry -- "
                 f"{scenario.get('entry_missing_because')}"]
@@ -915,7 +932,9 @@ def _render_scenario(scenario: dict) -> list[str]:
     when = (f"the admitted trade's own entry, paid {entry['paid']:.4f} "
             f"(execution read {entry['delay_after_move_seconds']:+.1f}s from "
             f"the move)" if scenario["kind"] == SCREEN_ADMITTED else
-            f"{entry['delay_after_move_seconds']:.1f}s after the move")
+            f"{entry['delay_after_move_seconds']:.1f}s after the signal was "
+            f"ready" if scenario["kind"] in (RESEARCH_DRIFT, RESEARCH_RETURN)
+            else f"{entry['delay_after_move_seconds']:.1f}s after the move")
     lines = [f"      capture ({label}): {scenario['side']} bought at "
              f"{entry['price']:.4f} ({paid}) + fee {entry['fee']:.4f}, "
              f"{when}",

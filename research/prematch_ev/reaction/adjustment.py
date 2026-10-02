@@ -92,6 +92,14 @@ from .screen import execution_candle, screen_books              # noqa: E402
 
 HYPOTHETICAL = "hypothetical_follow_move"
 SCREEN_ADMITTED = "screen_admitted"
+#: The research channels' captures (`reaction.research`). They find their
+#: own entry exactly as a hypothetical does -- the first usable read at or
+#: after the signal was ready -- are never handed the screen's, and are
+#: summarised under their own names: a research signal is not an entry.
+RESEARCH_DRIFT = "research_drift"
+RESEARCH_RETURN = "research_return"
+RESEARCH_KINDS = (RESEARCH_DRIFT, RESEARCH_RETURN)
+FINDS_ITS_OWN_ENTRY = (HYPOTHETICAL,) + RESEARCH_KINDS
 
 HINDSIGHT_LABEL = ("HINDSIGHT DIAGNOSTIC: the best and worst exits the reads "
                    "showed, chosen AFTER the fact. Not an achievable exit, "
@@ -418,7 +426,7 @@ def capture(*, kind: str, side: str, reads: Sequence[Read],
     `sharp`, when given, is the keyword arguments for `sharp_state` other
     than `at`, so each markout reports the signal as it stood then.
     """
-    if kind not in (HYPOTHETICAL, SCREEN_ADMITTED):
+    if kind not in (SCREEN_ADMITTED,) + FINDS_ITS_OWN_ENTRY:
         raise ValueError(f"unknown capture scenario {kind!r}")
     if (kind == SCREEN_ADMITTED) != (entry is not None):
         raise ValueError(
@@ -457,9 +465,12 @@ def capture(*, kind: str, side: str, reads: Sequence[Read],
             return out
         leg = _leg(entry_book, side, entering=True, policy=policy,
                    venue=venue, role=role, series=series, route=route)
-        leg["source"] = (f"the first usable read at or after the move, "
-                         f"within {policy.entry_within.total_seconds():g}s: "
-                         f"a hypothetical entry, not the screen's")
+        leg["source"] = (
+            f"the first usable read at or after the "
+            f"{'research signal was ready' if kind in RESEARCH_KINDS else 'move'}"
+            f", within {policy.entry_within.total_seconds():g}s: "
+            + ("a research entry, never the screen's" if kind in RESEARCH_KINDS
+               else "a hypothetical entry, not the screen's"))
     leg["delay_after_move_seconds"] = (entry_book.ts
                                        - detected_at).total_seconds()
     out["entry"] = leg

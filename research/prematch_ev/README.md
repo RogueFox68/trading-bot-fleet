@@ -1425,6 +1425,128 @@ refusals, entries, and recomputation disagreements), `settlement_value`,
 `fees`, and `assessments` -- each with its `shadow-assessment/1` record,
 its capture scenarios, any opposite sharp moves, and its settlement status.
 
+### Research channels: drift, and return after a gap (`reaction/research.py`)
+
+The 2026-10-01 session (24h, 2,872 answered polls, 0 qualifying moves) and
+the owner's offline audit of it showed two kinds of sharp-book change the
+adjacent detector cannot see by design: **PIT-CLE drifted 1.1336pp inside
+an uninterrupted hour in sub-point steps** (CLE 0.4241019282 to
+0.4127659574, ending ~1.70h before kickoff), and **LAR-PHI came back
+1.5781pp away after one poll whose event carried `bookmakers: []`** under
+HTTP 200. Lowering the threshold is not the answer -- four of the five
+half-point changes had negative one-contract settlement EV after the
+non-direct fee -- so two **research-only** channels watch the same quotes,
+reported apart from everything above. **A research signal is not
+permission to trade:** it never reaches the screen, never enters, and
+nothing in the adjacent path reads anything it computes.
+
+**The rules, declared before any session runs them** (in full in the
+module; recorded on every session and every signal with
+`tuned_on_outcomes: false`, `validated: false`):
+
+- **One idea of a valid quote.** A private copy of the adjacent detector,
+  running the session's own `MovePolicy`, is fed exactly what the monitor's
+  is -- the same envelopes, gaps and in-play retirement -- and its verdict
+  classifies each quote: declared book, event, orientation, two-sided,
+  de-viggable, dated, clock-coherent, at most 900s old when actionable. Its
+  triggers are therefore the adjacent detector's, and `--report` checks
+  them against the recorded ones.
+- **Interruptions are never bridged.** A failed poll and the outage it
+  becomes, a stretch not polled, the game missing from an answered poll
+  (which covers an HTTP 200 with no sharp quote), an unusable quote, an
+  **older copy** (stricter than the adjacent detector), or more than three
+  cadences between sightings. After one, only a new valid observation
+  restarts anything.
+- **`drift` (research-drift-v1).** Anchors are the valid observations since
+  the stream's last interruption that were ready within the trailing
+  **60 minutes**; older ones have expired, and none survives an
+  interruption. The current observation qualifies when it is at least
+  **1pp** from some anchor -- above the window's low or below its high --
+  and the reported anchor is the most recent sighting at that extreme.
+  Dated when the qualifying answer was ready. Qualifying observations in the
+  same direction within **60 minutes** of the last one are one EPISODE (a
+  hole does not split it, and a sliding window does not count it twice); a
+  qualifying observation the other way opens its own and names the one it
+  reverses.
+- **`return` (research-return-v1).** An interruption opens a gap; the last
+  valid observation before it is the pre-gap reference. The first valid new
+  observation after it is the return, judged once: `gap_too_long` (over
+  **300s** from the pre-gap sighting -- half the one measured exchange
+  response, ~610s), `return_stale` (over **120s** old when ready),
+  `return_not_newer` (not observed by the provider after the pre-gap quote),
+  `below_threshold` (under 1pp), else a signal. A re-served copy, an
+  unusable quote or an older copy inside the gap keeps it open and is
+  recorded as a refused return. In play censors it. The change is bracketed
+  between the provider's two observations and our two sightings, a bracket
+  that includes the gap: **no bookmaker instant and no exchange lag inside
+  it is claimed.** Same episode rule.
+
+**Live** (`shadow_monitor.py`): the channels see each answer after every
+adjacent move on it has been read and decided, so they cannot delay or
+reorder it, and a failure inside them stops them, not the session
+(`research_error`). A newly opened episode on a joined, in-horizon game gets
+one **fresh execution read** of each contract -- shared with the adjacent
+trigger's when it read the same contract on the same answer, never repeated
+straight behind one that just failed -- and is followed every 10s for 30
+minutes, except while the adjacent path follows the game. These reads are
+**free**, recorded with `research_*` purposes, counted apart, and **never
+enter the decision memory**. None starts at or after the authorized end,
+none within 10s of the next paid request (so a timed-out read still ends
+before it), and one failure abandons the rest; at most 4 games are read on
+one answer and 4 followed at once. The records: `research_signal` (every
+fact the channel used: pre-gap or anchor value and time, gap causes and
+length, the return's provider stamp and ready time, the episode),
+`research_execution` (what was read and why not), and `session_start`,
+`session_end` and the status file's `research` block (policies, bounds,
+counts).
+
+**`--report`** rebuilds both channels from the raw polls -- for any
+session, including one recorded before they existed, which it labels
+DEVELOPMENT -- and prints them after everything else, which is unchanged.
+Per episode, on each joined contract: coverage at the signal; a research
+capture (`research_drift` / `research_return`) through the same
+`reaction.adjustment.capture` -- entry at the first usable read at or after
+the signal was ready, exits at the declared markouts, both fees, depth,
+censoring at kickoff and the session's end; the quote's midpoint path from
+the capture's own reads; the exchange's last read before the anchor or the
+gap beside the entry read; and a **counterfactual screen** at the fresh
+quote (`reaction.assessment.assess`, unchanged) labelled as what the frozen
+screen would have said had the signal been a trigger -- never an admission,
+never counted with entries. Per channel: episodes and games, the primary
+contract (the one whose YES the move favoured) with its mirror beside it
+and never counted twice, overlap with adjacent triggers and the other
+channel, the signal-size distribution, and -- so a zero-signal run still
+says something -- every evaluation's excursion and every return's change in
+the owner's audit bins (0.1/0.25/0.5/0.75/1pp), gap causes and lengths,
+refusals by reason, and the research read load.
+
+**Shown on development data only** (`tests/synthetic_research_session.py`,
+SYNTHETIC, built from the reported figures): the drift crosses 1pp with a
+largest single step of 0.1793pp and no adjacent trigger; the return comes
+back 1.5781pp away after an HTTP 200 whose event has `bookmakers: []`, gap
+60s; a move 73.8h out is recorded and left unread, beyond the horizon. Its
+480 research reads sat beside 1,676 adjacent reads, and every adjacent
+record was identical, byte for byte, with the channels off. On the owner's
+machine the real session can be read the same way, for free and offline:
+
+```
+python3 shadow_monitor.py --report study_output/shadow/shadow_20261001T044202Z.jsonl \
+    --json study_output/shadow/shadow-20261001-research.json
+```
+
+That file predates the channels, so its research captures enter at its
+decision reads (each tick's, ~30s apart) rather than a fresh research read:
+coarser, and labelled DEVELOPMENT.
+
+**Limits.** Each threshold rests on one development example; nothing here
+is validated (see `SHADOW_NEXT_SESSION.md`). A drift slower than 1pp an
+hour, or one cut by any interruption, is not seen; a return after more than
+300s, or staler than 120s, is not judged. About a third of follow slots at a
+30s cadence fall inside the 10s guard and are skipped. And the older-copy
+rule makes the channels' continuity differ from the adjacent detector's in
+exactly that case: a point's jump across an older copy is both a trigger and
+a return, and is flagged as both.
+
 ### Verifying the NFL fee (`verify_fees.py`)
 
 ```

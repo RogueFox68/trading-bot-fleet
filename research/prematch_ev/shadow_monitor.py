@@ -41,6 +41,9 @@ EACH TICK, IN THIS ORDER
    reason, both sides' prices and costs, the books' ages and depth, the
    fee's provenance, and whether a missing book was never due, a one-sided
    market or a failed collection.
+3b. The RESEARCH CHANNELS see the same answer (`reaction.research`, below)
+   -- after every move on it has been read and decided, so they can
+   neither delay nor reorder anything above.
 4. The hourly slate rejoin, if one is due -- AFTER the moves, so its dozen
    requests never sit between a move and its execution read.
 5. A moved game is then followed every few seconds, free, for the declared
@@ -208,6 +211,37 @@ interrupt, a crash -- and local only: nothing is sent anywhere.
 and unable to open a connection (`shadow_diagnostics`), so a session recorded
 before assessments existed gets them, and one recorded after gets them
 checked.
+
+RESEARCH CHANNELS: WATCHED, NEVER TRADED
+----------------------------------------
+Two research-only channels (`reaction.research`, rules declared there) see
+every answer the detector sees: DRIFT, cumulative movement across a trailing
+60-minute window that no single jump reaches, and RETURN, a price changed on
+return after a quote gap -- the two shapes the 2026-10-01 development
+session showed the adjacent detector cannot see by design. A research signal
+is not permission to trade:
+
+  * it never reaches the screen or an entry, and nothing in the adjacent
+    path reads anything the channels compute. With the channels on or off,
+    the adjacent records are identical, byte for byte (`test_shadow_research`);
+  * a newly opened research episode gets a fresh execution read of its
+    game's contracts -- shared with the adjacent trigger's when one was made
+    on the same answer, and never repeated straight behind one that just
+    failed -- and is then followed every FOLLOW_EVERY for FOLLOW_FOR,
+    except while the adjacent path is following the game, whose reads serve;
+  * those reads are FREE (public books), counted apart, recorded with
+    research purposes, and NEVER enter the decision memory. They never start
+    at or after the authorized end, never within RESEARCH_READ_GUARD of the
+    next paid request -- so research can never delay a poll or a probe --
+    and one failure abandons the rest. At most
+    RESEARCH_MAX_GAMES_PER_ANSWER games are read on one answer and
+    RESEARCH_MAX_FOLLOWED_GAMES followed at once;
+  * a failure inside the channels stops the channels, never the session,
+    and is recorded (`research_error`).
+
+`--report` rebuilds both channels from the raw polls -- for any session,
+including one recorded before they existed -- and reports them apart, after
+everything else (`shadow_research`).
 """
 
 from __future__ import annotations
@@ -262,6 +296,10 @@ from reaction.assessment import (                                  # noqa: E402
     SCHEMA as ASSESSMENT_SCHEMA, TickContext, describe, read_status,
 )
 from reaction.screen import screen_live                            # noqa: E402
+from reaction.research import (                                    # noqa: E402
+    DRIFT, RETURN, DriftPolicy, ResearchChannels, ReturnPolicy,
+    research_coverage,
+)
 
 # --- declared operating values --------------------------------------------
 #
@@ -325,6 +363,31 @@ BOOK_MEMORY = timedelta(hours=2)
 #: still be the execution book: the read itself IS the delay, so the only
 #: slack needed is clock rounding.
 ENTRY_TOLERANCE = timedelta(seconds=1)
+
+# --- research channels: watched beside the detector, never screened --------
+#
+# `reaction.research` -- drift across a trailing window, and a price changed
+# on return after a quote gap. A research signal is not permission to trade:
+# it reaches neither the screen nor an entry, and its reads never enter the
+# decision memory the screen prices from. Its reads are FREE (public Kalshi
+# books) and bounded by these, recorded on every session:
+
+#: Off only in tests that hold the adjacent path's records against a run
+#: without the channels.
+RESEARCH_ENABLED = True
+#: Games whose newly opened research episodes get an execution read on one
+#: answer, the largest moves first: a provider hiccup that returns a whole
+#: slate at once must not turn into dozens of reads behind one poll.
+RESEARCH_MAX_GAMES_PER_ANSWER = 4
+#: Games followed for research at once (both contracts, every FOLLOW_EVERY,
+#: for FOLLOW_FOR): at most 8 reads per follow interval.
+RESEARCH_MAX_FOLLOWED_GAMES = 4
+#: A research read starts only if the next paid request is at least this far
+#: off: a read that runs to its full timeout still ends before it is due, so
+#: research can never delay a poll or a probe.
+RESEARCH_READ_GUARD = timedelta(seconds=kalshi_history.LIVE_BOOK_TIMEOUT)
+#: What a research read's record says it is: never a decision book.
+RESEARCH_PURPOSES = ("research_execution", "research_follow")
 
 EXIT_OK, EXIT_STOPPED, EXIT_USAGE = 0, 1, 2
 
@@ -682,6 +745,24 @@ class ShadowMonitor:
                        "book_failures": 0, "in_play_skipped": 0,
                        "assessment_errors": 0, "outages": 0,
                        "recovery_probes": 0, "gaps": 0}
+        #: THE RESEARCH CHANNELS, with their own counts: nothing they do is
+        #: in a count above, so the adjacent path's figures mean what they
+        #: meant before the channels existed.
+        self.research = (ResearchChannels(
+            self.detector.policy,
+            drift=DriftPolicy(max_spacing=self.max_poll_spacing),
+            ret=ReturnPolicy()) if RESEARCH_ENABLED else None)
+        self.research_follows: dict[str, Follow] = {}
+        self.research_counts: Counter = Counter()
+        self.research_error: str | None = None
+        #: Contracts the adjacent path read for execution on the answer being
+        #: absorbed, and whether each read answered. A research signal on
+        #: that answer shares the read -- and does not repeat a failed one
+        #: straight behind it, as a failed decision read stops the rest.
+        self._executed: dict[str, bool] = {}
+        #: The poll grid's origin, so a research read knows when the next
+        #: paid request is due without reaching into the loop.
+        self._grid_origin: datetime | None = None
 
     # --- the Kalshi side (free) -------------------------------------------
 
@@ -696,18 +777,24 @@ class ShadowMonitor:
             book, parsed = parse_orderbook(payload, ticker=watched.ticker,
                                            received_at=received, sent_at=sent)
             coverage.merge(parsed)
-        self.counts["book_reads"] += 1
+        # A RESEARCH READ is counted apart and never becomes a decision book:
+        # the screen prices from what the adjacent path read, exactly as it
+        # did before the research channels existed.
+        research = purpose in RESEARCH_PURPOSES
+        counts = self.research_counts if research else self.counts
+        counts["book_reads"] += 1
         failure = None
         if not coverage.complete:
-            self.counts["book_failures"] += 1
+            counts["book_failures"] += 1
             failure = _book_failure(coverage, sent, received)
-        self.last_read_status = read_status(payload is not None, book)
+        if not research:
+            self.last_read_status = read_status(payload is not None, book)
         self.recorder.write(
             "book", ticker=watched.ticker, purpose=purpose, sent_at=sent,
             received_at=received, payload=payload,
             coverage=coverage.reasons, **(context or {}),
             **({"failure": failure} if failure else {}))
-        if book is not None:
+        if book is not None and not research:
             history = self.books.setdefault(watched.ticker, [])
             history.append(book)
             horizon = received - BOOK_MEMORY
@@ -1023,6 +1110,7 @@ class ShadowMonitor:
                f"({self.max_poll_spacing.total_seconds():g}s)")
         for stream in sorted(self.seen):
             self.detector.note_gap(stream, until, why)
+        self._research_call(lambda r: r.on_unpolled(until))
         self._record_gap({
             "cause": "not_polled", "from": since, "to": until,
             # The next poll was due one cadence after the last; from then
@@ -1094,6 +1182,7 @@ class ShadowMonitor:
         for stream in sorted(self.seen):
             self.detector.note_gap(stream, live.received_at,
                                    "the live poll did not answer")
+        self._research_call(lambda r: r.on_failed_poll(live.received_at))
         return run
 
     def _failed_poll(self, live: LiveOdds, failure: dict,
@@ -1125,6 +1214,7 @@ class ShadowMonitor:
         if run.failed_polls >= OUTAGE_AFTER_FAILED_POLLS:
             run.outage_at = ready_at
             self.counts["outages"] += 1
+            self._research_call(lambda r: r.on_outage(ready_at))
             # The first answer after it rejoins the slate: an outage can
             # outlast the join the monitor was working from.
             self.next_rejoin = None
@@ -1228,6 +1318,7 @@ class ShadowMonitor:
         for quote in parsed.quotes:
             quotes_by_event.setdefault(quote.provider_event_id, []).append(quote)
         rejoin_due = self.next_rejoin is None or now >= self.next_rejoin
+        self._executed = {}
 
         present: set[str] = set()
         for quote in parsed.quotes:
@@ -1253,6 +1344,11 @@ class ShadowMonitor:
             self.detector.note_gap(stream, live.received_at,
                                    "absent from the live response")
         self.seen = (self.seen | present) - self.started
+        # THE RESEARCH CHANNELS see the same answer only now: after every
+        # move on it has been read and decided, so nothing they do can delay
+        # or reorder the adjacent path -- and before the rejoin, so their
+        # own reads do not wait behind its requests.
+        self._research_answer(parsed.quotes, live, ready_at)
         # THE HOURLY REJOIN COMES AFTER THIS ANSWER'S MOVES, never between a
         # move and its execution read. It is a dozen free requests; an
         # execution read that waited behind them recorded the monitor's
@@ -1318,6 +1414,7 @@ class ShadowMonitor:
                 continue
             executions[w.ticker] = self.read_book(
                 w, "execution", {"stream_id": trigger.stream_id})
+            self._executed[w.ticker] = executions[w.ticker] is not None
         decisions = []
         for watched in contracts:
             book = executions.get(watched.ticker)
@@ -1414,6 +1511,220 @@ class ShadowMonitor:
             while follow.next_at <= self.clock.now():
                 follow.next_at += self.follow_every
 
+    # --- the research channels: free reads, never a decision -----------------
+
+    def _research_call(self, step: Callable[[ResearchChannels], Any]) -> Any:
+        """One research step. A failure stops the CHANNELS, never the
+        session: it is recorded, the adjacent path carries on untouched, and
+        `--report` rebuilds the channels from the raw records anyway. A
+        session-level stop raised inside one -- the end, an undeclared
+        request, the cap -- passes through unchanged."""
+        if self.research is None:
+            return None
+        try:
+            return step(self.research)
+        except (AuthorizedEndReached, CaptureRefused, CreditCapReached):
+            raise
+        except Exception as exc:                    # noqa: BLE001 -- recorded
+            self.research_error = scrub(f"{type(exc).__name__}: {exc}",
+                                        (self.api_key,))
+            self.research = None
+            self.research_follows.clear()
+            self.research_counts["errors"] += 1
+            self.recorder.write(
+                "research_error", at=self.clock.now(),
+                error=self.research_error,
+                note=("the research channels stopped for the rest of the "
+                      "session; the adjacent path is unaffected, and "
+                      "--report rebuilds the channels from the raw records"))
+            return None
+
+    def _next_paid_due(self) -> datetime | None:
+        """When the next paid request is due: the outage's next probe, or
+        the next slot on the session's poll grid -- the one the loop polls
+        at -- or a later Retry-After."""
+        run = self.failures
+        if run is not None and run.is_outage:
+            return run.next_probe_at
+        if self._grid_origin is None:
+            return None
+        slots = math.floor((self.clock.now() - self._grid_origin)
+                           / self.cadence) + 1
+        due = self._grid_origin + slots * self.cadence
+        if self.not_before is not None and self.not_before > due:
+            due = self.not_before
+        return due
+
+    def _research_coverage(self, watched: Watched, at: datetime) -> str:
+        """Whether a research read of this contract is due at `at`: the
+        monitor's own horizon rule, judged at the signal."""
+        return research_coverage(watched.start, at, self.book_horizon)
+
+    def _research_reads(self, contracts: Sequence[Watched], purpose: str,
+                        context: dict, due: datetime | None) -> dict:
+        """Free reads for research, each started only if it cannot reach
+        the authorized end or the next paid request -- and one failure
+        abandons the rest, as a failed decision read does."""
+        outcomes: dict[str, str] = {}
+        stopped = None
+        for watched in contracts:
+            if stopped is None and self._past_end():
+                stopped = "not sent: the authorized end had passed"
+            if stopped is None and due is not None and (
+                    self.clock.now() + RESEARCH_READ_GUARD > due):
+                stopped = (f"not sent: the next paid request was due within "
+                           f"{RESEARCH_READ_GUARD.total_seconds():g}s")
+                self.research_counts["reads_deferred_for_the_poll"] += 1
+            if stopped is not None:
+                outcomes[watched.ticker] = stopped
+                continue
+            book = self.read_book(watched, purpose, context)
+            if book is None:
+                outcomes[watched.ticker] = "failed"
+                stopped = "not sent: an earlier research read failed"
+            else:
+                outcomes[watched.ticker] = "read"
+        return outcomes
+
+    def _research_answer(self, quotes: Sequence[Any], live: LiveOdds,
+                         ready_at: datetime) -> None:
+        opened = self._research_call(lambda r: r.on_answer(
+            quotes, received_at=live.received_at, sent_at=live.sent_at,
+            ready_at=ready_at,
+            request_url=recorded_url(live_odds_url(self.sport, "")),
+            resolution_seconds=self.cadence.total_seconds()))
+        if opened:
+            self._research_call(lambda r: self._research_signals(opened))
+
+    def _research_signals(self, signals: Sequence[Any]) -> None:
+        """Each newly opened research episode: recorded, then its game's
+        books read (free) and followed, within the declared bounds. Never
+        screened and never entered: its assessment is rebuilt offline."""
+        due = self._next_paid_due()
+        games = 0
+        for signal in sorted(signals, key=lambda s: (-s.magnitude,
+                                                     s.stream_id, s.channel)):
+            self.research_counts[f"{signal.channel}_episodes"] += 1
+            contracts = self.watched.get(signal.event_id, [])
+            plan = {w.ticker: self._research_coverage(w, signal.detected_at)
+                    for w in contracts}
+            self.recorder.write(
+                "research_signal", **signal.as_dict(), contracts=plan,
+                **({} if contracts else
+                   {"not_joined": "not joined to an open contract"}))
+            due_now = [w for w in contracts if plan[w.ticker] == "in_horizon"]
+            outcomes = {t: v for t, v in plan.items() if v != "in_horizon"}
+            fresh = []
+            for w in due_now:
+                if w.ticker not in self._executed:
+                    fresh.append(w)
+                elif self._executed[w.ticker]:
+                    outcomes[w.ticker] = ("shared: the adjacent trigger's "
+                                          "execution read on this answer")
+                    self.research_counts["execution_reads_shared"] += 1
+                else:
+                    outcomes[w.ticker] = (
+                        "not sent: the adjacent trigger's execution read of "
+                        "it on this answer had just failed")
+                    self.research_counts["execution_reads_not_repeated"] += 1
+            if fresh and games >= RESEARCH_MAX_GAMES_PER_ANSWER:
+                for w in fresh:
+                    outcomes[w.ticker] = (
+                        f"not sent: {RESEARCH_MAX_GAMES_PER_ANSWER} game(s) "
+                        f"were already read for research on this answer")
+                self.research_counts["execution_reads_capped"] += len(fresh)
+            elif fresh:
+                games += 1
+                outcomes.update(self._research_reads(
+                    fresh, "research_execution",
+                    {"research_episode": signal.episode_id,
+                     "channel": signal.channel,
+                     "stream_id": signal.stream_id}, due))
+            self.recorder.write(
+                "research_execution", episode=signal.episode_id,
+                channel=signal.channel, event_id=signal.event_id,
+                reads=outcomes, follow=self._research_follow(signal, due_now))
+
+    def _research_follow(self, signal: Any,
+                         contracts: Sequence[Watched]) -> str:
+        if not contracts:
+            return "none: no joined contract within the horizon"
+        now = self.clock.now()
+        until = signal.detected_at + self.follow_for
+        current = self.research_follows.get(signal.event_id)
+        if current is not None and current.until >= now:
+            current.until = max(current.until, until)
+            return "extended"
+        active = sum(1 for f in self.research_follows.values()
+                     if f.until >= now)
+        if active >= RESEARCH_MAX_FOLLOWED_GAMES:
+            self.research_counts["follows_refused_at_the_cap"] += 1
+            return (f"refused: {RESEARCH_MAX_FOLLOWED_GAMES} game(s) were "
+                    f"already followed for research")
+        self.research_follows[signal.event_id] = Follow(
+            until=until, next_at=now + self.follow_every)
+        self.research_counts["follows_started"] += 1
+        return "started"
+
+    def research_follow_due(self, due: datetime | None) -> None:
+        """The research follows, AFTER the adjacent ones. A game the adjacent
+        path is following already has its reads, and those serve; a slot
+        that cannot be read without reaching the next paid request is
+        skipped, never made late."""
+        now = self.clock.now()
+        stopped = False
+        for event_id in sorted(self.research_follows):
+            follow = self.research_follows[event_id]
+            if now > follow.until:
+                del self.research_follows[event_id]
+                continue
+            if now < follow.next_at:
+                continue
+            adjacent = self.follows.get(event_id)
+            if adjacent is not None and adjacent.until >= now:
+                self.research_counts["follow_slots_served_by_adjacent"] += 1
+            elif stopped:
+                self.research_counts["follow_slots_skipped"] += 1
+            else:
+                contracts = [w for w in self.watched.get(event_id, [])
+                             if self._research_coverage(w, now)
+                             == "in_horizon"]
+                outcomes = self._research_reads(
+                    contracts, "research_follow",
+                    {"research_follow": event_id}, due)
+                if any(v != "read" for v in outcomes.values()):
+                    stopped = True
+                    self.research_counts["follow_slots_cut_short"] += 1
+            while follow.next_at <= self.clock.now():
+                follow.next_at += self.follow_every
+
+    def _research_declaration(self) -> dict:
+        return {"policies": self.research.policies(),
+                "reads": {"purposes": list(RESEARCH_PURPOSES),
+                          "max_games_per_answer":
+                              RESEARCH_MAX_GAMES_PER_ANSWER,
+                          "max_followed_games": RESEARCH_MAX_FOLLOWED_GAMES,
+                          "follow_every_seconds":
+                              self.follow_every.total_seconds(),
+                          "follow_for_seconds": self.follow_for.total_seconds(),
+                          "read_guard_seconds":
+                              RESEARCH_READ_GUARD.total_seconds(),
+                          "decision_memory": "never: a research read is not "
+                                             "a decision book"},
+                "note": "research only: a research signal is not permission "
+                        "to trade, and is never screened for entry"}
+
+    def _research_status(self) -> dict:
+        channels = self.research
+        return {"enabled": True, "stopped_by_error": self.research_error,
+                "episodes": (None if channels is None else
+                             {c: len(channels.episodes[c])
+                              for c in (DRIFT, RETURN)}),
+                "counts": dict(sorted(self.research_counts.items())),
+                "note": "research only, never screened for entry. Its book "
+                        "reads are free and counted here, apart from the "
+                        "adjacent path's"}
+
     # --- the session ---------------------------------------------------------
 
     def run(self) -> Stop:
@@ -1436,7 +1747,10 @@ class ShadowMonitor:
             eligibility=vars(Eligibility()),
             recovery=recovery_policy(),
             max_poll_spacing_seconds=self.max_poll_spacing.total_seconds(),
-            status_file=self.status_path.name)
+            status_file=self.status_path.name,
+            **({"research": self._research_declaration()}
+               if self.research is not None else {}))
+        researched = self.research is not None
         crash: Exception | None = None
         try:
             with only_declared_endpoints(), self._dispatch_gate():
@@ -1467,6 +1781,7 @@ class ShadowMonitor:
             stop = Stop("crashed", scrub(f"{type(exc).__name__}: {exc}",
                                          (self.api_key,)))
         ended = self.clock.now()
+        self._research_call(lambda r: r.finish(ended))
         in_outage = self.failures is not None and self.failures.is_outage
         if self.failures is not None:
             # A run of failures still open at the end: its blind interval
@@ -1475,6 +1790,8 @@ class ShadowMonitor:
         else:
             self._unpolled_tail(ended)
         self.status = self._final_status(stop, started, end, ended, in_outage)
+        if researched:
+            self.status["research"] = self._research_status()
         self.recorder.write("session_end", at=ended,
                             reason=stop.reason, detail=stop.detail,
                             ok=stop.ok, counts=self.counts,
@@ -1484,14 +1801,20 @@ class ShadowMonitor:
                             account_remaining=self.ledger.remaining,
                             status=self.status["status"],
                             gaps=self.status["gaps"],
-                            deadline=self.status["deadline"])
+                            deadline=self.status["deadline"],
+                            **({"research": {
+                                **self._research_status(),
+                                "summary": (self.research.summary()
+                                            if self.research is not None
+                                            else None)}}
+                               if researched else {}))
         self._write_status(self.status)
         if crash is not None:
             raise crash
         return stop
 
     def _loop(self, end: datetime) -> Stop:
-        next_tick = self.clock.now()
+        next_tick = self._grid_origin = self.clock.now()
         while True:
             now = self.clock.now()
             if now >= end:
@@ -1516,8 +1839,10 @@ class ShadowMonitor:
             run = self.failures
             due = (run.next_probe_at if run is not None and run.is_outage
                    else self._due(next_tick))
+            self._research_call(lambda r: self.research_follow_due(due))
             wake = min([due, end]
-                       + [f.next_at for f in self.follows.values()])
+                       + [f.next_at for f in self.follows.values()]
+                       + [f.next_at for f in self.research_follows.values()])
             self.clock.sleep((wake - self.clock.now()).total_seconds())
 
     def _due(self, next_tick: datetime) -> datetime:
@@ -1694,6 +2019,16 @@ def read_records(path: Path) -> tuple[list[dict], int]:
     return rows, bad
 
 
+def adjacent_books(rows: Sequence[dict]) -> list[dict]:
+    """Every book read the ADJACENT path made: decision, execution and
+    follow reads. A research read (`RESEARCH_PURPOSES`) is never one of them
+    -- not a decision book, not a response read, not a count in the
+    adjacent report -- so a session that ran the research channels reports
+    its adjacent figures exactly as one that did not."""
+    return [r for r in rows if r["kind"] == "book"
+            and r.get("purpose") not in RESEARCH_PURPOSES]
+
+
 def parse_odds_row(row: dict) -> Any:
     """One recorded poll's answer, parsed as the monitor parsed it, or None
     when the poll did not answer. The one reading of an `odds` record: the
@@ -1826,7 +2161,7 @@ def report(rows: Sequence[dict], *, min_response: float | None = None,
 
     triggers = [r for r in rows if r["kind"] == "trigger"]
     decisions = [r for r in rows if r["kind"] == "decision"]
-    books = [r for r in rows if r["kind"] == "book"]
+    books = adjacent_books(rows)
     out["moves"] = len(triggers)
     refusals: dict[str, int] = {}
     for d in decisions:
@@ -1916,9 +2251,11 @@ def failure_chronology(rows: Sequence[dict]) -> dict:
     session from before failures were classified is described too; what is
     read from its message rather than recorded as a field says so. The
     failed Kalshi reads beside a run are evidence about the path, never a
-    cause: nothing here names one.
+    cause: nothing here names one. Research reads are left out, so these
+    counts mean what they meant before the research channels existed; the
+    research read-out reports its own.
     """
-    books = [r for r in rows if r["kind"] == "book"]
+    books = adjacent_books(rows)
     runs: list[dict] = []
     current: dict | None = None
     last_answer: datetime | None = None
@@ -2373,8 +2710,9 @@ def _report(args: argparse.Namespace) -> int:
     constants and parsers, so it depends on this one, not the reverse."""
     from shadow_diagnostics import (
         diagnose, jsonable, load_settlements, no_network, render_diagnostics,
-        source_of,
+        replay, source_of,
     )
+    from shadow_research import analyse as research, render_research
     path = Path(args.report)
     if not path.is_file():
         print(f"no such session file: {path}", file=sys.stderr)
@@ -2392,6 +2730,10 @@ def _report(args: argparse.Namespace) -> int:
         figures = diagnose(rows, settlements=settlements,
                            source=source_of(path, len(rows), bad))
         print(render_diagnostics(figures))
+        # THE RESEARCH CHANNELS, apart and after: everything above is the
+        # adjacent path's, and none of it reads anything computed here.
+        figures["research"] = research(rows, replayed=replay(rows))
+        print(render_research(figures["research"]))
     if bad:
         print(f"\n  *** {bad} unreadable line(s) skipped (a session "
               f"killed mid-write leaves one)")
